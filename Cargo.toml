@@ -10,6 +10,18 @@ description = "One graph for the Rust projects in our ecosystem: the core of the
 publish = false
 
 [dependencies]
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+uuid = { version = "1", features = ["v7", "serde"] }
+
+[dev-dependencies]
+fastrand = "2"
+rstest = "0.26"
+rstest-bdd = "0.6"
+rstest-bdd-macros = "0.6"
+tempfile = "3"
 
 [lints.rust]
 unsafe_code = "forbid"
@@ -22,3 +34,8 @@ unwrap_used = "warn"
 expect_used = "warn"
 dbg_macro = "warn"
 todo = "warn"
+
+# The scenarios build graphs at the toys' sizes (T4: 100,000 voices); an unoptimized bundled
+# SQLite makes those fixtures several times slower.
+[profile.dev.package."*"]
+opt-level = 3
