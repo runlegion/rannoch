@@ -239,6 +239,7 @@ impl Graph {
         let mut seen: HashSet<(&str, i64)> = HashSet::from([(root.class.as_str(), root_id)]);
         let mut frontier: Vec<(&str, i64)> = vec![(root.class.as_str(), root_id)];
         let mut found: Vec<NodeRef> = Vec::new();
+        let hops = if cap == 0 { 0 } else { hops };
         'hops: for _ in 0..hops {
             let mut next = Vec::new();
             for &(class, id) in &frontier {
