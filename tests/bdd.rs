@@ -19,8 +19,8 @@ use std::thread::JoinHandle;
 use std::time::SystemTime;
 
 use rannoch::{
-    Change, Class, Count, Cursor, Date, Declaration, Event, Fact, Graph, GroupBy, LinkFact, Node,
-    NodeRef, OpenLink, Relation, Step, Tally, Unit, ValidTime, Write, WriteError,
+    Change, Class, Count, Cursor, Date, Declaration, Event, Fact, Graph, GroupBy, Link, LinkFact,
+    Node, NodeRef, OpenLink, Relation, Step, Tally, Unit, ValidTime, Write, WriteError,
 };
 use rstest_bdd_macros::{given, scenarios, then, when};
 use tempfile::TempDir;
@@ -297,6 +297,116 @@ fn rewrite_s05(g: &mut Graph) {
     .unwrap();
 }
 
+/// The nodes and links a fixture wrote: nodes by class and key, links by relation and keys.
+#[derive(Default)]
+struct Instances {
+    nodes: Vec<NodeRef>,
+    links: Vec<(String, String, String)>,
+}
+
+/// The T9b instances (t9b-direct, 2026-10-14) on its declarations: 27 units, each its own
+/// write and so its own event, every link between nodes already present so none waits.
+fn t9b_instances(g: &mut Graph) -> Instances {
+    let mut instances = Instances::default();
+    let mut put =
+        |g: &mut Graph, unit: Unit, node: (&str, String), links: Vec<(&str, String, String)>| {
+            let written = g.write(&Write::new("t9b").unit(unit)).unwrap();
+            assert_eq!(written.len(), 1);
+            instances.nodes.push(NodeRef::new(node.0, node.1));
+            instances.links.extend(
+                links
+                    .into_iter()
+                    .map(|(relation, from, to)| (relation.to_string(), from, to)),
+            );
+        };
+    let when = day(2026, 10, 14);
+    for p in 0..2 {
+        let key = format!("place{p}");
+        let url = format!("https://example.org/{p}");
+        put(
+            g,
+            Unit::new("place", key.clone(), [("url", url)], when.clone()),
+            ("place", key),
+            vec![],
+        );
+    }
+    for c in 0..3 {
+        let (key, place) = (format!("conv{c}"), format!("place{}", c % 2));
+        put(
+            g,
+            Unit::new("conversation", key.clone(), NONE, when.clone()).link(
+                "at",
+                key.clone(),
+                place.clone(),
+                when.clone(),
+            ),
+            ("conversation", key.clone()),
+            vec![("at", key, place)],
+        );
+    }
+    for v in 0..4 {
+        let key = format!("voice{v}");
+        put(
+            g,
+            Unit::new("voice", key.clone(), NONE, ValidTime::Unknown),
+            ("voice", key),
+            vec![],
+        );
+    }
+    for f in 0..3 {
+        let key = format!("finding{f}");
+        put(
+            g,
+            Unit::new("finding", key.clone(), NONE, when.clone()),
+            ("finding", key),
+            vec![],
+        );
+    }
+    for s in 0..15 {
+        let (key, voice, conv, finding) = (
+            format!("st{s}"),
+            format!("voice{}", s % 4),
+            format!("conv{}", s % 3),
+            format!("finding{}", s % 3),
+        );
+        put(
+            g,
+            Unit::new(
+                "statement",
+                key.clone(),
+                [("text", format!("words {s}"))],
+                day(2025, 1, 1 + s),
+            )
+            .link("said", voice.clone(), key.clone(), when.clone())
+            .link("inside", key.clone(), conv.clone(), when.clone())
+            .link("supports", key.clone(), finding.clone(), ValidTime::Unknown),
+            ("statement", key.clone()),
+            vec![
+                ("said", voice, key.clone()),
+                ("inside", key.clone(), conv),
+                ("supports", key, finding),
+            ],
+        );
+    }
+    instances
+}
+
+/// A node without the time rannoch recorded it, which no event carries.
+fn node_facts(node: Node) -> (String, String, BTreeMap<String, String>, String, ValidTime) {
+    (
+        node.class,
+        node.key,
+        node.properties,
+        node.source,
+        node.valid,
+    )
+}
+
+/// A link without the time rannoch recorded it, which no event carries.
+fn link_facts(link: Link) -> (String, NodeRef, NodeRef, String, ValidTime) {
+    (link.relation, link.from, link.to, link.source, link.valid)
+}
+
 // ---------- the world ----------
 
 struct World {
@@ -321,6 +431,8 @@ struct World {
     read: Vec<Event>,
     folded: BTreeMap<String, usize>,
     open_links: Vec<OpenLink>,
+    instances: Instances,
+    rebuilt: Option<Graph>,
 }
 
 #[rstest::fixture]
@@ -347,6 +459,8 @@ fn world() -> World {
         read: Vec::new(),
         folded: BTreeMap::new(),
         open_links: Vec::new(),
+        instances: Instances::default(),
+        rebuilt: None,
     }
 }
 
@@ -363,6 +477,14 @@ impl World {
 
     fn g(&mut self) -> &mut Graph {
         self.graph.as_mut().expect("the graph is open")
+    }
+
+    /// The original graph and the graph rebuilt from its events.
+    fn both(&self) -> (&Graph, &Graph) {
+        (
+            self.graph.as_ref().expect("the graph is open"),
+            self.rebuilt.as_ref().expect("the graph was rebuilt"),
+        )
     }
 
     fn all_events(&mut self) -> Vec<Event> {
@@ -1771,6 +1893,115 @@ fn finds_s05_2023(world: &mut World) {
 fn no_node(world: &mut World) {
     assert!(world.found.is_none());
     assert!(world.g().find("statement", "s05").unwrap().is_some());
+}
+
+// ---------- rebuild ----------
+
+#[given("a graph whose stream holds 36 events, 9 of them declarations")]
+fn t9b_graph(world: &mut World) {
+    let g = world.open();
+    for d in t9b() {
+        g.declare(&d).unwrap();
+    }
+    world.instances = t9b_instances(world.g());
+    let events = world.all_events();
+    assert_eq!(events.len(), 36);
+    let declarations = events
+        .iter()
+        .filter(|e| matches!(e.change, Change::Declared(_)))
+        .count();
+    assert_eq!(declarations, 9);
+}
+
+#[given("a graph written from a reply stream in which some parents never arrive")]
+fn graph_from_stream_missing_parents(world: &mut World) {
+    parents_never_arrive(world);
+    writes_whole_stream(world);
+    assert!(!world.g().open_links().unwrap().is_empty());
+}
+
+#[when("the app rebuilds a file from those events into an empty path")]
+#[when("the app rebuilds a file from its events into an empty path")]
+fn rebuilds(world: &mut World) {
+    world.log = world.all_events();
+    let path = world.dir.path().join("rebuilt.rannoch");
+    assert!(!path.exists());
+    rannoch::rebuild(&world.log, &path).unwrap();
+    world.rebuilt = Some(rannoch::open(&path).unwrap());
+}
+
+#[then("none of the 36 events fails to land")]
+fn every_event_lands(world: &mut World) {
+    let landed = world
+        .rebuilt
+        .as_ref()
+        .unwrap()
+        .events()
+        .since(Cursor::START)
+        .unwrap();
+    assert_eq!(landed.len(), 36);
+    let ids =
+        |events: &[Event]| -> Vec<_> { events.iter().map(|e| (e.id, e.change.clone())).collect() };
+    assert_eq!(ids(&landed), ids(&world.log));
+}
+
+#[then("the rebuilt graph's ontology lists the same classes and relations as the original")]
+fn same_ontology(world: &mut World) {
+    let (original, rebuilt) = world.both();
+    assert_t9b_ontology(rebuilt);
+    assert_eq!(rebuilt.ontology(), original.ontology());
+}
+
+#[then("the rebuilt graph holds the same nodes and links as the original")]
+fn same_instances(world: &mut World) {
+    let (original, rebuilt) = world.both();
+    assert_eq!(world.instances.nodes.len(), 27);
+    for node in &world.instances.nodes {
+        let have = original.find(&node.class, &node.key).unwrap().unwrap();
+        let back = rebuilt.find(&node.class, &node.key).unwrap();
+        assert_eq!(back.map(node_facts), Some(node_facts(have)), "{node:?}");
+    }
+    assert!(!world.instances.links.is_empty());
+    for (relation, from, to) in &world.instances.links {
+        let have = original.find_link(relation, from, to).unwrap().unwrap();
+        let back = rebuilt.find_link(relation, from, to).unwrap();
+        assert_eq!(
+            back.map(link_facts),
+            Some(link_facts(have)),
+            "{relation} {from} {to}"
+        );
+    }
+}
+
+#[then("the rebuilt graph's answers links are the original's")]
+fn same_answers(world: &mut World) {
+    let stream = world.stream.take().unwrap();
+    let (original, rebuilt) = world.both();
+    let answers = |g: &Graph| {
+        let mut links = HashSet::new();
+        for (statement, _, _) in &stream.arrivals {
+            let root = NodeRef::new("statement", statement.clone());
+            for parent in g.walk(&root, &["answers"], 1, usize::MAX).unwrap() {
+                let link = g
+                    .find_link("answers", statement, &parent.key)
+                    .unwrap()
+                    .unwrap();
+                links.insert(link_facts(link));
+            }
+        }
+        links
+    };
+    let have = answers(original);
+    assert!(!have.is_empty());
+    assert_eq!(answers(rebuilt), have);
+}
+
+#[then("the rebuilt graph's open links are the original's")]
+fn same_open_links(world: &mut World) {
+    let (original, rebuilt) = world.both();
+    let have = original.open_links().unwrap();
+    assert!(!have.is_empty());
+    assert_eq!(rebuilt.open_links().unwrap(), have);
 }
 
 scenarios!("tests", fixtures = [world: World]);

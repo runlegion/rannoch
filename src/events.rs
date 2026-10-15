@@ -3,13 +3,15 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::path::Path;
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::open::{Graph, Ontology, open};
 use crate::read::NodeRef;
-use crate::write::{Declaration, Error, ValidTime};
+use crate::write::{Declaration, Error, ValidTime, now_millis, replay};
 
 /// rannoch's own tables: the event log, the ontology, and links waiting for an end.
 pub(crate) const OWN_TABLES: &str = "
@@ -116,10 +118,12 @@ struct Stored {
 
 /// Appends one event inside the caller's transaction, so it lands only if that transaction does.
 pub(crate) fn append(tx: &Connection, change: Change) -> Result<Event, Error> {
-    let stored = Stored {
-        id: EventId(Uuid::now_v7()),
-        change,
-    };
+    store(tx, EventId(Uuid::now_v7()), change)
+}
+
+/// Appends one event under the id it already has, inside the caller's transaction.
+fn store(tx: &Connection, id: EventId, change: Change) -> Result<Event, Error> {
+    let stored = Stored { id, change };
     tx.prepare_cached("INSERT INTO _events(body) VALUES (?1)")?
         .execute(params![serde_json::to_string(&stored)?])?;
     Ok(Event {
@@ -156,4 +160,29 @@ impl Events<'_> {
         }
         Ok(events)
     }
+}
+
+/// Rebuilds a graph file at `empty_path` from `events` alone, replaying them in order: its
+/// ontology from the declaration events, and its nodes, links and open links from the rest.
+/// Each event lands in the new file under its own id. The events land together or not at all.
+///
+/// # Errors
+/// The file cannot be opened as a graph file, or an event cannot be replayed into it.
+pub fn rebuild(events: &[Event], empty_path: impl AsRef<Path>) -> Result<Graph, Error> {
+    let mut graph = open(empty_path)?;
+    let tx = graph
+        .conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let mut ontology = Ontology::load(&tx)?;
+    let recorded = now_millis();
+    for event in events {
+        replay(&tx, &ontology, recorded, &event.change)?;
+        if matches!(event.change, Change::Declared(_)) {
+            ontology = Ontology::load(&tx)?;
+        }
+        store(&tx, event.id, event.change.clone())?;
+    }
+    tx.commit()?;
+    graph.ontology = ontology;
+    Ok(graph)
 }
