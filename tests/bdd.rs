@@ -3,7 +3,7 @@
 //!
 //! Steps act and observe through rannoch's public API. Only fixture setup touches the file
 //! directly: the trigger that makes a write's third piece fail, and reading the file's table
-//! names so a refusal can be checked against them.
+//! and column names so an answer or a refusal can be checked against them.
 
 #![allow(
     clippy::expect_used,
@@ -19,8 +19,9 @@ use std::thread::JoinHandle;
 use std::time::SystemTime;
 
 use rannoch::{
-    Change, Class, Count, Cursor, Date, Declaration, Error, Event, Fact, Graph, GroupBy, Node,
-    NodeRef, Relation, Step, Tally, Unit, ValidTime, Write, WriteError,
+    Change, Class, Count, Cursor, Date, Declaration, Description, Error, Event, EventId, Fact,
+    Fate, Graph, GroupBy, LinkFact, Node, NodeRef, OpenLink, PartOf, Relation, Step, Tally, Unit,
+    ValidTime, Write, WriteError,
 };
 use rstest_bdd_macros::{given, scenarios, then, when};
 use tempfile::TempDir;
@@ -133,6 +134,48 @@ fn declare_replies(g: &mut Graph) {
     .unwrap();
 }
 
+/// The T9b declarations and instances (t9b-direct, 2026-10-14): place swtor-tc, conversation c1
+/// at it, finding f1, voices v0 to v2, and statements s0 to s4, each inside c1, said by a voice
+/// and supporting f1.
+fn t9b_graph(g: &mut Graph) {
+    for d in t9b() {
+        g.declare(&d).unwrap();
+    }
+    let when = day(2021, 3, 2);
+    let mut write = Write::new("swtor")
+        .unit(Unit::new(
+            "place",
+            "swtor-tc",
+            [("url", "discord.gg/x")],
+            day(2019, 10, 1),
+        ))
+        .unit(Unit::new("conversation", "c1", NONE, when.clone()).link(
+            "at",
+            "c1",
+            "swtor-tc",
+            when.clone(),
+        ))
+        .unit(Unit::new("finding", "f1", NONE, day(2026, 10, 1)));
+    for i in 0..5 {
+        let (statement, voice) = (format!("s{i}"), format!("v{}", i % 3));
+        write = write
+            .unit(Unit::new("voice", voice.clone(), NONE, when.clone()))
+            .unit(
+                Unit::new(
+                    "statement",
+                    statement.clone(),
+                    [("text", "the respec cost is absurd")],
+                    when.clone(),
+                )
+                .link("inside", statement.clone(), "c1", when.clone())
+                .link("said", voice, statement.clone(), when.clone())
+                .link("supports", statement, "f1", day(2026, 10, 1)),
+            );
+    }
+    g.write(&write).unwrap();
+    assert!(g.open_links().unwrap().is_empty());
+}
+
 /// T4's source: per finding, its distinct voices, statements and per-place counts.
 #[derive(Default)]
 struct FindingSource {
@@ -201,13 +244,21 @@ fn t4(world: &mut World) -> HashMap<String, FindingSource> {
 }
 
 /// T2's size (t6-t2-refs-replay): 20 findings, 500 voices, 5,000 statements, each unit its own
-/// write. Returns the events the writes returned, in order.
+/// write. As in T2, each voice holds content: a name, "voice <n>". Returns the events the
+/// declaration of that name and the writes returned, in order.
 fn t2(g: &mut Graph) -> Vec<Event> {
     for d in t9b() {
         g.declare(&d).unwrap();
     }
+    let mut written: Vec<Event> = g
+        .declare(&Declaration::Property {
+            class: "voice".into(),
+            property: "name".into(),
+        })
+        .unwrap()
+        .into_iter()
+        .collect();
     let when = day(2026, 10, 1);
-    let mut written = Vec::new();
     let mut put = |g: &mut Graph, unit: Unit| {
         written.extend(g.write(&Write::new("eavesdrop").unit(unit)).unwrap());
     };
@@ -215,7 +266,15 @@ fn t2(g: &mut Graph) -> Vec<Event> {
         put(g, Unit::new("finding", format!("f{f}"), NONE, when.clone()));
     }
     for v in 0..500 {
-        put(g, Unit::new("voice", format!("v{v}"), NONE, when.clone()));
+        put(
+            g,
+            Unit::new(
+                "voice",
+                format!("v{v}"),
+                [("name", format!("voice {v}"))],
+                when.clone(),
+            ),
+        );
     }
     for s in 0..5000 {
         let (voice, finding, statement) = (
@@ -340,6 +399,15 @@ struct World {
     log: Vec<Event>,
     read: Vec<Event>,
     folded: BTreeMap<String, usize>,
+    forgot: Option<Event>,
+    content: String,
+    named: Vec<(EventId, Vec<Fact>)>,
+    open_links: Vec<OpenLink>,
+    described: Option<Description>,
+    answers: Vec<String>,
+    shared: Option<Graph>,
+    fates: Vec<Fate>,
+    references: Vec<Node>,
     before: Vec<Tally>,
 }
 
@@ -367,6 +435,15 @@ fn world() -> World {
         log: Vec::new(),
         read: Vec::new(),
         folded: BTreeMap::new(),
+        forgot: None,
+        content: String::new(),
+        named: Vec::new(),
+        open_links: Vec::new(),
+        described: None,
+        answers: Vec::new(),
+        shared: None,
+        fates: Vec::new(),
+        references: Vec::new(),
         before: Vec::new(),
     }
 }
@@ -974,6 +1051,58 @@ fn writes_v1_same(world: &mut World) {
     assert!(world.written.is_empty());
 }
 
+// ---------- write: replacing a node ----------
+
+#[given("statements s8 and s9")]
+fn s8_and_s9(world: &mut World) {
+    open_graph(world);
+    let when = day(2021, 3, 2);
+    world.write(
+        &Write::new("eavesdrop")
+            .unit(Unit::new(
+                "statement",
+                "s8",
+                [("text", "first")],
+                when.clone(),
+            ))
+            .unit(Unit::new("statement", "s9", [("text", "merged")], when)),
+    );
+    world.mark_events();
+}
+
+#[when("the app replaces s8 by s9")]
+fn replaces_s8_by_s9(world: &mut World) {
+    let event = world.g().replace("statement", "s8", "s9").unwrap();
+    world.written = vec![event];
+}
+
+#[then("the event log gains one event naming class statement, s8 and s9")]
+fn one_replacement_event(world: &mut World) {
+    let after = world.all_events();
+    let gained = &after[world.events_before..];
+    assert_eq!(gained, world.written.as_slice());
+    let [event] = gained else {
+        panic!("expected one event, got {gained:?}");
+    };
+    assert_eq!(
+        event.change,
+        Change::Replaced {
+            class: "statement".into(),
+            old: "s8".into(),
+            new: "s9".into(),
+        }
+    );
+}
+
+#[then("describing s8 answers replaced by s9")]
+fn s8_replaced_by_s9(world: &mut World) {
+    let s8 = world
+        .g()
+        .describe(&NodeRef::new("statement", "s8"))
+        .unwrap();
+    assert_eq!(s8.replaced_by, Some(NodeRef::new("statement", "s9")));
+}
+
 // ---------- write: source, valid time, recorded time ----------
 
 #[given("an open graph")]
@@ -1210,6 +1339,97 @@ fn no_parent_found(world: &mut World) {
     }
 }
 
+#[when("the listener writes the whole stream and the app reads the open links")]
+fn writes_stream_reads_open(world: &mut World) {
+    writes_whole_stream(world);
+    reads_open_links(world);
+}
+
+#[then("the open links listed are exactly the links to the parents that never arrived")]
+fn open_links_are_missing_parents(world: &mut World) {
+    let stream = world.stream.take().unwrap();
+    let arrived: HashSet<&str> = stream.arrivals.iter().map(|a| a.0.as_str()).collect();
+    let expected: BTreeSet<(String, String, String)> = stream
+        .links
+        .iter()
+        .filter(|l| arrived.contains(l.0.as_str()))
+        .map(|l| ("answers".to_string(), l.0.clone(), l.1.clone()))
+        .collect();
+    assert!(!expected.is_empty());
+    let listed: Vec<(String, String, String)> = world
+        .open_links
+        .iter()
+        .map(|o| (o.relation.clone(), o.from.key.clone(), o.to.key.clone()))
+        .collect();
+    assert_eq!(listed.len(), expected.len());
+    assert_eq!(listed.into_iter().collect::<BTreeSet<_>>(), expected);
+}
+
+fn s2_open_on_s1() -> OpenLink {
+    OpenLink {
+        relation: "answers".into(),
+        from: NodeRef::new("statement", "s2"),
+        to: NodeRef::new("statement", "s1"),
+        waits_on: NodeRef::new("statement", "s1"),
+    }
+}
+
+#[given("an answers link from statement s2 waiting on statement key s1, which is not in the graph")]
+#[given("an answers link from statement s2 waiting on statement key s1")]
+fn s2_waits_on_s1(world: &mut World) {
+    declare_replies(world.open());
+    let when = day(2021, 3, 2);
+    world.write(
+        &Write::new("discord").unit(
+            Unit::new("statement", "s2", [("text", "re")], when.clone())
+                .link("answers", "s2", "s1", when),
+        ),
+    );
+    assert!(world.g().find("statement", "s1").unwrap().is_none());
+}
+
+#[when("the app reads the open links")]
+fn reads_open_links(world: &mut World) {
+    world.open_links = world.g().open_links().unwrap();
+}
+
+#[when("the app writes a voice under key s1")]
+fn writes_voice_s1(world: &mut World) {
+    world.write(&Write::new("discord").unit(Unit::new("voice", "s1", NONE, day(2021, 3, 3))));
+}
+
+#[then("the link is listed with target kind statement and target key s1")]
+#[then("the open links still list the link from s2 waiting on statement s1")]
+fn lists_s2_waiting_on_s1(world: &mut World) {
+    let listed = world.g().open_links().unwrap();
+    assert_eq!(listed, [s2_open_on_s1()]);
+}
+
+#[then("the write's result reports a wrong-kind arrival under key s1, naming the open link")]
+fn reports_wrong_kind(world: &mut World) {
+    let reported: Vec<(NodeRef, LinkFact)> = world
+        .written
+        .iter()
+        .flat_map(|e| match &e.change {
+            Change::Wrote { wrong_kind, .. } => wrong_kind.clone(),
+            _ => Vec::new(),
+        })
+        .map(|report| (report.arrived, report.waiting))
+        .collect();
+    assert_eq!(
+        reported,
+        [(
+            NodeRef::new("voice", "s1"),
+            LinkFact {
+                relation: "answers".into(),
+                from: NodeRef::new("statement", "s2"),
+                to: NodeRef::new("statement", "s1"),
+                valid: day(2021, 3, 2),
+            }
+        )]
+    );
+}
+
 // ---------- links between declared classes ----------
 
 #[given("a finding and a statement exist")]
@@ -1422,7 +1642,7 @@ fn log_of_t2(world: &mut World) {
     world.graph = None;
     let g = world.open();
     let mut written = t2(g);
-    // t2 declared nothing new: its declarations were already on the stream.
+    // Of t2's declarations only the voice's name is new; t9b's were already on the stream.
     log.append(&mut written);
     world.log = log;
 }
@@ -1449,35 +1669,51 @@ fn a_t2_graph(world: &mut World) {
 #[when("the app folds distinct voices per finding from the events since the start")]
 fn folds_from_events(world: &mut World) {
     let mut voice_of: HashMap<String, String> = HashMap::new();
-    let mut supports: Vec<(String, String)> = Vec::new();
+    let mut supports: HashSet<(String, String)> = HashSet::new();
     for event in world.all_events() {
-        let links = match event.change {
-            Change::Wrote { added, .. } => added
-                .into_iter()
-                .filter_map(|f| match f {
-                    Fact::Link(l) => Some(l),
-                    _ => None,
-                })
-                .collect(),
-            Change::Closed(l) => vec![l],
-            Change::Declared(_) => Vec::new(),
+        let (added, removed) = match event.change {
+            Change::Wrote { added, .. } => (
+                added
+                    .into_iter()
+                    .filter_map(|f| match f {
+                        Fact::Link(l) => Some(l),
+                        _ => None,
+                    })
+                    .collect(),
+                Vec::new(),
+            ),
+            Change::Closed(l) => (vec![l], Vec::new()),
+            Change::Declared(_) | Change::Replaced { .. } => (Vec::new(), Vec::new()),
+            Change::Forgot { links, .. } => (Vec::new(), links),
         };
-        for link in links {
+        for link in added {
             match link.relation.as_str() {
                 "said" => {
                     voice_of.insert(link.to.key, link.from.key);
                 }
-                "supports" => supports.push((link.from.key, link.to.key)),
+                "supports" => {
+                    supports.insert((link.from.key, link.to.key));
+                }
+                _ => {}
+            }
+        }
+        for link in removed {
+            match link.relation.as_str() {
+                "said" => {
+                    voice_of.remove(&link.to.key);
+                }
+                "supports" => {
+                    supports.remove(&(link.from.key, link.to.key));
+                }
                 _ => {}
             }
         }
     }
     let mut pairs: BTreeMap<String, HashSet<String>> = BTreeMap::new();
     for (statement, finding) in supports {
-        pairs
-            .entry(finding)
-            .or_default()
-            .insert(voice_of[&statement].clone());
+        if let Some(voice) = voice_of.get(&statement) {
+            pairs.entry(finding).or_default().insert(voice.clone());
+        }
     }
     world.folded = pairs
         .into_iter()
@@ -1508,6 +1744,130 @@ fn fold_equals_live(world: &mut World) {
             tally.root
         );
     }
+}
+
+// ---------- events: forgetting ----------
+
+/// The voice the forget scenarios forget. Its 10 statements (st1, st501, ...) all support f1.
+fn forgotten() -> NodeRef {
+    NodeRef::new("voice", "v7")
+}
+
+/// Whether an event, as JSON, holds `content` (a JSON string, quotes included).
+fn holds(event: &Event, content: &str) -> bool {
+    serde_json::to_string(&event.change)
+        .unwrap()
+        .contains(content)
+}
+
+/// Per event, the facts that name `node`: as the node itself, or as an end of a link.
+fn naming(events: &[Event], node: &NodeRef) -> Vec<(EventId, Vec<Fact>)> {
+    let ends = |l: &rannoch::LinkFact| l.from == *node || l.to == *node;
+    events
+        .iter()
+        .filter_map(|e| {
+            let facts: Vec<Fact> = match &e.change {
+                Change::Wrote { added, .. } => added
+                    .iter()
+                    .filter(|f| match f {
+                        Fact::Node(n) => n.class == node.class && n.key == node.key,
+                        Fact::Link(l) | Fact::Opened(l) => ends(l),
+                    })
+                    .cloned()
+                    .collect(),
+                Change::Closed(l) if ends(l) => vec![Fact::Link(l.clone())],
+                _ => Vec::new(),
+            };
+            (!facts.is_empty()).then_some((e.id, facts))
+        })
+        .collect()
+}
+
+/// Forgets the voice, keeping its content as JSON and, per earlier event that named it, the
+/// facts it should still name once its content is stripped.
+fn forget_voice(world: &mut World) {
+    let voice = forgotten();
+    let content =
+        serde_json::to_string(&world.find(&voice.class, &voice.key).properties["name"]).unwrap();
+    let before = world.all_events();
+    assert!(before.iter().any(|e| holds(e, &content)));
+    let mut named = naming(&before, &voice);
+    for (_, facts) in &mut named {
+        for fact in facts {
+            if let Fact::Node(node) = fact {
+                assert!(!node.properties.is_empty());
+                node.properties.clear();
+            }
+        }
+    }
+    assert!(named.len() > 1);
+    world.content = content;
+    world.named = named;
+    world.forgot = Some(
+        world
+            .g()
+            .forget(&voice, "the voice asked to be forgotten", "eavesdrop")
+            .unwrap(),
+    );
+}
+
+fn f1_voices(world: &mut World) -> u64 {
+    world
+        .g()
+        .count(&Count {
+            class: "finding".into(),
+            roots: vec!["f1".into()],
+            path: vec![Step::new("supports<-"), Step::new("said<-")],
+            group_by: None,
+            as_of: None,
+        })
+        .unwrap()[0]
+        .distinct
+}
+
+#[when("the app forgets one voice")]
+fn forgets_one_voice(world: &mut World) {
+    forget_voice(world);
+}
+
+#[given("a graph after the app forgets one voice")]
+fn t2_after_forget(world: &mut World) {
+    t2(world.open());
+    let before = f1_voices(world);
+    forget_voice(world);
+    let voice = forgotten();
+    assert_eq!(world.g().find(&voice.class, &voice.key).unwrap(), None);
+    assert_eq!(f1_voices(world), before - 1);
+}
+
+#[then("no event read from the start holds that voice's content")]
+fn no_event_holds_content(world: &mut World) {
+    let content = world.content.clone();
+    let events = world.all_events();
+    assert!(!events.is_empty());
+    assert!(events.iter().all(|e| !holds(e, &content)));
+}
+
+#[then("the forget event names the voice by id and kind and holds none of its content")]
+fn forget_event_names_voice(world: &mut World) {
+    let forgot = world.forgot.clone().expect("the app forgot a voice");
+    assert_eq!(world.all_events().last(), Some(&forgot));
+    match &forgot.change {
+        Change::Forgot { nodes, .. } => assert_eq!(nodes, &[forgotten()]),
+        other => panic!("expected a forget event, got {other:?}"),
+    }
+    assert!(!holds(&forgot, &world.content));
+}
+
+#[then("the earlier events that named it still name its id, its kind and its links' endpoints")]
+fn earlier_events_keep_ids(world: &mut World) {
+    let forgot = world.forgot.clone().expect("the app forgot a voice");
+    let earlier: Vec<Event> = world
+        .all_events()
+        .into_iter()
+        .filter(|e| e.cursor < forgot.cursor)
+        .collect();
+    assert_eq!(naming(&earlier, &forgotten()), world.named);
 }
 
 // ---------- events: compaction ----------
@@ -2055,6 +2415,431 @@ fn finds_s05_2023(world: &mut World) {
 fn no_node(world: &mut World) {
     assert!(world.found.is_none());
     assert!(world.g().find("statement", "s05").unwrap().is_some());
+}
+
+// ---------- read: answers in ontology terms ----------
+
+#[given("the T9b graph")]
+#[given("the T9b graph, with inside and at declared as containment")]
+fn the_t9b_graph(world: &mut World) {
+    t9b_graph(world.open());
+    let relations = &world.g().ontology().relations;
+    assert!(relations["inside"].containment && relations["at"].containment);
+}
+
+#[given("a statement's inside link waits for a place that has not arrived")]
+fn inside_link_waits(world: &mut World) {
+    let when = day(2021, 3, 2);
+    world
+        .g()
+        .write(&Write::new("swtor").unit(
+            Unit::new("statement", "s9", NONE, when.clone()).link("inside", "s9", "c9", when),
+        ))
+        .unwrap();
+    assert_eq!(world.g().open_links().unwrap().len(), 1);
+}
+
+#[when("the app describes statement s1")]
+fn describes_s1(world: &mut World) {
+    world.described = Some(
+        world
+            .g()
+            .describe(&NodeRef::new("statement", "s1"))
+            .unwrap(),
+    );
+}
+
+fn described(world: &World) -> &Description {
+    world.described.as_ref().expect("a node was described")
+}
+
+#[then("the answer gives class statement and property text")]
+fn gives_class_and_text(world: &mut World) {
+    let d = described(world);
+    assert_eq!(d.node, NodeRef::new("statement", "s1"));
+    assert_eq!(
+        d.properties,
+        BTreeMap::from([("text".to_string(), "the respec cost is absurd".to_string())])
+    );
+}
+
+fn counts(pairs: &[(&str, u64)]) -> BTreeMap<String, u64> {
+    pairs.iter().map(|&(r, n)| (r.to_string(), n)).collect()
+}
+
+#[then("the answer gives relations out inside 1 and supports 1")]
+fn gives_relations_out(world: &mut World) {
+    assert_eq!(
+        described(world).relations_out,
+        counts(&[("inside", 1), ("supports", 1)])
+    );
+}
+
+#[then("relations in said 1")]
+fn gives_relations_in(world: &mut World) {
+    assert_eq!(described(world).relations_in, counts(&[("said", 1)]));
+}
+
+#[then("the answer gives s1 part of conversation c1 via inside")]
+fn part_of_c1(world: &mut World) {
+    let d = described(world);
+    assert_eq!(d.node, NodeRef::new("statement", "s1"));
+    assert_eq!(
+        d.part_of.first(),
+        Some(&PartOf {
+            node: NodeRef::new("conversation", "c1"),
+            via: "inside".into(),
+        })
+    );
+}
+
+#[then("part of place swtor-tc via at")]
+fn part_of_swtor_tc(world: &mut World) {
+    let d = described(world);
+    assert_eq!(d.part_of.len(), 2, "{:?}", d.part_of);
+    assert_eq!(
+        d.part_of[1],
+        PartOf {
+            node: NodeRef::new("place", "swtor-tc"),
+            via: "at".into(),
+        }
+    );
+}
+
+fn node_ref_texts(node: &NodeRef) -> [String; 2] {
+    [node.class.clone(), node.key.clone()]
+}
+
+fn description_texts(d: &Description) -> Vec<String> {
+    let mut texts = node_ref_texts(&d.node).to_vec();
+    texts.extend(
+        d.properties
+            .iter()
+            .flat_map(|(k, v)| [k.clone(), v.clone()]),
+    );
+    texts.extend(d.relations_out.keys().cloned());
+    texts.extend(d.relations_in.keys().cloned());
+    for p in &d.part_of {
+        texts.extend(node_ref_texts(&p.node));
+        texts.push(p.via.clone());
+    }
+    texts
+}
+
+/// Fails when a text names one of the file's tables or columns. A table name counts anywhere in
+/// a text; a column name counts as a whole word, so `id` inside `said` does not.
+fn assert_names_no_storage(world: &World, texts: &[String]) {
+    let file = rusqlite::Connection::open(world.path()).unwrap();
+    let tables: Vec<String> = file
+        .prepare("SELECT name FROM sqlite_master")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let mut columns: BTreeSet<String> = BTreeSet::new();
+    for table in &tables {
+        let mut statement = file
+            .prepare("SELECT name FROM pragma_table_info(?1)")
+            .unwrap();
+        columns.extend(
+            statement
+                .query_map([table], |row| row.get::<_, String>(0))
+                .unwrap()
+                .map(Result::unwrap),
+        );
+    }
+    assert!(!tables.is_empty() && !columns.is_empty());
+    assert!(!texts.is_empty());
+    for text in texts {
+        for table in &tables {
+            assert!(
+                !text.contains(table.as_str()),
+                "{text:?} names table {table}"
+            );
+        }
+        for word in text.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == ':')) {
+            assert!(!columns.contains(word), "{text:?} names column {word}");
+        }
+    }
+}
+
+#[then("no table name and no column name appears in the answer")]
+fn describe_names_no_storage(world: &mut World) {
+    let texts = description_texts(described(world));
+    assert_names_no_storage(world, &texts);
+}
+
+#[when(
+    "the app runs a find, a walk, a count and an open-links read, and writes a link between the wrong classes"
+)]
+fn runs_every_read_and_a_refused_write(world: &mut World) {
+    let g = world.g();
+    let mut texts = Vec::new();
+    let found = g
+        .find("statement", "s1")
+        .unwrap()
+        .expect("s1 is in the graph");
+    texts.extend([
+        found.class,
+        found.key,
+        found.source,
+        format!("{:?}", found.valid),
+    ]);
+    texts.extend(found.properties.into_iter().flat_map(|(k, v)| [k, v]));
+    let walked = g
+        .walk(&NodeRef::new("statement", "s1"), &["inside", "at"], 2, 200)
+        .unwrap();
+    assert_eq!(walked.len(), 2, "{walked:?}");
+    texts.extend(walked.iter().flat_map(|(node, _)| node_ref_texts(node)));
+    let tallies = g
+        .count(&Count {
+            class: "finding".into(),
+            roots: vec!["f1".into()],
+            path: vec![Step::new("supports<-"), Step::new("said<-")],
+            group_by: Some(GroupBy {
+                class: "statement".into(),
+                property: "text".into(),
+            }),
+            as_of: None,
+        })
+        .unwrap();
+    assert_eq!(tallies[0].distinct, 3, "{tallies:?}");
+    for tally in tallies {
+        texts.push(tally.root);
+        texts.extend(tally.groups.into_keys().flatten());
+    }
+    let open_links = g.open_links().unwrap();
+    assert!(
+        !open_links.is_empty(),
+        "the open-links read has nothing to answer"
+    );
+    for open in open_links {
+        texts.push(open.relation);
+        for end in [open.from, open.to, open.waits_on] {
+            texts.extend(node_ref_texts(&end));
+        }
+    }
+    let when = day(2021, 3, 2);
+    let refused = g
+        .write(
+            &Write::new("swtor").unit(
+                Unit::new(
+                    "statement",
+                    "s1",
+                    [("text", "the respec cost is absurd")],
+                    when.clone(),
+                )
+                .link("said", "f1", "s1", when),
+            ),
+        )
+        .expect_err("a said link from a finding is refused");
+    assert!(
+        matches!(refused.cause, Error::Refused(_)),
+        "not refused: {}",
+        refused.cause
+    );
+    texts.push(refused.cause.to_string());
+    texts.push(refused.to_string());
+    world.answers = texts;
+}
+
+#[then("no table name and no column name appears in any answer or in the refusal")]
+fn reads_and_refusal_name_no_storage(world: &mut World) {
+    assert_names_no_storage(world, &world.answers);
+}
+
+// ---------- refs: references into another graph file (FR-RANNOCH-046) ----------
+
+/// The T6 files' size: the local file holds this many references into the shared file.
+const REFERENCES: usize = 300;
+
+/// The T6 files (t6-t2-refs-replay, 2026-10-13): a shared file of statements s0..s299, and a
+/// local file whose mentions l0..l299 each refer to the shared statement of the same number by
+/// the shared file's name, its class and its key. The local file mounts the shared one.
+#[given("the local file mounts the shared file")]
+fn local_mounts_shared(world: &mut World) {
+    let when = day(2026, 10, 13);
+    let shared_path = world.dir.path().join("shared.rannoch");
+    let mut shared = rannoch::open(&shared_path).unwrap();
+    shared
+        .declare(&Declaration::Class(Class::new("statement", ["text"])))
+        .unwrap();
+    let mut write = Write::new("eavesdrop");
+    for i in 0..REFERENCES {
+        write = write.unit(Unit::new(
+            "statement",
+            format!("s{i}"),
+            [("text", format!("statement {i}"))],
+            when.clone(),
+        ));
+    }
+    shared.write(&write).unwrap();
+    world.shared = Some(shared);
+
+    let local = world.open();
+    local
+        .declare(&Declaration::Class(Class::new(
+            "mention",
+            ["graph", "class", "key"],
+        )))
+        .unwrap();
+    let mut write = Write::new("legion");
+    for i in 0..REFERENCES {
+        write = write.unit(Unit::new(
+            "mention",
+            format!("l{i}"),
+            [
+                ("graph", "shared".to_string()),
+                ("class", "statement".to_string()),
+                ("key", format!("s{i}")),
+            ],
+            when.clone(),
+        ));
+    }
+    local.write(&write).unwrap();
+    local.mount("shared", &shared_path).unwrap();
+}
+
+impl World {
+    fn shared(&mut self) -> &mut Graph {
+        self.shared.as_mut().expect("the shared file is open")
+    }
+
+    /// The reference the local mention `from` holds: the mounted file's name and the target.
+    fn reference(&mut self, from: &str) -> (String, NodeRef) {
+        let mention = self
+            .g()
+            .find("mention", from)
+            .unwrap()
+            .expect("the mention");
+        let property = |name: &str| mention.properties[name].clone();
+        (
+            property("graph"),
+            NodeRef::new(property("class"), property("key")),
+        )
+    }
+
+    fn resolve(&mut self, from: &str) -> Fate {
+        let (graph, target) = self.reference(from);
+        self.g().resolve(&graph, &target).unwrap()
+    }
+
+    /// Every mention in the local file, in order, and the local file's events.
+    fn local_references(&mut self) -> (Vec<Node>, Vec<Event>) {
+        let mentions = (0..REFERENCES)
+            .map(|i| {
+                self.g()
+                    .find("mention", &format!("l{i}"))
+                    .unwrap()
+                    .expect("the mention")
+            })
+            .collect();
+        (mentions, self.all_events())
+    }
+}
+
+#[given("shared node s7 was forgotten by rule superseded")]
+fn shared_s7_forgotten(world: &mut World) {
+    world
+        .shared()
+        .forget(&NodeRef::new("statement", "s7"), "superseded", "eavesdrop")
+        .unwrap();
+    assert_eq!(world.shared().find("statement", "s7").unwrap(), None);
+}
+
+#[given("shared node s8 was replaced by s9 with a replace event")]
+fn shared_s8_replaced(world: &mut World) {
+    let event = world.shared().replace("statement", "s8", "s9").unwrap();
+    assert!(matches!(event.change, Change::Replaced { .. }));
+}
+
+#[given("shared node s10 is live")]
+fn shared_s10_live(world: &mut World) {
+    assert!(world.shared().find("statement", "s10").unwrap().is_some());
+}
+
+#[given("shared node s10 was written again with a changed property")]
+fn shared_s10_new_version(world: &mut World) {
+    let events = world
+        .shared()
+        .write(&Write::new("eavesdrop").unit(Unit::new(
+            "statement",
+            "s10",
+            [("text", "changed")],
+            day(2026, 10, 14),
+        )))
+        .unwrap();
+    assert_eq!(events.len(), 1, "the new version lands as one event");
+    let s10 = world.shared().find("statement", "s10").unwrap().unwrap();
+    assert_eq!(s10.properties["text"], "changed");
+}
+
+#[given("the local file holds 300 references into the shared file")]
+fn local_holds_300(world: &mut World) {
+    let (mentions, _) = world.local_references();
+    assert_eq!(mentions.len(), 300);
+    assert!(world.g().find("mention", "l300").unwrap().is_none());
+    world.references = mentions;
+}
+
+#[when("the app resolves reference l7 to s7")]
+fn resolves_l7(world: &mut World) {
+    assert_eq!(world.reference("l7").1, NodeRef::new("statement", "s7"));
+    world.fates = vec![world.resolve("l7")];
+}
+
+#[when("the app resolves reference l8 to s8")]
+fn resolves_l8(world: &mut World) {
+    assert_eq!(world.reference("l8").1, NodeRef::new("statement", "s8"));
+    world.fates = vec![world.resolve("l8")];
+}
+
+#[when("the app resolves reference l10 to s10")]
+fn resolves_l10(world: &mut World) {
+    assert_eq!(world.reference("l10").1, NodeRef::new("statement", "s10"));
+    world.fates = vec![world.resolve("l10")];
+}
+
+#[when("the app resolves them")]
+fn resolves_all(world: &mut World) {
+    world.log = world.all_events();
+    world.fates = (0..REFERENCES)
+        .map(|i| world.resolve(&format!("l{i}")))
+        .collect();
+    assert_eq!(world.fates.len(), REFERENCES);
+}
+
+#[then("it answers forgotten by superseded")]
+fn answers_forgotten(world: &mut World) {
+    assert_eq!(
+        world.fates,
+        [Fate::Forgotten {
+            rule: "superseded".into()
+        }]
+    );
+}
+
+#[then("it answers replaced by s9")]
+fn answers_replaced(world: &mut World) {
+    assert_eq!(
+        world.fates,
+        [Fate::Replaced {
+            by: NodeRef::new("statement", "s9")
+        }]
+    );
+}
+
+#[then("it answers live")]
+fn answers_live(world: &mut World) {
+    assert_eq!(world.fates, [Fate::Live]);
+}
+
+#[then("the local file's 300 references are unchanged")]
+fn local_references_unchanged(world: &mut World) {
+    let (mentions, events) = world.local_references();
+    assert_eq!(mentions, world.references);
+    assert_eq!(events, world.log);
 }
 
 // ---------- read: as of a valid time ----------

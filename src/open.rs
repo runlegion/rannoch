@@ -140,6 +140,8 @@ fn retry_lock(attempts: i32) -> bool {
 pub struct Graph {
     pub(crate) conn: Connection,
     pub(crate) ontology: Ontology,
+    /// Other graph files this graph's references can name, by the name each was mounted under.
+    pub(crate) mounts: BTreeMap<String, Graph>,
 }
 
 /// Opens the graph the file at `path` holds, with the ontology its own stream declared. A path
@@ -156,7 +158,11 @@ pub fn open(path: impl AsRef<Path>) -> Result<Graph, Error> {
     conn.set_prepared_statement_cache_capacity(256);
     conn.execute_batch(OWN_TABLES)?;
     let ontology = Ontology::load(&conn)?;
-    Ok(Graph { conn, ontology })
+    Ok(Graph {
+        conn,
+        ontology,
+        mounts: BTreeMap::new(),
+    })
 }
 
 impl Graph {
