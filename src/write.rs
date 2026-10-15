@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
-use crate::events::{Change, Event, Fact, LinkFact, NodeFact, append};
+use crate::events::{Change, Event, Fact, LinkFact, NodeFact, WrongKind, append};
 use crate::open::{
     CLASS, Class, Graph, Ontology, RELATION, Relation, class_table, concat, property_column,
     relation_index, relation_table,
@@ -313,7 +313,7 @@ fn now_millis() -> i64 {
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
-fn node_id(tx: &Connection, class: &str, key: &str) -> Result<Option<i64>, Error> {
+pub(crate) fn node_id(tx: &Connection, class: &str, key: &str) -> Result<Option<i64>, Error> {
     let sql = format!("SELECT id FROM {} WHERE key = ?1", class_table(class));
     Ok(tx
         .prepare_cached(&sql)?
@@ -328,6 +328,7 @@ struct Piece<'a> {
     source: &'a str,
     recorded: i64,
     added: Vec<Fact>,
+    wrong_kind: Vec<WrongKind>,
     closed: Vec<LinkFact>,
 }
 
@@ -481,11 +482,13 @@ impl Piece<'_> {
         Ok(())
     }
 
-    /// Closes every open link that was waiting for the node `key` of `class`, now present.
-    fn close(&mut self, class: &str, key: &str) -> Result<(), Error> {
+    /// Closes every open link that was waiting for the node `key` of `class`, now present, and
+    /// reports every open link that waits on `key` as a node of another kind, which stays open.
+    fn arrived(&mut self, class: &str, key: &str) -> Result<(), Error> {
         for relation in self.ontology.relations.values() {
             for (waits_on, column) in [(&relation.to, "to_key"), (&relation.from, "from_key")] {
-                if waits_on != class {
+                let wrong_kind = waits_on != class;
+                if wrong_kind && node_id(self.tx, waits_on, key)?.is_some() {
                     continue;
                 }
                 let waiting: Vec<(String, String, String, Option<String>)> = self
@@ -499,6 +502,18 @@ impl Piece<'_> {
                     })?
                     .collect::<Result<_, _>>()?;
                 for (from_key, to_key, source, valid) in waiting {
+                    if wrong_kind {
+                        self.wrong_kind.push(WrongKind {
+                            arrived: NodeRef::new(class, key),
+                            waiting: LinkFact {
+                                relation: relation.name.clone(),
+                                from: NodeRef::new(&relation.from, from_key),
+                                to: NodeRef::new(&relation.to, to_key),
+                                valid: ValidTime::from_sql(valid),
+                            },
+                        });
+                        continue;
+                    }
                     let from = node_id(self.tx, &relation.from, &from_key)?;
                     let to = node_id(self.tx, &relation.to, &to_key)?;
                     let (Some(from), Some(to)) = (from, to) else {
@@ -550,7 +565,9 @@ impl Graph {
 
     /// Writes whole units in pieces, each piece one transaction. Returns the events the pieces
     /// wrote: per piece, one for what it added and one per open link it closed. A unit that adds
-    /// nothing new writes no event.
+    /// nothing new writes no event. A new node under the key an open link waits on, but of
+    /// another kind, leaves the link open and is reported as a [`WrongKind`] on its piece's
+    /// `Wrote` event, apart from what the piece added.
     ///
     /// # Errors
     /// [`WriteError`] when a piece fails: the pieces before it are kept, and the error holds
@@ -580,25 +597,32 @@ impl Graph {
             source,
             recorded: now_millis(),
             added: Vec::new(),
+            wrong_kind: Vec::new(),
             closed: Vec::new(),
         };
         for unit in units {
             let (_, new) = piece.node(&unit.node)?;
             if new {
-                piece.close(&unit.node.class, &unit.node.key)?;
+                piece.arrived(&unit.node.class, &unit.node.key)?;
             }
             for link in &unit.links {
                 piece.link(link)?;
             }
         }
-        let Piece { added, closed, .. } = piece;
+        let Piece {
+            added,
+            wrong_kind,
+            closed,
+            ..
+        } = piece;
         let mut events = Vec::new();
-        if !added.is_empty() {
+        if !added.is_empty() || !wrong_kind.is_empty() {
             events.push(append(
                 &tx,
                 Change::Wrote {
                     source: source.to_string(),
                     added,
+                    wrong_kind,
                 },
             )?);
         }
