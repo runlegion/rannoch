@@ -28,6 +28,8 @@
 //! ```
 
 mod events;
+#[cfg(test)]
+mod measure;
 mod open;
 mod read;
 mod refs;
