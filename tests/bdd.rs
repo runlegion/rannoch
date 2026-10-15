@@ -20,12 +20,15 @@ use std::time::SystemTime;
 
 use rannoch::{
     Change, Class, Count, Cursor, Date, Declaration, Event, EventId, Fact, Graph, GroupBy, Node,
-    NodeRef, PIECE_CHANGES, Relation, Step, Tally, Unit, ValidTime, Write, WriteError,
+    NodeRef, Relation, Step, Tally, Unit, ValidTime, Write, WriteError,
 };
 use rstest_bdd_macros::{given, scenarios, then, when};
 use tempfile::TempDir;
 
 const NONE: [(&str, &str); 0] = [];
+
+/// The piece size these fixtures are shaped to: rannoch's own.
+const PIECE_CHANGES: usize = 1_000;
 
 // ---------- fixtures ----------
 
