@@ -1961,6 +1961,18 @@ fn the_t9b_graph(world: &mut World) {
     assert!(relations["inside"].containment && relations["at"].containment);
 }
 
+#[given("a statement's inside link waits for a place that has not arrived")]
+fn inside_link_waits(world: &mut World) {
+    let when = day(2021, 3, 2);
+    world
+        .g()
+        .write(&Write::new("swtor").unit(
+            Unit::new("statement", "s9", NONE, when.clone()).link("inside", "s9", "c9", when),
+        ))
+        .unwrap();
+    assert_eq!(world.g().open_links().unwrap().len(), 1);
+}
+
 #[when("the app describes statement s1")]
 fn describes_s1(world: &mut World) {
     world.described = Some(
@@ -2130,7 +2142,12 @@ fn runs_every_read_and_a_refused_write(world: &mut World) {
         texts.push(tally.root);
         texts.extend(tally.groups.into_keys().flatten());
     }
-    for open in g.open_links().unwrap() {
+    let open_links = g.open_links().unwrap();
+    assert!(
+        !open_links.is_empty(),
+        "the open-links read has nothing to answer"
+    );
+    for open in open_links {
         texts.push(open.relation);
         for end in [open.from, open.to, open.waits_on] {
             texts.extend(node_ref_texts(&end));
