@@ -435,6 +435,9 @@ impl Graph {
         let mut found: Vec<(NodeRef, ValidTime)> = Vec::new();
         let hops = if cap == 0 { 0 } else { hops };
         'hops: for _ in 0..hops {
+            if frontier.is_empty() {
+                break;
+            }
             let mut next = Vec::new();
             for &(class, id) in &frontier {
                 for &(relation, backwards) in &steps {
@@ -649,7 +652,7 @@ fn filter_condition(
 
 #[cfg(test)]
 mod tests {
-    use crate::{Error, NodeRef, open};
+    use crate::{Class, Date, Declaration, Error, NodeRef, Relation, Unit, ValidTime, Write, open};
 
     #[test]
     fn walk_from_an_undeclared_class_is_refused_in_ontology_terms() -> Result<(), Error> {
@@ -659,6 +662,36 @@ mod tests {
             matches!(&refused, Err(Error::Refused(reason)) if reason == "class ghost is not declared"),
             "expected a refusal, got {refused:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_walk_asked_for_every_hop_ends_when_nothing_is_left()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = std::env::temp_dir().join(format!("rannoch-hops-{}.db", uuid::Uuid::now_v7()));
+        let mut g = open(path)?;
+        g.declare(&Declaration::Class(Class::new("crate", ["name"])))?;
+        g.declare(&Declaration::Relation(Relation::new(
+            "depends_on",
+            "crate",
+            "crate",
+            false,
+        )))?;
+        let when = ValidTime::On(Date::day(2026, 1, 1));
+        let unit = |key: &str| Unit::new("crate", key, [("name", key)], when.clone());
+        g.write(&Write::new("registry").unit(unit("a")).unit(unit("b").link(
+            "depends_on",
+            "b",
+            "a",
+            when.clone(),
+        )))?;
+        let dependents = g.walk(
+            &NodeRef::new("crate", "a"),
+            &["depends_on<-"],
+            usize::MAX,
+            10,
+        )?;
+        assert_eq!(dependents.len(), 1);
         Ok(())
     }
 }
