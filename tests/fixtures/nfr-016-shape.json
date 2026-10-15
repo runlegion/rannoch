@@ -1,0 +1,21 @@
+{
+  "speaker_class": "voice",
+  "speaker_key": "v",
+  "utterance_class": "statement",
+  "utterance_key": "s",
+  "property": "place",
+  "values": ["discord", "reddit", "forums", "youtube", "steam"],
+  "subject_class": "finding",
+  "subject_key": "f",
+  "subjects": 1000,
+  "speakers": 100000,
+  "speaks": "said",
+  "backs": "supports",
+  "backing_share": 0.3,
+  "path": ["supports<-", "said<-"],
+  "source": "t4",
+  "seed": 4,
+  "burst_source": "listener",
+  "burst_key": "listener",
+  "burst_seed": 13
+}
