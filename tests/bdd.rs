@@ -19,8 +19,8 @@ use std::thread::JoinHandle;
 use std::time::SystemTime;
 
 use rannoch::{
-    Change, Class, Count, Cursor, Date, Declaration, Event, Fact, Graph, GroupBy, Node, NodeRef,
-    PIECE_CHANGES, Relation, Step, Tally, Unit, ValidTime, Write, WriteError,
+    Change, Class, Count, Cursor, Date, Declaration, Event, EventId, Fact, Graph, GroupBy, Node,
+    NodeRef, PIECE_CHANGES, Relation, Step, Tally, Unit, ValidTime, Write, WriteError,
 };
 use rstest_bdd_macros::{given, scenarios, then, when};
 use tempfile::TempDir;
@@ -198,13 +198,21 @@ fn t4(world: &mut World) -> HashMap<String, FindingSource> {
 }
 
 /// T2's size (t6-t2-refs-replay): 20 findings, 500 voices, 5,000 statements, each unit its own
-/// write. Returns the events the writes returned, in order.
+/// write. As in T2, each voice holds content: a name, "voice <n>". Returns the events the
+/// declaration of that name and the writes returned, in order.
 fn t2(g: &mut Graph) -> Vec<Event> {
     for d in t9b() {
         g.declare(&d).unwrap();
     }
+    let mut written: Vec<Event> = g
+        .declare(&Declaration::Property {
+            class: "voice".into(),
+            property: "name".into(),
+        })
+        .unwrap()
+        .into_iter()
+        .collect();
     let when = day(2026, 10, 1);
-    let mut written = Vec::new();
     let mut put = |g: &mut Graph, unit: Unit| {
         written.extend(g.write(&Write::new("eavesdrop").unit(unit)).unwrap());
     };
@@ -212,7 +220,15 @@ fn t2(g: &mut Graph) -> Vec<Event> {
         put(g, Unit::new("finding", format!("f{f}"), NONE, when.clone()));
     }
     for v in 0..500 {
-        put(g, Unit::new("voice", format!("v{v}"), NONE, when.clone()));
+        put(
+            g,
+            Unit::new(
+                "voice",
+                format!("v{v}"),
+                [("name", format!("voice {v}"))],
+                when.clone(),
+            ),
+        );
     }
     for s in 0..5000 {
         let (voice, finding, statement) = (
@@ -317,6 +333,9 @@ struct World {
     log: Vec<Event>,
     read: Vec<Event>,
     folded: BTreeMap<String, usize>,
+    forgot: Option<Event>,
+    content: String,
+    named: Vec<(EventId, Vec<Fact>)>,
 }
 
 #[rstest::fixture]
@@ -342,6 +361,9 @@ fn world() -> World {
         log: Vec::new(),
         read: Vec::new(),
         folded: BTreeMap::new(),
+        forgot: None,
+        content: String::new(),
+        named: Vec::new(),
     }
 }
 
@@ -1263,7 +1285,7 @@ fn log_of_t2(world: &mut World) {
     world.graph = None;
     let g = world.open();
     let mut written = t2(g);
-    // t2 declared nothing new: its declarations were already on the stream.
+    // Of t2's declarations only the voice's name is new; t9b's were already on the stream.
     log.append(&mut written);
     world.log = log;
 }
@@ -1290,35 +1312,51 @@ fn a_t2_graph(world: &mut World) {
 #[when("the app folds distinct voices per finding from the events since the start")]
 fn folds_from_events(world: &mut World) {
     let mut voice_of: HashMap<String, String> = HashMap::new();
-    let mut supports: Vec<(String, String)> = Vec::new();
+    let mut supports: HashSet<(String, String)> = HashSet::new();
     for event in world.all_events() {
-        let links = match event.change {
-            Change::Wrote { added, .. } => added
-                .into_iter()
-                .filter_map(|f| match f {
-                    Fact::Link(l) => Some(l),
-                    _ => None,
-                })
-                .collect(),
-            Change::Closed(l) => vec![l],
-            Change::Declared(_) => Vec::new(),
+        let (added, removed) = match event.change {
+            Change::Wrote { added, .. } => (
+                added
+                    .into_iter()
+                    .filter_map(|f| match f {
+                        Fact::Link(l) => Some(l),
+                        _ => None,
+                    })
+                    .collect(),
+                Vec::new(),
+            ),
+            Change::Closed(l) => (vec![l], Vec::new()),
+            Change::Declared(_) => (Vec::new(), Vec::new()),
+            Change::Forgot { links, .. } => (Vec::new(), links),
         };
-        for link in links {
+        for link in added {
             match link.relation.as_str() {
                 "said" => {
                     voice_of.insert(link.to.key, link.from.key);
                 }
-                "supports" => supports.push((link.from.key, link.to.key)),
+                "supports" => {
+                    supports.insert((link.from.key, link.to.key));
+                }
+                _ => {}
+            }
+        }
+        for link in removed {
+            match link.relation.as_str() {
+                "said" => {
+                    voice_of.remove(&link.to.key);
+                }
+                "supports" => {
+                    supports.remove(&(link.from.key, link.to.key));
+                }
                 _ => {}
             }
         }
     }
     let mut pairs: BTreeMap<String, HashSet<String>> = BTreeMap::new();
     for (statement, finding) in supports {
-        pairs
-            .entry(finding)
-            .or_default()
-            .insert(voice_of[&statement].clone());
+        if let Some(voice) = voice_of.get(&statement) {
+            pairs.entry(finding).or_default().insert(voice.clone());
+        }
     }
     world.folded = pairs
         .into_iter()
@@ -1348,6 +1386,129 @@ fn fold_equals_live(world: &mut World) {
             tally.root
         );
     }
+}
+
+// ---------- events: forgetting ----------
+
+/// The voice the forget scenarios forget. Its 10 statements (st1, st501, ...) all support f1.
+fn forgotten() -> NodeRef {
+    NodeRef::new("voice", "v7")
+}
+
+/// Whether an event, as JSON, holds `content` (a JSON string, quotes included).
+fn holds(event: &Event, content: &str) -> bool {
+    serde_json::to_string(&event.change)
+        .unwrap()
+        .contains(content)
+}
+
+/// Per event, the facts that name `node`: as the node itself, or as an end of a link.
+fn naming(events: &[Event], node: &NodeRef) -> Vec<(EventId, Vec<Fact>)> {
+    let ends = |l: &rannoch::LinkFact| l.from == *node || l.to == *node;
+    events
+        .iter()
+        .filter_map(|e| {
+            let facts: Vec<Fact> = match &e.change {
+                Change::Wrote { added, .. } => added
+                    .iter()
+                    .filter(|f| match f {
+                        Fact::Node(n) => n.class == node.class && n.key == node.key,
+                        Fact::Link(l) | Fact::Opened(l) => ends(l),
+                    })
+                    .cloned()
+                    .collect(),
+                Change::Closed(l) if ends(l) => vec![Fact::Link(l.clone())],
+                _ => Vec::new(),
+            };
+            (!facts.is_empty()).then_some((e.id, facts))
+        })
+        .collect()
+}
+
+/// Forgets the voice, keeping its content as JSON and, per earlier event that named it, the
+/// facts it should still name once its content is stripped.
+fn forget_voice(world: &mut World) {
+    let voice = forgotten();
+    let content =
+        serde_json::to_string(&world.find(&voice.class, &voice.key).properties["name"]).unwrap();
+    let before = world.all_events();
+    assert!(before.iter().any(|e| holds(e, &content)));
+    let mut named = naming(&before, &voice);
+    for (_, facts) in &mut named {
+        for fact in facts {
+            if let Fact::Node(node) = fact {
+                assert!(!node.properties.is_empty());
+                node.properties.clear();
+            }
+        }
+    }
+    assert!(named.len() > 1);
+    world.content = content;
+    world.named = named;
+    world.forgot = Some(
+        world
+            .g()
+            .forget(&voice, "the voice asked to be forgotten", "eavesdrop")
+            .unwrap(),
+    );
+}
+
+fn f1_voices(world: &mut World) -> u64 {
+    world
+        .g()
+        .count(&Count {
+            class: "finding".into(),
+            roots: vec!["f1".into()],
+            path: vec![Step::new("supports<-"), Step::new("said<-")],
+            group_by: None,
+        })
+        .unwrap()[0]
+        .distinct
+}
+
+#[when("the app forgets one voice")]
+fn forgets_one_voice(world: &mut World) {
+    forget_voice(world);
+}
+
+#[given("a graph after the app forgets one voice")]
+fn t2_after_forget(world: &mut World) {
+    t2(world.open());
+    let before = f1_voices(world);
+    forget_voice(world);
+    let voice = forgotten();
+    assert_eq!(world.g().find(&voice.class, &voice.key).unwrap(), None);
+    assert_eq!(f1_voices(world), before - 1);
+}
+
+#[then("no event read from the start holds that voice's content")]
+fn no_event_holds_content(world: &mut World) {
+    let content = world.content.clone();
+    let events = world.all_events();
+    assert!(!events.is_empty());
+    assert!(events.iter().all(|e| !holds(e, &content)));
+}
+
+#[then("the forget event names the voice by id and kind and holds none of its content")]
+fn forget_event_names_voice(world: &mut World) {
+    let forgot = world.forgot.clone().expect("the app forgot a voice");
+    assert_eq!(world.all_events().last(), Some(&forgot));
+    match &forgot.change {
+        Change::Forgot { nodes, .. } => assert_eq!(nodes, &[forgotten()]),
+        other => panic!("expected a forget event, got {other:?}"),
+    }
+    assert!(!holds(&forgot, &world.content));
+}
+
+#[then("the earlier events that named it still name its id, its kind and its links' endpoints")]
+fn earlier_events_keep_ids(world: &mut World) {
+    let forgot = world.forgot.clone().expect("the app forgot a voice");
+    let earlier: Vec<Event> = world
+        .all_events()
+        .into_iter()
+        .filter(|e| e.cursor < forgot.cursor)
+        .collect();
+    assert_eq!(naming(&earlier, &forgotten()), world.named);
 }
 
 // ---------- read: walks ----------
