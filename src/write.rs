@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -16,9 +16,13 @@ use crate::open::{
 use crate::read::NodeRef;
 
 /// The most changes one piece holds (a node is one change, a link is one); a unit larger than
-/// this is a piece of its own. Pieces of this size keep a hook's write and a reader from waiting
-/// on a burst (T3).
-pub const PIECE_CHANGES: usize = 1_000;
+/// this is a piece of its own. A piece of this size commits well inside a hook's deadline (T3).
+pub(crate) const PIECE_CHANGES: usize = 1_000;
+
+/// How long a write leaves the file free after each piece but its last. It is longer than the
+/// interval at which a waiting connection retries the lock (see `open`), so a hook's write
+/// waiting on a burst takes the lock between pieces instead of waiting for the whole burst.
+const BETWEEN_PIECES: Duration = Duration::from_millis(5);
 
 /// Why rannoch did not do what was asked.
 #[derive(Debug, thiserror::Error)]
@@ -578,7 +582,10 @@ impl Graph {
             Ok(ontology) => self.ontology = ontology,
             Err(cause) => return Err(WriteError { events, cause }),
         }
-        for piece in pieces(&write.units) {
+        for (i, piece) in pieces(&write.units).into_iter().enumerate() {
+            if i > 0 {
+                std::thread::sleep(BETWEEN_PIECES);
+            }
             match self.piece(&write.source, piece) {
                 Ok(written) => events.extend(written),
                 Err(cause) => return Err(WriteError { events, cause }),
