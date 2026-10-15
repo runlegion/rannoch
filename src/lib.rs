@@ -10,19 +10,19 @@
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let dir = tempfile::tempdir()?;
 //! let mut g = rannoch::open(dir.path().join("graph.rannoch"))?;
-//! g.declare(&Declaration::Class(Class::new("voice", [] as [&str; 0])))?;
-//! g.declare(&Declaration::Class(Class::new("statement", ["text"])))?;
-//! g.declare(&Declaration::Relation(Relation::new("said", "voice", "statement", false)))?;
+//! g.declare(&Declaration::Class(Class::new("author", [] as [&str; 0])))?;
+//! g.declare(&Declaration::Class(Class::new("book", ["title"])))?;
+//! g.declare(&Declaration::Relation(Relation::new("wrote", "author", "book", false)))?;
 //!
 //! let when = ValidTime::On(Date::month(2019, 10));
 //! let events = g.write(
 //!     &Write::new("swtor")
-//!         .unit(Unit::new("voice", "v1", [] as [(&str, &str); 0], when.clone()))
-//!         .unit(Unit::new("statement", "s1", [("text", "hi")], when.clone())
-//!             .link("said", "v1", "s1", when)),
+//!         .unit(Unit::new("author", "a1", [] as [(&str, &str); 0], when.clone()))
+//!         .unit(Unit::new("book", "b1", [("title", "hi")], when.clone())
+//!             .link("wrote", "a1", "b1", when)),
 //! )?;
 //! assert_eq!(events.len(), 1);
-//! assert_eq!(g.find("statement", "s1")?.map(|n| n.source), Some("swtor".to_string()));
+//! assert_eq!(g.find("book", "b1")?.map(|n| n.source), Some("swtor".to_string()));
 //! # Ok(())
 //! # }
 //! ```
@@ -37,4 +37,4 @@ mod write;
 pub use events::{Change, Cursor, Event, EventId, Events, Fact, LinkFact, NodeFact};
 pub use open::{Class, Graph, Ontology, Relation, open};
 pub use read::{Count, Filter, GroupBy, Link, Node, NodeRef, Step, Tally};
-pub use write::{Date, Declaration, Error, PIECE_CHANGES, Unit, ValidTime, Write, WriteError};
+pub use write::{Date, Declaration, Error, Unit, ValidTime, Write, WriteError};
