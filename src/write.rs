@@ -325,6 +325,37 @@ pub(crate) fn node_id(tx: &Connection, class: &str, key: &str) -> Result<Option<
         .optional()?)
 }
 
+/// Checks a whole write before any piece commits: refuses it when one of its links has a source
+/// that is not of its relation's declared source class. A target is named by kind and key, so a
+/// target key not yet a node of the declared target class leaves the link open.
+fn check(conn: &Connection, ontology: &Ontology, write: &Write) -> Result<(), Error> {
+    let brought: BTreeSet<(&str, &str)> = write
+        .units
+        .iter()
+        .map(|u| (u.node.class.as_str(), u.node.key.as_str()))
+        .collect();
+    let present = |class: &str, key: &str| -> Result<bool, Error> {
+        Ok(brought.contains(&(class, key)) || node_id(conn, class, key)?.is_some())
+    };
+    for link in write.units.iter().flat_map(|u| &u.links) {
+        let relation = ontology.relation(&link.relation)?;
+        let (class, key) = (&relation.from, &link.from);
+        if present(class, key)? {
+            continue;
+        }
+        for other in ontology.classes.keys().filter(|c| *c != class) {
+            if present(other, key)? {
+                return Err(Error::Refused(format!(
+                    "relation {} is declared {}; {key} is a {other}, not a {class}",
+                    relation.name,
+                    ends(relation)
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// What a piece is writing: its transaction, source, recorded time and what it added so far.
 struct Piece<'a> {
     tx: &'a Connection,
@@ -574,6 +605,9 @@ impl Graph {
     /// `Wrote` event, apart from what the piece added.
     ///
     /// # Errors
+    /// [`WriteError`] holding [`Error::Refused`] and no events when a link's source is not of its
+    /// relation's declared source class: the write is checked before any piece commits, so it
+    /// lands nothing.
     /// [`WriteError`] when a piece fails: the pieces before it are kept, and the error holds
     /// their events.
     pub fn write(&mut self, write: &Write) -> Result<Vec<Event>, WriteError> {
@@ -581,6 +615,9 @@ impl Graph {
         match Ontology::load(&self.conn) {
             Ok(ontology) => self.ontology = ontology,
             Err(cause) => return Err(WriteError { events, cause }),
+        }
+        if let Err(cause) = check(&self.conn, &self.ontology, write) {
+            return Err(WriteError { events, cause });
         }
         for (i, piece) in pieces(&write.units).into_iter().enumerate() {
             if i > 0 {

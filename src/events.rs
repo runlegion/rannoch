@@ -1,5 +1,5 @@
-//! The log: every change to a graph is an event, read in order from a cursor. This module owns
-//! rannoch's own tables, whose names start with `_`.
+//! The log: every change to a graph is an event, read in order from a cursor, and compacted up
+//! to a cursor the app picks. This module owns rannoch's own tables, whose names start with `_`.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -8,12 +8,15 @@ use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::open::Graph;
 use crate::read::NodeRef;
 use crate::write::{Declaration, Error, ValidTime};
 
-/// rannoch's own tables: the event log, the ontology, and links waiting for an end.
+/// rannoch's own tables: the event log, the ontology, and links waiting for an end. An event's
+/// place is never reused, so a cursor stays a place in the log after compaction removes the
+/// events up to it.
 pub(crate) const OWN_TABLES: &str = "
-    CREATE TABLE IF NOT EXISTS _events(seq INTEGER PRIMARY KEY, body TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS _events(seq INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS _ontology(
         kind TEXT NOT NULL, name TEXT NOT NULL, body TEXT NOT NULL,
         PRIMARY KEY(kind, name)) WITHOUT ROWID;
@@ -155,5 +158,21 @@ impl Events<'_> {
             });
         }
         Ok(events)
+    }
+}
+
+impl Graph {
+    /// Compacts the graph's events up to `cursor`, a place the app picks: the events up to it
+    /// are deleted, and the state they built is kept as the base. Counts read after compaction
+    /// equal the counts before it, and numbers an app folds from the base plus the events after
+    /// `cursor` equal live state.
+    ///
+    /// # Errors
+    /// The graph file cannot be written.
+    pub fn compact(&mut self, cursor: Cursor) -> Result<(), Error> {
+        self.conn
+            .prepare_cached("DELETE FROM _events WHERE seq <= ?1")?
+            .execute(params![cursor.0])?;
+        Ok(())
     }
 }
