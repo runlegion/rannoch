@@ -58,8 +58,13 @@ pub struct Event {
 pub enum Change {
     /// One declaration of a class, a relation or a property.
     Declared(Declaration),
-    /// What one piece of a write added.
-    Wrote { source: String, added: Vec<Fact> },
+    /// What one piece of a write added, and the wrong-kind arrivals it met.
+    Wrote {
+        source: String,
+        added: Vec<Fact>,
+        #[serde(default)]
+        wrong_kind: Vec<WrongKind>,
+    },
     /// An open link whose missing end arrived: it now holds in its relation.
     Closed(LinkFact),
 }
@@ -74,6 +79,15 @@ pub enum Fact {
     Link(LinkFact),
     /// A link to a key not yet present: it waits as an open link and joins no relation.
     Opened(LinkFact),
+}
+
+/// A node arrived under the key an open link waits on, but of another kind: the link stays open.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WrongKind {
+    /// The node that arrived.
+    pub arrived: NodeRef,
+    /// The open link still waiting on its key.
+    pub waiting: LinkFact,
 }
 
 /// A node as a piece wrote it.

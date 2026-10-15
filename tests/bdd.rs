@@ -19,8 +19,8 @@ use std::thread::JoinHandle;
 use std::time::SystemTime;
 
 use rannoch::{
-    Change, Class, Count, Cursor, Date, Declaration, Error, Event, Fact, Graph, GroupBy, Node,
-    NodeRef, Relation, Step, Tally, Unit, ValidTime, Write, WriteError,
+    Change, Class, Count, Cursor, Date, Declaration, Error, Event, Fact, Graph, GroupBy, LinkFact,
+    Node, NodeRef, OpenLink, Relation, Step, Tally, Unit, ValidTime, Write, WriteError,
 };
 use rstest_bdd_macros::{given, scenarios, then, when};
 use tempfile::TempDir;
@@ -320,6 +320,7 @@ struct World {
     log: Vec<Event>,
     read: Vec<Event>,
     folded: BTreeMap<String, usize>,
+    open_links: Vec<OpenLink>,
 }
 
 #[rstest::fixture]
@@ -345,6 +346,7 @@ fn world() -> World {
         log: Vec::new(),
         read: Vec::new(),
         folded: BTreeMap::new(),
+        open_links: Vec::new(),
     }
 }
 
@@ -1313,6 +1315,97 @@ fn no_dangling(world: &mut World) {
     assert_eq!(
         dangling, 0,
         "{dangling} answers links found to a missing statement"
+    );
+}
+
+#[when("the listener writes the whole stream and the app reads the open links")]
+fn writes_stream_reads_open(world: &mut World) {
+    writes_whole_stream(world);
+    reads_open_links(world);
+}
+
+#[then("the open links listed are exactly the links to the parents that never arrived")]
+fn open_links_are_missing_parents(world: &mut World) {
+    let stream = world.stream.take().unwrap();
+    let arrived: HashSet<&str> = stream.arrivals.iter().map(|a| a.0.as_str()).collect();
+    let expected: BTreeSet<(String, String, String)> = stream
+        .links
+        .iter()
+        .filter(|l| arrived.contains(l.0.as_str()))
+        .map(|l| ("answers".to_string(), l.0.clone(), l.1.clone()))
+        .collect();
+    assert!(!expected.is_empty());
+    let listed: Vec<(String, String, String)> = world
+        .open_links
+        .iter()
+        .map(|o| (o.relation.clone(), o.from.key.clone(), o.to.key.clone()))
+        .collect();
+    assert_eq!(listed.len(), expected.len());
+    assert_eq!(listed.into_iter().collect::<BTreeSet<_>>(), expected);
+}
+
+fn s2_open_on_s1() -> OpenLink {
+    OpenLink {
+        relation: "answers".into(),
+        from: NodeRef::new("statement", "s2"),
+        to: NodeRef::new("statement", "s1"),
+        waits_on: NodeRef::new("statement", "s1"),
+    }
+}
+
+#[given("an answers link from statement s2 waiting on statement key s1, which is not in the graph")]
+#[given("an answers link from statement s2 waiting on statement key s1")]
+fn s2_waits_on_s1(world: &mut World) {
+    declare_replies(world.open());
+    let when = day(2021, 3, 2);
+    world.write(
+        &Write::new("discord").unit(
+            Unit::new("statement", "s2", [("text", "re")], when.clone())
+                .link("answers", "s2", "s1", when),
+        ),
+    );
+    assert!(world.g().find("statement", "s1").unwrap().is_none());
+}
+
+#[when("the app reads the open links")]
+fn reads_open_links(world: &mut World) {
+    world.open_links = world.g().open_links().unwrap();
+}
+
+#[when("the app writes a voice under key s1")]
+fn writes_voice_s1(world: &mut World) {
+    world.write(&Write::new("discord").unit(Unit::new("voice", "s1", NONE, day(2021, 3, 3))));
+}
+
+#[then("the link is listed with target kind statement and target key s1")]
+#[then("the open links still list the link from s2 waiting on statement s1")]
+fn lists_s2_waiting_on_s1(world: &mut World) {
+    let listed = world.g().open_links().unwrap();
+    assert_eq!(listed, [s2_open_on_s1()]);
+}
+
+#[then("the write's result reports a wrong-kind arrival under key s1, naming the open link")]
+fn reports_wrong_kind(world: &mut World) {
+    let reported: Vec<(NodeRef, LinkFact)> = world
+        .written
+        .iter()
+        .flat_map(|e| match &e.change {
+            Change::Wrote { wrong_kind, .. } => wrong_kind.clone(),
+            _ => Vec::new(),
+        })
+        .map(|report| (report.arrived, report.waiting))
+        .collect();
+    assert_eq!(
+        reported,
+        [(
+            NodeRef::new("voice", "s1"),
+            LinkFact {
+                relation: "answers".into(),
+                from: NodeRef::new("statement", "s2"),
+                to: NodeRef::new("statement", "s1"),
+                valid: day(2021, 3, 2),
+            }
+        )]
     );
 }
 

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::open::{
     Graph, Ontology, Relation, class_table, concat, property_column, relation_table,
 };
-use crate::write::{Date, Error, ValidTime};
+use crate::write::{Date, Error, ValidTime, node_id};
 
 /// A node named by its class and natural key.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -37,6 +37,16 @@ pub struct Node {
     pub source: String,
     pub valid: ValidTime,
     pub recorded: SystemTime,
+}
+
+/// A link still waiting for an end: its relation, both ends, and the end it waits on.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct OpenLink {
+    pub relation: String,
+    pub from: NodeRef,
+    pub to: NodeRef,
+    /// The target it waits on, by kind and key.
+    pub waits_on: NodeRef,
 }
 
 /// A link as the graph holds it now.
@@ -206,6 +216,39 @@ impl Graph {
                 })
             })
             .optional()?)
+    }
+
+    /// Every link still waiting for an end, each naming the kind and key of the target it
+    /// waits on.
+    ///
+    /// # Errors
+    /// The graph file cannot be read.
+    pub fn open_links(&self) -> Result<Vec<OpenLink>, Error> {
+        let tx = self.conn.unchecked_transaction()?;
+        let rows: Vec<(String, String, String)> = tx
+            .prepare_cached(
+                "SELECT relation, from_key, to_key FROM _open ORDER BY relation, from_key, to_key",
+            )?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<Result<_, _>>()?;
+        let mut open = Vec::with_capacity(rows.len());
+        for (relation, from_key, to_key) in rows {
+            let relation = self.ontology.relation(&relation)?;
+            let from = NodeRef::new(&relation.from, from_key);
+            let to = NodeRef::new(&relation.to, to_key);
+            let waits_on = if node_id(&tx, &to.class, &to.key)?.is_some() {
+                from.clone()
+            } else {
+                to.clone()
+            };
+            open.push(OpenLink {
+                relation: relation.name.clone(),
+                from,
+                to,
+                waits_on,
+            });
+        }
+        Ok(open)
     }
 
     /// Walks from `root` along the relations in `via` (each read backwards when written
