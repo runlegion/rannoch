@@ -98,13 +98,15 @@ pub struct GroupBy {
 }
 
 /// An exact count from many roots of one class, along a path of relations. It counts the
-/// nodes the path ends on.
+/// nodes the path ends on. With `as_of`, every node and link the count reads must be valid on
+/// or before that date; one whose valid time is unknown is never counted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Count {
     pub class: String,
     pub roots: Vec<String>,
     pub path: Vec<Step>,
     pub group_by: Option<GroupBy>,
+    pub as_of: Option<Date>,
 }
 
 /// One root's count: the distinct nodes the path ends on, the total of paths that reach them,
@@ -209,8 +211,9 @@ impl Graph {
     }
 
     /// Walks from `root` along the relations in `via` (each read backwards when written
-    /// `name<-`), for up to `hops` hops, and returns at most `cap` nodes, nearest first. The
-    /// root itself is not among them.
+    /// `name<-`), for up to `hops` hops, and returns at most `cap` nodes, nearest first, each
+    /// with its valid time: a node whose valid time is stated unknown is returned marked
+    /// [`ValidTime::Unknown`]. The root itself is not among them.
     ///
     /// # Errors
     /// [`Error::NotFound`] when the root is not in the graph; a relation in `via` is not
@@ -221,24 +224,61 @@ impl Graph {
         via: &[&str],
         hops: usize,
         cap: usize,
-    ) -> Result<Vec<NodeRef>, Error> {
+    ) -> Result<Vec<(NodeRef, ValidTime)>, Error> {
+        self.walk_in(root, via, hops, cap, None)
+    }
+
+    /// [`Graph::walk`] as of `as_of`: it follows only links and reaches only nodes valid on or
+    /// before that date, from a root valid by then. A node or link whose valid time is unknown
+    /// is never followed as of a date.
+    ///
+    /// # Errors
+    /// As [`Graph::walk`].
+    pub fn walk_as_of(
+        &self,
+        root: &NodeRef,
+        via: &[&str],
+        hops: usize,
+        cap: usize,
+        as_of: &Date,
+    ) -> Result<Vec<(NodeRef, ValidTime)>, Error> {
+        self.walk_in(root, via, hops, cap, Some(as_of))
+    }
+
+    fn walk_in(
+        &self,
+        root: &NodeRef,
+        via: &[&str],
+        hops: usize,
+        cap: usize,
+        as_of: Option<&Date>,
+    ) -> Result<Vec<(NodeRef, ValidTime)>, Error> {
         let steps = via
             .iter()
             .map(|v| parse(&self.ontology, v))
             .collect::<Result<Vec<_>, _>>()?;
         let tx = self.conn.unchecked_transaction()?;
-        let sql = format!("SELECT id FROM {} WHERE key = ?1", class_table(&root.class));
-        let root_id: i64 = tx
+        let sql = format!(
+            "SELECT id, valid FROM {} WHERE key = ?1",
+            class_table(&root.class)
+        );
+        let (root_id, root_valid): (i64, Option<String>) = tx
             .prepare_cached(&sql)?
-            .query_row(params![root.key], |row| row.get(0))
+            .query_row(params![root.key], |row| Ok((row.get(0)?, row.get(1)?)))
             .optional()?
             .ok_or_else(|| Error::NotFound {
                 class: root.class.clone(),
                 key: root.key.clone(),
             })?;
+        let valid_by = |valid: Option<String>| {
+            as_of.is_none_or(|date| valid.is_some_and(|v| v.as_str() <= date.as_str()))
+        };
+        if !valid_by(root_valid) {
+            return Ok(Vec::new());
+        }
         let mut seen: HashSet<(&str, i64)> = HashSet::from([(root.class.as_str(), root_id)]);
         let mut frontier: Vec<(&str, i64)> = vec![(root.class.as_str(), root_id)];
-        let mut found: Vec<NodeRef> = Vec::new();
+        let mut found: Vec<(NodeRef, ValidTime)> = Vec::new();
         let hops = if cap == 0 { 0 } else { hops };
         'hops: for _ in 0..hops {
             let mut next = Vec::new();
@@ -253,16 +293,23 @@ impl Graph {
                         continue;
                     }
                     let sql = format!(
-                        "SELECT n.id, n.key FROM {} r JOIN {} n ON n.id = r.{far} WHERE r.{near} = ?1",
+                        "SELECT n.id, n.key, r.valid, n.valid FROM {} r JOIN {} n ON n.id = r.{far} WHERE r.{near} = ?1",
                         relation_table(&relation.name),
                         class_table(there)
                     );
                     let mut statement = tx.prepare_cached(&sql)?;
                     let mut rows = statement.query(params![id])?;
                     while let Some(row) = rows.next()? {
+                        let node_valid: Option<String> = row.get(3)?;
+                        if !(valid_by(row.get(2)?) && valid_by(node_valid.clone())) {
+                            continue;
+                        }
                         let node: (&str, i64) = (there.as_str(), row.get(0)?);
                         if seen.insert(node) {
-                            found.push(NodeRef::new(there, row.get::<_, String>(1)?));
+                            found.push((
+                                NodeRef::new(there, row.get::<_, String>(1)?),
+                                ValidTime::from_sql(node_valid),
+                            ));
                             next.push(node);
                             if found.len() >= cap {
                                 break 'hops;
@@ -287,7 +334,10 @@ impl Graph {
         let roots = serde_json::to_string(&count.roots)?;
         let tx = self.conn.unchecked_transaction()?;
         let mut statement = tx.prepare(&query)?;
-        let mut rows = statement.query(params![roots])?;
+        let mut rows = match &count.as_of {
+            None => statement.query(params![roots])?,
+            Some(date) => statement.query(params![roots, date.as_str()])?,
+        };
         let mut tallies: HashMap<String, Tally> = HashMap::new();
         let mut last: Option<(String, i64)> = None;
         while let Some(row) = rows.next()? {
@@ -327,6 +377,12 @@ fn count_query(ontology: &Ontology, count: &Count) -> Result<String, Error> {
     let root_class = ontology.class(&count.class)?;
     let mut joins = vec![format!("FROM {} n0", class_table(&root_class.name))];
     let mut conditions = vec!["n0.key IN (SELECT value FROM json_each(?1))".to_string()];
+    // As of a date, every node and link the count reads is valid by then (`?2`); an unknown
+    // valid time is NULL, and NULL <= ?2 is never true.
+    let as_of = count.as_of.is_some();
+    if as_of {
+        conditions.push("n0.valid <= ?2".to_string());
+    }
     let mut at: Vec<(&str, String)> = vec![(root_class.name.as_str(), "n0.id".to_string())];
     for (i, step) in count.path.iter().enumerate() {
         let (class, node) = at[i].clone();
@@ -348,6 +404,14 @@ fn count_query(ontology: &Ontology, count: &Count) -> Result<String, Error> {
             relation_table(&relation.name)
         ));
         let reached = format!("{r}.{far}");
+        if as_of {
+            let n = format!("n{}", i + 1);
+            joins.push(format!(
+                "JOIN {} {n} ON {n}.id = {reached}",
+                class_table(there)
+            ));
+            conditions.push(format!("{r}.valid <= ?2 AND {n}.valid <= ?2"));
+        }
         if let Some(filter) = &step.filter {
             conditions.push(filter_condition(
                 ontology,
@@ -356,6 +420,7 @@ fn count_query(ontology: &Ontology, count: &Count) -> Result<String, Error> {
                 &root_class.name,
                 &reached,
                 i + 1,
+                as_of,
             )?);
         }
         at.push((there.as_str(), reached));
@@ -401,6 +466,7 @@ fn filter_condition(
     root_class: &str,
     reached: &str,
     step: usize,
+    as_of: bool,
 ) -> Result<String, Error> {
     let (by, backwards) = parse(ontology, &filter.via)?;
     let (node_end, root_end, node_col, root_col) = if backwards {
@@ -416,8 +482,13 @@ fn filter_condition(
     }
     let f = format!("f{step}");
     Ok(format!(
-        "{}EXISTS (SELECT 1 FROM {} {f} WHERE {f}.{node_col} = {reached} AND {f}.{root_col} = n0.id)",
+        "{}EXISTS (SELECT 1 FROM {} {f} WHERE {f}.{node_col} = {reached} AND {f}.{root_col} = n0.id{})",
         if filter.keep { "" } else { "NOT " },
-        relation_table(&by.name)
+        relation_table(&by.name),
+        if as_of {
+            format!(" AND {f}.valid <= ?2")
+        } else {
+            String::new()
+        }
     ))
 }
