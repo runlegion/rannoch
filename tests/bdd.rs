@@ -3,7 +3,7 @@
 //!
 //! Steps act and observe through rannoch's public API. Only fixture setup touches the file
 //! directly: the trigger that makes a write's third piece fail, and reading the file's table
-//! names so a refusal can be checked against them.
+//! and column names so an answer or a refusal can be checked against them.
 
 #![allow(
     clippy::expect_used,
@@ -19,8 +19,9 @@ use std::thread::JoinHandle;
 use std::time::SystemTime;
 
 use rannoch::{
-    Change, Class, Count, Cursor, Date, Declaration, Error, Event, Fact, Graph, GroupBy, LinkFact,
-    Node, NodeRef, OpenLink, Relation, Step, Tally, Unit, ValidTime, Write, WriteError,
+    Change, Class, Count, Cursor, Date, Declaration, Description, Error, Event, Fact, Graph,
+    GroupBy, LinkFact, Node, NodeRef, OpenLink, PartOf, Relation, Step, Tally, Unit, ValidTime,
+    Write, WriteError,
 };
 use rstest_bdd_macros::{given, scenarios, then, when};
 use tempfile::TempDir;
@@ -131,6 +132,48 @@ fn declare_replies(g: &mut Graph) {
         false,
     )))
     .unwrap();
+}
+
+/// The T9b declarations and instances (t9b-direct, 2026-10-14): place swtor-tc, conversation c1
+/// at it, finding f1, voices v0 to v2, and statements s0 to s4, each inside c1, said by a voice
+/// and supporting f1.
+fn t9b_graph(g: &mut Graph) {
+    for d in t9b() {
+        g.declare(&d).unwrap();
+    }
+    let when = day(2021, 3, 2);
+    let mut write = Write::new("swtor")
+        .unit(Unit::new(
+            "place",
+            "swtor-tc",
+            [("url", "discord.gg/x")],
+            day(2019, 10, 1),
+        ))
+        .unit(Unit::new("conversation", "c1", NONE, when.clone()).link(
+            "at",
+            "c1",
+            "swtor-tc",
+            when.clone(),
+        ))
+        .unit(Unit::new("finding", "f1", NONE, day(2026, 10, 1)));
+    for i in 0..5 {
+        let (statement, voice) = (format!("s{i}"), format!("v{}", i % 3));
+        write = write
+            .unit(Unit::new("voice", voice.clone(), NONE, when.clone()))
+            .unit(
+                Unit::new(
+                    "statement",
+                    statement.clone(),
+                    [("text", "the respec cost is absurd")],
+                    when.clone(),
+                )
+                .link("inside", statement.clone(), "c1", when.clone())
+                .link("said", voice, statement.clone(), when.clone())
+                .link("supports", statement, "f1", day(2026, 10, 1)),
+            );
+    }
+    g.write(&write).unwrap();
+    assert!(g.open_links().unwrap().is_empty());
 }
 
 /// T4's source: per finding, its distinct voices, statements and per-place counts.
@@ -321,6 +364,8 @@ struct World {
     read: Vec<Event>,
     folded: BTreeMap<String, usize>,
     open_links: Vec<OpenLink>,
+    described: Option<Description>,
+    answers: Vec<String>,
 }
 
 #[rstest::fixture]
@@ -347,6 +392,8 @@ fn world() -> World {
         read: Vec::new(),
         folded: BTreeMap::new(),
         open_links: Vec::new(),
+        described: None,
+        answers: Vec::new(),
     }
 }
 
@@ -1902,6 +1949,220 @@ fn finds_s05_2023(world: &mut World) {
 fn no_node(world: &mut World) {
     assert!(world.found.is_none());
     assert!(world.g().find("statement", "s05").unwrap().is_some());
+}
+
+// ---------- read: answers in ontology terms ----------
+
+#[given("the T9b graph")]
+#[given("the T9b graph, with inside and at declared as containment")]
+fn the_t9b_graph(world: &mut World) {
+    t9b_graph(world.open());
+    let relations = &world.g().ontology().relations;
+    assert!(relations["inside"].containment && relations["at"].containment);
+}
+
+#[when("the app describes statement s1")]
+fn describes_s1(world: &mut World) {
+    world.described = Some(
+        world
+            .g()
+            .describe(&NodeRef::new("statement", "s1"))
+            .unwrap(),
+    );
+}
+
+fn described(world: &World) -> &Description {
+    world.described.as_ref().expect("a node was described")
+}
+
+#[then("the answer gives class statement and property text")]
+fn gives_class_and_text(world: &mut World) {
+    let d = described(world);
+    assert_eq!(d.node, NodeRef::new("statement", "s1"));
+    assert_eq!(
+        d.properties,
+        BTreeMap::from([("text".to_string(), "the respec cost is absurd".to_string())])
+    );
+}
+
+fn counts(pairs: &[(&str, u64)]) -> BTreeMap<String, u64> {
+    pairs.iter().map(|&(r, n)| (r.to_string(), n)).collect()
+}
+
+#[then("the answer gives relations out inside 1 and supports 1")]
+fn gives_relations_out(world: &mut World) {
+    assert_eq!(
+        described(world).relations_out,
+        counts(&[("inside", 1), ("supports", 1)])
+    );
+}
+
+#[then("relations in said 1")]
+fn gives_relations_in(world: &mut World) {
+    assert_eq!(described(world).relations_in, counts(&[("said", 1)]));
+}
+
+#[then("the answer gives s1 part of conversation c1 via inside")]
+fn part_of_c1(world: &mut World) {
+    let d = described(world);
+    assert_eq!(d.node, NodeRef::new("statement", "s1"));
+    assert_eq!(
+        d.part_of.first(),
+        Some(&PartOf {
+            node: NodeRef::new("conversation", "c1"),
+            via: "inside".into(),
+        })
+    );
+}
+
+#[then("part of place swtor-tc via at")]
+fn part_of_swtor_tc(world: &mut World) {
+    let d = described(world);
+    assert_eq!(d.part_of.len(), 2, "{:?}", d.part_of);
+    assert_eq!(
+        d.part_of[1],
+        PartOf {
+            node: NodeRef::new("place", "swtor-tc"),
+            via: "at".into(),
+        }
+    );
+}
+
+fn node_ref_texts(node: &NodeRef) -> [String; 2] {
+    [node.class.clone(), node.key.clone()]
+}
+
+fn description_texts(d: &Description) -> Vec<String> {
+    let mut texts = node_ref_texts(&d.node).to_vec();
+    texts.extend(
+        d.properties
+            .iter()
+            .flat_map(|(k, v)| [k.clone(), v.clone()]),
+    );
+    texts.extend(d.relations_out.keys().cloned());
+    texts.extend(d.relations_in.keys().cloned());
+    for p in &d.part_of {
+        texts.extend(node_ref_texts(&p.node));
+        texts.push(p.via.clone());
+    }
+    texts
+}
+
+/// Fails when a text names one of the file's tables or columns. A table name counts anywhere in
+/// a text; a column name counts as a whole word, so `id` inside `said` does not.
+fn assert_names_no_storage(world: &World, texts: &[String]) {
+    let file = rusqlite::Connection::open(world.path()).unwrap();
+    let tables: Vec<String> = file
+        .prepare("SELECT name FROM sqlite_master")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let mut columns: BTreeSet<String> = BTreeSet::new();
+    for table in &tables {
+        let mut statement = file
+            .prepare("SELECT name FROM pragma_table_info(?1)")
+            .unwrap();
+        columns.extend(
+            statement
+                .query_map([table], |row| row.get::<_, String>(0))
+                .unwrap()
+                .map(Result::unwrap),
+        );
+    }
+    assert!(!tables.is_empty() && !columns.is_empty());
+    assert!(!texts.is_empty());
+    for text in texts {
+        for table in &tables {
+            assert!(
+                !text.contains(table.as_str()),
+                "{text:?} names table {table}"
+            );
+        }
+        for word in text.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == ':')) {
+            assert!(!columns.contains(word), "{text:?} names column {word}");
+        }
+    }
+}
+
+#[then("no table name and no column name appears in the answer")]
+fn describe_names_no_storage(world: &mut World) {
+    let texts = description_texts(described(world));
+    assert_names_no_storage(world, &texts);
+}
+
+#[when(
+    "the app runs a find, a walk, a count and an open-links read, and writes a link between the wrong classes"
+)]
+fn runs_every_read_and_a_refused_write(world: &mut World) {
+    let g = world.g();
+    let mut texts = Vec::new();
+    let found = g
+        .find("statement", "s1")
+        .unwrap()
+        .expect("s1 is in the graph");
+    texts.extend([
+        found.class,
+        found.key,
+        found.source,
+        format!("{:?}", found.valid),
+    ]);
+    texts.extend(found.properties.into_iter().flat_map(|(k, v)| [k, v]));
+    let walked = g
+        .walk(&NodeRef::new("statement", "s1"), &["inside", "at"], 2, 200)
+        .unwrap();
+    assert_eq!(walked.len(), 2, "{walked:?}");
+    texts.extend(walked.iter().flat_map(node_ref_texts));
+    let tallies = g
+        .count(&Count {
+            class: "finding".into(),
+            roots: vec!["f1".into()],
+            path: vec![Step::new("supports<-"), Step::new("said<-")],
+            group_by: Some(GroupBy {
+                class: "statement".into(),
+                property: "text".into(),
+            }),
+        })
+        .unwrap();
+    assert_eq!(tallies[0].distinct, 3, "{tallies:?}");
+    for tally in tallies {
+        texts.push(tally.root);
+        texts.extend(tally.groups.into_keys().flatten());
+    }
+    for open in g.open_links().unwrap() {
+        texts.push(open.relation);
+        for end in [open.from, open.to, open.waits_on] {
+            texts.extend(node_ref_texts(&end));
+        }
+    }
+    let when = day(2021, 3, 2);
+    let refused = g
+        .write(
+            &Write::new("swtor").unit(
+                Unit::new(
+                    "statement",
+                    "s1",
+                    [("text", "the respec cost is absurd")],
+                    when.clone(),
+                )
+                .link("said", "f1", "s1", when),
+            ),
+        )
+        .expect_err("a said link from a finding is refused");
+    assert!(
+        matches!(refused.cause, Error::Refused(_)),
+        "not refused: {}",
+        refused.cause
+    );
+    texts.push(refused.cause.to_string());
+    texts.push(refused.to_string());
+    world.answers = texts;
+}
+
+#[then("no table name and no column name appears in any answer or in the refusal")]
+fn reads_and_refusal_name_no_storage(world: &mut World) {
+    assert_names_no_storage(world, &world.answers);
 }
 
 scenarios!("tests", fixtures = [world: World]);

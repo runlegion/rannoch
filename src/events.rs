@@ -18,10 +18,10 @@ pub(crate) const OWN_TABLES: &str = "
         kind TEXT NOT NULL, name TEXT NOT NULL, body TEXT NOT NULL,
         PRIMARY KEY(kind, name)) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS _open(
-        relation TEXT NOT NULL, from_key TEXT NOT NULL, to_key TEXT NOT NULL,
+        rel TEXT NOT NULL, from_key TEXT NOT NULL, to_key TEXT NOT NULL,
         source TEXT NOT NULL, valid TEXT,
-        PRIMARY KEY(relation, from_key, to_key)) WITHOUT ROWID;
-    CREATE INDEX IF NOT EXISTS _open_to ON _open(relation, to_key);";
+        PRIMARY KEY(rel, from_key, to_key)) WITHOUT ROWID;
+    CREATE INDEX IF NOT EXISTS _open_to ON _open(rel, to_key);";
 
 /// A place in a graph's event log. Reading since a cursor returns the events after it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

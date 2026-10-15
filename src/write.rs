@@ -498,9 +498,9 @@ impl Piece<'_> {
         let changed = self
             .tx
             .prepare_cached(
-                "INSERT INTO _open(relation, from_key, to_key, source, valid) \
+                "INSERT INTO _open(rel, from_key, to_key, source, valid) \
                  VALUES (?1, ?2, ?3, ?4, ?5) \
-                 ON CONFLICT(relation, from_key, to_key) DO UPDATE SET \
+                 ON CONFLICT(rel, from_key, to_key) DO UPDATE SET \
                  source = excluded.source, valid = excluded.valid \
                  WHERE source IS NOT excluded.source OR valid IS NOT excluded.valid",
             )?
@@ -530,7 +530,7 @@ impl Piece<'_> {
                     .tx
                     .prepare_cached(&format!(
                         "SELECT from_key, to_key, source, valid FROM _open \
-                         WHERE relation = ?1 AND {column} = ?2"
+                         WHERE rel = ?1 AND {column} = ?2"
                     ))?
                     .query_map(params![relation.name, key], |row| {
                         Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
@@ -558,7 +558,7 @@ impl Piece<'_> {
                     self.relate(&relation.name, from, to, &source, &valid)?;
                     self.tx
                         .prepare_cached(
-                            "DELETE FROM _open WHERE relation = ?1 AND from_key = ?2 AND to_key = ?3",
+                            "DELETE FROM _open WHERE rel = ?1 AND from_key = ?2 AND to_key = ?3",
                         )?
                         .execute(params![relation.name, from_key, to_key])?;
                     self.closed.push(LinkFact {

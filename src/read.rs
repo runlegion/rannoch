@@ -1,4 +1,4 @@
-//! Reads: find a node or a link, walk from a root, count exactly.
+//! Reads: find a node or a link, describe a node, walk from a root, count exactly.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -58,6 +58,28 @@ pub struct Link {
     pub source: String,
     pub valid: ValidTime,
     pub recorded: SystemTime,
+}
+
+/// A node in ontology terms: its class and key, its properties, its relations by name in both
+/// directions with how many links each has, and what it is part of. It names no table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Description {
+    pub node: NodeRef,
+    pub properties: BTreeMap<String, String>,
+    /// Links from the node, by relation: only relations it has a link of.
+    pub relations_out: BTreeMap<String, u64>,
+    /// Links to the node, by relation: only relations it has a link of.
+    pub relations_in: BTreeMap<String, u64>,
+    /// Its containment ancestors, nearest first.
+    pub part_of: Vec<PartOf>,
+}
+
+/// A containment ancestor: the node something is part of, and the containment relation it is
+/// part of it through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartOf {
+    pub node: NodeRef,
+    pub via: String,
 }
 
 fn recorded(millis: i64) -> SystemTime {
@@ -227,7 +249,7 @@ impl Graph {
         let tx = self.conn.unchecked_transaction()?;
         let rows: Vec<(String, String, String)> = tx
             .prepare_cached(
-                "SELECT relation, from_key, to_key FROM _open ORDER BY relation, from_key, to_key",
+                "SELECT rel, from_key, to_key FROM _open ORDER BY rel, from_key, to_key",
             )?
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
             .collect::<Result<_, _>>()?;
@@ -249,6 +271,85 @@ impl Graph {
             });
         }
         Ok(open)
+    }
+
+    /// Describes `node` in ontology terms: its class, its properties, its relations by name in
+    /// both directions with counts, and its ancestors along the relations declared as
+    /// containment.
+    ///
+    /// # Errors
+    /// [`Error::NotFound`] when the node is not in the graph; its class is not declared; the
+    /// graph file cannot be read.
+    pub fn describe(&self, node: &NodeRef) -> Result<Description, Error> {
+        let tx = self.conn.unchecked_transaction()?;
+        let not_found = || Error::NotFound {
+            class: node.class.clone(),
+            key: node.key.clone(),
+        };
+        let found = find_in(&tx, &self.ontology, &node.class, &node.key)?.ok_or_else(not_found)?;
+        let id = node_id(&tx, &node.class, &node.key)?.ok_or_else(not_found)?;
+        let links = |relation: &Relation, end: &str| -> Result<u64, Error> {
+            let sql = format!(
+                "SELECT count(*) FROM {} WHERE {end} = ?1",
+                relation_table(&relation.name)
+            );
+            let n: i64 = tx
+                .prepare_cached(&sql)?
+                .query_row(params![id], |row| row.get(0))?;
+            Ok(u64::try_from(n).unwrap_or(0))
+        };
+        let (mut relations_out, mut relations_in) = (BTreeMap::new(), BTreeMap::new());
+        for relation in self.ontology.relations.values() {
+            for (class, end, counts) in [
+                (&relation.from, "src", &mut relations_out),
+                (&relation.to, "dst", &mut relations_in),
+            ] {
+                if *class == node.class {
+                    let n = links(relation, end)?;
+                    if n > 0 {
+                        counts.insert(relation.name.clone(), n);
+                    }
+                }
+            }
+        }
+        let mut seen: HashSet<(&str, i64)> = HashSet::from([(node.class.as_str(), id)]);
+        let mut frontier: Vec<(&str, i64)> = vec![(node.class.as_str(), id)];
+        let mut part_of = Vec::new();
+        while !frontier.is_empty() {
+            let mut next = Vec::new();
+            for &(class, id) in &frontier {
+                for relation in self.ontology.relations.values() {
+                    if !relation.containment || relation.from != class {
+                        continue;
+                    }
+                    let sql = format!(
+                        "SELECT n.id, n.key FROM {} r JOIN {} n ON n.id = r.dst WHERE r.src = ?1",
+                        relation_table(&relation.name),
+                        class_table(&relation.to)
+                    );
+                    let mut statement = tx.prepare_cached(&sql)?;
+                    let mut rows = statement.query(params![id])?;
+                    while let Some(row) = rows.next()? {
+                        let ancestor: (&str, i64) = (relation.to.as_str(), row.get(0)?);
+                        if seen.insert(ancestor) {
+                            part_of.push(PartOf {
+                                node: NodeRef::new(&relation.to, row.get::<_, String>(1)?),
+                                via: relation.name.clone(),
+                            });
+                            next.push(ancestor);
+                        }
+                    }
+                }
+            }
+            frontier = next;
+        }
+        Ok(Description {
+            node: NodeRef::new(found.class, found.key),
+            properties: found.properties,
+            relations_out,
+            relations_in,
+            part_of,
+        })
     }
 
     /// Walks from `root` along the relations in `via` (each read backwards when written
