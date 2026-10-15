@@ -5,7 +5,7 @@ use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::events::{Change, Stored};
+use crate::events::{Change, naming_key};
 use crate::open::{Graph, open};
 use crate::read::NodeRef;
 use crate::write::Error;
@@ -72,14 +72,7 @@ impl Graph {
 
 /// The rule of the latest forget event that named `target`, if one did.
 fn forgotten_by(conn: &Connection, target: &NodeRef) -> Result<Option<String>, Error> {
-    // A coarse filter on the key as the events encode it; each candidate is matched exactly.
-    let pattern = format!("%{}%", serde_json::to_string(&target.key)?);
-    let bodies: Vec<String> = conn
-        .prepare_cached("SELECT body FROM _events WHERE body LIKE ?1 ORDER BY seq DESC")?
-        .query_map(params![pattern], |row| row.get(0))?
-        .collect::<Result<_, _>>()?;
-    for body in bodies {
-        let stored: Stored = serde_json::from_str(&body)?;
+    for (_, stored) in naming_key(conn, &target.key)?.into_iter().rev() {
         if let Change::Forgot { rule, nodes, .. } = stored.change
             && nodes.contains(target)
         {

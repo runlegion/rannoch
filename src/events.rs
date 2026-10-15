@@ -268,14 +268,7 @@ fn unlink(
 
 /// Strips `target`'s content from every earlier event that wrote it, keeping its id and kind.
 fn strip(tx: &Connection, target: &NodeRef) -> Result<(), Error> {
-    // A coarse filter on the key as the events encode it; each candidate is matched exactly.
-    let pattern = format!("%{}%", serde_json::to_string(&target.key)?);
-    let candidates: Vec<(i64, String)> = tx
-        .prepare_cached("SELECT seq, body FROM _events WHERE body LIKE ?1")?
-        .query_map(params![pattern], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect::<Result<_, _>>()?;
-    for (seq, body) in candidates {
-        let mut stored: Stored = serde_json::from_str(&body)?;
+    for (seq, mut stored) in naming_key(tx, &target.key)? {
         let Change::Wrote { added, .. } = &mut stored.change else {
             continue;
         };
@@ -296,4 +289,17 @@ fn strip(tx: &Connection, target: &NodeRef) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+/// Every event whose encoding holds `key`, in log order, with its place in the log. A coarse
+/// filter on the key as the events encode it: the caller matches each candidate exactly.
+pub(crate) fn naming_key(conn: &Connection, key: &str) -> Result<Vec<(i64, Stored)>, Error> {
+    let pattern = format!("%{}%", serde_json::to_string(key)?);
+    let rows: Vec<(i64, String)> = conn
+        .prepare_cached("SELECT seq, body FROM _events WHERE body LIKE ?1 ORDER BY seq")?
+        .query_map(params![pattern], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    rows.into_iter()
+        .map(|(seq, body)| Ok((seq, serde_json::from_str(&body)?)))
+        .collect()
 }
