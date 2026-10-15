@@ -236,34 +236,40 @@ fn t2(g: &mut Graph) -> Vec<Event> {
 }
 
 /// T10's synthetic set (t10-as-of): 1 finding, 40 supporting statements from 12 voices with
-/// valid times from 2023 to 2026, 3 of them stated unknown; s05 valid 2024-05-01, from swtor.
+/// valid times from 2023 to 2026, 3 of them stated unknown; s05 valid 2024-05-01. Per
+/// statement: its key, its voice and its valid time.
+fn t10_statements() -> Vec<(String, String, ValidTime)> {
+    (0u16..40)
+        .map(|i| {
+            let valid = if i == 5 {
+                day(2024, 5, 1)
+            } else if i % 13 == 7 {
+                ValidTime::Unknown
+            } else {
+                let small = |n: u16| u8::try_from(n).unwrap();
+                day(
+                    2023 + i * 7 % 4,
+                    small(1 + i * 5 % 12),
+                    small(1 + i * 3 % 28),
+                )
+            };
+            (format!("s{i:02}"), format!("v{}", i % 12), valid)
+        })
+        .collect()
+}
+
+/// T10 written from swtor. The finding and the voices are valid from 2023-01-01, the earliest
+/// statement's date, so a read as of a date is decided by the statements and their links.
 fn t10(g: &mut Graph) {
     for d in t9b() {
         g.declare(&d).unwrap();
     }
-    let mut write = Write::new("swtor").unit(Unit::new("finding", "f1", NONE, day(2026, 10, 1)));
+    let since = day(2023, 1, 1);
+    let mut write = Write::new("swtor").unit(Unit::new("finding", "f1", NONE, since.clone()));
     for v in 0..12 {
-        write = write.unit(Unit::new(
-            "voice",
-            format!("v{v}"),
-            NONE,
-            ValidTime::Unknown,
-        ));
+        write = write.unit(Unit::new("voice", format!("v{v}"), NONE, since.clone()));
     }
-    for i in 0u16..40 {
-        let valid = if i == 5 {
-            day(2024, 5, 1)
-        } else if i % 13 == 7 {
-            ValidTime::Unknown
-        } else {
-            let small = |n: u16| u8::try_from(n).unwrap();
-            day(
-                2023 + i * 7 % 4,
-                small(1 + i * 5 % 12),
-                small(1 + i * 3 % 28),
-            )
-        };
-        let statement = format!("s{i:02}");
+    for (statement, voice, valid) in t10_statements() {
         write = write.unit(
             Unit::new(
                 "statement",
@@ -271,16 +277,29 @@ fn t10(g: &mut Graph) {
                 [("text", format!("text of {statement}"))],
                 valid.clone(),
             )
-            .link(
-                "said",
-                format!("v{}", i % 12),
-                statement.clone(),
-                valid.clone(),
-            )
+            .link("said", voice, statement.clone(), valid.clone())
             .link("supports", statement, "f1", valid),
         );
     }
     g.write(&write).unwrap();
+}
+
+/// The T10 statements the fixture marks valid on or before `as_of`, with their voices.
+fn t10_valid_by(as_of: &Date) -> Vec<(String, String)> {
+    t10_statements()
+        .into_iter()
+        .filter(|(_, _, valid)| matches!(valid, ValidTime::On(date) if date <= as_of))
+        .map(|(statement, voice, _)| (statement, voice))
+        .collect()
+}
+
+/// The T10 statements whose valid time is stated unknown.
+fn t10_unknown() -> Vec<String> {
+    t10_statements()
+        .into_iter()
+        .filter(|(_, _, valid)| *valid == ValidTime::Unknown)
+        .map(|(statement, _, _)| statement)
+        .collect()
 }
 
 /// The rewrite of s05 (T10): corrected text, still true from 2024-05-01.
@@ -305,7 +324,8 @@ struct World {
     written: Vec<Event>,
     write_error: Option<WriteError>,
     stream: Option<Stream>,
-    walked: Vec<NodeRef>,
+    walked: Vec<(NodeRef, ValidTime)>,
+    walks: Vec<(Date, Vec<(NodeRef, ValidTime)>)>,
     tallies: Vec<Tally>,
     found: Option<Node>,
     window: (SystemTime, SystemTime),
@@ -331,6 +351,7 @@ fn world() -> World {
         write_error: None,
         stream: None,
         walked: Vec::new(),
+        walks: Vec::new(),
         tallies: Vec::new(),
         found: None,
         window: (SystemTime::UNIX_EPOCH, SystemTime::UNIX_EPOCH),
@@ -870,6 +891,7 @@ fn reader_counts(world: &mut World) {
                 roots: keys.clone(),
                 path,
                 group_by: None,
+                as_of: None,
             })
             .unwrap()
     };
@@ -926,6 +948,7 @@ fn one_v1(world: &mut World) {
             roots: vec!["v1".into()],
             path: Vec::new(),
             group_by: None,
+            as_of: None,
         })
         .unwrap();
     assert_eq!(tallies.len(), 1);
@@ -1118,7 +1141,7 @@ fn answers_equal_source(world: &mut World) {
     let mut stored = BTreeSet::new();
     for (statement, _, _) in &stream.arrivals {
         let root = NodeRef::new("statement", statement.clone());
-        for parent in g.walk(&root, &["answers"], 1, usize::MAX).unwrap() {
+        for (parent, _) in g.walk(&root, &["answers"], 1, usize::MAX).unwrap() {
             stored.insert((statement.clone(), parent.key));
         }
     }
@@ -1336,6 +1359,7 @@ fn fold_equals_live(world: &mut World) {
             roots: findings.clone(),
             path: vec![Step::new("supports<-"), Step::new("said<-")],
             group_by: None,
+            as_of: None,
         })
         .unwrap();
     assert_eq!(world.folded.len(), 20);
@@ -1404,7 +1428,15 @@ fn walks_capped(world: &mut World) {
 #[then("the walk returns 200 nodes")]
 fn returns_200(world: &mut World) {
     assert_eq!(world.walked.len(), 200);
-    assert_eq!(world.walked.iter().collect::<HashSet<_>>().len(), 200);
+    assert_eq!(
+        world
+            .walked
+            .iter()
+            .map(|(node, _)| node)
+            .collect::<HashSet<_>>()
+            .len(),
+        200
+    );
 }
 
 #[given("statement s2 answers statement s1")]
@@ -1436,7 +1468,8 @@ fn walks_answers_back(world: &mut World) {
 
 #[then("the walk returns s2")]
 fn returns_s2(world: &mut World) {
-    assert_eq!(world.walked, [NodeRef::new("statement", "s2")]);
+    let walked: Vec<&NodeRef> = world.walked.iter().map(|(node, _)| node).collect();
+    assert_eq!(walked, [&NodeRef::new("statement", "s2")]);
 }
 
 // ---------- read: counts ----------
@@ -1472,6 +1505,7 @@ fn count_from_f1(world: &mut World, path: Vec<Step>) {
             roots: vec!["f1".into()],
             path,
             group_by: None,
+            as_of: None,
         })
         .unwrap();
 }
@@ -1517,6 +1551,7 @@ fn counts_largest(world: &mut World) {
                 class: "statement".into(),
                 property: "place".into(),
             }),
+            as_of: None,
         })
         .unwrap();
 }
@@ -1551,6 +1586,7 @@ fn counts_all_findings(world: &mut World) {
             roots: (0..1000).map(|f| format!("f{f}")).collect(),
             path: vec![Step::new("supports<-"), Step::new("said<-")],
             group_by: None,
+            as_of: None,
         })
         .unwrap();
 }
@@ -1675,6 +1711,169 @@ fn finds_s05_2023(world: &mut World) {
 fn no_node(world: &mut World) {
     assert!(world.found.is_none());
     assert!(world.g().find("statement", "s05").unwrap().is_some());
+}
+
+// ---------- read: as of a valid time ----------
+
+/// A date written `YYYY-MM-DD`.
+fn date(text: &str) -> Date {
+    let mut parts = text.split('-');
+    let mut next = || parts.next().unwrap();
+    let year = next().parse().unwrap();
+    let month = next().parse().unwrap();
+    let d = next().parse().unwrap();
+    Date::day(year, month, d)
+}
+
+fn count_f1_as_of(world: &mut World, path: Vec<Step>, as_of: Date) {
+    world.tallies = world
+        .g()
+        .count(&Count {
+            class: "finding".into(),
+            roots: vec!["f1".into()],
+            path,
+            group_by: None,
+            as_of: Some(as_of),
+        })
+        .unwrap();
+}
+
+fn supporting(world: &mut World, as_of: Option<&Date>) -> Vec<(NodeRef, ValidTime)> {
+    let f1 = NodeRef::new("finding", "f1");
+    let g = world.g();
+    match as_of {
+        None => g.walk(&f1, &["supports<-"], 1, 1000),
+        Some(as_of) => g.walk_as_of(&f1, &["supports<-"], 1, 1000, as_of),
+    }
+    .unwrap()
+}
+
+fn keys(nodes: &[(NodeRef, ValidTime)]) -> BTreeSet<String> {
+    nodes.iter().map(|(n, _)| n.key.clone()).collect()
+}
+
+#[given("T10's finding with 40 supporting statements")]
+#[given("T10's finding with 40 supporting statements from 12 voices")]
+fn t10_finding(world: &mut World) {
+    t10(world.open());
+}
+
+#[given("T10's finding with 3 supporting statements of stated-unknown valid time")]
+fn t10_unknowns(world: &mut World) {
+    t10(world.open());
+    assert_eq!(t10_unknown().len(), 3);
+}
+
+#[when("the app counts the finding's supporting statements as of 2024-12-31")]
+fn counts_statements_2024(world: &mut World) {
+    count_f1_as_of(world, vec![Step::new("supports<-")], date("2024-12-31"));
+}
+
+#[then(
+    "the count equals the number of the 40 that the fixture marks valid on or before 2024-12-31"
+)]
+fn statements_valid_by_2024(world: &mut World) {
+    let expected = t10_valid_by(&date("2024-12-31")).len() as u64;
+    assert!(expected > 0 && expected < 40);
+    assert_eq!(world.tallies[0].distinct, expected);
+    assert_eq!(world.tallies[0].total, expected);
+}
+
+#[when("the app counts the finding's distinct voices as of {when}")]
+fn counts_voices_as_of(world: &mut World, when: String) {
+    count_f1_as_of(
+        world,
+        vec![Step::new("supports<-"), Step::new("said<-")],
+        date(&when),
+    );
+}
+
+#[then(
+    "the count equals the distinct voices of the statements the fixture marks valid on or before {when}"
+)]
+fn voices_valid_by(world: &mut World, when: String) {
+    let valid = t10_valid_by(&date(&when));
+    assert!(!valid.is_empty());
+    let voices: BTreeSet<&str> = valid.iter().map(|(_, voice)| voice.as_str()).collect();
+    assert_eq!(world.tallies[0].distinct, voices.len() as u64);
+    assert_eq!(world.tallies[0].total, valid.len() as u64);
+}
+
+#[when(
+    "the app reads the finding's supporting statements as of 2023-01-01, as of 2026-10-14 and as of 2100-01-01"
+)]
+fn reads_as_of_three(world: &mut World) {
+    for when in ["2023-01-01", "2026-10-14", "2100-01-01"] {
+        let as_of = date(when);
+        let walked = supporting(world, Some(&as_of));
+        world.walks.push((as_of, walked));
+    }
+}
+
+#[then("none of the 3 statements of unknown valid time is returned")]
+fn no_unknown_returned(world: &mut World) {
+    let unknown = t10_unknown();
+    assert_eq!(world.walks.len(), 3);
+    for (as_of, walked) in &world.walks {
+        let walked = keys(walked);
+        for statement in &unknown {
+            assert!(!walked.contains(statement), "{statement} as of {as_of}");
+        }
+        let expected: BTreeSet<String> = t10_valid_by(as_of).into_iter().map(|(s, _)| s).collect();
+        assert!(!expected.is_empty());
+        assert_eq!(walked, expected, "as of {as_of}");
+    }
+}
+
+#[when("the app reads the finding's supporting statements with no as_of")]
+fn reads_no_as_of(world: &mut World) {
+    world.walked = supporting(world, None);
+}
+
+#[then("each of the 3 is returned marked unknown")]
+fn unknowns_marked(world: &mut World) {
+    for statement in t10_unknown() {
+        let marks: Vec<&ValidTime> = world
+            .walked
+            .iter()
+            .filter(|(node, _)| node.class == "statement" && node.key == statement)
+            .map(|(_, valid)| valid)
+            .collect();
+        assert_eq!(
+            marks,
+            [&ValidTime::Unknown],
+            "{statement} is returned marked unknown"
+        );
+    }
+}
+
+#[given("a statement valid before a date t that supports finding f1 by a link valid after t")]
+fn link_after_t(world: &mut World) {
+    open_graph(world);
+    let before = day(2024, 1, 1);
+    world.write(
+        &Write::new("swtor")
+            .unit(Unit::new("finding", "f1", NONE, before.clone()))
+            .unit(
+                Unit::new("statement", "s1", [("text", "words")], before).link(
+                    "supports",
+                    "s1",
+                    "f1",
+                    day(2025, 1, 1),
+                ),
+            ),
+    );
+}
+
+#[when("the app counts statements supporting f1 as of t")]
+fn counts_as_of_t(world: &mut World) {
+    count_f1_as_of(world, vec![Step::new("supports<-")], date("2024-06-30"));
+}
+
+#[then("the statement is not counted")]
+fn not_counted(world: &mut World) {
+    assert_eq!(world.tallies[0].distinct, 0);
+    assert_eq!(world.tallies[0].total, 0);
 }
 
 scenarios!("tests", fixtures = [world: World]);
