@@ -1316,6 +1316,97 @@ fn no_parent_found(world: &mut World) {
     }
 }
 
+#[when("the listener writes the whole stream and the app reads the open links")]
+fn writes_stream_reads_open(world: &mut World) {
+    writes_whole_stream(world);
+    reads_open_links(world);
+}
+
+#[then("the open links listed are exactly the links to the parents that never arrived")]
+fn open_links_are_missing_parents(world: &mut World) {
+    let stream = world.stream.take().unwrap();
+    let arrived: HashSet<&str> = stream.arrivals.iter().map(|a| a.0.as_str()).collect();
+    let expected: BTreeSet<(String, String, String)> = stream
+        .links
+        .iter()
+        .filter(|l| arrived.contains(l.0.as_str()))
+        .map(|l| ("answers".to_string(), l.0.clone(), l.1.clone()))
+        .collect();
+    assert!(!expected.is_empty());
+    let listed: Vec<(String, String, String)> = world
+        .open_links
+        .iter()
+        .map(|o| (o.relation.clone(), o.from.key.clone(), o.to.key.clone()))
+        .collect();
+    assert_eq!(listed.len(), expected.len());
+    assert_eq!(listed.into_iter().collect::<BTreeSet<_>>(), expected);
+}
+
+fn s2_open_on_s1() -> OpenLink {
+    OpenLink {
+        relation: "answers".into(),
+        from: NodeRef::new("statement", "s2"),
+        to: NodeRef::new("statement", "s1"),
+        waits_on: NodeRef::new("statement", "s1"),
+    }
+}
+
+#[given("an answers link from statement s2 waiting on statement key s1, which is not in the graph")]
+#[given("an answers link from statement s2 waiting on statement key s1")]
+fn s2_waits_on_s1(world: &mut World) {
+    declare_replies(world.open());
+    let when = day(2021, 3, 2);
+    world.write(
+        &Write::new("discord").unit(
+            Unit::new("statement", "s2", [("text", "re")], when.clone())
+                .link("answers", "s2", "s1", when),
+        ),
+    );
+    assert!(world.g().find("statement", "s1").unwrap().is_none());
+}
+
+#[when("the app reads the open links")]
+fn reads_open_links(world: &mut World) {
+    world.open_links = world.g().open_links().unwrap();
+}
+
+#[when("the app writes a voice under key s1")]
+fn writes_voice_s1(world: &mut World) {
+    world.write(&Write::new("discord").unit(Unit::new("voice", "s1", NONE, day(2021, 3, 3))));
+}
+
+#[then("the link is listed with target kind statement and target key s1")]
+#[then("the open links still list the link from s2 waiting on statement s1")]
+fn lists_s2_waiting_on_s1(world: &mut World) {
+    let listed = world.g().open_links().unwrap();
+    assert_eq!(listed, [s2_open_on_s1()]);
+}
+
+#[then("the write's result reports a wrong-kind arrival under key s1, naming the open link")]
+fn reports_wrong_kind(world: &mut World) {
+    let reported: Vec<(NodeRef, LinkFact)> = world
+        .written
+        .iter()
+        .flat_map(|e| match &e.change {
+            Change::Wrote { wrong_kind, .. } => wrong_kind.clone(),
+            _ => Vec::new(),
+        })
+        .map(|report| (report.arrived, report.waiting))
+        .collect();
+    assert_eq!(
+        reported,
+        [(
+            NodeRef::new("voice", "s1"),
+            LinkFact {
+                relation: "answers".into(),
+                from: NodeRef::new("statement", "s2"),
+                to: NodeRef::new("statement", "s1"),
+                valid: day(2021, 3, 2),
+            }
+        )]
+    );
+}
+
 // ---------- links between declared classes ----------
 
 #[given("a finding and a statement exist")]
@@ -1444,97 +1535,6 @@ fn no_dangling(world: &mut World) {
     assert_eq!(
         dangling, 0,
         "{dangling} answers links found to a missing statement"
-    );
-}
-
-#[when("the listener writes the whole stream and the app reads the open links")]
-fn writes_stream_reads_open(world: &mut World) {
-    writes_whole_stream(world);
-    reads_open_links(world);
-}
-
-#[then("the open links listed are exactly the links to the parents that never arrived")]
-fn open_links_are_missing_parents(world: &mut World) {
-    let stream = world.stream.take().unwrap();
-    let arrived: HashSet<&str> = stream.arrivals.iter().map(|a| a.0.as_str()).collect();
-    let expected: BTreeSet<(String, String, String)> = stream
-        .links
-        .iter()
-        .filter(|l| arrived.contains(l.0.as_str()))
-        .map(|l| ("answers".to_string(), l.0.clone(), l.1.clone()))
-        .collect();
-    assert!(!expected.is_empty());
-    let listed: Vec<(String, String, String)> = world
-        .open_links
-        .iter()
-        .map(|o| (o.relation.clone(), o.from.key.clone(), o.to.key.clone()))
-        .collect();
-    assert_eq!(listed.len(), expected.len());
-    assert_eq!(listed.into_iter().collect::<BTreeSet<_>>(), expected);
-}
-
-fn s2_open_on_s1() -> OpenLink {
-    OpenLink {
-        relation: "answers".into(),
-        from: NodeRef::new("statement", "s2"),
-        to: NodeRef::new("statement", "s1"),
-        waits_on: NodeRef::new("statement", "s1"),
-    }
-}
-
-#[given("an answers link from statement s2 waiting on statement key s1, which is not in the graph")]
-#[given("an answers link from statement s2 waiting on statement key s1")]
-fn s2_waits_on_s1(world: &mut World) {
-    declare_replies(world.open());
-    let when = day(2021, 3, 2);
-    world.write(
-        &Write::new("discord").unit(
-            Unit::new("statement", "s2", [("text", "re")], when.clone())
-                .link("answers", "s2", "s1", when),
-        ),
-    );
-    assert!(world.g().find("statement", "s1").unwrap().is_none());
-}
-
-#[when("the app reads the open links")]
-fn reads_open_links(world: &mut World) {
-    world.open_links = world.g().open_links().unwrap();
-}
-
-#[when("the app writes a voice under key s1")]
-fn writes_voice_s1(world: &mut World) {
-    world.write(&Write::new("discord").unit(Unit::new("voice", "s1", NONE, day(2021, 3, 3))));
-}
-
-#[then("the link is listed with target kind statement and target key s1")]
-#[then("the open links still list the link from s2 waiting on statement s1")]
-fn lists_s2_waiting_on_s1(world: &mut World) {
-    let listed = world.g().open_links().unwrap();
-    assert_eq!(listed, [s2_open_on_s1()]);
-}
-
-#[then("the write's result reports a wrong-kind arrival under key s1, naming the open link")]
-fn reports_wrong_kind(world: &mut World) {
-    let reported: Vec<(NodeRef, LinkFact)> = world
-        .written
-        .iter()
-        .flat_map(|e| match &e.change {
-            Change::Wrote { wrong_kind, .. } => wrong_kind.clone(),
-            _ => Vec::new(),
-        })
-        .map(|report| (report.arrived, report.waiting))
-        .collect();
-    assert_eq!(
-        reported,
-        [(
-            NodeRef::new("voice", "s1"),
-            LinkFact {
-                relation: "answers".into(),
-                from: NodeRef::new("statement", "s2"),
-                to: NodeRef::new("statement", "s1"),
-                valid: day(2021, 3, 2),
-            }
-        )]
     );
 }
 
@@ -2389,6 +2389,18 @@ fn the_t9b_graph(world: &mut World) {
     assert!(relations["inside"].containment && relations["at"].containment);
 }
 
+#[given("a statement's inside link waits for a place that has not arrived")]
+fn inside_link_waits(world: &mut World) {
+    let when = day(2021, 3, 2);
+    world
+        .g()
+        .write(&Write::new("swtor").unit(
+            Unit::new("statement", "s9", NONE, when.clone()).link("inside", "s9", "c9", when),
+        ))
+        .unwrap();
+    assert_eq!(world.g().open_links().unwrap().len(), 1);
+}
+
 #[when("the app describes statement s1")]
 fn describes_s1(world: &mut World) {
     world.described = Some(
@@ -2558,7 +2570,12 @@ fn runs_every_read_and_a_refused_write(world: &mut World) {
         texts.push(tally.root);
         texts.extend(tally.groups.into_keys().flatten());
     }
-    for open in g.open_links().unwrap() {
+    let open_links = g.open_links().unwrap();
+    assert!(
+        !open_links.is_empty(),
+        "the open-links read has nothing to answer"
+    );
+    for open in open_links {
         texts.push(open.relation);
         for end in [open.from, open.to, open.waits_on] {
             texts.extend(node_ref_texts(&end));
