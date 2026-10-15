@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
-use crate::events::{Change, Event, Fact, LinkFact, NodeFact, append};
+use crate::events::{Change, Event, Fact, LinkFact, NodeFact, WrongKind, append};
 use crate::open::{
     CLASS, Class, Graph, Ontology, RELATION, Relation, class_table, concat, property_column,
     relation_index, relation_table,
@@ -317,12 +317,43 @@ fn now_millis() -> i64 {
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
-fn node_id(tx: &Connection, class: &str, key: &str) -> Result<Option<i64>, Error> {
+pub(crate) fn node_id(tx: &Connection, class: &str, key: &str) -> Result<Option<i64>, Error> {
     let sql = format!("SELECT id FROM {} WHERE key = ?1", class_table(class));
     Ok(tx
         .prepare_cached(&sql)?
         .query_row(params![key], |row| row.get(0))
         .optional()?)
+}
+
+/// Checks a whole write before any piece commits: refuses it when one of its links has a source
+/// that is not of its relation's declared source class. A target is named by kind and key, so a
+/// target key not yet a node of the declared target class leaves the link open.
+fn check(conn: &Connection, ontology: &Ontology, write: &Write) -> Result<(), Error> {
+    let brought: BTreeSet<(&str, &str)> = write
+        .units
+        .iter()
+        .map(|u| (u.node.class.as_str(), u.node.key.as_str()))
+        .collect();
+    let present = |class: &str, key: &str| -> Result<bool, Error> {
+        Ok(brought.contains(&(class, key)) || node_id(conn, class, key)?.is_some())
+    };
+    for link in write.units.iter().flat_map(|u| &u.links) {
+        let relation = ontology.relation(&link.relation)?;
+        let (class, key) = (&relation.from, &link.from);
+        if present(class, key)? {
+            continue;
+        }
+        for other in ontology.classes.keys().filter(|c| *c != class) {
+            if present(other, key)? {
+                return Err(Error::Refused(format!(
+                    "relation {} is declared {}; {key} is a {other}, not a {class}",
+                    relation.name,
+                    ends(relation)
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// What a piece is writing: its transaction, source, recorded time and what it added so far.
@@ -332,6 +363,7 @@ struct Piece<'a> {
     source: &'a str,
     recorded: i64,
     added: Vec<Fact>,
+    wrong_kind: Vec<WrongKind>,
     closed: Vec<LinkFact>,
 }
 
@@ -466,9 +498,9 @@ impl Piece<'_> {
         let changed = self
             .tx
             .prepare_cached(
-                "INSERT INTO _open(relation, from_key, to_key, source, valid) \
+                "INSERT INTO _open(rel, from_key, to_key, source, valid) \
                  VALUES (?1, ?2, ?3, ?4, ?5) \
-                 ON CONFLICT(relation, from_key, to_key) DO UPDATE SET \
+                 ON CONFLICT(rel, from_key, to_key) DO UPDATE SET \
                  source = excluded.source, valid = excluded.valid \
                  WHERE source IS NOT excluded.source OR valid IS NOT excluded.valid",
             )?
@@ -485,24 +517,38 @@ impl Piece<'_> {
         Ok(())
     }
 
-    /// Closes every open link that was waiting for the node `key` of `class`, now present.
-    fn close(&mut self, class: &str, key: &str) -> Result<(), Error> {
+    /// Closes every open link that was waiting for the node `key` of `class`, now present, and
+    /// reports every open link that waits on `key` as a node of another kind, which stays open.
+    fn arrived(&mut self, class: &str, key: &str) -> Result<(), Error> {
         for relation in self.ontology.relations.values() {
             for (waits_on, column) in [(&relation.to, "to_key"), (&relation.from, "from_key")] {
-                if waits_on != class {
+                let wrong_kind = waits_on != class;
+                if wrong_kind && node_id(self.tx, waits_on, key)?.is_some() {
                     continue;
                 }
                 let waiting: Vec<(String, String, String, Option<String>)> = self
                     .tx
                     .prepare_cached(&format!(
                         "SELECT from_key, to_key, source, valid FROM _open \
-                         WHERE relation = ?1 AND {column} = ?2"
+                         WHERE rel = ?1 AND {column} = ?2"
                     ))?
                     .query_map(params![relation.name, key], |row| {
                         Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
                     })?
                     .collect::<Result<_, _>>()?;
                 for (from_key, to_key, source, valid) in waiting {
+                    if wrong_kind {
+                        self.wrong_kind.push(WrongKind {
+                            arrived: NodeRef::new(class, key),
+                            waiting: LinkFact {
+                                relation: relation.name.clone(),
+                                from: NodeRef::new(&relation.from, from_key),
+                                to: NodeRef::new(&relation.to, to_key),
+                                valid: ValidTime::from_sql(valid),
+                            },
+                        });
+                        continue;
+                    }
                     let from = node_id(self.tx, &relation.from, &from_key)?;
                     let to = node_id(self.tx, &relation.to, &to_key)?;
                     let (Some(from), Some(to)) = (from, to) else {
@@ -512,7 +558,7 @@ impl Piece<'_> {
                     self.relate(&relation.name, from, to, &source, &valid)?;
                     self.tx
                         .prepare_cached(
-                            "DELETE FROM _open WHERE relation = ?1 AND from_key = ?2 AND to_key = ?3",
+                            "DELETE FROM _open WHERE rel = ?1 AND from_key = ?2 AND to_key = ?3",
                         )?
                         .execute(params![relation.name, from_key, to_key])?;
                     self.closed.push(LinkFact {
@@ -552,11 +598,47 @@ impl Graph {
         Ok(Some(event))
     }
 
-    /// Writes whole units in pieces, each piece one transaction. Returns the events the pieces
-    /// wrote: per piece, one for what it added and one per open link it closed. A unit that adds
-    /// nothing new writes no event.
+    /// Replaces the node `old` of `class` by the node `new` of the same class, under a different
+    /// key, as one event naming the class, the old key and the new key. The old node stays in
+    /// the graph and describes as replaced by the new one. The event and the replacement land
+    /// together or not at all.
     ///
     /// # Errors
+    /// `class` is not declared; the graph file cannot be written.
+    pub fn replace(&mut self, class: &str, old: &str, new: &str) -> Result<Event, Error> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let ontology = Ontology::load(&tx)?;
+        let class = ontology.class(class)?.name.clone();
+        tx.prepare_cached(
+            "INSERT INTO _fates(class, key, replaced_by) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(class, key) DO UPDATE SET replaced_by = excluded.replaced_by",
+        )?
+        .execute(params![class, old, new])?;
+        let event = append(
+            &tx,
+            Change::Replaced {
+                class,
+                old: old.to_string(),
+                new: new.to_string(),
+            },
+        )?;
+        self.ontology = ontology;
+        tx.commit()?;
+        Ok(event)
+    }
+
+    /// Writes whole units in pieces, each piece one transaction. Returns the events the pieces
+    /// wrote: per piece, one for what it added and one per open link it closed. A unit that adds
+    /// nothing new writes no event. A new node under the key an open link waits on, but of
+    /// another kind, leaves the link open and is reported as a [`WrongKind`] on its piece's
+    /// `Wrote` event, apart from what the piece added.
+    ///
+    /// # Errors
+    /// [`WriteError`] holding [`Error::Refused`] and no events when a link's source is not of its
+    /// relation's declared source class: the write is checked before any piece commits, so it
+    /// lands nothing.
     /// [`WriteError`] when a piece fails: the pieces before it are kept, and the error holds
     /// their events.
     pub fn write(&mut self, write: &Write) -> Result<Vec<Event>, WriteError> {
@@ -564,6 +646,9 @@ impl Graph {
         match Ontology::load(&self.conn) {
             Ok(ontology) => self.ontology = ontology,
             Err(cause) => return Err(WriteError { events, cause }),
+        }
+        if let Err(cause) = check(&self.conn, &self.ontology, write) {
+            return Err(WriteError { events, cause });
         }
         for (i, piece) in pieces(&write.units).into_iter().enumerate() {
             if i > 0 {
@@ -587,25 +672,32 @@ impl Graph {
             source,
             recorded: now_millis(),
             added: Vec::new(),
+            wrong_kind: Vec::new(),
             closed: Vec::new(),
         };
         for unit in units {
             let (_, new) = piece.node(&unit.node)?;
             if new {
-                piece.close(&unit.node.class, &unit.node.key)?;
+                piece.arrived(&unit.node.class, &unit.node.key)?;
             }
             for link in &unit.links {
                 piece.link(link)?;
             }
         }
-        let Piece { added, closed, .. } = piece;
+        let Piece {
+            added,
+            wrong_kind,
+            closed,
+            ..
+        } = piece;
         let mut events = Vec::new();
-        if !added.is_empty() {
+        if !added.is_empty() || !wrong_kind.is_empty() {
             events.push(append(
                 &tx,
                 Change::Wrote {
                     source: source.to_string(),
                     added,
+                    wrong_kind,
                 },
             )?);
         }

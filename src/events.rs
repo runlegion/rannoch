@@ -12,17 +12,21 @@ use crate::open::{Graph, Ontology, class_table, relation_table};
 use crate::read::NodeRef;
 use crate::write::{Declaration, Error, ValidTime};
 
-/// rannoch's own tables: the event log, the ontology, and links waiting for an end.
+/// rannoch's own tables: the event log, the ontology, links waiting for an end, and the fates of
+/// nodes that were replaced.
 pub(crate) const OWN_TABLES: &str = "
     CREATE TABLE IF NOT EXISTS _events(seq INTEGER PRIMARY KEY, body TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS _ontology(
         kind TEXT NOT NULL, name TEXT NOT NULL, body TEXT NOT NULL,
         PRIMARY KEY(kind, name)) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS _open(
-        relation TEXT NOT NULL, from_key TEXT NOT NULL, to_key TEXT NOT NULL,
+        rel TEXT NOT NULL, from_key TEXT NOT NULL, to_key TEXT NOT NULL,
         source TEXT NOT NULL, valid TEXT,
-        PRIMARY KEY(relation, from_key, to_key)) WITHOUT ROWID;
-    CREATE INDEX IF NOT EXISTS _open_to ON _open(relation, to_key);";
+        PRIMARY KEY(rel, from_key, to_key)) WITHOUT ROWID;
+    CREATE INDEX IF NOT EXISTS _open_to ON _open(rel, to_key);
+    CREATE TABLE IF NOT EXISTS _fates(
+        class TEXT NOT NULL, key TEXT NOT NULL, replaced_by TEXT NOT NULL,
+        PRIMARY KEY(class, key)) WITHOUT ROWID;";
 
 /// A place in a graph's event log. Reading since a cursor returns the events after it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -59,8 +63,13 @@ pub struct Event {
 pub enum Change {
     /// One declaration of a class, a relation or a property.
     Declared(Declaration),
-    /// What one piece of a write added.
-    Wrote { source: String, added: Vec<Fact> },
+    /// What one piece of a write added, and the wrong-kind arrivals it met.
+    Wrote {
+        source: String,
+        added: Vec<Fact>,
+        #[serde(default)]
+        wrong_kind: Vec<WrongKind>,
+    },
     /// An open link whose missing end arrived: it now holds in its relation.
     Closed(LinkFact),
     /// A node the app forgot under its own rule, and the links that left with it. It names
@@ -70,6 +79,12 @@ pub enum Change {
         rule: String,
         nodes: Vec<NodeRef>,
         links: Vec<LinkFact>,
+    },
+    /// The node `old` of `class` was replaced by the node `new` of the same class.
+    Replaced {
+        class: String,
+        old: String,
+        new: String,
     },
 }
 
@@ -83,6 +98,15 @@ pub enum Fact {
     Link(LinkFact),
     /// A link to a key not yet present: it waits as an open link and joins no relation.
     Opened(LinkFact),
+}
+
+/// A node arrived under the key an open link waits on, but of another kind: the link stays open.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WrongKind {
+    /// The node that arrived.
+    pub arrived: NodeRef,
+    /// The open link still waiting on its key.
+    pub waiting: LinkFact,
 }
 
 /// A node as a piece wrote it.

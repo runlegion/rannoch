@@ -3,7 +3,7 @@
 //!
 //! Steps act and observe through rannoch's public API. Only fixture setup touches the file
 //! directly: the trigger that makes a write's third piece fail, and reading the file's table
-//! names so a refusal can be checked against them.
+//! and column names so an answer or a refusal can be checked against them.
 
 #![allow(
     clippy::expect_used,
@@ -19,8 +19,9 @@ use std::thread::JoinHandle;
 use std::time::SystemTime;
 
 use rannoch::{
-    Change, Class, Count, Cursor, Date, Declaration, Event, EventId, Fact, Graph, GroupBy, Node,
-    NodeRef, Relation, Step, Tally, Unit, ValidTime, Write, WriteError,
+    Change, Class, Count, Cursor, Date, Declaration, Description, Error, Event, EventId, Fact,
+    Graph, GroupBy, LinkFact, Node, NodeRef, OpenLink, PartOf, Relation, Step, Tally, Unit,
+    ValidTime, Write, WriteError,
 };
 use rstest_bdd_macros::{given, scenarios, then, when};
 use tempfile::TempDir;
@@ -131,6 +132,48 @@ fn declare_replies(g: &mut Graph) {
         false,
     )))
     .unwrap();
+}
+
+/// The T9b declarations and instances (t9b-direct, 2026-10-14): place swtor-tc, conversation c1
+/// at it, finding f1, voices v0 to v2, and statements s0 to s4, each inside c1, said by a voice
+/// and supporting f1.
+fn t9b_graph(g: &mut Graph) {
+    for d in t9b() {
+        g.declare(&d).unwrap();
+    }
+    let when = day(2021, 3, 2);
+    let mut write = Write::new("swtor")
+        .unit(Unit::new(
+            "place",
+            "swtor-tc",
+            [("url", "discord.gg/x")],
+            day(2019, 10, 1),
+        ))
+        .unit(Unit::new("conversation", "c1", NONE, when.clone()).link(
+            "at",
+            "c1",
+            "swtor-tc",
+            when.clone(),
+        ))
+        .unit(Unit::new("finding", "f1", NONE, day(2026, 10, 1)));
+    for i in 0..5 {
+        let (statement, voice) = (format!("s{i}"), format!("v{}", i % 3));
+        write = write
+            .unit(Unit::new("voice", voice.clone(), NONE, when.clone()))
+            .unit(
+                Unit::new(
+                    "statement",
+                    statement.clone(),
+                    [("text", "the respec cost is absurd")],
+                    when.clone(),
+                )
+                .link("inside", statement.clone(), "c1", when.clone())
+                .link("said", voice, statement.clone(), when.clone())
+                .link("supports", statement, "f1", day(2026, 10, 1)),
+            );
+    }
+    g.write(&write).unwrap();
+    assert!(g.open_links().unwrap().is_empty());
 }
 
 /// T4's source: per finding, its distinct voices, statements and per-place counts.
@@ -339,6 +382,9 @@ struct World {
     forgot: Option<Event>,
     content: String,
     named: Vec<(EventId, Vec<Fact>)>,
+    open_links: Vec<OpenLink>,
+    described: Option<Description>,
+    answers: Vec<String>,
 }
 
 #[rstest::fixture]
@@ -367,6 +413,9 @@ fn world() -> World {
         forgot: None,
         content: String::new(),
         named: Vec::new(),
+        open_links: Vec::new(),
+        described: None,
+        answers: Vec::new(),
     }
 }
 
@@ -971,6 +1020,58 @@ fn writes_v1_same(world: &mut World) {
     assert!(world.written.is_empty());
 }
 
+// ---------- write: replacing a node ----------
+
+#[given("statements s8 and s9")]
+fn s8_and_s9(world: &mut World) {
+    open_graph(world);
+    let when = day(2021, 3, 2);
+    world.write(
+        &Write::new("eavesdrop")
+            .unit(Unit::new(
+                "statement",
+                "s8",
+                [("text", "first")],
+                when.clone(),
+            ))
+            .unit(Unit::new("statement", "s9", [("text", "merged")], when)),
+    );
+    world.mark_events();
+}
+
+#[when("the app replaces s8 by s9")]
+fn replaces_s8_by_s9(world: &mut World) {
+    let event = world.g().replace("statement", "s8", "s9").unwrap();
+    world.written = vec![event];
+}
+
+#[then("the event log gains one event naming class statement, s8 and s9")]
+fn one_replacement_event(world: &mut World) {
+    let after = world.all_events();
+    let gained = &after[world.events_before..];
+    assert_eq!(gained, world.written.as_slice());
+    let [event] = gained else {
+        panic!("expected one event, got {gained:?}");
+    };
+    assert_eq!(
+        event.change,
+        Change::Replaced {
+            class: "statement".into(),
+            old: "s8".into(),
+            new: "s9".into(),
+        }
+    );
+}
+
+#[then("describing s8 answers replaced by s9")]
+fn s8_replaced_by_s9(world: &mut World) {
+    let s8 = world
+        .g()
+        .describe(&NodeRef::new("statement", "s8"))
+        .unwrap();
+    assert_eq!(s8.replaced_by, Some(NodeRef::new("statement", "s9")));
+}
+
 // ---------- write: source, valid time, recorded time ----------
 
 #[given("an open graph")]
@@ -1207,6 +1308,228 @@ fn no_parent_found(world: &mut World) {
     }
 }
 
+// ---------- links between declared classes ----------
+
+#[given("a finding and a statement exist")]
+fn finding_and_statement(world: &mut World) {
+    let when = day(2021, 3, 2);
+    world.write(
+        &Write::new("swtor")
+            .unit(Unit::new("finding", "f1", NONE, when.clone()))
+            .unit(Unit::new("statement", "s1", [("text", "hi")], when)),
+    );
+    world.mark_events();
+}
+
+/// The new statements written ahead of the wrong-class link: enough for several pieces.
+const NEW_STATEMENTS: usize = 2 * PIECE_CHANGES + 1;
+
+#[when(
+    "the app writes, in one write of several pieces, new statements followed by a said link from the finding to the statement"
+)]
+fn writes_wrong_class_link(world: &mut World) {
+    let when = day(2021, 3, 2);
+    let mut write = Write::new("swtor");
+    for n in 0..NEW_STATEMENTS {
+        write = write.unit(Unit::new(
+            "statement",
+            format!("n{n}"),
+            [("text", "new")],
+            when.clone(),
+        ));
+    }
+    write = write.unit(
+        Unit::new("statement", "s1", [("text", "hi")], when.clone()).link("said", "f1", "s1", when),
+    );
+    world.write_error = Some(world.g().write(&write).expect_err("the write is refused"));
+}
+
+#[then("the write is refused")]
+fn write_refused(world: &mut World) {
+    let error = world.write_error.as_ref().unwrap();
+    assert!(
+        matches!(error.cause, Error::Refused(_)),
+        "not refused: {}",
+        error.cause
+    );
+    assert!(error.events.is_empty(), "{:?}", error.events);
+}
+
+#[then("none of the new statements is in the graph")]
+fn new_statements_absent(world: &mut World) {
+    let g = world.g();
+    for n in 0..NEW_STATEMENTS {
+        assert!(
+            g.find("statement", &format!("n{n}")).unwrap().is_none(),
+            "statement n{n} landed"
+        );
+    }
+}
+
+// ---------- read: no dangling link during a burst ----------
+
+#[given("the listener is writing a reply stream in which some parents never arrive")]
+fn listener_writing_without_parents(world: &mut World) {
+    parents_never_arrive(world);
+    world.graph = None;
+    let write = stream_write(&world.stream.as_ref().unwrap().arrivals);
+    let path = world.path();
+    let done = Arc::clone(&world.burst_done);
+    world.burst = Some(std::thread::spawn(move || {
+        let mut g = rannoch::open(path).unwrap();
+        g.write(&write).unwrap();
+        done.store(true, Ordering::SeqCst);
+    }));
+}
+
+#[when("a reader walks answers links during the burst")]
+fn reader_walks_answers(world: &mut World) {
+    let reader = rannoch::open(world.path()).unwrap();
+    let stream = world.stream.as_ref().unwrap();
+    // The replies whose parents never arrive, and every reply of the stream's first window.
+    let replies: BTreeSet<String> = stream
+        .links
+        .iter()
+        .map(|l| l.0.clone())
+        .chain(
+            stream
+                .arrivals
+                .iter()
+                .take(200)
+                .filter(|a| a.2.is_some())
+                .map(|a| a.0.clone()),
+        )
+        .collect();
+    let missing: BTreeSet<&str> = stream.links.iter().map(|l| l.1.as_str()).collect();
+    let (mut reads, mut mid_burst, mut dangling) = (0, 0, 0);
+    while !world.burst_done.load(Ordering::SeqCst) {
+        let mut present = 0;
+        for reply in &replies {
+            let root = NodeRef::new("statement", reply.clone());
+            let parents = match reader.walk(&root, &["answers"], 1, usize::MAX) {
+                Ok(parents) => parents,
+                Err(Error::NotFound { .. }) => continue,
+                Err(other) => panic!("{other}"),
+            };
+            present += 1;
+            for parent in parents {
+                // A parent read once stays present, so one missing now was never written.
+                let found = reader.find("statement", &parent.key).unwrap();
+                if missing.contains(parent.key.as_str()) || found.is_none() {
+                    dangling += 1;
+                }
+            }
+        }
+        reads += 1;
+        if present > 0 && present < replies.len() {
+            mid_burst += 1;
+        }
+    }
+    world.burst.take().unwrap().join().unwrap();
+    world.reads = (reads, mid_burst, dangling);
+}
+
+#[then("no answers link it finds points at a missing statement")]
+fn no_dangling(world: &mut World) {
+    let (reads, mid_burst, dangling) = world.reads;
+    assert!(mid_burst > 0, "{reads} reads, none during the burst");
+    assert_eq!(
+        dangling, 0,
+        "{dangling} answers links found to a missing statement"
+    );
+}
+
+#[when("the listener writes the whole stream and the app reads the open links")]
+fn writes_stream_reads_open(world: &mut World) {
+    writes_whole_stream(world);
+    reads_open_links(world);
+}
+
+#[then("the open links listed are exactly the links to the parents that never arrived")]
+fn open_links_are_missing_parents(world: &mut World) {
+    let stream = world.stream.take().unwrap();
+    let arrived: HashSet<&str> = stream.arrivals.iter().map(|a| a.0.as_str()).collect();
+    let expected: BTreeSet<(String, String, String)> = stream
+        .links
+        .iter()
+        .filter(|l| arrived.contains(l.0.as_str()))
+        .map(|l| ("answers".to_string(), l.0.clone(), l.1.clone()))
+        .collect();
+    assert!(!expected.is_empty());
+    let listed: Vec<(String, String, String)> = world
+        .open_links
+        .iter()
+        .map(|o| (o.relation.clone(), o.from.key.clone(), o.to.key.clone()))
+        .collect();
+    assert_eq!(listed.len(), expected.len());
+    assert_eq!(listed.into_iter().collect::<BTreeSet<_>>(), expected);
+}
+
+fn s2_open_on_s1() -> OpenLink {
+    OpenLink {
+        relation: "answers".into(),
+        from: NodeRef::new("statement", "s2"),
+        to: NodeRef::new("statement", "s1"),
+        waits_on: NodeRef::new("statement", "s1"),
+    }
+}
+
+#[given("an answers link from statement s2 waiting on statement key s1, which is not in the graph")]
+#[given("an answers link from statement s2 waiting on statement key s1")]
+fn s2_waits_on_s1(world: &mut World) {
+    declare_replies(world.open());
+    let when = day(2021, 3, 2);
+    world.write(
+        &Write::new("discord").unit(
+            Unit::new("statement", "s2", [("text", "re")], when.clone())
+                .link("answers", "s2", "s1", when),
+        ),
+    );
+    assert!(world.g().find("statement", "s1").unwrap().is_none());
+}
+
+#[when("the app reads the open links")]
+fn reads_open_links(world: &mut World) {
+    world.open_links = world.g().open_links().unwrap();
+}
+
+#[when("the app writes a voice under key s1")]
+fn writes_voice_s1(world: &mut World) {
+    world.write(&Write::new("discord").unit(Unit::new("voice", "s1", NONE, day(2021, 3, 3))));
+}
+
+#[then("the link is listed with target kind statement and target key s1")]
+#[then("the open links still list the link from s2 waiting on statement s1")]
+fn lists_s2_waiting_on_s1(world: &mut World) {
+    let listed = world.g().open_links().unwrap();
+    assert_eq!(listed, [s2_open_on_s1()]);
+}
+
+#[then("the write's result reports a wrong-kind arrival under key s1, naming the open link")]
+fn reports_wrong_kind(world: &mut World) {
+    let reported: Vec<(NodeRef, LinkFact)> = world
+        .written
+        .iter()
+        .flat_map(|e| match &e.change {
+            Change::Wrote { wrong_kind, .. } => wrong_kind.clone(),
+            _ => Vec::new(),
+        })
+        .map(|report| (report.arrived, report.waiting))
+        .collect();
+    assert_eq!(
+        reported,
+        [(
+            NodeRef::new("voice", "s1"),
+            LinkFact {
+                relation: "answers".into(),
+                from: NodeRef::new("statement", "s2"),
+                to: NodeRef::new("statement", "s1"),
+                valid: day(2021, 3, 2),
+            }
+        )]
+    );
+}
+
 // ---------- events ----------
 
 #[when("the app writes statement s1 with a said link from voice v1")]
@@ -1329,7 +1652,7 @@ fn folds_from_events(world: &mut World) {
                 Vec::new(),
             ),
             Change::Closed(l) => (vec![l], Vec::new()),
-            Change::Declared(_) => (Vec::new(), Vec::new()),
+            Change::Declared(_) | Change::Replaced { .. } => (Vec::new(), Vec::new()),
             Change::Forgot { links, .. } => (Vec::new(), links),
         };
         for link in added {
@@ -1839,6 +2162,220 @@ fn finds_s05_2023(world: &mut World) {
 fn no_node(world: &mut World) {
     assert!(world.found.is_none());
     assert!(world.g().find("statement", "s05").unwrap().is_some());
+}
+
+// ---------- read: answers in ontology terms ----------
+
+#[given("the T9b graph")]
+#[given("the T9b graph, with inside and at declared as containment")]
+fn the_t9b_graph(world: &mut World) {
+    t9b_graph(world.open());
+    let relations = &world.g().ontology().relations;
+    assert!(relations["inside"].containment && relations["at"].containment);
+}
+
+#[when("the app describes statement s1")]
+fn describes_s1(world: &mut World) {
+    world.described = Some(
+        world
+            .g()
+            .describe(&NodeRef::new("statement", "s1"))
+            .unwrap(),
+    );
+}
+
+fn described(world: &World) -> &Description {
+    world.described.as_ref().expect("a node was described")
+}
+
+#[then("the answer gives class statement and property text")]
+fn gives_class_and_text(world: &mut World) {
+    let d = described(world);
+    assert_eq!(d.node, NodeRef::new("statement", "s1"));
+    assert_eq!(
+        d.properties,
+        BTreeMap::from([("text".to_string(), "the respec cost is absurd".to_string())])
+    );
+}
+
+fn counts(pairs: &[(&str, u64)]) -> BTreeMap<String, u64> {
+    pairs.iter().map(|&(r, n)| (r.to_string(), n)).collect()
+}
+
+#[then("the answer gives relations out inside 1 and supports 1")]
+fn gives_relations_out(world: &mut World) {
+    assert_eq!(
+        described(world).relations_out,
+        counts(&[("inside", 1), ("supports", 1)])
+    );
+}
+
+#[then("relations in said 1")]
+fn gives_relations_in(world: &mut World) {
+    assert_eq!(described(world).relations_in, counts(&[("said", 1)]));
+}
+
+#[then("the answer gives s1 part of conversation c1 via inside")]
+fn part_of_c1(world: &mut World) {
+    let d = described(world);
+    assert_eq!(d.node, NodeRef::new("statement", "s1"));
+    assert_eq!(
+        d.part_of.first(),
+        Some(&PartOf {
+            node: NodeRef::new("conversation", "c1"),
+            via: "inside".into(),
+        })
+    );
+}
+
+#[then("part of place swtor-tc via at")]
+fn part_of_swtor_tc(world: &mut World) {
+    let d = described(world);
+    assert_eq!(d.part_of.len(), 2, "{:?}", d.part_of);
+    assert_eq!(
+        d.part_of[1],
+        PartOf {
+            node: NodeRef::new("place", "swtor-tc"),
+            via: "at".into(),
+        }
+    );
+}
+
+fn node_ref_texts(node: &NodeRef) -> [String; 2] {
+    [node.class.clone(), node.key.clone()]
+}
+
+fn description_texts(d: &Description) -> Vec<String> {
+    let mut texts = node_ref_texts(&d.node).to_vec();
+    texts.extend(
+        d.properties
+            .iter()
+            .flat_map(|(k, v)| [k.clone(), v.clone()]),
+    );
+    texts.extend(d.relations_out.keys().cloned());
+    texts.extend(d.relations_in.keys().cloned());
+    for p in &d.part_of {
+        texts.extend(node_ref_texts(&p.node));
+        texts.push(p.via.clone());
+    }
+    texts
+}
+
+/// Fails when a text names one of the file's tables or columns. A table name counts anywhere in
+/// a text; a column name counts as a whole word, so `id` inside `said` does not.
+fn assert_names_no_storage(world: &World, texts: &[String]) {
+    let file = rusqlite::Connection::open(world.path()).unwrap();
+    let tables: Vec<String> = file
+        .prepare("SELECT name FROM sqlite_master")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let mut columns: BTreeSet<String> = BTreeSet::new();
+    for table in &tables {
+        let mut statement = file
+            .prepare("SELECT name FROM pragma_table_info(?1)")
+            .unwrap();
+        columns.extend(
+            statement
+                .query_map([table], |row| row.get::<_, String>(0))
+                .unwrap()
+                .map(Result::unwrap),
+        );
+    }
+    assert!(!tables.is_empty() && !columns.is_empty());
+    assert!(!texts.is_empty());
+    for text in texts {
+        for table in &tables {
+            assert!(
+                !text.contains(table.as_str()),
+                "{text:?} names table {table}"
+            );
+        }
+        for word in text.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == ':')) {
+            assert!(!columns.contains(word), "{text:?} names column {word}");
+        }
+    }
+}
+
+#[then("no table name and no column name appears in the answer")]
+fn describe_names_no_storage(world: &mut World) {
+    let texts = description_texts(described(world));
+    assert_names_no_storage(world, &texts);
+}
+
+#[when(
+    "the app runs a find, a walk, a count and an open-links read, and writes a link between the wrong classes"
+)]
+fn runs_every_read_and_a_refused_write(world: &mut World) {
+    let g = world.g();
+    let mut texts = Vec::new();
+    let found = g
+        .find("statement", "s1")
+        .unwrap()
+        .expect("s1 is in the graph");
+    texts.extend([
+        found.class,
+        found.key,
+        found.source,
+        format!("{:?}", found.valid),
+    ]);
+    texts.extend(found.properties.into_iter().flat_map(|(k, v)| [k, v]));
+    let walked = g
+        .walk(&NodeRef::new("statement", "s1"), &["inside", "at"], 2, 200)
+        .unwrap();
+    assert_eq!(walked.len(), 2, "{walked:?}");
+    texts.extend(walked.iter().flat_map(node_ref_texts));
+    let tallies = g
+        .count(&Count {
+            class: "finding".into(),
+            roots: vec!["f1".into()],
+            path: vec![Step::new("supports<-"), Step::new("said<-")],
+            group_by: Some(GroupBy {
+                class: "statement".into(),
+                property: "text".into(),
+            }),
+        })
+        .unwrap();
+    assert_eq!(tallies[0].distinct, 3, "{tallies:?}");
+    for tally in tallies {
+        texts.push(tally.root);
+        texts.extend(tally.groups.into_keys().flatten());
+    }
+    for open in g.open_links().unwrap() {
+        texts.push(open.relation);
+        for end in [open.from, open.to, open.waits_on] {
+            texts.extend(node_ref_texts(&end));
+        }
+    }
+    let when = day(2021, 3, 2);
+    let refused = g
+        .write(
+            &Write::new("swtor").unit(
+                Unit::new(
+                    "statement",
+                    "s1",
+                    [("text", "the respec cost is absurd")],
+                    when.clone(),
+                )
+                .link("said", "f1", "s1", when),
+            ),
+        )
+        .expect_err("a said link from a finding is refused");
+    assert!(
+        matches!(refused.cause, Error::Refused(_)),
+        "not refused: {}",
+        refused.cause
+    );
+    texts.push(refused.cause.to_string());
+    texts.push(refused.to_string());
+    world.answers = texts;
+}
+
+#[then("no table name and no column name appears in any answer or in the refusal")]
+fn reads_and_refusal_name_no_storage(world: &mut World) {
+    assert_names_no_storage(world, &world.answers);
 }
 
 scenarios!("tests", fixtures = [world: World]);
