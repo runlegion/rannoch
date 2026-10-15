@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::time::Duration;
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -126,6 +127,14 @@ pub(crate) fn property_column(property: &str) -> String {
     ident(&format!("p:{property}"))
 }
 
+/// While another connection holds the file's write lock, a connection retries every millisecond,
+/// for the same five seconds the default handler waits, so it takes the lock in the gap a write
+/// leaves between pieces. The default handler backs off to 100 ms and misses that gap.
+fn retry_lock(attempts: i32) -> bool {
+    std::thread::sleep(Duration::from_millis(1));
+    attempts < 5_000
+}
+
 /// One graph file.
 #[derive(Debug)]
 pub struct Graph {
@@ -140,6 +149,7 @@ pub struct Graph {
 /// The file cannot be opened as a graph file.
 pub fn open(path: impl AsRef<Path>) -> Result<Graph, Error> {
     let conn = Connection::open(path)?;
+    conn.busy_handler(Some(retry_lock))?;
     conn.execute_batch(
         "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;",
     )?;
