@@ -169,6 +169,7 @@ fn largest_count(shape: &Shape, largest: &str) -> Count {
             class: shape.utterance_class.clone(),
             property: shape.property.clone(),
         }),
+        as_of: None,
     }
 }
 

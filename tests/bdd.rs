@@ -1314,7 +1314,7 @@ fn reader_walks_answers(world: &mut World) {
                 Err(other) => panic!("{other}"),
             };
             present += 1;
-            for parent in parents {
+            for (parent, _) in parents {
                 // A parent read once stays present, so one missing now was never written.
                 let found = reader.find("statement", &parent.key).unwrap();
                 if missing.contains(parent.key.as_str()) || found.is_none() {
@@ -1586,6 +1586,7 @@ fn count_t4_findings(g: &Graph) -> Vec<Tally> {
             class: "statement".into(),
             property: "place".into(),
         }),
+        as_of: None,
     })
     .unwrap()
 }
