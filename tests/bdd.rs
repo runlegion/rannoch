@@ -19,8 +19,8 @@ use std::thread::JoinHandle;
 use std::time::SystemTime;
 
 use rannoch::{
-    Change, Class, Count, Cursor, Date, Declaration, Event, Fact, Graph, GroupBy, Node, NodeRef,
-    Relation, Step, Tally, Unit, ValidTime, Write, WriteError,
+    Change, Class, Count, Cursor, Date, Declaration, Error, Event, Fact, Graph, GroupBy, Node,
+    NodeRef, Relation, Step, Tally, Unit, ValidTime, Write, WriteError,
 };
 use rstest_bdd_macros::{given, scenarios, then, when};
 use tempfile::TempDir;
@@ -1185,6 +1185,137 @@ fn no_parent_found(world: &mut World) {
             "{reply} reached {walked:?}, its parent {parent} never arrived"
         );
     }
+}
+
+// ---------- links between declared classes ----------
+
+#[given("a finding and a statement exist")]
+fn finding_and_statement(world: &mut World) {
+    let when = day(2021, 3, 2);
+    world.write(
+        &Write::new("swtor")
+            .unit(Unit::new("finding", "f1", NONE, when.clone()))
+            .unit(Unit::new("statement", "s1", [("text", "hi")], when)),
+    );
+    world.mark_events();
+}
+
+/// The new statements written ahead of the wrong-class link: enough for several pieces.
+const NEW_STATEMENTS: usize = 2 * PIECE_CHANGES + 1;
+
+#[when(
+    "the app writes, in one write of several pieces, new statements followed by a said link from the finding to the statement"
+)]
+fn writes_wrong_class_link(world: &mut World) {
+    let when = day(2021, 3, 2);
+    let mut write = Write::new("swtor");
+    for n in 0..NEW_STATEMENTS {
+        write = write.unit(Unit::new(
+            "statement",
+            format!("n{n}"),
+            [("text", "new")],
+            when.clone(),
+        ));
+    }
+    write = write.unit(
+        Unit::new("statement", "s1", [("text", "hi")], when.clone()).link("said", "f1", "s1", when),
+    );
+    world.write_error = Some(world.g().write(&write).expect_err("the write is refused"));
+}
+
+#[then("the write is refused")]
+fn write_refused(world: &mut World) {
+    let error = world.write_error.as_ref().unwrap();
+    assert!(
+        matches!(error.cause, Error::Refused(_)),
+        "not refused: {}",
+        error.cause
+    );
+    assert!(error.events.is_empty(), "{:?}", error.events);
+}
+
+#[then("none of the new statements is in the graph")]
+fn new_statements_absent(world: &mut World) {
+    let g = world.g();
+    for n in 0..NEW_STATEMENTS {
+        assert!(
+            g.find("statement", &format!("n{n}")).unwrap().is_none(),
+            "statement n{n} landed"
+        );
+    }
+}
+
+// ---------- read: no dangling link during a burst ----------
+
+#[given("the listener is writing a reply stream in which some parents never arrive")]
+fn listener_writing_without_parents(world: &mut World) {
+    parents_never_arrive(world);
+    world.graph = None;
+    let write = stream_write(&world.stream.as_ref().unwrap().arrivals);
+    let path = world.path();
+    let done = Arc::clone(&world.burst_done);
+    world.burst = Some(std::thread::spawn(move || {
+        let mut g = rannoch::open(path).unwrap();
+        g.write(&write).unwrap();
+        done.store(true, Ordering::SeqCst);
+    }));
+}
+
+#[when("a reader walks answers links during the burst")]
+fn reader_walks_answers(world: &mut World) {
+    let reader = rannoch::open(world.path()).unwrap();
+    let stream = world.stream.as_ref().unwrap();
+    // The replies whose parents never arrive, and every reply of the stream's first window.
+    let replies: BTreeSet<String> = stream
+        .links
+        .iter()
+        .map(|l| l.0.clone())
+        .chain(
+            stream
+                .arrivals
+                .iter()
+                .take(200)
+                .filter(|a| a.2.is_some())
+                .map(|a| a.0.clone()),
+        )
+        .collect();
+    let missing: BTreeSet<&str> = stream.links.iter().map(|l| l.1.as_str()).collect();
+    let (mut reads, mut mid_burst, mut dangling) = (0, 0, 0);
+    while !world.burst_done.load(Ordering::SeqCst) {
+        let mut present = 0;
+        for reply in &replies {
+            let root = NodeRef::new("statement", reply.clone());
+            let parents = match reader.walk(&root, &["answers"], 1, usize::MAX) {
+                Ok(parents) => parents,
+                Err(Error::NotFound { .. }) => continue,
+                Err(other) => panic!("{other}"),
+            };
+            present += 1;
+            for parent in parents {
+                // A parent read once stays present, so one missing now was never written.
+                let found = reader.find("statement", &parent.key).unwrap();
+                if missing.contains(parent.key.as_str()) || found.is_none() {
+                    dangling += 1;
+                }
+            }
+        }
+        reads += 1;
+        if present > 0 && present < replies.len() {
+            mid_burst += 1;
+        }
+    }
+    world.burst.take().unwrap().join().unwrap();
+    world.reads = (reads, mid_burst, dangling);
+}
+
+#[then("no answers link it finds points at a missing statement")]
+fn no_dangling(world: &mut World) {
+    let (reads, mid_burst, dangling) = world.reads;
+    assert!(mid_burst > 0, "{reads} reads, none during the burst");
+    assert_eq!(
+        dangling, 0,
+        "{dangling} answers links found to a missing statement"
+    );
 }
 
 // ---------- events ----------
