@@ -1,4 +1,4 @@
-# Generated from legion requirement FR-RANNOCH-044, revision 2026-10-14T19:39:22.181789+00:00.
+# Generated from legion requirement FR-RANNOCH-044, revision 2026-10-15T05:08:56.311174+00:00.
 # Do not edit: regenerate with scripts/features.mjs.
 
 Feature: Reads answer in ontology terms
@@ -37,5 +37,6 @@ Feature: Reads answer in ontology terms
     # fixture: the T9b declarations and instances (t9b-direct, 2026-10-14)
   Scenario: no read or refusal names a table
     Given the T9b graph
+    And a statement's inside link waits for a place that has not arrived
     When the app runs a find, a walk, a count and an open-links read, and writes a link between the wrong classes
     Then no table name and no column name appears in any answer or in the refusal
