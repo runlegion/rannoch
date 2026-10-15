@@ -460,6 +460,7 @@ fn count_one(largest: &str) -> Count {
             class: "statement".into(),
             property: "place".into(),
         }),
+        as_of: None,
     }
 }
 
@@ -470,6 +471,7 @@ fn count_all() -> Count {
         roots: (0..1000).map(|f| format!("f{f}")).collect(),
         path: vec![Step::new("supports<-"), Step::new("said<-")],
         group_by: None,
+        as_of: None,
     }
 }
 

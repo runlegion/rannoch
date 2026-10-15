@@ -1,4 +1,4 @@
-//! Reads: find a node or a link, walk from a root, count exactly.
+//! Reads: find a node or a link, describe a node, walk from a root, count exactly.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -60,6 +60,31 @@ pub struct Link {
     pub recorded: SystemTime,
 }
 
+/// A node in ontology terms: its class and key, its properties, its relations by name in both
+/// directions with how many links each has, what it is part of, and what replaced it. It names
+/// no table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Description {
+    pub node: NodeRef,
+    pub properties: BTreeMap<String, String>,
+    /// Links from the node, by relation: only relations it has a link of.
+    pub relations_out: BTreeMap<String, u64>,
+    /// Links to the node, by relation: only relations it has a link of.
+    pub relations_in: BTreeMap<String, u64>,
+    /// Its containment ancestors, nearest first.
+    pub part_of: Vec<PartOf>,
+    /// The node of the same class that replaced it, if one did.
+    pub replaced_by: Option<NodeRef>,
+}
+
+/// A containment ancestor: the node something is part of, and the containment relation it is
+/// part of it through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartOf {
+    pub node: NodeRef,
+    pub via: String,
+}
+
 fn recorded(millis: i64) -> SystemTime {
     UNIX_EPOCH + Duration::from_millis(u64::try_from(millis).unwrap_or(0))
 }
@@ -108,13 +133,15 @@ pub struct GroupBy {
 }
 
 /// An exact count from many roots of one class, along a path of relations. It counts the
-/// nodes the path ends on.
+/// nodes the path ends on. With `as_of`, every node and link the count reads must be valid on
+/// or before that date; one whose valid time is unknown is never counted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Count {
     pub class: String,
     pub roots: Vec<String>,
     pub path: Vec<Step>,
     pub group_by: Option<GroupBy>,
+    pub as_of: Option<Date>,
 }
 
 /// One root's count: the distinct nodes the path ends on, the total of paths that reach them,
@@ -227,7 +254,7 @@ impl Graph {
         let tx = self.conn.unchecked_transaction()?;
         let rows: Vec<(String, String, String)> = tx
             .prepare_cached(
-                "SELECT relation, from_key, to_key FROM _open ORDER BY relation, from_key, to_key",
+                "SELECT rel, from_key, to_key FROM _open ORDER BY rel, from_key, to_key",
             )?
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
             .collect::<Result<_, _>>()?;
@@ -251,9 +278,95 @@ impl Graph {
         Ok(open)
     }
 
+    /// Describes `node` in ontology terms: its class, its properties, its relations by name in
+    /// both directions with counts, and its ancestors along the relations declared as
+    /// containment, and the node that replaced it, if one did.
+    ///
+    /// # Errors
+    /// [`Error::NotFound`] when the node is not in the graph; its class is not declared; the
+    /// graph file cannot be read.
+    pub fn describe(&self, node: &NodeRef) -> Result<Description, Error> {
+        let tx = self.conn.unchecked_transaction()?;
+        let not_found = || Error::NotFound {
+            class: node.class.clone(),
+            key: node.key.clone(),
+        };
+        let found = find_in(&tx, &self.ontology, &node.class, &node.key)?.ok_or_else(not_found)?;
+        let id = node_id(&tx, &node.class, &node.key)?.ok_or_else(not_found)?;
+        let links = |relation: &Relation, end: &str| -> Result<u64, Error> {
+            let sql = format!(
+                "SELECT count(*) FROM {} WHERE {end} = ?1",
+                relation_table(&relation.name)
+            );
+            let n: i64 = tx
+                .prepare_cached(&sql)?
+                .query_row(params![id], |row| row.get(0))?;
+            Ok(u64::try_from(n).unwrap_or(0))
+        };
+        let (mut relations_out, mut relations_in) = (BTreeMap::new(), BTreeMap::new());
+        for relation in self.ontology.relations.values() {
+            for (class, end, counts) in [
+                (&relation.from, "src", &mut relations_out),
+                (&relation.to, "dst", &mut relations_in),
+            ] {
+                if *class == node.class {
+                    let n = links(relation, end)?;
+                    if n > 0 {
+                        counts.insert(relation.name.clone(), n);
+                    }
+                }
+            }
+        }
+        let mut seen: HashSet<(&str, i64)> = HashSet::from([(node.class.as_str(), id)]);
+        let mut frontier: Vec<(&str, i64)> = vec![(node.class.as_str(), id)];
+        let mut part_of = Vec::new();
+        while !frontier.is_empty() {
+            let mut next = Vec::new();
+            for &(class, id) in &frontier {
+                for relation in self.ontology.relations.values() {
+                    if !relation.containment || relation.from != class {
+                        continue;
+                    }
+                    let sql = format!(
+                        "SELECT n.id, n.key FROM {} r JOIN {} n ON n.id = r.dst WHERE r.src = ?1",
+                        relation_table(&relation.name),
+                        class_table(&relation.to)
+                    );
+                    let mut statement = tx.prepare_cached(&sql)?;
+                    let mut rows = statement.query(params![id])?;
+                    while let Some(row) = rows.next()? {
+                        let ancestor: (&str, i64) = (relation.to.as_str(), row.get(0)?);
+                        if seen.insert(ancestor) {
+                            part_of.push(PartOf {
+                                node: NodeRef::new(&relation.to, row.get::<_, String>(1)?),
+                                via: relation.name.clone(),
+                            });
+                            next.push(ancestor);
+                        }
+                    }
+                }
+            }
+            frontier = next;
+        }
+        let replaced_by = tx
+            .prepare_cached("SELECT replaced_by FROM _fates WHERE class = ?1 AND key = ?2")?
+            .query_row(params![node.class, node.key], |row| row.get::<_, String>(0))
+            .optional()?
+            .map(|key| NodeRef::new(&node.class, key));
+        Ok(Description {
+            node: NodeRef::new(found.class, found.key),
+            properties: found.properties,
+            relations_out,
+            relations_in,
+            part_of,
+            replaced_by,
+        })
+    }
+
     /// Walks from `root` along the relations in `via` (each read backwards when written
-    /// `name<-`), for up to `hops` hops, and returns at most `cap` nodes, nearest first. The
-    /// root itself is not among them.
+    /// `name<-`), for up to `hops` hops, and returns at most `cap` nodes, nearest first, each
+    /// with its valid time: a node whose valid time is stated unknown is returned marked
+    /// [`ValidTime::Unknown`]. The root itself is not among them.
     ///
     /// # Errors
     /// [`Error::NotFound`] when the root is not in the graph; a relation in `via` is not
@@ -264,24 +377,61 @@ impl Graph {
         via: &[&str],
         hops: usize,
         cap: usize,
-    ) -> Result<Vec<NodeRef>, Error> {
+    ) -> Result<Vec<(NodeRef, ValidTime)>, Error> {
+        self.walk_in(root, via, hops, cap, None)
+    }
+
+    /// [`Graph::walk`] as of `as_of`: it follows only links and reaches only nodes valid on or
+    /// before that date, from a root valid by then. A node or link whose valid time is unknown
+    /// is never followed as of a date.
+    ///
+    /// # Errors
+    /// As [`Graph::walk`].
+    pub fn walk_as_of(
+        &self,
+        root: &NodeRef,
+        via: &[&str],
+        hops: usize,
+        cap: usize,
+        as_of: &Date,
+    ) -> Result<Vec<(NodeRef, ValidTime)>, Error> {
+        self.walk_in(root, via, hops, cap, Some(as_of))
+    }
+
+    fn walk_in(
+        &self,
+        root: &NodeRef,
+        via: &[&str],
+        hops: usize,
+        cap: usize,
+        as_of: Option<&Date>,
+    ) -> Result<Vec<(NodeRef, ValidTime)>, Error> {
         let steps = via
             .iter()
             .map(|v| parse(&self.ontology, v))
             .collect::<Result<Vec<_>, _>>()?;
         let tx = self.conn.unchecked_transaction()?;
-        let sql = format!("SELECT id FROM {} WHERE key = ?1", class_table(&root.class));
-        let root_id: i64 = tx
+        let sql = format!(
+            "SELECT id, valid FROM {} WHERE key = ?1",
+            class_table(&root.class)
+        );
+        let (root_id, root_valid): (i64, Option<String>) = tx
             .prepare_cached(&sql)?
-            .query_row(params![root.key], |row| row.get(0))
+            .query_row(params![root.key], |row| Ok((row.get(0)?, row.get(1)?)))
             .optional()?
             .ok_or_else(|| Error::NotFound {
                 class: root.class.clone(),
                 key: root.key.clone(),
             })?;
+        let valid_by = |valid: Option<String>| {
+            as_of.is_none_or(|date| valid.is_some_and(|v| v.as_str() <= date.as_str()))
+        };
+        if !valid_by(root_valid) {
+            return Ok(Vec::new());
+        }
         let mut seen: HashSet<(&str, i64)> = HashSet::from([(root.class.as_str(), root_id)]);
         let mut frontier: Vec<(&str, i64)> = vec![(root.class.as_str(), root_id)];
-        let mut found: Vec<NodeRef> = Vec::new();
+        let mut found: Vec<(NodeRef, ValidTime)> = Vec::new();
         let hops = if cap == 0 { 0 } else { hops };
         'hops: for _ in 0..hops {
             let mut next = Vec::new();
@@ -296,16 +446,23 @@ impl Graph {
                         continue;
                     }
                     let sql = format!(
-                        "SELECT n.id, n.key FROM {} r JOIN {} n ON n.id = r.{far} WHERE r.{near} = ?1",
+                        "SELECT n.id, n.key, r.valid, n.valid FROM {} r JOIN {} n ON n.id = r.{far} WHERE r.{near} = ?1",
                         relation_table(&relation.name),
                         class_table(there)
                     );
                     let mut statement = tx.prepare_cached(&sql)?;
                     let mut rows = statement.query(params![id])?;
                     while let Some(row) = rows.next()? {
+                        let node_valid: Option<String> = row.get(3)?;
+                        if !(valid_by(row.get(2)?) && valid_by(node_valid.clone())) {
+                            continue;
+                        }
                         let node: (&str, i64) = (there.as_str(), row.get(0)?);
                         if seen.insert(node) {
-                            found.push(NodeRef::new(there, row.get::<_, String>(1)?));
+                            found.push((
+                                NodeRef::new(there, row.get::<_, String>(1)?),
+                                ValidTime::from_sql(node_valid),
+                            ));
                             next.push(node);
                             if found.len() >= cap {
                                 break 'hops;
@@ -330,7 +487,10 @@ impl Graph {
         let roots = serde_json::to_string(&count.roots)?;
         let tx = self.conn.unchecked_transaction()?;
         let mut statement = tx.prepare(&query)?;
-        let mut rows = statement.query(params![roots])?;
+        let mut rows = match &count.as_of {
+            None => statement.query(params![roots])?,
+            Some(date) => statement.query(params![roots, date.as_str()])?,
+        };
         let mut tallies: HashMap<String, Tally> = HashMap::new();
         let mut last: Option<(String, i64)> = None;
         while let Some(row) = rows.next()? {
@@ -370,6 +530,12 @@ fn count_query(ontology: &Ontology, count: &Count) -> Result<String, Error> {
     let root_class = ontology.class(&count.class)?;
     let mut joins = vec![format!("FROM {} n0", class_table(&root_class.name))];
     let mut conditions = vec!["n0.key IN (SELECT value FROM json_each(?1))".to_string()];
+    // As of a date, every node and link the count reads is valid by then (`?2`); an unknown
+    // valid time is NULL, and NULL <= ?2 is never true.
+    let as_of = count.as_of.is_some();
+    if as_of {
+        conditions.push("n0.valid <= ?2".to_string());
+    }
     let mut at: Vec<(&str, String)> = vec![(root_class.name.as_str(), "n0.id".to_string())];
     for (i, step) in count.path.iter().enumerate() {
         let (class, node) = at[i].clone();
@@ -391,6 +557,14 @@ fn count_query(ontology: &Ontology, count: &Count) -> Result<String, Error> {
             relation_table(&relation.name)
         ));
         let reached = format!("{r}.{far}");
+        if as_of {
+            let n = format!("n{}", i + 1);
+            joins.push(format!(
+                "JOIN {} {n} ON {n}.id = {reached}",
+                class_table(there)
+            ));
+            conditions.push(format!("{r}.valid <= ?2 AND {n}.valid <= ?2"));
+        }
         if let Some(filter) = &step.filter {
             conditions.push(filter_condition(
                 ontology,
@@ -399,6 +573,7 @@ fn count_query(ontology: &Ontology, count: &Count) -> Result<String, Error> {
                 &root_class.name,
                 &reached,
                 i + 1,
+                as_of,
             )?);
         }
         at.push((there.as_str(), reached));
@@ -444,6 +619,7 @@ fn filter_condition(
     root_class: &str,
     reached: &str,
     step: usize,
+    as_of: bool,
 ) -> Result<String, Error> {
     let (by, backwards) = parse(ontology, &filter.via)?;
     let (node_end, root_end, node_col, root_col) = if backwards {
@@ -459,8 +635,13 @@ fn filter_condition(
     }
     let f = format!("f{step}");
     Ok(format!(
-        "{}EXISTS (SELECT 1 FROM {} {f} WHERE {f}.{node_col} = {reached} AND {f}.{root_col} = n0.id)",
+        "{}EXISTS (SELECT 1 FROM {} {f} WHERE {f}.{node_col} = {reached} AND {f}.{root_col} = n0.id{})",
         if filter.keep { "" } else { "NOT " },
-        relation_table(&by.name)
+        relation_table(&by.name),
+        if as_of {
+            format!(" AND {f}.valid <= ?2")
+        } else {
+            String::new()
+        }
     ))
 }

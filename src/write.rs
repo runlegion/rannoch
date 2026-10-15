@@ -528,9 +528,9 @@ impl<'a> Piece<'a> {
         let changed = self
             .tx
             .prepare_cached(
-                "INSERT INTO _open(relation, from_key, to_key, source, valid) \
+                "INSERT INTO _open(rel, from_key, to_key, source, valid) \
                  VALUES (?1, ?2, ?3, ?4, ?5) \
-                 ON CONFLICT(relation, from_key, to_key) DO UPDATE SET \
+                 ON CONFLICT(rel, from_key, to_key) DO UPDATE SET \
                  source = excluded.source, valid = excluded.valid \
                  WHERE source IS NOT excluded.source OR valid IS NOT excluded.valid",
             )?
@@ -549,9 +549,7 @@ impl<'a> Piece<'a> {
     fn close(&self, link: &LinkFact, from: i64, to: i64, source: &str) -> Result<(), Error> {
         self.relate(&link.relation, from, to, source, &link.valid)?;
         self.tx
-            .prepare_cached(
-                "DELETE FROM _open WHERE relation = ?1 AND from_key = ?2 AND to_key = ?3",
-            )?
+            .prepare_cached("DELETE FROM _open WHERE rel = ?1 AND from_key = ?2 AND to_key = ?3")?
             .execute(params![link.relation, link.from.key, link.to.key])?;
         Ok(())
     }
@@ -580,7 +578,7 @@ impl<'a> Piece<'a> {
                     .tx
                     .prepare_cached(&format!(
                         "SELECT from_key, to_key, source, valid FROM _open \
-                         WHERE relation = ?1 AND {column} = ?2"
+                         WHERE rel = ?1 AND {column} = ?2"
                     ))?
                     .query_map(params![relation.name, key], |row| {
                         Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
@@ -621,7 +619,8 @@ impl<'a> Piece<'a> {
 
 /// Applies one event's change to the state in `tx`, as it was applied when the event was
 /// written: a declaration builds what it needs, a write puts what it added, a closing moves its
-/// open link into its relation. Facts are stamped as recorded at `recorded`.
+/// open link into its relation, a forget removes the node and its links, a replacement records
+/// the node's fate. Facts are stamped as recorded at `recorded`.
 pub(crate) fn replay(
     tx: &Connection,
     ontology: &Ontology,
@@ -652,7 +651,7 @@ pub(crate) fn replay(
         Change::Closed(link) => {
             let source: String = tx
                 .prepare_cached(
-                    "SELECT source FROM _open WHERE relation = ?1 AND from_key = ?2 AND to_key = ?3",
+                    "SELECT source FROM _open WHERE rel = ?1 AND from_key = ?2 AND to_key = ?3",
                 )?
                 .query_row(params![link.relation, link.from.key, link.to.key], |row| {
                     row.get(0)
@@ -661,7 +660,26 @@ pub(crate) fn replay(
             let (from, to) = piece.ends(link)?;
             piece.close(link, from, to, &source)?;
         }
+        Change::Forgot { nodes, .. } => {
+            for node in nodes {
+                crate::events::remove(tx, ontology, node)?;
+            }
+        }
+        Change::Replaced { class, old, new } => {
+            record_fate(tx, class, old, new)?;
+        }
     }
+    Ok(())
+}
+
+/// Records that the node `old` of `class` was replaced by the node `new`. Replacing and
+/// replaying a replacement both record through here.
+fn record_fate(tx: &Connection, class: &str, old: &str, new: &str) -> Result<(), Error> {
+    tx.prepare_cached(
+        "INSERT INTO _fates(class, key, replaced_by) VALUES (?1, ?2, ?3) \
+         ON CONFLICT(class, key) DO UPDATE SET replaced_by = excluded.replaced_by",
+    )?
+    .execute(params![class, old, new])?;
     Ok(())
 }
 
@@ -687,6 +705,33 @@ impl Graph {
         self.ontology = Ontology::load(&tx)?;
         tx.commit()?;
         Ok(Some(event))
+    }
+
+    /// Replaces the node `old` of `class` by the node `new` of the same class, under a different
+    /// key, as one event naming the class, the old key and the new key. The old node stays in
+    /// the graph and describes as replaced by the new one. The event and the replacement land
+    /// together or not at all.
+    ///
+    /// # Errors
+    /// `class` is not declared; the graph file cannot be written.
+    pub fn replace(&mut self, class: &str, old: &str, new: &str) -> Result<Event, Error> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let ontology = Ontology::load(&tx)?;
+        let class = ontology.class(class)?.name.clone();
+        record_fate(&tx, &class, old, new)?;
+        let event = append(
+            &tx,
+            Change::Replaced {
+                class,
+                old: old.to_string(),
+                new: new.to_string(),
+            },
+        )?;
+        self.ontology = ontology;
+        tx.commit()?;
+        Ok(event)
     }
 
     /// Writes whole units in pieces, each piece one transaction. Returns the events the pieces
