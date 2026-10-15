@@ -276,7 +276,8 @@ pub(crate) fn remove(
     Ok(Some(links))
 }
 
-/// Removes every link of the node `id`, which is `target`, from live state, and returns them.
+/// Removes every link of the node `id`, which is `target`, from live state, open links waiting
+/// on its other end included, and returns them.
 fn unlink(
     tx: &Connection,
     ontology: &Ontology,
@@ -293,7 +294,12 @@ fn unlink(
                 continue;
             }
             let table = relation_table(&relation.name);
-            let ends: Vec<(String, Option<String>)> = tx
+            let (mine, theirs) = if near == "src" {
+                ("from_key", "to_key")
+            } else {
+                ("to_key", "from_key")
+            };
+            let mut ends: Vec<(String, Option<String>)> = tx
                 .prepare_cached(&format!(
                     "SELECT o.key, r.valid FROM {table} r JOIN {} o ON o.id = r.{far} \
                      WHERE r.{near} = ?1",
@@ -301,6 +307,15 @@ fn unlink(
                 ))?
                 .query_map(params![id], |row| Ok((row.get(0)?, row.get(1)?)))?
                 .collect::<Result<_, _>>()?;
+            ends.extend(
+                tx.prepare_cached(&format!(
+                    "SELECT {theirs}, valid FROM _open WHERE rel = ?1 AND {mine} = ?2"
+                ))?
+                .query_map(params![relation.name, target.key], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?,
+            );
             for (key, valid) in ends {
                 let there = NodeRef::new(other, key);
                 let (from, to) = if near == "src" {
@@ -317,6 +332,8 @@ fn unlink(
             }
             tx.prepare_cached(&format!("DELETE FROM {table} WHERE {near} = ?1"))?
                 .execute(params![id])?;
+            tx.prepare_cached(&format!("DELETE FROM _open WHERE rel = ?1 AND {mine} = ?2"))?
+                .execute(params![relation.name, target.key])?;
         }
     }
     Ok(links)
@@ -358,4 +375,45 @@ pub(crate) fn naming_key(conn: &Connection, key: &str) -> Result<Vec<(i64, Store
     rows.into_iter()
         .map(|(seq, body)| Ok((seq, serde_json::from_str(&body)?)))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        Change, Class, Date, Declaration, NodeRef, Relation, Unit, ValidTime, Write, open,
+    };
+
+    const NONE: [(&str, &str); 0] = [];
+
+    #[test]
+    fn a_forget_takes_the_nodes_open_links_with_it() -> Result<(), Box<dyn std::error::Error>> {
+        let path = std::env::temp_dir().join(format!("rannoch-forget-{}.db", uuid::Uuid::now_v7()));
+        let mut g = open(path)?;
+        g.declare(&Declaration::Class(Class::new("person", ["name"])))?;
+        g.declare(&Declaration::Class(Class::new("place", ["name"])))?;
+        g.declare(&Declaration::Relation(Relation::new(
+            "born_in", "person", "place", false,
+        )))?;
+        let when = ValidTime::On(Date::day(1975, 2, 10));
+        let fiona = || Unit::new("person", "p05", [("name", "Fiona")], when.clone());
+        g.write(&Write::new("tree").unit(fiona().link("born_in", "p05", "pl-late", when.clone())))?;
+
+        let forgot = g.forget(&NodeRef::new("person", "p05"), "living", "tree")?;
+        let Change::Forgot { links, .. } = forgot.change else {
+            panic!("expected a forget event, got {:?}", forgot.change);
+        };
+        assert_eq!(links.len(), 1, "the forget names the open born_in link");
+        assert!(
+            g.open_links()?.is_empty(),
+            "no open link names the forgotten person"
+        );
+
+        g.write(&Write::new("tree").unit(Unit::new("place", "pl-late", NONE, when.clone())))?;
+        let back = g.write(&Write::new("tree").unit(fiona()))?;
+        assert!(
+            back.iter().all(|e| !matches!(e.change, Change::Closed(_))),
+            "a link the forget removed never closes onto the returning key: {back:?}"
+        );
+        Ok(())
+    }
 }
