@@ -369,8 +369,8 @@ impl Graph {
     /// [`ValidTime::Unknown`]. The root itself is not among them.
     ///
     /// # Errors
-    /// [`Error::NotFound`] when the root is not in the graph; a relation in `via` is not
-    /// declared; the graph file cannot be read.
+    /// [`Error::NotFound`] when the root is not in the graph; the root's class or a relation in
+    /// `via` is not declared; the graph file cannot be read.
     pub fn walk(
         &self,
         root: &NodeRef,
@@ -406,6 +406,7 @@ impl Graph {
         cap: usize,
         as_of: Option<&Date>,
     ) -> Result<Vec<(NodeRef, ValidTime)>, Error> {
+        self.ontology.class(&root.class)?;
         let steps = via
             .iter()
             .map(|v| parse(&self.ontology, v))
@@ -651,7 +652,18 @@ fn filter_condition(
 
 #[cfg(test)]
 mod tests {
-    use crate::{Class, Date, Declaration, NodeRef, Relation, Unit, ValidTime, Write, open};
+    use crate::{Class, Date, Declaration, Error, NodeRef, Relation, Unit, ValidTime, Write, open};
+
+    #[test]
+    fn walk_from_an_undeclared_class_is_refused_in_ontology_terms() -> Result<(), Error> {
+        let path = std::env::temp_dir().join(format!("rannoch-walk-{}.db", uuid::Uuid::now_v7()));
+        let refused = open(path)?.walk(&NodeRef::new("ghost", "k"), &[], 1, 10);
+        assert!(
+            matches!(&refused, Err(Error::Refused(reason)) if reason == "class ghost is not declared"),
+            "expected a refusal, got {refused:?}"
+        );
+        Ok(())
+    }
 
     #[test]
     fn a_walk_asked_for_every_hop_ends_when_nothing_is_left()
