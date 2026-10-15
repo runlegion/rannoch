@@ -19,8 +19,8 @@ use std::thread::JoinHandle;
 use std::time::SystemTime;
 
 use rannoch::{
-    Change, Class, Count, Cursor, Date, Declaration, Event, Fact, Graph, GroupBy, Link, LinkFact,
-    Node, NodeRef, OpenLink, Relation, Step, Tally, Unit, ValidTime, Write, WriteError,
+    Change, Class, Count, Cursor, Date, Declaration, Error, Event, Fact, Graph, GroupBy, Link,
+    LinkFact, Node, NodeRef, OpenLink, Relation, Step, Tally, Unit, ValidTime, Write, WriteError,
 };
 use rstest_bdd_macros::{given, scenarios, then, when};
 use tempfile::TempDir;
@@ -433,6 +433,7 @@ struct World {
     open_links: Vec<OpenLink>,
     instances: Instances,
     rebuilt: Option<Graph>,
+    before: Vec<Tally>,
 }
 
 #[rstest::fixture]
@@ -461,6 +462,7 @@ fn world() -> World {
         open_links: Vec::new(),
         instances: Instances::default(),
         rebuilt: None,
+        before: Vec::new(),
     }
 }
 
@@ -1400,6 +1402,137 @@ fn reports_wrong_kind(world: &mut World) {
     );
 }
 
+// ---------- links between declared classes ----------
+
+#[given("a finding and a statement exist")]
+fn finding_and_statement(world: &mut World) {
+    let when = day(2021, 3, 2);
+    world.write(
+        &Write::new("swtor")
+            .unit(Unit::new("finding", "f1", NONE, when.clone()))
+            .unit(Unit::new("statement", "s1", [("text", "hi")], when)),
+    );
+    world.mark_events();
+}
+
+/// The new statements written ahead of the wrong-class link: enough for several pieces.
+const NEW_STATEMENTS: usize = 2 * PIECE_CHANGES + 1;
+
+#[when(
+    "the app writes, in one write of several pieces, new statements followed by a said link from the finding to the statement"
+)]
+fn writes_wrong_class_link(world: &mut World) {
+    let when = day(2021, 3, 2);
+    let mut write = Write::new("swtor");
+    for n in 0..NEW_STATEMENTS {
+        write = write.unit(Unit::new(
+            "statement",
+            format!("n{n}"),
+            [("text", "new")],
+            when.clone(),
+        ));
+    }
+    write = write.unit(
+        Unit::new("statement", "s1", [("text", "hi")], when.clone()).link("said", "f1", "s1", when),
+    );
+    world.write_error = Some(world.g().write(&write).expect_err("the write is refused"));
+}
+
+#[then("the write is refused")]
+fn write_refused(world: &mut World) {
+    let error = world.write_error.as_ref().unwrap();
+    assert!(
+        matches!(error.cause, Error::Refused(_)),
+        "not refused: {}",
+        error.cause
+    );
+    assert!(error.events.is_empty(), "{:?}", error.events);
+}
+
+#[then("none of the new statements is in the graph")]
+fn new_statements_absent(world: &mut World) {
+    let g = world.g();
+    for n in 0..NEW_STATEMENTS {
+        assert!(
+            g.find("statement", &format!("n{n}")).unwrap().is_none(),
+            "statement n{n} landed"
+        );
+    }
+}
+
+// ---------- read: no dangling link during a burst ----------
+
+#[given("the listener is writing a reply stream in which some parents never arrive")]
+fn listener_writing_without_parents(world: &mut World) {
+    parents_never_arrive(world);
+    world.graph = None;
+    let write = stream_write(&world.stream.as_ref().unwrap().arrivals);
+    let path = world.path();
+    let done = Arc::clone(&world.burst_done);
+    world.burst = Some(std::thread::spawn(move || {
+        let mut g = rannoch::open(path).unwrap();
+        g.write(&write).unwrap();
+        done.store(true, Ordering::SeqCst);
+    }));
+}
+
+#[when("a reader walks answers links during the burst")]
+fn reader_walks_answers(world: &mut World) {
+    let reader = rannoch::open(world.path()).unwrap();
+    let stream = world.stream.as_ref().unwrap();
+    // The replies whose parents never arrive, and every reply of the stream's first window.
+    let replies: BTreeSet<String> = stream
+        .links
+        .iter()
+        .map(|l| l.0.clone())
+        .chain(
+            stream
+                .arrivals
+                .iter()
+                .take(200)
+                .filter(|a| a.2.is_some())
+                .map(|a| a.0.clone()),
+        )
+        .collect();
+    let missing: BTreeSet<&str> = stream.links.iter().map(|l| l.1.as_str()).collect();
+    let (mut reads, mut mid_burst, mut dangling) = (0, 0, 0);
+    while !world.burst_done.load(Ordering::SeqCst) {
+        let mut present = 0;
+        for reply in &replies {
+            let root = NodeRef::new("statement", reply.clone());
+            let parents = match reader.walk(&root, &["answers"], 1, usize::MAX) {
+                Ok(parents) => parents,
+                Err(Error::NotFound { .. }) => continue,
+                Err(other) => panic!("{other}"),
+            };
+            present += 1;
+            for parent in parents {
+                // A parent read once stays present, so one missing now was never written.
+                let found = reader.find("statement", &parent.key).unwrap();
+                if missing.contains(parent.key.as_str()) || found.is_none() {
+                    dangling += 1;
+                }
+            }
+        }
+        reads += 1;
+        if present > 0 && present < replies.len() {
+            mid_burst += 1;
+        }
+    }
+    world.burst.take().unwrap().join().unwrap();
+    world.reads = (reads, mid_burst, dangling);
+}
+
+#[then("no answers link it finds points at a missing statement")]
+fn no_dangling(world: &mut World) {
+    let (reads, mid_burst, dangling) = world.reads;
+    assert!(mid_burst > 0, "{reads} reads, none during the burst");
+    assert_eq!(
+        dangling, 0,
+        "{dangling} answers links found to a missing statement"
+    );
+}
+
 // ---------- events ----------
 
 #[when("the app writes statement s1 with a said link from voice v1")]
@@ -1566,6 +1699,213 @@ fn fold_equals_live(world: &mut World) {
             tally.root
         );
     }
+}
+
+// ---------- events: compaction ----------
+
+#[given("a graph with events before and after a cursor")]
+fn events_around_cursor(world: &mut World) {
+    let when = day(2026, 10, 14);
+    let g = world.open();
+    for d in t9b() {
+        g.declare(&d).unwrap();
+    }
+    for v in 0..10 {
+        g.write(&Write::new("eavesdrop").unit(Unit::new(
+            "voice",
+            format!("v{v}"),
+            NONE,
+            when.clone(),
+        )))
+        .unwrap();
+    }
+    world.cursor = world.all_events().last().unwrap().cursor;
+    for s in 0..10 {
+        let statement = format!("s{s}");
+        world
+            .g()
+            .write(
+                &Write::new("eavesdrop").unit(
+                    Unit::new(
+                        "statement",
+                        statement.clone(),
+                        [("text", "words")],
+                        when.clone(),
+                    )
+                    .link("said", format!("v{s}"), statement, when.clone()),
+                ),
+            )
+            .unwrap();
+    }
+    world.log = world.all_events();
+}
+
+#[when("the app compacts at the cursor")]
+fn compacts_at_the_cursor(world: &mut World) {
+    let cursor = world.cursor;
+    world.g().compact(cursor).unwrap();
+    world.read = world.all_events();
+}
+
+#[then("reading the events returns no event up to the cursor")]
+fn none_up_to_cursor(world: &mut World) {
+    // 9 declarations and 10 voices were written up to the cursor.
+    let up_to = world.log.iter().filter(|e| e.cursor <= world.cursor);
+    assert_eq!(up_to.count(), 19);
+    assert!(world.read.iter().all(|e| e.cursor > world.cursor));
+}
+
+#[then("it returns every event after the cursor")]
+fn every_after_cursor(world: &mut World) {
+    let after: Vec<Event> = world
+        .log
+        .iter()
+        .filter(|e| e.cursor > world.cursor)
+        .cloned()
+        .collect();
+    assert_eq!(after.len(), 10);
+    assert_eq!(world.read, after);
+}
+
+/// Per finding, all 1,000 of T4's: distinct voices with the total, grouped by place.
+fn count_t4_findings(g: &Graph) -> Vec<Tally> {
+    g.count(&Count {
+        class: "finding".into(),
+        roots: (0..1000).map(|f| format!("f{f}")).collect(),
+        path: vec![Step::new("supports<-"), Step::new("said<-")],
+        group_by: Some(GroupBy {
+            class: "statement".into(),
+            property: "place".into(),
+        }),
+    })
+    .unwrap()
+}
+
+/// Compacts at the cursor of the last event, so every event up to now is removed.
+fn compact_at_end(world: &mut World) {
+    world.cursor = world.all_events().last().unwrap().cursor;
+    let cursor = world.cursor;
+    world.g().compact(cursor).unwrap();
+    assert!(world.all_events().is_empty());
+}
+
+#[given("a graph of 100,000 voices and its live count for each of the 1,000 findings")]
+fn t4_with_live_counts(world: &mut World) {
+    world.source = t4(world);
+    world.before = count_t4_findings(world.g());
+}
+
+#[when("the app compacts at a cursor")]
+fn compacts_at_a_cursor(world: &mut World) {
+    compact_at_end(world);
+}
+
+#[then("the count for each of the 1,000 findings equals its count before compaction")]
+fn counts_unchanged(world: &mut World) {
+    let after = count_t4_findings(world.g());
+    assert_eq!(world.before.len(), 1000);
+    assert!(world.before.iter().any(|t| t.distinct > 0));
+    assert_eq!(after, world.before);
+}
+
+#[given(
+    "a graph compacted at a cursor, and the count for each of the 1,000 findings taken right after compaction"
+)]
+fn t4_compacted_with_counts(world: &mut World) {
+    world.source = t4(world);
+    compact_at_end(world);
+    world.before = count_t4_findings(world.g());
+}
+
+#[when("the app writes more statements and folds the events after the cursor onto those counts")]
+fn writes_and_folds(world: &mut World) {
+    let when = day(2026, 10, 15);
+    let mut rng = fastrand::Rng::with_seed(43);
+    let mut write = Write::new("t4");
+    for v in 100_000..100_200 {
+        let voice = format!("v{v}");
+        write = write.unit(Unit::new("voice", voice.clone(), NONE, when.clone()));
+        for k in 0..rng.usize(1..4) {
+            let statement = format!("v{v}s{k}");
+            let finding = format!("f{}", rng.usize(..1000));
+            let place = PLACES[rng.usize(..PLACES.len())];
+            write = write.unit(
+                Unit::new(
+                    "statement",
+                    statement.clone(),
+                    [("place", place)],
+                    when.clone(),
+                )
+                .link("said", voice.clone(), statement.clone(), when.clone())
+                .link("supports", statement, finding, when.clone()),
+            );
+        }
+    }
+    world.g().write(&write).unwrap();
+
+    // The app's fold: statements' places, their voices and the findings they support.
+    let mut place_of: HashMap<String, Option<String>> = HashMap::new();
+    let mut voice_of: HashMap<String, String> = HashMap::new();
+    let mut supports: Vec<(String, String)> = Vec::new();
+    let cursor = world.cursor;
+    for event in world.g().events().since(cursor).unwrap() {
+        let Change::Wrote { added, .. } = event.change else {
+            continue;
+        };
+        for fact in added {
+            match fact {
+                Fact::Node(node) if node.class == "statement" => {
+                    place_of.insert(node.key, node.properties.get("place").cloned());
+                }
+                Fact::Link(link) if link.relation == "said" => {
+                    voice_of.insert(link.to.key, link.from.key);
+                }
+                Fact::Link(link) if link.relation == "supports" => {
+                    supports.push((link.from.key, link.to.key));
+                }
+                _ => {}
+            }
+        }
+    }
+    // The voices written after the cursor are new, so none is in the base's distinct counts.
+    let mut voices: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut by_place: HashMap<(String, Option<String>), HashSet<String>> = HashMap::new();
+    let mut tallies: HashMap<String, Tally> = world
+        .before
+        .iter()
+        .map(|t| (t.root.clone(), t.clone()))
+        .collect();
+    for (statement, finding) in supports {
+        let voice = voice_of[&statement].clone();
+        let place = place_of[&statement].clone();
+        let tally = tallies.get_mut(&finding).unwrap();
+        tally.total += 1;
+        let group = tally.groups.entry(place.clone()).or_default();
+        group.1 += 1;
+        if by_place
+            .entry((finding.clone(), place))
+            .or_default()
+            .insert(voice.clone())
+        {
+            group.0 += 1;
+        }
+        if voices.entry(finding).or_default().insert(voice) {
+            tally.distinct += 1;
+        }
+    }
+    world.tallies = world
+        .before
+        .iter()
+        .map(|t| tallies.remove(&t.root).unwrap())
+        .collect();
+}
+
+#[then("its per-finding numbers equal the live counts for all 1,000 findings")]
+fn fold_on_base_equals_live(world: &mut World) {
+    let live = count_t4_findings(world.g());
+    assert_eq!(live.len(), 1000);
+    assert_ne!(live, world.before);
+    assert_eq!(world.tallies, live);
 }
 
 // ---------- read: walks ----------
