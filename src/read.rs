@@ -61,7 +61,8 @@ pub struct Link {
 }
 
 /// A node in ontology terms: its class and key, its properties, its relations by name in both
-/// directions with how many links each has, and what it is part of. It names no table.
+/// directions with how many links each has, what it is part of, and what replaced it. It names
+/// no table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Description {
     pub node: NodeRef,
@@ -72,6 +73,8 @@ pub struct Description {
     pub relations_in: BTreeMap<String, u64>,
     /// Its containment ancestors, nearest first.
     pub part_of: Vec<PartOf>,
+    /// The node of the same class that replaced it, if one did.
+    pub replaced_by: Option<NodeRef>,
 }
 
 /// A containment ancestor: the node something is part of, and the containment relation it is
@@ -275,7 +278,7 @@ impl Graph {
 
     /// Describes `node` in ontology terms: its class, its properties, its relations by name in
     /// both directions with counts, and its ancestors along the relations declared as
-    /// containment.
+    /// containment, and the node that replaced it, if one did.
     ///
     /// # Errors
     /// [`Error::NotFound`] when the node is not in the graph; its class is not declared; the
@@ -343,12 +346,18 @@ impl Graph {
             }
             frontier = next;
         }
+        let replaced_by = tx
+            .prepare_cached("SELECT replaced_by FROM _fates WHERE class = ?1 AND key = ?2")?
+            .query_row(params![node.class, node.key], |row| row.get::<_, String>(0))
+            .optional()?
+            .map(|key| NodeRef::new(&node.class, key));
         Ok(Description {
             node: NodeRef::new(found.class, found.key),
             properties: found.properties,
             relations_out,
             relations_in,
             part_of,
+            replaced_by,
         })
     }
 

@@ -11,7 +11,8 @@ use uuid::Uuid;
 use crate::read::NodeRef;
 use crate::write::{Declaration, Error, ValidTime};
 
-/// rannoch's own tables: the event log, the ontology, and links waiting for an end.
+/// rannoch's own tables: the event log, the ontology, links waiting for an end, and the fates of
+/// nodes that were replaced.
 pub(crate) const OWN_TABLES: &str = "
     CREATE TABLE IF NOT EXISTS _events(seq INTEGER PRIMARY KEY, body TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS _ontology(
@@ -21,7 +22,10 @@ pub(crate) const OWN_TABLES: &str = "
         rel TEXT NOT NULL, from_key TEXT NOT NULL, to_key TEXT NOT NULL,
         source TEXT NOT NULL, valid TEXT,
         PRIMARY KEY(rel, from_key, to_key)) WITHOUT ROWID;
-    CREATE INDEX IF NOT EXISTS _open_to ON _open(rel, to_key);";
+    CREATE INDEX IF NOT EXISTS _open_to ON _open(rel, to_key);
+    CREATE TABLE IF NOT EXISTS _fates(
+        class TEXT NOT NULL, key TEXT NOT NULL, replaced_by TEXT NOT NULL,
+        PRIMARY KEY(class, key)) WITHOUT ROWID;";
 
 /// A place in a graph's event log. Reading since a cursor returns the events after it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -67,6 +71,12 @@ pub enum Change {
     },
     /// An open link whose missing end arrived: it now holds in its relation.
     Closed(LinkFact),
+    /// The node `old` of `class` was replaced by the node `new` of the same class.
+    Replaced {
+        class: String,
+        old: String,
+        new: String,
+    },
 }
 
 /// One thing a piece added.

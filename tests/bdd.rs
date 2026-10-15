@@ -998,6 +998,58 @@ fn writes_v1_same(world: &mut World) {
     assert!(world.written.is_empty());
 }
 
+// ---------- write: replacing a node ----------
+
+#[given("statements s8 and s9")]
+fn s8_and_s9(world: &mut World) {
+    open_graph(world);
+    let when = day(2021, 3, 2);
+    world.write(
+        &Write::new("eavesdrop")
+            .unit(Unit::new(
+                "statement",
+                "s8",
+                [("text", "first")],
+                when.clone(),
+            ))
+            .unit(Unit::new("statement", "s9", [("text", "merged")], when)),
+    );
+    world.mark_events();
+}
+
+#[when("the app replaces s8 by s9")]
+fn replaces_s8_by_s9(world: &mut World) {
+    let event = world.g().replace("statement", "s8", "s9").unwrap();
+    world.written = vec![event];
+}
+
+#[then("the event log gains one event naming class statement, s8 and s9")]
+fn one_replacement_event(world: &mut World) {
+    let after = world.all_events();
+    let gained = &after[world.events_before..];
+    assert_eq!(gained, world.written.as_slice());
+    let [event] = gained else {
+        panic!("expected one event, got {gained:?}");
+    };
+    assert_eq!(
+        event.change,
+        Change::Replaced {
+            class: "statement".into(),
+            old: "s8".into(),
+            new: "s9".into(),
+        }
+    );
+}
+
+#[then("describing s8 answers replaced by s9")]
+fn s8_replaced_by_s9(world: &mut World) {
+    let s8 = world
+        .g()
+        .describe(&NodeRef::new("statement", "s8"))
+        .unwrap();
+    assert_eq!(s8.replaced_by, Some(NodeRef::new("statement", "s9")));
+}
+
 // ---------- write: source, valid time, recorded time ----------
 
 #[given("an open graph")]
@@ -1575,7 +1627,7 @@ fn folds_from_events(world: &mut World) {
                 })
                 .collect(),
             Change::Closed(l) => vec![l],
-            Change::Declared(_) => Vec::new(),
+            Change::Declared(_) | Change::Replaced { .. } => Vec::new(),
         };
         for link in links {
             match link.relation.as_str() {

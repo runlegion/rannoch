@@ -598,6 +598,37 @@ impl Graph {
         Ok(Some(event))
     }
 
+    /// Replaces the node `old` of `class` by the node `new` of the same class, under a different
+    /// key, as one event naming the class, the old key and the new key. The old node stays in
+    /// the graph and describes as replaced by the new one. The event and the replacement land
+    /// together or not at all.
+    ///
+    /// # Errors
+    /// `class` is not declared; the graph file cannot be written.
+    pub fn replace(&mut self, class: &str, old: &str, new: &str) -> Result<Event, Error> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let ontology = Ontology::load(&tx)?;
+        let class = ontology.class(class)?.name.clone();
+        tx.prepare_cached(
+            "INSERT INTO _fates(class, key, replaced_by) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(class, key) DO UPDATE SET replaced_by = excluded.replaced_by",
+        )?
+        .execute(params![class, old, new])?;
+        let event = append(
+            &tx,
+            Change::Replaced {
+                class,
+                old: old.to_string(),
+                new: new.to_string(),
+            },
+        )?;
+        self.ontology = ontology;
+        tx.commit()?;
+        Ok(event)
+    }
+
     /// Writes whole units in pieces, each piece one transaction. Returns the events the pieces
     /// wrote: per piece, one for what it added and one per open link it closed. A unit that adds
     /// nothing new writes no event. A new node under the key an open link waits on, but of
