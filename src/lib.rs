@@ -30,6 +30,7 @@
 mod events;
 mod open;
 mod read;
+mod refs;
 mod write;
 
 pub use events::{Change, Cursor, Event, EventId, Events, Fact, LinkFact, NodeFact, WrongKind};
@@ -37,4 +38,5 @@ pub use open::{Class, Graph, Ontology, Relation, open};
 pub use read::{
     Count, Description, Filter, GroupBy, Link, Node, NodeRef, OpenLink, PartOf, Step, Tally,
 };
+pub use refs::Fate;
 pub use write::{Date, Declaration, Error, Unit, ValidTime, Write, WriteError};

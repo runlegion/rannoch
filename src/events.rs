@@ -128,9 +128,9 @@ pub struct LinkFact {
 }
 
 #[derive(Serialize, Deserialize)]
-struct Stored {
+pub(crate) struct Stored {
     id: EventId,
-    change: Change,
+    pub(crate) change: Change,
 }
 
 /// Appends one event inside the caller's transaction, so it lands only if that transaction does.

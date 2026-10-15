@@ -20,7 +20,7 @@ use std::time::SystemTime;
 
 use rannoch::{
     Change, Class, Count, Cursor, Date, Declaration, Description, Error, Event, EventId, Fact,
-    Graph, GroupBy, LinkFact, Node, NodeRef, OpenLink, PartOf, Relation, Step, Tally, Unit,
+    Fate, Graph, GroupBy, LinkFact, Node, NodeRef, OpenLink, PartOf, Relation, Step, Tally, Unit,
     ValidTime, Write, WriteError,
 };
 use rstest_bdd_macros::{given, scenarios, then, when};
@@ -385,6 +385,9 @@ struct World {
     open_links: Vec<OpenLink>,
     described: Option<Description>,
     answers: Vec<String>,
+    shared: Option<Graph>,
+    fates: Vec<Fate>,
+    references: Vec<Node>,
 }
 
 #[rstest::fixture]
@@ -416,6 +419,9 @@ fn world() -> World {
         open_links: Vec::new(),
         described: None,
         answers: Vec::new(),
+        shared: None,
+        fates: Vec::new(),
+        references: Vec::new(),
     }
 }
 
@@ -2376,6 +2382,199 @@ fn runs_every_read_and_a_refused_write(world: &mut World) {
 #[then("no table name and no column name appears in any answer or in the refusal")]
 fn reads_and_refusal_name_no_storage(world: &mut World) {
     assert_names_no_storage(world, &world.answers);
+}
+
+// ---------- refs: references into another graph file (FR-RANNOCH-046) ----------
+
+/// The T6 files' size: the local file holds this many references into the shared file.
+const REFERENCES: usize = 300;
+
+/// The T6 files (t6-t2-refs-replay, 2026-10-13): a shared file of statements s0..s299, and a
+/// local file whose mentions l0..l299 each refer to the shared statement of the same number by
+/// the shared file's name, its class and its key. The local file mounts the shared one.
+#[given("the local file mounts the shared file")]
+fn local_mounts_shared(world: &mut World) {
+    let when = day(2026, 10, 13);
+    let shared_path = world.dir.path().join("shared.rannoch");
+    let mut shared = rannoch::open(&shared_path).unwrap();
+    shared
+        .declare(&Declaration::Class(Class::new("statement", ["text"])))
+        .unwrap();
+    let mut write = Write::new("eavesdrop");
+    for i in 0..REFERENCES {
+        write = write.unit(Unit::new(
+            "statement",
+            format!("s{i}"),
+            [("text", format!("statement {i}"))],
+            when.clone(),
+        ));
+    }
+    shared.write(&write).unwrap();
+    world.shared = Some(shared);
+
+    let local = world.open();
+    local
+        .declare(&Declaration::Class(Class::new(
+            "mention",
+            ["graph", "class", "key"],
+        )))
+        .unwrap();
+    let mut write = Write::new("legion");
+    for i in 0..REFERENCES {
+        write = write.unit(Unit::new(
+            "mention",
+            format!("l{i}"),
+            [
+                ("graph", "shared".to_string()),
+                ("class", "statement".to_string()),
+                ("key", format!("s{i}")),
+            ],
+            when.clone(),
+        ));
+    }
+    local.write(&write).unwrap();
+    local.mount("shared", &shared_path).unwrap();
+}
+
+impl World {
+    fn shared(&mut self) -> &mut Graph {
+        self.shared.as_mut().expect("the shared file is open")
+    }
+
+    /// The reference the local mention `from` holds: the mounted file's name and the target.
+    fn reference(&mut self, from: &str) -> (String, NodeRef) {
+        let mention = self
+            .g()
+            .find("mention", from)
+            .unwrap()
+            .expect("the mention");
+        let property = |name: &str| mention.properties[name].clone();
+        (
+            property("graph"),
+            NodeRef::new(property("class"), property("key")),
+        )
+    }
+
+    fn resolve(&mut self, from: &str) -> Fate {
+        let (graph, target) = self.reference(from);
+        self.g().resolve(&graph, &target).unwrap()
+    }
+
+    /// Every mention in the local file, in order, and the local file's events.
+    fn local_references(&mut self) -> (Vec<Node>, Vec<Event>) {
+        let mentions = (0..REFERENCES)
+            .map(|i| {
+                self.g()
+                    .find("mention", &format!("l{i}"))
+                    .unwrap()
+                    .expect("the mention")
+            })
+            .collect();
+        (mentions, self.all_events())
+    }
+}
+
+#[given("shared node s7 was forgotten by rule superseded")]
+fn shared_s7_forgotten(world: &mut World) {
+    world
+        .shared()
+        .forget(&NodeRef::new("statement", "s7"), "superseded", "eavesdrop")
+        .unwrap();
+    assert_eq!(world.shared().find("statement", "s7").unwrap(), None);
+}
+
+#[given("shared node s8 was replaced by s9 with a replace event")]
+fn shared_s8_replaced(world: &mut World) {
+    let event = world.shared().replace("statement", "s8", "s9").unwrap();
+    assert!(matches!(event.change, Change::Replaced { .. }));
+}
+
+#[given("shared node s10 is live")]
+fn shared_s10_live(world: &mut World) {
+    assert!(world.shared().find("statement", "s10").unwrap().is_some());
+}
+
+#[given("shared node s10 was written again with a changed property")]
+fn shared_s10_new_version(world: &mut World) {
+    let events = world
+        .shared()
+        .write(&Write::new("eavesdrop").unit(Unit::new(
+            "statement",
+            "s10",
+            [("text", "changed")],
+            day(2026, 10, 14),
+        )))
+        .unwrap();
+    assert_eq!(events.len(), 1, "the new version lands as one event");
+    let s10 = world.shared().find("statement", "s10").unwrap().unwrap();
+    assert_eq!(s10.properties["text"], "changed");
+}
+
+#[given("the local file holds 300 references into the shared file")]
+fn local_holds_300(world: &mut World) {
+    let (mentions, _) = world.local_references();
+    assert_eq!(mentions.len(), 300);
+    assert!(world.g().find("mention", "l300").unwrap().is_none());
+    world.references = mentions;
+}
+
+#[when("the app resolves reference l7 to s7")]
+fn resolves_l7(world: &mut World) {
+    assert_eq!(world.reference("l7").1, NodeRef::new("statement", "s7"));
+    world.fates = vec![world.resolve("l7")];
+}
+
+#[when("the app resolves reference l8 to s8")]
+fn resolves_l8(world: &mut World) {
+    assert_eq!(world.reference("l8").1, NodeRef::new("statement", "s8"));
+    world.fates = vec![world.resolve("l8")];
+}
+
+#[when("the app resolves reference l10 to s10")]
+fn resolves_l10(world: &mut World) {
+    assert_eq!(world.reference("l10").1, NodeRef::new("statement", "s10"));
+    world.fates = vec![world.resolve("l10")];
+}
+
+#[when("the app resolves them")]
+fn resolves_all(world: &mut World) {
+    world.log = world.all_events();
+    world.fates = (0..REFERENCES)
+        .map(|i| world.resolve(&format!("l{i}")))
+        .collect();
+    assert_eq!(world.fates.len(), REFERENCES);
+}
+
+#[then("it answers forgotten by superseded")]
+fn answers_forgotten(world: &mut World) {
+    assert_eq!(
+        world.fates,
+        [Fate::Forgotten {
+            rule: "superseded".into()
+        }]
+    );
+}
+
+#[then("it answers replaced by s9")]
+fn answers_replaced(world: &mut World) {
+    assert_eq!(
+        world.fates,
+        [Fate::Replaced {
+            by: NodeRef::new("statement", "s9")
+        }]
+    );
+}
+
+#[then("it answers live")]
+fn answers_live(world: &mut World) {
+    assert_eq!(world.fates, [Fate::Live]);
+}
+
+#[then("the local file's 300 references are unchanged")]
+fn local_references_unchanged(world: &mut World) {
+    let (mentions, events) = world.local_references();
+    assert_eq!(mentions, world.references);
+    assert_eq!(events, world.log);
 }
 
 scenarios!("tests", fixtures = [world: World]);
