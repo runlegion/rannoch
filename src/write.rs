@@ -135,7 +135,11 @@ fn save(tx: &Connection, kind: &str, name: &str, body: &impl Serialize) -> Resul
 
 /// Builds what a declaration needs in `tx`. Returns false, building nothing, when the
 /// declaration is identical to the ontology as it is now.
-fn build(tx: &Connection, ontology: &Ontology, declaration: &Declaration) -> Result<bool, Error> {
+pub(crate) fn build(
+    tx: &Connection,
+    ontology: &Ontology,
+    declaration: &Declaration,
+) -> Result<bool, Error> {
     match declaration {
         Declaration::Class(class) => {
             if let Some(have) = ontology.classes.get(&class.name) {
@@ -311,7 +315,7 @@ fn pieces(units: &[Unit]) -> Vec<&[Unit]> {
     pieces
 }
 
-fn now_millis() -> i64 {
+pub(crate) fn now_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
@@ -367,7 +371,19 @@ struct Piece<'a> {
     closed: Vec<LinkFact>,
 }
 
-impl Piece<'_> {
+impl<'a> Piece<'a> {
+    fn new(tx: &'a Connection, ontology: &'a Ontology, source: &'a str, recorded: i64) -> Self {
+        Piece {
+            tx,
+            ontology,
+            source,
+            recorded,
+            added: Vec::new(),
+            wrong_kind: Vec::new(),
+            closed: Vec::new(),
+        }
+    }
+
     /// Writes a node, or a new version of it. Returns the node's id and whether it is new.
     fn node(&mut self, node: &NodeFact) -> Result<(i64, bool), Error> {
         let class = self.ontology.class(&node.class)?;
@@ -495,6 +511,20 @@ impl Piece<'_> {
             }
             return Ok(());
         }
+        if self.open(&relation.name, &link.from, &link.to, &link.valid)? {
+            self.added.push(Fact::Opened(fact));
+        }
+        Ok(())
+    }
+
+    /// Puts a link that waits for an end into `_open`. Returns whether it changed.
+    fn open(
+        &self,
+        relation: &str,
+        from_key: &str,
+        to_key: &str,
+        valid: &ValidTime,
+    ) -> Result<bool, Error> {
         let changed = self
             .tx
             .prepare_cached(
@@ -505,16 +535,34 @@ impl Piece<'_> {
                  WHERE source IS NOT excluded.source OR valid IS NOT excluded.valid",
             )?
             .execute(params![
-                relation.name,
-                link.from,
-                link.to,
+                relation,
+                from_key,
+                to_key,
                 self.source,
-                link.valid.to_sql()
+                valid.to_sql()
             ])?;
-        if changed > 0 {
-            self.added.push(Fact::Opened(fact));
-        }
+        Ok(changed > 0)
+    }
+
+    /// Moves an open link, both of whose ends are now present, into its relation with the
+    /// source it was opened with.
+    fn close(&self, link: &LinkFact, from: i64, to: i64, source: &str) -> Result<(), Error> {
+        self.relate(&link.relation, from, to, source, &link.valid)?;
+        self.tx
+            .prepare_cached("DELETE FROM _open WHERE rel = ?1 AND from_key = ?2 AND to_key = ?3")?
+            .execute(params![link.relation, link.from.key, link.to.key])?;
         Ok(())
+    }
+
+    /// The ids of a link's two ends, both present.
+    fn ends(&self, link: &LinkFact) -> Result<(i64, i64), Error> {
+        let id = |end: &NodeRef| {
+            node_id(self.tx, &end.class, &end.key)?.ok_or_else(|| Error::NotFound {
+                class: end.class.clone(),
+                key: end.key.clone(),
+            })
+        };
+        Ok((id(&link.from)?, id(&link.to)?))
     }
 
     /// Closes every open link that was waiting for the node `key` of `class`, now present, and
@@ -554,24 +602,85 @@ impl Piece<'_> {
                     let (Some(from), Some(to)) = (from, to) else {
                         continue;
                     };
-                    let valid = ValidTime::from_sql(valid);
-                    self.relate(&relation.name, from, to, &source, &valid)?;
-                    self.tx
-                        .prepare_cached(
-                            "DELETE FROM _open WHERE rel = ?1 AND from_key = ?2 AND to_key = ?3",
-                        )?
-                        .execute(params![relation.name, from_key, to_key])?;
-                    self.closed.push(LinkFact {
+                    let link = LinkFact {
                         relation: relation.name.clone(),
                         from: NodeRef::new(&relation.from, from_key),
                         to: NodeRef::new(&relation.to, to_key),
-                        valid,
-                    });
+                        valid: ValidTime::from_sql(valid),
+                    };
+                    self.close(&link, from, to, &source)?;
+                    self.closed.push(link);
                 }
             }
         }
         Ok(())
     }
+}
+
+/// Applies one event's change to the state in `tx`, as it was applied when the event was
+/// written: a declaration builds what it needs, a write puts what it added, a closing moves its
+/// open link into its relation, a forget removes the node and its links, a replacement records
+/// the node's fate. Facts are stamped as recorded at `recorded`.
+pub(crate) fn replay(
+    tx: &Connection,
+    ontology: &Ontology,
+    recorded: i64,
+    change: &Change,
+) -> Result<(), Error> {
+    match change {
+        Change::Declared(declaration) => {
+            build(tx, ontology, declaration)?;
+        }
+        Change::Wrote { source, added, .. } => {
+            let mut piece = Piece::new(tx, ontology, source, recorded);
+            for fact in added {
+                match fact {
+                    Fact::Node(node) => {
+                        piece.node(node)?;
+                    }
+                    Fact::Link(link) => {
+                        let (from, to) = piece.ends(link)?;
+                        piece.relate(&link.relation, from, to, source, &link.valid)?;
+                    }
+                    Fact::Opened(link) => {
+                        piece.open(&link.relation, &link.from.key, &link.to.key, &link.valid)?;
+                    }
+                }
+            }
+        }
+        Change::Closed(link) => {
+            let source: String = tx
+                .prepare_cached(
+                    "SELECT source FROM _open WHERE rel = ?1 AND from_key = ?2 AND to_key = ?3",
+                )?
+                .query_row(params![link.relation, link.from.key, link.to.key], |row| {
+                    row.get(0)
+                })?;
+            let piece = Piece::new(tx, ontology, &source, recorded);
+            let (from, to) = piece.ends(link)?;
+            piece.close(link, from, to, &source)?;
+        }
+        Change::Forgot { nodes, .. } => {
+            for node in nodes {
+                crate::events::remove(tx, ontology, node)?;
+            }
+        }
+        Change::Replaced { class, old, new } => {
+            record_fate(tx, class, old, new)?;
+        }
+    }
+    Ok(())
+}
+
+/// Records that the node `old` of `class` was replaced by the node `new`. Replacing and
+/// replaying a replacement both record through here.
+fn record_fate(tx: &Connection, class: &str, old: &str, new: &str) -> Result<(), Error> {
+    tx.prepare_cached(
+        "INSERT INTO _fates(class, key, replaced_by) VALUES (?1, ?2, ?3) \
+         ON CONFLICT(class, key) DO UPDATE SET replaced_by = excluded.replaced_by",
+    )?
+    .execute(params![class, old, new])?;
+    Ok(())
 }
 
 impl Graph {
@@ -611,11 +720,7 @@ impl Graph {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let ontology = Ontology::load(&tx)?;
         let class = ontology.class(class)?.name.clone();
-        tx.prepare_cached(
-            "INSERT INTO _fates(class, key, replaced_by) VALUES (?1, ?2, ?3) \
-             ON CONFLICT(class, key) DO UPDATE SET replaced_by = excluded.replaced_by",
-        )?
-        .execute(params![class, old, new])?;
+        record_fate(&tx, &class, old, new)?;
         let event = append(
             &tx,
             Change::Replaced {
@@ -666,15 +771,7 @@ impl Graph {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut piece = Piece {
-            tx: &tx,
-            ontology: &self.ontology,
-            source,
-            recorded: now_millis(),
-            added: Vec::new(),
-            wrong_kind: Vec::new(),
-            closed: Vec::new(),
-        };
+        let mut piece = Piece::new(&tx, &self.ontology, source, now_millis());
         for unit in units {
             let (_, new) = piece.node(&unit.node)?;
             if new {

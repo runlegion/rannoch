@@ -3,14 +3,15 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::open::{Graph, Ontology, class_table, relation_table};
+use crate::open::{Graph, Ontology, class_table, open, relation_table};
 use crate::read::NodeRef;
-use crate::write::{Declaration, Error, ValidTime};
+use crate::write::{Declaration, Error, ValidTime, now_millis, replay};
 
 /// rannoch's own tables: the event log, the ontology, links waiting for an end, and the fates of
 /// nodes that were replaced. An event's place is never reused, so a cursor stays a place in the
@@ -136,10 +137,12 @@ pub(crate) struct Stored {
 
 /// Appends one event inside the caller's transaction, so it lands only if that transaction does.
 pub(crate) fn append(tx: &Connection, change: Change) -> Result<Event, Error> {
-    let stored = Stored {
-        id: EventId(Uuid::now_v7()),
-        change,
-    };
+    store(tx, EventId(Uuid::now_v7()), change)
+}
+
+/// Appends one event under the id it already has, inside the caller's transaction.
+fn store(tx: &Connection, id: EventId, change: Change) -> Result<Event, Error> {
+    let stored = Stored { id, change };
     tx.prepare_cached("INSERT INTO _events(body) VALUES (?1)")?
         .execute(params![serde_json::to_string(&stored)?])?;
     Ok(Event {
@@ -178,6 +181,31 @@ impl Events<'_> {
     }
 }
 
+/// Rebuilds a graph file at `empty_path` from `events` alone, replaying them in order: its
+/// ontology from the declaration events, and its nodes, links and open links from the rest.
+/// Each event lands in the new file under its own id. The events land together or not at all.
+///
+/// # Errors
+/// The file cannot be opened as a graph file, or an event cannot be replayed into it.
+pub fn rebuild(events: &[Event], empty_path: impl AsRef<Path>) -> Result<Graph, Error> {
+    let mut graph = open(empty_path)?;
+    let tx = graph
+        .conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let mut ontology = Ontology::load(&tx)?;
+    let recorded = now_millis();
+    for event in events {
+        replay(&tx, &ontology, recorded, &event.change)?;
+        if matches!(event.change, Change::Declared(_)) {
+            ontology = Ontology::load(&tx)?;
+        }
+        store(&tx, event.id, event.change.clone())?;
+    }
+    tx.commit()?;
+    graph.ontology = ontology;
+    Ok(graph)
+}
+
 impl Graph {
     /// Compacts the graph's events up to `cursor`, a place the app picks: the events up to it
     /// are deleted, and the state they built is kept as the base. Counts read after compaction
@@ -207,18 +235,10 @@ impl Graph {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let ontology = Ontology::load(&tx)?;
-        let table = class_table(&ontology.class(&target.class)?.name);
-        let id: i64 = tx
-            .prepare_cached(&format!("SELECT id FROM {table} WHERE key = ?1"))?
-            .query_row(params![target.key], |row| row.get(0))
-            .optional()?
-            .ok_or_else(|| Error::NotFound {
-                class: target.class.clone(),
-                key: target.key.clone(),
-            })?;
-        let links = unlink(&tx, &ontology, target, id)?;
-        tx.prepare_cached(&format!("DELETE FROM {table} WHERE id = ?1"))?
-            .execute(params![id])?;
+        let links = remove(&tx, &ontology, target)?.ok_or_else(|| Error::NotFound {
+            class: target.class.clone(),
+            key: target.key.clone(),
+        })?;
         strip(&tx, target)?;
         let event = append(
             &tx,
@@ -233,6 +253,27 @@ impl Graph {
         tx.commit()?;
         Ok(event)
     }
+}
+
+/// Removes `target` and its links from live state and returns the links, or `None` when no node
+/// of its class has its key. Forgetting and replaying a forget both remove through here.
+pub(crate) fn remove(
+    tx: &Connection,
+    ontology: &Ontology,
+    target: &NodeRef,
+) -> Result<Option<Vec<LinkFact>>, Error> {
+    let table = class_table(&ontology.class(&target.class)?.name);
+    let Some(id) = tx
+        .prepare_cached(&format!("SELECT id FROM {table} WHERE key = ?1"))?
+        .query_row(params![target.key], |row| row.get::<_, i64>(0))
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    let links = unlink(tx, ontology, target, id)?;
+    tx.prepare_cached(&format!("DELETE FROM {table} WHERE id = ?1"))?
+        .execute(params![id])?;
+    Ok(Some(links))
 }
 
 /// Removes every link of the node `id`, which is `target`, from live state, and returns them.
