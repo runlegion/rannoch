@@ -4,12 +4,13 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
+use std::sync::Arc;
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::open::{Graph, Ontology, class_table, open, relation_table};
+use crate::open::{Fresh, Graph, Ontology, class_table, open, relation_table, schema_version};
 use crate::read::NodeRef;
 use crate::write::{Declaration, Error, ValidTime, now_millis, replay};
 
@@ -234,6 +235,7 @@ impl Graph {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let version = schema_version(&tx)?;
         let ontology = Ontology::load(&tx)?;
         let links = remove(&tx, &ontology, target)?.ok_or_else(|| Error::NotFound {
             class: target.class.clone(),
@@ -251,6 +253,10 @@ impl Graph {
         )?;
         self.ontology = ontology;
         tx.commit()?;
+        *self.fresh.get_mut() = Fresh {
+            schema_version: version,
+            ontology: Arc::new(self.ontology.clone()),
+        };
         Ok(event)
     }
 }

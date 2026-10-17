@@ -1,7 +1,9 @@
 //! Opening a graph file, and the ontology its own stream declared.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use rusqlite::Connection;
@@ -62,8 +64,16 @@ pub struct Ontology {
     pub relations: BTreeMap<String, Relation>,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many times `Ontology::load` ran on this thread, so a test can see a reload.
+    pub(crate) static LOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl Ontology {
     pub(crate) fn load(conn: &Connection) -> Result<Ontology, Error> {
+        #[cfg(test)]
+        LOADS.with(|loads| loads.set(loads.get() + 1));
         let mut ontology = Ontology::default();
         let mut statement = conn.prepare_cached("SELECT kind, body FROM _ontology")?;
         let mut rows = statement.query([])?;
@@ -135,13 +145,35 @@ fn retry_lock(attempts: i32) -> bool {
     attempts < 5_000
 }
 
+/// The file's `PRAGMA schema_version`. SQLite raises it only when the schema changes, and every
+/// declaration that is not identical creates a table or adds a column, so an unchanged version
+/// means an unchanged ontology. Read it before loading the ontology it stands for, or inside the
+/// same transaction, so a declaration landing in between costs a reload, never a stale ontology.
+pub(crate) fn schema_version(conn: &Connection) -> Result<i64, Error> {
+    Ok(conn
+        .prepare_cached("PRAGMA schema_version")?
+        .query_row([], |row| row.get(0))?)
+}
+
 /// One graph file.
 #[derive(Debug)]
 pub struct Graph {
     pub(crate) conn: Connection,
+    /// As of the last load by `open` or a `&mut self` method; what `ontology()` returns.
     pub(crate) ontology: Ontology,
+    /// What reads use: the ontology and the `PRAGMA schema_version` it was loaded at.
+    /// `Graph` is already `!Sync` through `Connection`, so a `RefCell` costs nothing; `Arc`
+    /// (not `Rc`) keeps `Graph` `Send`, as it is today.
+    pub(crate) fresh: RefCell<Fresh>,
     /// Other graph files this graph's references can name, by the name each was mounted under.
     pub(crate) mounts: BTreeMap<String, Graph>,
+}
+
+/// An ontology and the schema version of the file it was loaded at.
+#[derive(Debug)]
+pub(crate) struct Fresh {
+    pub(crate) schema_version: i64,
+    pub(crate) ontology: Arc<Ontology>,
 }
 
 /// Opens the graph the file at `path` holds, with the ontology its own stream declared. A path
@@ -157,24 +189,116 @@ pub fn open(path: impl AsRef<Path>) -> Result<Graph, Error> {
     )?;
     conn.set_prepared_statement_cache_capacity(256);
     conn.execute_batch(OWN_TABLES)?;
+    let schema_version = schema_version(&conn)?;
     let ontology = Ontology::load(&conn)?;
+    let fresh = RefCell::new(Fresh {
+        schema_version,
+        ontology: Arc::new(ontology.clone()),
+    });
     Ok(Graph {
         conn,
         ontology,
+        fresh,
         mounts: BTreeMap::new(),
     })
 }
 
 impl Graph {
-    /// The graph's ontology: every class and relation declared on its stream.
+    /// The graph's ontology as of this handle's last load, by `open` or by one of its own
+    /// declarations or writes: every class and relation declared on its stream by then. A
+    /// declaration another handle made since is not in it; reads see it all the same.
     #[must_use]
     pub fn ontology(&self) -> &Ontology {
         &self.ontology
+    }
+
+    /// The ontology the file holds now. Another handle may have declared since this one last
+    /// loaded, and a read must answer from the file's own stream; checking the schema version
+    /// first keeps a plain data write elsewhere from costing a reload.
+    pub(crate) fn current_ontology(&self) -> Result<Arc<Ontology>, Error> {
+        let version = schema_version(&self.conn)?;
+        {
+            let fresh = self.fresh.borrow();
+            if fresh.schema_version == version {
+                return Ok(Arc::clone(&fresh.ontology));
+            }
+        }
+        let ontology = Arc::new(Ontology::load(&self.conn)?);
+        *self.fresh.borrow_mut() = Fresh {
+            schema_version: version,
+            ontology: Arc::clone(&ontology),
+        };
+        Ok(ontology)
     }
 
     /// The graph's event log.
     #[must_use]
     pub fn events(&self) -> Events<'_> {
         Events { conn: &self.conn }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LOADS;
+    use crate::{Class, Date, Declaration, Unit, ValidTime, Write, open};
+
+    fn loads() -> usize {
+        LOADS.with(std::cell::Cell::get)
+    }
+
+    fn temp(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("rannoch-{name}-{}.db", uuid::Uuid::now_v7()))
+    }
+
+    fn unit(class: &str, key: &str) -> Unit {
+        Unit::new(
+            class,
+            key,
+            [] as [(&str, &str); 0],
+            ValidTime::On(Date::day(2026, 1, 1)),
+        )
+    }
+
+    #[test]
+    fn a_graph_is_still_send() {
+        fn send<T: Send>() {}
+        send::<crate::Graph>();
+    }
+
+    #[test]
+    fn a_data_write_elsewhere_costs_a_read_no_reload() -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp("no-reload");
+        let mut a = open(&path)?;
+        a.declare(&Declaration::Class(Class::new("crate", [] as [&str; 0])))?;
+        let b = open(&path)?;
+        a.write(&Write::new("a").unit(unit("crate", "k")))?;
+
+        let before = loads();
+        let found = b.find("crate", "k")?;
+        assert_eq!(
+            loads(),
+            before,
+            "a plain data write must not reload the ontology"
+        );
+        assert!(found.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn a_declaration_elsewhere_reloads_once_on_the_first_read()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp("reload-once");
+        let mut a = open(&path)?;
+        let b = open(&path)?;
+        a.declare(&Declaration::Class(Class::new("late", [] as [&str; 0])))?;
+        a.write(&Write::new("a").unit(unit("late", "k")))?;
+
+        let before = loads();
+        assert!(b.find("late", "k")?.is_some());
+        assert_eq!(loads(), before + 1, "the first read reloads once");
+        assert!(b.find("late", "k")?.is_some());
+        assert_eq!(loads(), before + 1, "the second read does not reload");
+        Ok(())
     }
 }

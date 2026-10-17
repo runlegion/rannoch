@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -10,8 +11,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::events::{Change, Event, Fact, LinkFact, NodeFact, WrongKind, append};
 use crate::open::{
-    CLASS, Class, Graph, Ontology, RELATION, Relation, class_table, concat, property_column,
-    relation_index, relation_table,
+    CLASS, Class, Fresh, Graph, Ontology, RELATION, Relation, class_table, concat, property_column,
+    relation_index, relation_table, schema_version,
 };
 use crate::read::NodeRef;
 
@@ -698,12 +699,23 @@ impl Graph {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let ontology = Ontology::load(&tx)?;
         if !build(&tx, &ontology, declaration)? {
+            let version = schema_version(&tx)?;
+            drop(tx);
+            *self.fresh.get_mut() = Fresh {
+                schema_version: version,
+                ontology: Arc::new(ontology.clone()),
+            };
             self.ontology = ontology;
             return Ok(None);
         }
         let event = append(&tx, Change::Declared(declaration.clone()))?;
         self.ontology = Ontology::load(&tx)?;
+        let version = schema_version(&tx)?;
         tx.commit()?;
+        *self.fresh.get_mut() = Fresh {
+            schema_version: version,
+            ontology: Arc::new(self.ontology.clone()),
+        };
         Ok(Some(event))
     }
 
@@ -718,6 +730,7 @@ impl Graph {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let version = schema_version(&tx)?;
         let ontology = Ontology::load(&tx)?;
         let class = ontology.class(class)?.name.clone();
         record_fate(&tx, &class, old, new)?;
@@ -731,6 +744,10 @@ impl Graph {
         )?;
         self.ontology = ontology;
         tx.commit()?;
+        *self.fresh.get_mut() = Fresh {
+            schema_version: version,
+            ontology: Arc::new(self.ontology.clone()),
+        };
         Ok(event)
     }
 
@@ -748,8 +765,16 @@ impl Graph {
     /// their events.
     pub fn write(&mut self, write: &Write) -> Result<Vec<Event>, WriteError> {
         let mut events = Vec::new();
-        match Ontology::load(&self.conn) {
-            Ok(ontology) => self.ontology = ontology,
+        // The version is read before the load: a declaration landing between them leaves the
+        // cached version behind the ontology, which costs the next read a reload and nothing more.
+        match schema_version(&self.conn).and_then(|v| Ok((v, Ontology::load(&self.conn)?))) {
+            Ok((version, ontology)) => {
+                *self.fresh.get_mut() = Fresh {
+                    schema_version: version,
+                    ontology: Arc::new(ontology.clone()),
+                };
+                self.ontology = ontology;
+            }
             Err(cause) => return Err(WriteError { events, cause }),
         }
         if let Err(cause) = check(&self.conn, &self.ontology, write) {
