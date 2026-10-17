@@ -231,6 +231,16 @@ impl Graph {
         Ok(ontology)
     }
 
+    /// Takes `ontology`, loaded at `schema_version`, as both what `ontology()` returns and what
+    /// reads use.
+    pub(crate) fn loaded(&mut self, schema_version: i64, ontology: Ontology) {
+        *self.fresh.get_mut() = Fresh {
+            schema_version,
+            ontology: Arc::new(ontology.clone()),
+        };
+        self.ontology = ontology;
+    }
+
     /// The graph's event log.
     #[must_use]
     pub fn events(&self) -> Events<'_> {

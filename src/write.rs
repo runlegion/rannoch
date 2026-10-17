@@ -3,7 +3,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -11,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::events::{Change, Event, Fact, LinkFact, NodeFact, WrongKind, append};
 use crate::open::{
-    CLASS, Class, Fresh, Graph, Ontology, RELATION, Relation, class_table, concat, property_column,
+    CLASS, Class, Graph, Ontology, RELATION, Relation, class_table, concat, property_column,
     relation_index, relation_table, schema_version,
 };
 use crate::read::NodeRef;
@@ -701,21 +700,14 @@ impl Graph {
         if !build(&tx, &ontology, declaration)? {
             let version = schema_version(&tx)?;
             drop(tx);
-            *self.fresh.get_mut() = Fresh {
-                schema_version: version,
-                ontology: Arc::new(ontology.clone()),
-            };
-            self.ontology = ontology;
+            self.loaded(version, ontology);
             return Ok(None);
         }
         let event = append(&tx, Change::Declared(declaration.clone()))?;
-        self.ontology = Ontology::load(&tx)?;
+        let ontology = Ontology::load(&tx)?;
         let version = schema_version(&tx)?;
         tx.commit()?;
-        *self.fresh.get_mut() = Fresh {
-            schema_version: version,
-            ontology: Arc::new(self.ontology.clone()),
-        };
+        self.loaded(version, ontology);
         Ok(Some(event))
     }
 
@@ -742,12 +734,8 @@ impl Graph {
                 new: new.to_string(),
             },
         )?;
-        self.ontology = ontology;
         tx.commit()?;
-        *self.fresh.get_mut() = Fresh {
-            schema_version: version,
-            ontology: Arc::new(self.ontology.clone()),
-        };
+        self.loaded(version, ontology);
         Ok(event)
     }
 
@@ -768,13 +756,7 @@ impl Graph {
         // The version is read before the load: a declaration landing between them leaves the
         // cached version behind the ontology, which costs the next read a reload and nothing more.
         match schema_version(&self.conn).and_then(|v| Ok((v, Ontology::load(&self.conn)?))) {
-            Ok((version, ontology)) => {
-                *self.fresh.get_mut() = Fresh {
-                    schema_version: version,
-                    ontology: Arc::new(ontology.clone()),
-                };
-                self.ontology = ontology;
-            }
+            Ok((version, ontology)) => self.loaded(version, ontology),
             Err(cause) => return Err(WriteError { events, cause }),
         }
         if let Err(cause) = check(&self.conn, &self.ontology, write) {
