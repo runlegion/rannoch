@@ -85,6 +85,16 @@ pub struct PartOf {
     pub via: String,
 }
 
+/// What a walk reached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Walk {
+    /// The nodes reached, nearest first, at most `cap`; the root is not among them.
+    pub nodes: Vec<(NodeRef, ValidTime)>,
+    /// True when at least one more node within `hops` (and valid as of the date, for
+    /// `walk_as_of`) would have been returned under a larger cap.
+    pub capped: bool,
+}
+
 fn recorded(millis: i64) -> SystemTime {
     UNIX_EPOCH + Duration::from_millis(u64::try_from(millis).unwrap_or(0))
 }
@@ -366,7 +376,9 @@ impl Graph {
     /// Walks from `root` along the relations in `via` (each read backwards when written
     /// `name<-`), for up to `hops` hops, and returns at most `cap` nodes, nearest first, each
     /// with its valid time: a node whose valid time is stated unknown is returned marked
-    /// [`ValidTime::Unknown`]. The root itself is not among them.
+    /// [`ValidTime::Unknown`]. The root itself is not among them. The walk says whether it
+    /// stopped at its cap: [`Walk::capped`] is true when a larger cap would have returned
+    /// more, so a caller never has to ask for `cap + 1` to tell.
     ///
     /// # Errors
     /// [`Error::NotFound`] when the root is not in the graph; the root's class or a relation in
@@ -377,7 +389,7 @@ impl Graph {
         via: &[&str],
         hops: usize,
         cap: usize,
-    ) -> Result<Vec<(NodeRef, ValidTime)>, Error> {
+    ) -> Result<Walk, Error> {
         self.walk_in(root, via, hops, cap, None)
     }
 
@@ -394,7 +406,7 @@ impl Graph {
         hops: usize,
         cap: usize,
         as_of: &Date,
-    ) -> Result<Vec<(NodeRef, ValidTime)>, Error> {
+    ) -> Result<Walk, Error> {
         self.walk_in(root, via, hops, cap, Some(as_of))
     }
 
@@ -405,7 +417,7 @@ impl Graph {
         hops: usize,
         cap: usize,
         as_of: Option<&Date>,
-    ) -> Result<Vec<(NodeRef, ValidTime)>, Error> {
+    ) -> Result<Walk, Error> {
         self.ontology.class(&root.class)?;
         let steps = via
             .iter()
@@ -428,12 +440,15 @@ impl Graph {
             as_of.is_none_or(|date| valid.is_some_and(|v| v.as_str() <= date.as_str()))
         };
         if !valid_by(root_valid) {
-            return Ok(Vec::new());
+            return Ok(Walk {
+                nodes: Vec::new(),
+                capped: false,
+            });
         }
         let mut seen: HashSet<(&str, i64)> = HashSet::from([(root.class.as_str(), root_id)]);
         let mut frontier: Vec<(&str, i64)> = vec![(root.class.as_str(), root_id)];
         let mut found: Vec<(NodeRef, ValidTime)> = Vec::new();
-        let hops = if cap == 0 { 0 } else { hops };
+        let mut capped = false;
         'hops: for _ in 0..hops {
             if frontier.is_empty() {
                 break;
@@ -463,21 +478,27 @@ impl Graph {
                         }
                         let node: (&str, i64) = (there.as_str(), row.get(0)?);
                         if seen.insert(node) {
+                            // Past the cap, one more node is all it takes to know the walk
+                            // stopped short.
+                            if found.len() >= cap {
+                                capped = true;
+                                break 'hops;
+                            }
                             found.push((
                                 NodeRef::new(there, row.get::<_, String>(1)?),
                                 ValidTime::from_sql(node_valid),
                             ));
                             next.push(node);
-                            if found.len() >= cap {
-                                break 'hops;
-                            }
                         }
                     }
                 }
             }
             frontier = next;
         }
-        Ok(found)
+        Ok(Walk {
+            nodes: found,
+            capped,
+        })
     }
 
     /// Counts exactly, in one pass, from every root: the distinct nodes the path ends on, the
@@ -691,7 +712,94 @@ mod tests {
             usize::MAX,
             10,
         )?;
-        assert_eq!(dependents.len(), 1);
+        assert_eq!(dependents.nodes.len(), 1);
+        assert!(!dependents.capped);
+        Ok(())
+    }
+
+    /// A graph of crates where `root` has one `depends_on` link to each of `neighbours`, each
+    /// link and neighbour valid on its own date.
+    fn star(neighbours: &[(&str, Date)]) -> Result<crate::Graph, Box<dyn std::error::Error>> {
+        let path = std::env::temp_dir().join(format!("rannoch-cap-{}.db", uuid::Uuid::now_v7()));
+        let mut g = open(path)?;
+        g.declare(&Declaration::Class(Class::new("crate", ["name"])))?;
+        g.declare(&Declaration::Relation(Relation::new(
+            "depends_on",
+            "crate",
+            "crate",
+            false,
+        )))?;
+        let root_when = ValidTime::On(Date::day(2026, 1, 1));
+        let mut root = Unit::new("crate", "root", [("name", "root")], root_when);
+        let mut write = Write::new("registry");
+        for (key, date) in neighbours {
+            let when = ValidTime::On(date.clone());
+            root = root.link("depends_on", "root", *key, when.clone());
+            write = write.unit(Unit::new("crate", *key, [("name", *key)], when));
+        }
+        g.write(&write.unit(root))?;
+        Ok(g)
+    }
+
+    fn early() -> Date {
+        Date::day(2026, 1, 1)
+    }
+
+    #[test]
+    fn a_walk_that_reaches_exactly_its_cap_is_not_capped() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let g = star(&[("a", early()), ("b", early()), ("c", early())])?;
+        let walk = g.walk(&NodeRef::new("crate", "root"), &["depends_on"], 1, 3)?;
+        assert_eq!(walk.nodes.len(), 3);
+        assert!(!walk.capped);
+        Ok(())
+    }
+
+    #[test]
+    fn a_walk_with_one_more_node_than_its_cap_is_capped() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let g = star(&[
+            ("a", early()),
+            ("b", early()),
+            ("c", early()),
+            ("d", early()),
+        ])?;
+        let walk = g.walk(&NodeRef::new("crate", "root"), &["depends_on"], 1, 3)?;
+        assert_eq!(walk.nodes.len(), 3);
+        assert!(walk.capped);
+        Ok(())
+    }
+
+    #[test]
+    fn a_walk_capped_at_zero_says_whether_anything_was_reachable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = NodeRef::new("crate", "root");
+        let one = star(&[("a", early())])?.walk(&root, &["depends_on"], 1, 0)?;
+        assert!(one.nodes.is_empty());
+        assert!(one.capped);
+        let no_hops = star(&[("a", early())])?.walk(&root, &["depends_on"], 0, 0)?;
+        assert!(no_hops.nodes.is_empty());
+        assert!(!no_hops.capped);
+        let none = star(&[])?.walk(&root, &["depends_on"], 1, 0)?;
+        assert!(none.nodes.is_empty());
+        assert!(!none.capped);
+        Ok(())
+    }
+
+    #[test]
+    fn a_walk_as_of_does_not_count_a_node_valid_after_the_date_toward_its_cap()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let late = Date::day(2026, 6, 1);
+        let g = star(&[("a", early()), ("b", early()), ("c", early()), ("d", late)])?;
+        let walk = g.walk_as_of(
+            &NodeRef::new("crate", "root"),
+            &["depends_on"],
+            1,
+            3,
+            &Date::day(2026, 3, 1),
+        )?;
+        assert_eq!(walk.nodes.len(), 3);
+        assert!(!walk.capped);
         Ok(())
     }
 }
