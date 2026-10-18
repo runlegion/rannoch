@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::events::{Change, Event, Fact, LinkFact, NodeFact, WrongKind, append};
 use crate::open::{
     CLASS, Class, Graph, Ontology, RELATION, Relation, class_table, concat, property_column,
-    relation_index, relation_table,
+    relation_index, relation_table, schema_version,
 };
 use crate::read::NodeRef;
 
@@ -68,6 +68,56 @@ impl Date {
 
     pub(crate) fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Year, month and day; a month date's day is 1. Err when the month is outside 1..=12 or
+    /// the day is outside the month (leap years counted).
+    ///
+    /// The constructors stay infallible and a stored date is kept as written, so the range is
+    /// checked where a write or an as-of read takes a date, and as-of reads compare by value
+    /// through here rather than as text.
+    pub(crate) fn parts(&self) -> Result<(u16, u8, u8), Error> {
+        let refused =
+            |why: String| Error::Refused(format!("valid time {self} is not a date: {why}"));
+        let fields: Vec<&str> = self.0.split('-').collect();
+        let (year, month, day) = match fields.as_slice() {
+            [year, month] => (*year, *month, None),
+            [year, month, day] => (*year, *month, Some(*day)),
+            _ => {
+                return Err(refused(
+                    "it is not year-month or year-month-day".to_string(),
+                ));
+            }
+        };
+        let number = |field: &str, part: &str| -> Result<u16, Error> {
+            if field.is_empty() || !field.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(refused(format!("{part} {field} is not a number")));
+            }
+            field
+                .parse()
+                .map_err(|_| refused(format!("{part} {field} is out of range")))
+        };
+        let year = number(year, "year")?;
+        let month = u8::try_from(number(month, "month")?)
+            .ok()
+            .filter(|m| (1..=12).contains(m))
+            .ok_or_else(|| refused(format!("month {month} is out of range")))?;
+        let Some(day) = day else {
+            return Ok((year, month, 1));
+        };
+        let leap =
+            (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400);
+        let last = match month {
+            2 if leap => 29,
+            2 => 28,
+            4 | 6 | 9 | 11 => 30,
+            _ => 31,
+        };
+        let day = u8::try_from(number(day, "day")?)
+            .ok()
+            .filter(|d| (1..=last).contains(d))
+            .ok_or_else(|| refused(format!("day {day} is out of range")))?;
+        Ok((year, month, day))
     }
 }
 
@@ -329,10 +379,20 @@ pub(crate) fn node_id(tx: &Connection, class: &str, key: &str) -> Result<Option<
         .optional()?)
 }
 
-/// Checks a whole write before any piece commits: refuses it when one of its links has a source
-/// that is not of its relation's declared source class. A target is named by kind and key, so a
+/// Checks a whole write before any piece commits: refuses it when a unit's or a link's valid
+/// time is not a real date, or when one of its links has a source that is not of its relation's
+/// declared source class. A target is named by kind and key, so a
 /// target key not yet a node of the declared target class leaves the link open.
 fn check(conn: &Connection, ontology: &Ontology, write: &Write) -> Result<(), Error> {
+    let valid_times = write
+        .units
+        .iter()
+        .flat_map(|u| std::iter::once(&u.node.valid).chain(u.links.iter().map(|l| &l.valid)));
+    for valid in valid_times {
+        if let ValidTime::On(date) = valid {
+            date.parts()?;
+        }
+    }
     let brought: BTreeSet<(&str, &str)> = write
         .units
         .iter()
@@ -698,12 +758,16 @@ impl Graph {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let ontology = Ontology::load(&tx)?;
         if !build(&tx, &ontology, declaration)? {
-            self.ontology = ontology;
+            let version = schema_version(&tx)?;
+            drop(tx);
+            self.loaded(version, ontology);
             return Ok(None);
         }
         let event = append(&tx, Change::Declared(declaration.clone()))?;
-        self.ontology = Ontology::load(&tx)?;
+        let ontology = Ontology::load(&tx)?;
+        let version = schema_version(&tx)?;
         tx.commit()?;
+        self.loaded(version, ontology);
         Ok(Some(event))
     }
 
@@ -713,13 +777,30 @@ impl Graph {
     /// together or not at all.
     ///
     /// # Errors
-    /// `class` is not declared; the graph file cannot be written.
+    /// `class` is not declared; [`Error::Refused`] when `old` and `new` are the same key;
+    /// [`Error::NotFound`] when no node of `class` has key `old`, or key `new`; the graph file
+    /// cannot be written.
     pub fn replace(&mut self, class: &str, old: &str, new: &str) -> Result<Event, Error> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let version = schema_version(&tx)?;
         let ontology = Ontology::load(&tx)?;
         let class = ontology.class(class)?.name.clone();
+        if old == new {
+            return Err(Error::Refused(format!(
+                "replacing {class} {old} by itself is not a replacement; \
+                 a new version under the same key is a write"
+            )));
+        }
+        for key in [old, new] {
+            if node_id(&tx, &class, key)?.is_none() {
+                return Err(Error::NotFound {
+                    class,
+                    key: key.to_string(),
+                });
+            }
+        }
         record_fate(&tx, &class, old, new)?;
         let event = append(
             &tx,
@@ -729,8 +810,8 @@ impl Graph {
                 new: new.to_string(),
             },
         )?;
-        self.ontology = ontology;
         tx.commit()?;
+        self.loaded(version, ontology);
         Ok(event)
     }
 
@@ -741,15 +822,18 @@ impl Graph {
     /// `Wrote` event, apart from what the piece added.
     ///
     /// # Errors
-    /// [`WriteError`] holding [`Error::Refused`] and no events when a link's source is not of its
-    /// relation's declared source class: the write is checked before any piece commits, so it
-    /// lands nothing.
+    /// [`WriteError`] holding [`Error::Refused`] and no events when a unit's or a link's valid
+    /// time is not a real date (a month outside 1 to 12, or a day past its month's end), or a
+    /// link's source is not of its relation's declared source class: the write is checked before
+    /// any piece commits, so it lands nothing.
     /// [`WriteError`] when a piece fails: the pieces before it are kept, and the error holds
     /// their events.
     pub fn write(&mut self, write: &Write) -> Result<Vec<Event>, WriteError> {
         let mut events = Vec::new();
-        match Ontology::load(&self.conn) {
-            Ok(ontology) => self.ontology = ontology,
+        // The version is read before the load: a declaration landing between them leaves the
+        // cached version behind the ontology, which costs the next read a reload and nothing more.
+        match schema_version(&self.conn).and_then(|v| Ok((v, Ontology::load(&self.conn)?))) {
+            Ok((version, ontology)) => self.loaded(version, ontology),
             Err(cause) => return Err(WriteError { events, cause }),
         }
         if let Err(cause) = check(&self.conn, &self.ontology, write) {
@@ -803,5 +887,205 @@ impl Graph {
         }
         tx.commit()?;
         Ok(events)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        Change, Class, Cursor, Date, Declaration, Error, Fact, Graph, NodeRef, Relation, Unit,
+        ValidTime, Write, WriteError, open, rebuild,
+    };
+
+    /// A graph with class `item` holding nodes `x` and `y`.
+    fn items() -> Result<Graph, Box<dyn std::error::Error>> {
+        let path =
+            std::env::temp_dir().join(format!("rannoch-replace-{}.db", uuid::Uuid::now_v7()));
+        let mut g = open(path)?;
+        g.declare(&Declaration::Class(Class::new("item", ["name"])))?;
+        let when = ValidTime::On(Date::day(2026, 1, 1));
+        let unit = |key: &str| Unit::new("item", key, [("name", key)], when.clone());
+        g.write(&Write::new("toy").unit(unit("x")).unit(unit("y")))?;
+        Ok(g)
+    }
+
+    fn log_len(g: &Graph) -> Result<usize, Error> {
+        Ok(g.events().since(Cursor::START)?.len())
+    }
+
+    #[test]
+    fn replacing_a_node_by_its_own_key_is_refused() -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = items()?;
+        let before = log_len(&g)?;
+        let refused = g.replace("item", "x", "x");
+        assert!(
+            matches!(&refused, Err(Error::Refused(reason)) if reason
+                == "replacing item x by itself is not a replacement; \
+                    a new version under the same key is a write"),
+            "expected a refusal, got {refused:?}"
+        );
+        assert_eq!(log_len(&g)?, before);
+        assert_eq!(g.describe(&NodeRef::new("item", "x"))?.replaced_by, None);
+        Ok(())
+    }
+
+    #[test]
+    fn replacing_a_key_that_is_not_a_node_is_not_found() -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = items()?;
+        let before = log_len(&g)?;
+        let missing = g.replace("item", "nope1", "x");
+        assert!(
+            matches!(&missing, Err(Error::NotFound { class, key }) if class == "item" && key == "nope1"),
+            "expected not found, got {missing:?}"
+        );
+        assert_eq!(log_len(&g)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn replacing_by_a_key_that_is_not_a_node_is_not_found() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut g = items()?;
+        let before = log_len(&g)?;
+        let missing = g.replace("item", "x", "nope2");
+        assert!(
+            matches!(&missing, Err(Error::NotFound { class, key }) if class == "item" && key == "nope2"),
+            "expected not found, got {missing:?}"
+        );
+        assert_eq!(log_len(&g)?, before);
+        assert_eq!(g.describe(&NodeRef::new("item", "x"))?.replaced_by, None);
+        Ok(())
+    }
+
+    #[test]
+    fn replacing_a_node_by_another_present_node_writes_one_event()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = items()?;
+        let before = log_len(&g)?;
+        let event = g.replace("item", "x", "y")?;
+        assert_eq!(
+            event.change,
+            Change::Replaced {
+                class: "item".into(),
+                old: "x".into(),
+                new: "y".into(),
+            }
+        );
+        assert_eq!(log_len(&g)?, before + 1);
+        assert_eq!(
+            g.describe(&NodeRef::new("item", "x"))?.replaced_by,
+            Some(NodeRef::new("item", "y"))
+        );
+        Ok(())
+    }
+
+    fn graph(name: &str) -> Result<Graph, Error> {
+        let path = std::env::temp_dir().join(format!("rannoch-{name}-{}.db", uuid::Uuid::now_v7()));
+        let mut g = open(path)?;
+        g.declare(&Declaration::Class(Class::new("item", ["name"])))?;
+        g.declare(&Declaration::Relation(Relation::new(
+            "part", "item", "item", false,
+        )))?;
+        Ok(g)
+    }
+
+    fn unit(key: &str, valid: Date) -> Unit {
+        Unit::new("item", key, [("name", key)], ValidTime::On(valid))
+    }
+
+    /// Asserts the write is refused for `reason`, with no events, and the log is unchanged.
+    fn assert_refused(g: &mut Graph, write: &Write, reason: &str) -> Result<(), Error> {
+        let before = g.events().since(Cursor::START)?;
+        let refused = g.write(write);
+        assert!(
+            matches!(&refused, Err(WriteError { events, cause: Error::Refused(why) })
+                if events.is_empty() && why == reason),
+            "expected a refusal for {reason}, got {refused:?}"
+        );
+        assert_eq!(g.events().since(Cursor::START)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn a_write_with_month_13_is_refused_and_lands_nothing() -> Result<(), Error> {
+        let mut g = graph("month13")?;
+        let write = Write::new("src")
+            .unit(unit("a", Date::day(2020, 1, 1)))
+            .unit(unit("b", Date::month(2020, 13)));
+        assert_refused(
+            &mut g,
+            &write,
+            "valid time 2020-13 is not a date: month 13 is out of range",
+        )?;
+        assert_eq!(g.find("item", "a")?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn a_write_with_a_day_past_its_month_is_refused_and_a_leap_day_lands()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = graph("leap")?;
+        let write = Write::new("src").unit(unit("a", Date::day(2021, 2, 29)));
+        assert_refused(
+            &mut g,
+            &write,
+            "valid time 2021-02-29 is not a date: day 29 is out of range",
+        )?;
+        let events = g.write(&Write::new("src").unit(unit("a", Date::day(2020, 2, 29))))?;
+        assert_eq!(events.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_link_with_a_day_past_its_month_is_refused() -> Result<(), Error> {
+        let mut g = graph("link")?;
+        let when = Date::day(2021, 4, 1);
+        let write = Write::new("src")
+            .unit(unit("a", when.clone()))
+            .unit(unit("b", when).link("part", "b", "a", ValidTime::On(Date::day(2021, 4, 31))));
+        assert_refused(
+            &mut g,
+            &write,
+            "valid time 2021-04-31 is not a date: day 31 is out of range",
+        )
+    }
+
+    #[test]
+    fn parts_reads_a_month_as_its_first_day() -> Result<(), Error> {
+        assert_eq!(Date::month(2020, 1).parts()?, (2020, 1, 1));
+        assert_eq!(Date::day(2000, 2, 29).parts()?, (2000, 2, 29));
+        assert!(matches!(
+            Date::day(1900, 2, 29).parts(),
+            Err(Error::Refused(why)) if why == "valid time 1900-02-29 is not a date: day 29 is out of range"
+        ));
+        assert!(matches!(
+            Date::month(2020, 0).parts(),
+            Err(Error::Refused(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn a_stored_out_of_range_date_still_rebuilds() -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = graph("rebuild")?;
+        g.write(&Write::new("src").unit(unit("a", Date::day(2020, 1, 1))))?;
+        let mut events = g.events().since(Cursor::START)?;
+        for event in &mut events {
+            if let Change::Wrote { added, .. } = &mut event.change {
+                for fact in added {
+                    if let Fact::Node(node) = fact {
+                        node.valid = ValidTime::On(Date::month(2020, 13));
+                    }
+                }
+            }
+        }
+        let path =
+            std::env::temp_dir().join(format!("rannoch-rebuilt-{}.db", uuid::Uuid::now_v7()));
+        let rebuilt = rebuild(&events, path)?;
+        assert_eq!(
+            rebuilt.find("item", "a")?.map(|n| n.valid),
+            Some(ValidTime::On(Date::month(2020, 13)))
+        );
+        Ok(())
     }
 }

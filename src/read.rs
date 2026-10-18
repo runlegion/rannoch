@@ -164,6 +164,34 @@ pub struct Tally {
     pub groups: BTreeMap<Option<String>, (u64, u64)>,
 }
 
+/// A date's parts as `YYYY-MM-DD`: the form count's SQL compares valid times in.
+fn day_text((year, month, day): (u16, u8, u8)) -> String {
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+/// Whether `valid` is on or before `as_of`, a month standing for its first day. A stored date
+/// that is not a real date (written before writes checked the range) is compared as count's SQL
+/// compares it, so find, walk and count agree on it.
+fn on_or_before(valid: &Date, as_of: (u16, u8, u8)) -> bool {
+    if let Ok(parts) = valid.parts() {
+        return parts <= as_of;
+    }
+    let text = valid.as_str();
+    let text = if text.len() == 7 {
+        format!("{text}-01")
+    } else {
+        text.to_string()
+    };
+    text <= day_text(as_of)
+}
+
+/// The SQL condition that `column`, a valid time, is on or before the count's `?2`, bound as
+/// `YYYY-MM-DD`: a month (7 characters) compares as its first day. An unknown valid time is
+/// NULL, and the condition on NULL is never true.
+fn valid_by_sql(column: &str) -> String {
+    format!("(CASE WHEN length({column}) = 7 THEN {column} || '-01' ELSE {column} END) <= ?2")
+}
+
 /// A relation named in a path, and whether it is read backwards (`name<-`).
 fn parse<'o>(ontology: &'o Ontology, via: &str) -> Result<(&'o Relation, bool), Error> {
     match via.strip_suffix("<-") {
@@ -211,18 +239,22 @@ impl Graph {
     /// # Errors
     /// The class is not declared, or the graph file cannot be read.
     pub fn find(&self, class: &str, key: &str) -> Result<Option<Node>, Error> {
-        find_in(&self.conn, &self.ontology, class, key)
+        let ontology = self.current_ontology()?;
+        find_in(&self.conn, &ontology, class, key)
     }
 
     /// The node of `class` with natural key `key` as of `as_of`: none when it was not yet
-    /// true then. A node whose valid time is unknown is never returned as of a date.
+    /// true then. A node whose valid time is unknown is never returned as of a date. A month
+    /// stands for its first day.
     ///
     /// # Errors
-    /// The class is not declared, or the graph file cannot be read.
+    /// [`Error::Refused`] when `as_of` is not a real date; the class is not declared, or the
+    /// graph file cannot be read.
     pub fn find_as_of(&self, class: &str, key: &str, as_of: &Date) -> Result<Option<Node>, Error> {
+        let as_of = as_of.parts()?;
         Ok(self
             .find(class, key)?
-            .filter(|node| matches!(&node.valid, ValidTime::On(date) if date <= as_of)))
+            .filter(|node| matches!(&node.valid, ValidTime::On(date) if on_or_before(date, as_of))))
     }
 
     /// The link of `relation` from the node keyed `from` to the node keyed `to`.
@@ -230,7 +262,8 @@ impl Graph {
     /// # Errors
     /// The relation is not declared, or the graph file cannot be read.
     pub fn find_link(&self, relation: &str, from: &str, to: &str) -> Result<Option<Link>, Error> {
-        let relation = self.ontology.relation(relation)?;
+        let ontology = self.current_ontology()?;
+        let relation = ontology.relation(relation)?;
         let sql = format!(
             "SELECT r.source, r.valid, r.recorded FROM {} r \
              JOIN {} f ON f.id = r.src JOIN {} t ON t.id = r.dst \
@@ -262,6 +295,7 @@ impl Graph {
     /// The graph file cannot be read.
     pub fn open_links(&self) -> Result<Vec<OpenLink>, Error> {
         let tx = self.conn.unchecked_transaction()?;
+        let ontology = self.current_ontology()?;
         let rows: Vec<(String, String, String)> = tx
             .prepare_cached(
                 "SELECT rel, from_key, to_key FROM _open ORDER BY rel, from_key, to_key",
@@ -270,7 +304,7 @@ impl Graph {
             .collect::<Result<_, _>>()?;
         let mut open = Vec::with_capacity(rows.len());
         for (relation, from_key, to_key) in rows {
-            let relation = self.ontology.relation(&relation)?;
+            let relation = ontology.relation(&relation)?;
             let from = NodeRef::new(&relation.from, from_key);
             let to = NodeRef::new(&relation.to, to_key);
             let waits_on = if node_id(&tx, &to.class, &to.key)?.is_some() {
@@ -297,11 +331,12 @@ impl Graph {
     /// graph file cannot be read.
     pub fn describe(&self, node: &NodeRef) -> Result<Description, Error> {
         let tx = self.conn.unchecked_transaction()?;
+        let ontology = self.current_ontology()?;
         let not_found = || Error::NotFound {
             class: node.class.clone(),
             key: node.key.clone(),
         };
-        let found = find_in(&tx, &self.ontology, &node.class, &node.key)?.ok_or_else(not_found)?;
+        let found = find_in(&tx, &ontology, &node.class, &node.key)?.ok_or_else(not_found)?;
         let id = node_id(&tx, &node.class, &node.key)?.ok_or_else(not_found)?;
         let links = |relation: &Relation, end: &str| -> Result<u64, Error> {
             let sql = format!(
@@ -314,7 +349,7 @@ impl Graph {
             Ok(u64::try_from(n).unwrap_or(0))
         };
         let (mut relations_out, mut relations_in) = (BTreeMap::new(), BTreeMap::new());
-        for relation in self.ontology.relations.values() {
+        for relation in ontology.relations.values() {
             for (class, end, counts) in [
                 (&relation.from, "src", &mut relations_out),
                 (&relation.to, "dst", &mut relations_in),
@@ -333,7 +368,7 @@ impl Graph {
         while !frontier.is_empty() {
             let mut next = Vec::new();
             for &(class, id) in &frontier {
-                for relation in self.ontology.relations.values() {
+                for relation in ontology.relations.values() {
                     if !relation.containment || relation.from != class {
                         continue;
                     }
@@ -395,10 +430,10 @@ impl Graph {
 
     /// [`Graph::walk`] as of `as_of`: it follows only links and reaches only nodes valid on or
     /// before that date, from a root valid by then. A node or link whose valid time is unknown
-    /// is never followed as of a date.
+    /// is never followed as of a date. A month stands for its first day.
     ///
     /// # Errors
-    /// As [`Graph::walk`].
+    /// [`Error::Refused`] when `as_of` is not a real date; otherwise as [`Graph::walk`].
     pub fn walk_as_of(
         &self,
         root: &NodeRef,
@@ -418,12 +453,14 @@ impl Graph {
         cap: usize,
         as_of: Option<&Date>,
     ) -> Result<Walk, Error> {
-        self.ontology.class(&root.class)?;
+        let tx = self.conn.unchecked_transaction()?;
+        let ontology = self.current_ontology()?;
+        ontology.class(&root.class)?;
+        let as_of: Option<(u16, u8, u8)> = as_of.map(Date::parts).transpose()?;
         let steps = via
             .iter()
-            .map(|v| parse(&self.ontology, v))
+            .map(|v| parse(&ontology, v))
             .collect::<Result<Vec<_>, _>>()?;
-        let tx = self.conn.unchecked_transaction()?;
         let sql = format!(
             "SELECT id, valid FROM {} WHERE key = ?1",
             class_table(&root.class)
@@ -437,7 +474,9 @@ impl Graph {
                 key: root.key.clone(),
             })?;
         let valid_by = |valid: Option<String>| {
-            as_of.is_none_or(|date| valid.is_some_and(|v| v.as_str() <= date.as_str()))
+            as_of.is_none_or(|as_of| {
+                matches!(ValidTime::from_sql(valid), ValidTime::On(date) if on_or_before(&date, as_of))
+            })
         };
         if !valid_by(root_valid) {
             return Ok(Walk {
@@ -505,16 +544,23 @@ impl Graph {
     /// total, and both per group. Returns one tally per root, in the order given.
     ///
     /// # Errors
-    /// [`Error::Refused`] when a class, relation or property is not declared, or a relation on
-    /// the path does not join the class the path has reached; the graph file cannot be read.
+    /// [`Error::Refused`] when `as_of` is not a real date, a class, relation or property is not
+    /// declared, or a relation on the path does not join the class the path has reached; the
+    /// graph file cannot be read.
     pub fn count(&self, count: &Count) -> Result<Vec<Tally>, Error> {
-        let query = count_query(&self.ontology, count)?;
-        let roots = serde_json::to_string(&count.roots)?;
+        let as_of: Option<String> = count
+            .as_of
+            .as_ref()
+            .map(|date| date.parts().map(day_text))
+            .transpose()?;
         let tx = self.conn.unchecked_transaction()?;
+        let ontology = self.current_ontology()?;
+        let query = count_query(&ontology, count)?;
+        let roots = serde_json::to_string(&count.roots)?;
         let mut statement = tx.prepare(&query)?;
-        let mut rows = match &count.as_of {
+        let mut rows = match &as_of {
             None => statement.query(params![roots])?,
-            Some(date) => statement.query(params![roots, date.as_str()])?,
+            Some(date) => statement.query(params![roots, date])?,
         };
         let mut tallies: HashMap<String, Tally> = HashMap::new();
         let mut last: Option<(String, i64)> = None;
@@ -555,11 +601,11 @@ fn count_query(ontology: &Ontology, count: &Count) -> Result<String, Error> {
     let root_class = ontology.class(&count.class)?;
     let mut joins = vec![format!("FROM {} n0", class_table(&root_class.name))];
     let mut conditions = vec!["n0.key IN (SELECT value FROM json_each(?1))".to_string()];
-    // As of a date, every node and link the count reads is valid by then (`?2`); an unknown
-    // valid time is NULL, and NULL <= ?2 is never true.
+    // As of a date, every node and link the count reads is valid by then (`?2`, `YYYY-MM-DD`);
+    // see `valid_by_sql`.
     let as_of = count.as_of.is_some();
     if as_of {
-        conditions.push("n0.valid <= ?2".to_string());
+        conditions.push(valid_by_sql("n0.valid"));
     }
     let mut at: Vec<(&str, String)> = vec![(root_class.name.as_str(), "n0.id".to_string())];
     for (i, step) in count.path.iter().enumerate() {
@@ -588,7 +634,11 @@ fn count_query(ontology: &Ontology, count: &Count) -> Result<String, Error> {
                 "JOIN {} {n} ON {n}.id = {reached}",
                 class_table(there)
             ));
-            conditions.push(format!("{r}.valid <= ?2 AND {n}.valid <= ?2"));
+            conditions.push(format!(
+                "{} AND {}",
+                valid_by_sql(&format!("{r}.valid")),
+                valid_by_sql(&format!("{n}.valid"))
+            ));
         }
         if let Some(filter) = &step.filter {
             conditions.push(filter_condition(
@@ -664,7 +714,7 @@ fn filter_condition(
         if filter.keep { "" } else { "NOT " },
         relation_table(&by.name),
         if as_of {
-            format!(" AND {f}.valid <= ?2")
+            format!(" AND {}", valid_by_sql(&format!("{f}.valid")))
         } else {
             String::new()
         }
@@ -673,7 +723,119 @@ fn filter_condition(
 
 #[cfg(test)]
 mod tests {
-    use crate::{Class, Date, Declaration, Error, NodeRef, Relation, Unit, ValidTime, Write, open};
+    use std::collections::BTreeMap;
+
+    use crate::{
+        Class, Count, Date, Declaration, Error, Fate, Graph, GroupBy, NodeRef, Relation, Step,
+        Unit, ValidTime, Write, open,
+    };
+
+    const NONE: [(&str, &str); 0] = [];
+
+    fn temp(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("rannoch-{name}-{}.db", uuid::Uuid::now_v7()))
+    }
+
+    fn late(key: &str) -> Unit {
+        Unit::new("late", key, NONE, ValidTime::On(Date::day(2026, 1, 1)))
+    }
+
+    #[test]
+    fn a_handle_reads_a_class_declared_after_it_opened() -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp("late");
+        let mut a = open(&path)?;
+        let b = open(&path)?;
+        a.declare(&Declaration::Class(Class::new("late", [] as [&str; 0])))?;
+        a.write(&Write::new("a").unit(late("k")))?;
+
+        let found = b.find("late", "k")?;
+        assert_eq!(found.map(|n| n.key), Some("k".to_string()));
+        let walked = b.walk(&NodeRef::new("late", "k"), &[], 1, 10);
+        assert!(walked.is_ok(), "expected the walk to run, got {walked:?}");
+        assert_eq!(b.describe(&NodeRef::new("late", "k"))?.node.class, "late");
+        Ok(())
+    }
+
+    #[test]
+    fn a_handle_counts_by_a_property_added_after_it_opened()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp("grown");
+        let mut a = open(&path)?;
+        a.declare(&Declaration::Class(Class::new("voice", ["name"])))?;
+        let b = open(&path)?;
+        a.declare(&Declaration::Property {
+            class: "voice".to_string(),
+            property: "region".to_string(),
+        })?;
+        let when = ValidTime::On(Date::day(2026, 1, 1));
+        a.write(&Write::new("a").unit(Unit::new(
+            "voice",
+            "v1",
+            [("name", "Ana"), ("region", "north")],
+            when,
+        )))?;
+
+        let tallies = b.count(&Count {
+            class: "voice".to_string(),
+            roots: vec!["v1".to_string()],
+            path: Vec::new(),
+            group_by: Some(GroupBy {
+                class: "voice".to_string(),
+                property: "region".to_string(),
+            }),
+            as_of: None,
+        })?;
+        assert_eq!(tallies.len(), 1);
+        assert_eq!(
+            tallies[0].groups,
+            BTreeMap::from([(Some("north".to_string()), (1, 1))])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_mount_resolves_a_class_declared_after_it_mounted() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let path = temp("mounted");
+        let mut a = open(&path)?;
+        let mut app = open(temp("app"))?;
+        app.mount("other", &path)?;
+        a.declare(&Declaration::Class(Class::new("late", [] as [&str; 0])))?;
+        a.write(&Write::new("a").unit(late("k")))?;
+
+        assert_eq!(
+            app.resolve("other", &NodeRef::new("late", "k"))?,
+            Fate::Live
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_known_class_still_reads_after_another_handle_writes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp("known");
+        let mut a = open(&path)?;
+        a.declare(&Declaration::Class(Class::new("late", [] as [&str; 0])))?;
+        a.declare(&Declaration::Class(Class::new("other", [] as [&str; 0])))?;
+        a.write(&Write::new("a").unit(late("k")))?;
+        let b = open(&path)?;
+        assert!(b.find("late", "k")?.is_some());
+
+        a.write(&Write::new("a").unit(Unit::new("other", "o", NONE, ValidTime::Unknown)))?;
+        assert_eq!(b.find("late", "k")?.map(|n| n.key), Some("k".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_never_declared_is_still_refused() -> Result<(), Error> {
+        let path = temp("ghost");
+        let refused = open(path)?.find("ghost", "k");
+        assert!(
+            matches!(&refused, Err(Error::Refused(reason)) if reason == "class ghost is not declared"),
+            "expected a refusal, got {refused:?}"
+        );
+        Ok(())
+    }
 
     #[test]
     fn walk_from_an_undeclared_class_is_refused_in_ontology_terms() -> Result<(), Error> {
@@ -800,6 +962,90 @@ mod tests {
         )?;
         assert_eq!(walk.nodes.len(), 3);
         assert!(!walk.capped);
+        Ok(())
+    }
+
+    /// A graph of items, each `part` of another and `flags` another, holding the units given.
+    fn items(units: Vec<Unit>) -> Result<Graph, Box<dyn std::error::Error>> {
+        let path = std::env::temp_dir().join(format!("rannoch-asof-{}.db", uuid::Uuid::now_v7()));
+        let mut g = open(path)?;
+        g.declare(&Declaration::Class(Class::new("item", ["name"])))?;
+        for relation in ["part", "flags"] {
+            g.declare(&Declaration::Relation(Relation::new(
+                relation, "item", "item", false,
+            )))?;
+        }
+        g.write(&units.into_iter().fold(Write::new("src"), Write::unit))?;
+        Ok(g)
+    }
+
+    fn item(key: &str, valid: &Date) -> Unit {
+        Unit::new("item", key, [("name", key)], ValidTime::On(valid.clone()))
+    }
+
+    fn refused(result: &Result<impl std::fmt::Debug, Error>) -> bool {
+        matches!(result, Err(Error::Refused(why))
+            if why == "valid time 2020-13 is not a date: month 13 is out of range")
+    }
+
+    #[test]
+    fn an_as_of_read_given_an_out_of_range_date_is_refused()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let jan = Date::day(2020, 1, 1);
+        let g = items(vec![item("r", &jan)])?;
+        let bad = Date::month(2020, 13);
+        let found = g.find_as_of("item", "r", &bad);
+        assert!(refused(&found), "find_as_of: {found:?}");
+        let walked = g.walk_as_of(&NodeRef::new("item", "r"), &["part<-"], 1, 10, &bad);
+        assert!(refused(&walked), "walk_as_of: {walked:?}");
+        let counted = g.count(&Count {
+            class: "item".to_string(),
+            roots: vec!["r".to_string()],
+            path: vec![Step::new("part<-")],
+            group_by: None,
+            as_of: Some(bad),
+        });
+        assert!(refused(&counted), "count: {counted:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_node_valid_on_the_first_of_a_month_is_read_as_of_that_month()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let first = Date::day(2020, 1, 1);
+        let when = ValidTime::On(first.clone());
+        let g = items(vec![
+            item("r", &first),
+            item("n", &first)
+                .link("part", "n", "r", when.clone())
+                .link("flags", "n", "r", when),
+        ])?;
+        let month = Date::month(2020, 1);
+        assert!(g.find_as_of("item", "n", &month)?.is_some());
+        let walked = g.walk_as_of(&NodeRef::new("item", "r"), &["part<-"], 1, 10, &month)?;
+        assert_eq!(
+            walked.nodes,
+            vec![(NodeRef::new("item", "n"), ValidTime::On(first))]
+        );
+        let tallies = g.count(&Count {
+            class: "item".to_string(),
+            roots: vec!["r".to_string()],
+            path: vec![Step::new("part<-").filter("flags", true)],
+            group_by: None,
+            as_of: Some(month),
+        })?;
+        assert_eq!(tallies[0].distinct, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_month_is_read_as_its_first_day() -> Result<(), Box<dyn std::error::Error>> {
+        let g = items(vec![
+            item("m", &Date::month(2020, 1)),
+            item("d", &Date::day(2020, 1, 15)),
+        ])?;
+        assert!(g.find_as_of("item", "m", &Date::day(2020, 1, 1))?.is_some());
+        assert!(g.find_as_of("item", "d", &Date::month(2020, 1))?.is_none());
         Ok(())
     }
 }

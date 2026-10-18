@@ -1,0 +1,65 @@
+name: Release
+
+# rannoch is a library released as a git tag plus a GitHub release; consumers pin
+# the tag. It is not published to crates.io yet (Cargo.toml: publish = false).
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.98.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Refuse before anything is released: the tag must name the version in
+      # Cargo.toml.
+      - name: Check tag matches package version
+        run: |
+          version="$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "rannoch") | .version')"
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match package version v$version"
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: cargo build --release --all-features
+
+      # The release notes are this version's CHANGELOG section: from its
+      # "## X.Y.Z" heading up to the next "## " heading.
+      - name: Release notes
+        run: |
+          python3 - "$VERSION" <<'EOF' > notes.md
+          import sys
+          version = sys.argv[1]
+          out, on = [], False
+          for line in open("CHANGELOG.md", encoding="utf-8"):
+              if line.startswith("## "):
+                  if on:
+                      break
+                  on = line[3:].split()[0] == version
+                  continue
+              if on:
+                  out.append(line)
+          if not on and not out:
+              sys.exit(f"CHANGELOG.md has no ## {version} section")
+          sys.stdout.write("".join(out).strip() + "\n")
+          EOF
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: rannoch ${{ env.VERSION }}
+          body_path: notes.md

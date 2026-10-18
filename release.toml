@@ -1,0 +1,24 @@
+# release.toml: read by scripts/release.sh and scripts/sync-version.sh
+# (schema per legion's release.toml, #741). Procedure: RELEASING.md.
+
+[version]
+file = "Cargo.toml"
+field = "package.version"
+
+[changelog]
+path = "CHANGELOG.md"
+
+[git]
+branch = "main"
+tag_format = "v{version}"
+tag_message = "rannoch {version}"
+co_authored_by = "Claude Opus 5.5 <noreply@anthropic.com>"
+repo = "rannoch"
+
+[preflight]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo clippy --all-targets --all-features -- -D warnings",
+  "cargo test --all-features",
+  "bash scripts/test-release.sh",
+]
