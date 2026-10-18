@@ -630,7 +630,8 @@ fn peak_in_fresh_process(step: &str, file: &Path, root: &str) -> u64 {
     );
     stdout
         .lines()
-        .find_map(|line| line.trim().strip_prefix(PEAK)?.trim().parse().ok())
+        // Anywhere in the line: single-threaded, libtest prints `test nfr_013_014 ... ` first.
+        .find_map(|line| line.split_once(PEAK)?.1.trim().parse().ok())
         .unwrap_or_else(|| panic!("no {PEAK} line in:\n{stdout}"))
 }
 
