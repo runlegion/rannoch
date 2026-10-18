@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::events::{Change, Event, Fact, LinkFact, NodeFact, WrongKind, append};
 use crate::open::{
     CLASS, Class, Graph, Ontology, RELATION, Relation, class_table, concat, property_column,
-    relation_index, relation_table,
+    relation_index, relation_table, schema_version,
 };
 use crate::read::NodeRef;
 
@@ -758,12 +758,16 @@ impl Graph {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let ontology = Ontology::load(&tx)?;
         if !build(&tx, &ontology, declaration)? {
-            self.ontology = ontology;
+            let version = schema_version(&tx)?;
+            drop(tx);
+            self.loaded(version, ontology);
             return Ok(None);
         }
         let event = append(&tx, Change::Declared(declaration.clone()))?;
-        self.ontology = Ontology::load(&tx)?;
+        let ontology = Ontology::load(&tx)?;
+        let version = schema_version(&tx)?;
         tx.commit()?;
+        self.loaded(version, ontology);
         Ok(Some(event))
     }
 
@@ -780,6 +784,7 @@ impl Graph {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let version = schema_version(&tx)?;
         let ontology = Ontology::load(&tx)?;
         let class = ontology.class(class)?.name.clone();
         if old == new {
@@ -805,8 +810,8 @@ impl Graph {
                 new: new.to_string(),
             },
         )?;
-        self.ontology = ontology;
         tx.commit()?;
+        self.loaded(version, ontology);
         Ok(event)
     }
 
@@ -825,8 +830,10 @@ impl Graph {
     /// their events.
     pub fn write(&mut self, write: &Write) -> Result<Vec<Event>, WriteError> {
         let mut events = Vec::new();
-        match Ontology::load(&self.conn) {
-            Ok(ontology) => self.ontology = ontology,
+        // The version is read before the load: a declaration landing between them leaves the
+        // cached version behind the ontology, which costs the next read a reload and nothing more.
+        match schema_version(&self.conn).and_then(|v| Ok((v, Ontology::load(&self.conn)?))) {
+            Ok((version, ontology)) => self.loaded(version, ontology),
             Err(cause) => return Err(WriteError { events, cause }),
         }
         if let Err(cause) = check(&self.conn, &self.ontology, write) {

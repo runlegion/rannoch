@@ -229,7 +229,8 @@ impl Graph {
     /// # Errors
     /// The class is not declared, or the graph file cannot be read.
     pub fn find(&self, class: &str, key: &str) -> Result<Option<Node>, Error> {
-        find_in(&self.conn, &self.ontology, class, key)
+        let ontology = self.current_ontology()?;
+        find_in(&self.conn, &ontology, class, key)
     }
 
     /// The node of `class` with natural key `key` as of `as_of`: none when it was not yet
@@ -251,7 +252,8 @@ impl Graph {
     /// # Errors
     /// The relation is not declared, or the graph file cannot be read.
     pub fn find_link(&self, relation: &str, from: &str, to: &str) -> Result<Option<Link>, Error> {
-        let relation = self.ontology.relation(relation)?;
+        let ontology = self.current_ontology()?;
+        let relation = ontology.relation(relation)?;
         let sql = format!(
             "SELECT r.source, r.valid, r.recorded FROM {} r \
              JOIN {} f ON f.id = r.src JOIN {} t ON t.id = r.dst \
@@ -283,6 +285,7 @@ impl Graph {
     /// The graph file cannot be read.
     pub fn open_links(&self) -> Result<Vec<OpenLink>, Error> {
         let tx = self.conn.unchecked_transaction()?;
+        let ontology = self.current_ontology()?;
         let rows: Vec<(String, String, String)> = tx
             .prepare_cached(
                 "SELECT rel, from_key, to_key FROM _open ORDER BY rel, from_key, to_key",
@@ -291,7 +294,7 @@ impl Graph {
             .collect::<Result<_, _>>()?;
         let mut open = Vec::with_capacity(rows.len());
         for (relation, from_key, to_key) in rows {
-            let relation = self.ontology.relation(&relation)?;
+            let relation = ontology.relation(&relation)?;
             let from = NodeRef::new(&relation.from, from_key);
             let to = NodeRef::new(&relation.to, to_key);
             let waits_on = if node_id(&tx, &to.class, &to.key)?.is_some() {
@@ -318,11 +321,12 @@ impl Graph {
     /// graph file cannot be read.
     pub fn describe(&self, node: &NodeRef) -> Result<Description, Error> {
         let tx = self.conn.unchecked_transaction()?;
+        let ontology = self.current_ontology()?;
         let not_found = || Error::NotFound {
             class: node.class.clone(),
             key: node.key.clone(),
         };
-        let found = find_in(&tx, &self.ontology, &node.class, &node.key)?.ok_or_else(not_found)?;
+        let found = find_in(&tx, &ontology, &node.class, &node.key)?.ok_or_else(not_found)?;
         let id = node_id(&tx, &node.class, &node.key)?.ok_or_else(not_found)?;
         let links = |relation: &Relation, end: &str| -> Result<u64, Error> {
             let sql = format!(
@@ -335,7 +339,7 @@ impl Graph {
             Ok(u64::try_from(n).unwrap_or(0))
         };
         let (mut relations_out, mut relations_in) = (BTreeMap::new(), BTreeMap::new());
-        for relation in self.ontology.relations.values() {
+        for relation in ontology.relations.values() {
             for (class, end, counts) in [
                 (&relation.from, "src", &mut relations_out),
                 (&relation.to, "dst", &mut relations_in),
@@ -354,7 +358,7 @@ impl Graph {
         while !frontier.is_empty() {
             let mut next = Vec::new();
             for &(class, id) in &frontier {
-                for relation in self.ontology.relations.values() {
+                for relation in ontology.relations.values() {
                     if !relation.containment || relation.from != class {
                         continue;
                     }
@@ -437,13 +441,14 @@ impl Graph {
         cap: usize,
         as_of: Option<&Date>,
     ) -> Result<Vec<(NodeRef, ValidTime)>, Error> {
-        self.ontology.class(&root.class)?;
+        let tx = self.conn.unchecked_transaction()?;
+        let ontology = self.current_ontology()?;
+        ontology.class(&root.class)?;
         let as_of: Option<(u16, u8, u8)> = as_of.map(Date::parts).transpose()?;
         let steps = via
             .iter()
-            .map(|v| parse(&self.ontology, v))
+            .map(|v| parse(&ontology, v))
             .collect::<Result<Vec<_>, _>>()?;
-        let tx = self.conn.unchecked_transaction()?;
         let sql = format!(
             "SELECT id, valid FROM {} WHERE key = ?1",
             class_table(&root.class)
@@ -527,9 +532,10 @@ impl Graph {
             .as_ref()
             .map(|date| date.parts().map(day_text))
             .transpose()?;
-        let query = count_query(&self.ontology, count)?;
-        let roots = serde_json::to_string(&count.roots)?;
         let tx = self.conn.unchecked_transaction()?;
+        let ontology = self.current_ontology()?;
+        let query = count_query(&ontology, count)?;
+        let roots = serde_json::to_string(&count.roots)?;
         let mut statement = tx.prepare(&query)?;
         let mut rows = match &as_of {
             None => statement.query(params![roots])?,
@@ -696,10 +702,160 @@ fn filter_condition(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use crate::{
-        Class, Count, Date, Declaration, Error, Graph, NodeRef, Relation, Step, Unit, ValidTime,
-        Write, open,
+        Class, Count, Date, Declaration, Error, Fate, Graph, GroupBy, NodeRef, Relation, Step,
+        Unit, ValidTime, Write, open,
     };
+
+    const NONE: [(&str, &str); 0] = [];
+
+    fn temp(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("rannoch-{name}-{}.db", uuid::Uuid::now_v7()))
+    }
+
+    fn late(key: &str) -> Unit {
+        Unit::new("late", key, NONE, ValidTime::On(Date::day(2026, 1, 1)))
+    }
+
+    #[test]
+    fn a_handle_reads_a_class_declared_after_it_opened() -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp("late");
+        let mut a = open(&path)?;
+        let b = open(&path)?;
+        a.declare(&Declaration::Class(Class::new("late", [] as [&str; 0])))?;
+        a.write(&Write::new("a").unit(late("k")))?;
+
+        let found = b.find("late", "k")?;
+        assert_eq!(found.map(|n| n.key), Some("k".to_string()));
+        let walked = b.walk(&NodeRef::new("late", "k"), &[], 1, 10);
+        assert!(walked.is_ok(), "expected the walk to run, got {walked:?}");
+        assert_eq!(b.describe(&NodeRef::new("late", "k"))?.node.class, "late");
+        Ok(())
+    }
+
+    #[test]
+    fn a_handle_counts_by_a_property_added_after_it_opened()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp("grown");
+        let mut a = open(&path)?;
+        a.declare(&Declaration::Class(Class::new("voice", ["name"])))?;
+        let b = open(&path)?;
+        a.declare(&Declaration::Property {
+            class: "voice".to_string(),
+            property: "region".to_string(),
+        })?;
+        let when = ValidTime::On(Date::day(2026, 1, 1));
+        a.write(&Write::new("a").unit(Unit::new(
+            "voice",
+            "v1",
+            [("name", "Ana"), ("region", "north")],
+            when,
+        )))?;
+
+        let tallies = b.count(&Count {
+            class: "voice".to_string(),
+            roots: vec!["v1".to_string()],
+            path: Vec::new(),
+            group_by: Some(GroupBy {
+                class: "voice".to_string(),
+                property: "region".to_string(),
+            }),
+            as_of: None,
+        })?;
+        assert_eq!(tallies.len(), 1);
+        assert_eq!(
+            tallies[0].groups,
+            BTreeMap::from([(Some("north".to_string()), (1, 1))])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_mount_resolves_a_class_declared_after_it_mounted() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let path = temp("mounted");
+        let mut a = open(&path)?;
+        let mut app = open(temp("app"))?;
+        app.mount("other", &path)?;
+        a.declare(&Declaration::Class(Class::new("late", [] as [&str; 0])))?;
+        a.write(&Write::new("a").unit(late("k")))?;
+
+        assert_eq!(
+            app.resolve("other", &NodeRef::new("late", "k"))?,
+            Fate::Live
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_known_class_still_reads_after_another_handle_writes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp("known");
+        let mut a = open(&path)?;
+        a.declare(&Declaration::Class(Class::new("late", [] as [&str; 0])))?;
+        a.declare(&Declaration::Class(Class::new("other", [] as [&str; 0])))?;
+        a.write(&Write::new("a").unit(late("k")))?;
+        let b = open(&path)?;
+        assert!(b.find("late", "k")?.is_some());
+
+        a.write(&Write::new("a").unit(Unit::new("other", "o", NONE, ValidTime::Unknown)))?;
+        assert_eq!(b.find("late", "k")?.map(|n| n.key), Some("k".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn a_class_never_declared_is_still_refused() -> Result<(), Error> {
+        let path = temp("ghost");
+        let refused = open(path)?.find("ghost", "k");
+        assert!(
+            matches!(&refused, Err(Error::Refused(reason)) if reason == "class ghost is not declared"),
+            "expected a refusal, got {refused:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn walk_from_an_undeclared_class_is_refused_in_ontology_terms() -> Result<(), Error> {
+        let path = std::env::temp_dir().join(format!("rannoch-walk-{}.db", uuid::Uuid::now_v7()));
+        let refused = open(path)?.walk(&NodeRef::new("ghost", "k"), &[], 1, 10);
+        assert!(
+            matches!(&refused, Err(Error::Refused(reason)) if reason == "class ghost is not declared"),
+            "expected a refusal, got {refused:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_walk_asked_for_every_hop_ends_when_nothing_is_left()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = std::env::temp_dir().join(format!("rannoch-hops-{}.db", uuid::Uuid::now_v7()));
+        let mut g = open(path)?;
+        g.declare(&Declaration::Class(Class::new("crate", ["name"])))?;
+        g.declare(&Declaration::Relation(Relation::new(
+            "depends_on",
+            "crate",
+            "crate",
+            false,
+        )))?;
+        let when = ValidTime::On(Date::day(2026, 1, 1));
+        let unit = |key: &str| Unit::new("crate", key, [("name", key)], when.clone());
+        g.write(&Write::new("registry").unit(unit("a")).unit(unit("b").link(
+            "depends_on",
+            "b",
+            "a",
+            when.clone(),
+        )))?;
+        let dependents = g.walk(
+            &NodeRef::new("crate", "a"),
+            &["depends_on<-"],
+            usize::MAX,
+            10,
+        )?;
+        assert_eq!(dependents.len(), 1);
+        Ok(())
+    }
 
     /// A graph of items, each `part` of another and `flags` another, holding the units given.
     fn items(units: Vec<Unit>) -> Result<Graph, Box<dyn std::error::Error>> {
@@ -782,47 +938,6 @@ mod tests {
         ])?;
         assert!(g.find_as_of("item", "m", &Date::day(2020, 1, 1))?.is_some());
         assert!(g.find_as_of("item", "d", &Date::month(2020, 1))?.is_none());
-        Ok(())
-    }
-
-    #[test]
-    fn walk_from_an_undeclared_class_is_refused_in_ontology_terms() -> Result<(), Error> {
-        let path = std::env::temp_dir().join(format!("rannoch-walk-{}.db", uuid::Uuid::now_v7()));
-        let refused = open(path)?.walk(&NodeRef::new("ghost", "k"), &[], 1, 10);
-        assert!(
-            matches!(&refused, Err(Error::Refused(reason)) if reason == "class ghost is not declared"),
-            "expected a refusal, got {refused:?}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn a_walk_asked_for_every_hop_ends_when_nothing_is_left()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let path = std::env::temp_dir().join(format!("rannoch-hops-{}.db", uuid::Uuid::now_v7()));
-        let mut g = open(path)?;
-        g.declare(&Declaration::Class(Class::new("crate", ["name"])))?;
-        g.declare(&Declaration::Relation(Relation::new(
-            "depends_on",
-            "crate",
-            "crate",
-            false,
-        )))?;
-        let when = ValidTime::On(Date::day(2026, 1, 1));
-        let unit = |key: &str| Unit::new("crate", key, [("name", key)], when.clone());
-        g.write(&Write::new("registry").unit(unit("a")).unit(unit("b").link(
-            "depends_on",
-            "b",
-            "a",
-            when.clone(),
-        )))?;
-        let dependents = g.walk(
-            &NodeRef::new("crate", "a"),
-            &["depends_on<-"],
-            usize::MAX,
-            10,
-        )?;
-        assert_eq!(dependents.len(), 1);
         Ok(())
     }
 }
