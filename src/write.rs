@@ -773,13 +773,29 @@ impl Graph {
     /// together or not at all.
     ///
     /// # Errors
-    /// `class` is not declared; the graph file cannot be written.
+    /// `class` is not declared; [`Error::Refused`] when `old` and `new` are the same key;
+    /// [`Error::NotFound`] when no node of `class` has key `old`, or key `new`; the graph file
+    /// cannot be written.
     pub fn replace(&mut self, class: &str, old: &str, new: &str) -> Result<Event, Error> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let ontology = Ontology::load(&tx)?;
         let class = ontology.class(class)?.name.clone();
+        if old == new {
+            return Err(Error::Refused(format!(
+                "replacing {class} {old} by itself is not a replacement; \
+                 a new version under the same key is a write"
+            )));
+        }
+        for key in [old, new] {
+            if node_id(&tx, &class, key)?.is_none() {
+                return Err(Error::NotFound {
+                    class,
+                    key: key.to_string(),
+                });
+            }
+        }
         record_fate(&tx, &class, old, new)?;
         let event = append(
             &tx,
@@ -870,9 +886,91 @@ impl Graph {
 #[cfg(test)]
 mod tests {
     use crate::{
-        Change, Class, Cursor, Date, Declaration, Error, Fact, Graph, Relation, Unit, ValidTime,
-        Write, WriteError, open, rebuild,
+        Change, Class, Cursor, Date, Declaration, Error, Fact, Graph, NodeRef, Relation, Unit,
+        ValidTime, Write, WriteError, open, rebuild,
     };
+
+    /// A graph with class `item` holding nodes `x` and `y`.
+    fn items() -> Result<Graph, Box<dyn std::error::Error>> {
+        let path =
+            std::env::temp_dir().join(format!("rannoch-replace-{}.db", uuid::Uuid::now_v7()));
+        let mut g = open(path)?;
+        g.declare(&Declaration::Class(Class::new("item", ["name"])))?;
+        let when = ValidTime::On(Date::day(2026, 1, 1));
+        let unit = |key: &str| Unit::new("item", key, [("name", key)], when.clone());
+        g.write(&Write::new("toy").unit(unit("x")).unit(unit("y")))?;
+        Ok(g)
+    }
+
+    fn log_len(g: &Graph) -> Result<usize, Error> {
+        Ok(g.events().since(Cursor::START)?.len())
+    }
+
+    #[test]
+    fn replacing_a_node_by_its_own_key_is_refused() -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = items()?;
+        let before = log_len(&g)?;
+        let refused = g.replace("item", "x", "x");
+        assert!(
+            matches!(&refused, Err(Error::Refused(reason)) if reason
+                == "replacing item x by itself is not a replacement; \
+                    a new version under the same key is a write"),
+            "expected a refusal, got {refused:?}"
+        );
+        assert_eq!(log_len(&g)?, before);
+        assert_eq!(g.describe(&NodeRef::new("item", "x"))?.replaced_by, None);
+        Ok(())
+    }
+
+    #[test]
+    fn replacing_a_key_that_is_not_a_node_is_not_found() -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = items()?;
+        let before = log_len(&g)?;
+        let missing = g.replace("item", "nope1", "x");
+        assert!(
+            matches!(&missing, Err(Error::NotFound { class, key }) if class == "item" && key == "nope1"),
+            "expected not found, got {missing:?}"
+        );
+        assert_eq!(log_len(&g)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn replacing_by_a_key_that_is_not_a_node_is_not_found() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut g = items()?;
+        let before = log_len(&g)?;
+        let missing = g.replace("item", "x", "nope2");
+        assert!(
+            matches!(&missing, Err(Error::NotFound { class, key }) if class == "item" && key == "nope2"),
+            "expected not found, got {missing:?}"
+        );
+        assert_eq!(log_len(&g)?, before);
+        assert_eq!(g.describe(&NodeRef::new("item", "x"))?.replaced_by, None);
+        Ok(())
+    }
+
+    #[test]
+    fn replacing_a_node_by_another_present_node_writes_one_event()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = items()?;
+        let before = log_len(&g)?;
+        let event = g.replace("item", "x", "y")?;
+        assert_eq!(
+            event.change,
+            Change::Replaced {
+                class: "item".into(),
+                old: "x".into(),
+                new: "y".into(),
+            }
+        );
+        assert_eq!(log_len(&g)?, before + 1);
+        assert_eq!(
+            g.describe(&NodeRef::new("item", "x"))?.replaced_by,
+            Some(NodeRef::new("item", "y"))
+        );
+        Ok(())
+    }
 
     fn graph(name: &str) -> Result<Graph, Error> {
         let path = std::env::temp_dir().join(format!("rannoch-{name}-{}.db", uuid::Uuid::now_v7()));

@@ -17,6 +17,7 @@ thiserror = "2"
 uuid = { version = "1", features = ["v7", "serde"] }
 
 [dev-dependencies]
+dirs = "6"
 fastrand = "2"
 rstest = "0.26"
 rstest-bdd = "0.6"
@@ -39,3 +40,9 @@ todo = "warn"
 # SQLite makes those fixtures several times slower.
 [profile.dev.package."*"]
 opt-level = 3
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+nix = { version = "0.30", features = ["resource"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+memory-stats = "1.2"
