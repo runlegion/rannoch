@@ -270,7 +270,8 @@ fn hook_lookup(graph: &Path) -> f64 {
             2,
             200,
         )
-        .unwrap();
+        .unwrap()
+        .nodes;
     assert!(!found.is_empty());
     millis(start)
 }

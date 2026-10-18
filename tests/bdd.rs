@@ -1397,7 +1397,7 @@ fn answers_equal_source(world: &mut World) {
     let mut stored = BTreeSet::new();
     for (statement, _, _) in &stream.arrivals {
         let root = NodeRef::new("statement", statement.clone());
-        for (parent, _) in g.walk(&root, &["answers"], 1, usize::MAX).unwrap() {
+        for (parent, _) in g.walk(&root, &["answers"], 1, usize::MAX).unwrap().nodes {
             stored.insert((statement.clone(), parent.key));
         }
     }
@@ -1453,7 +1453,8 @@ fn no_parent_found(world: &mut World) {
                 1,
                 usize::MAX,
             )
-            .unwrap();
+            .unwrap()
+            .nodes;
         assert!(
             walked.is_empty(),
             "{reply} reached {walked:?}, its parent {parent} never arrived"
@@ -1651,7 +1652,7 @@ fn reader_walks_answers(world: &mut World) {
         for reply in &replies {
             let root = NodeRef::new("statement", reply.clone());
             let parents = match reader.walk(&root, &["answers"], 1, usize::MAX) {
-                Ok(parents) => parents,
+                Ok(walk) => walk.nodes,
                 Err(Error::NotFound { .. }) => continue,
                 Err(other) => panic!("{other}"),
             };
@@ -2234,7 +2235,8 @@ fn t8_finding(world: &mut World) {
             2,
             usize::MAX,
         )
-        .unwrap();
+        .unwrap()
+        .nodes;
     assert!(all.len() > 200);
 }
 
@@ -2248,7 +2250,8 @@ fn walks_capped(world: &mut World) {
             2,
             200,
         )
-        .unwrap();
+        .unwrap()
+        .nodes;
 }
 
 #[then("the walk returns 200 nodes")]
@@ -2289,7 +2292,8 @@ fn walks_answers_back(world: &mut World) {
     world.walked = world
         .g()
         .walk(&NodeRef::new("statement", "s1"), &["answers<-"], 1, 200)
-        .unwrap();
+        .unwrap()
+        .nodes;
 }
 
 #[then("the walk returns s2")]
@@ -2789,7 +2793,8 @@ fn runs_every_read_and_a_refused_write(world: &mut World) {
     texts.extend(found.properties.into_iter().flat_map(|(k, v)| [k, v]));
     let walked = g
         .walk(&NodeRef::new("statement", "s1"), &["inside", "at"], 2, 200)
-        .unwrap();
+        .unwrap()
+        .nodes;
     assert_eq!(walked.len(), 2, "{walked:?}");
     texts.extend(walked.iter().flat_map(|(node, _)| node_ref_texts(node)));
     let tallies = g
@@ -3075,6 +3080,7 @@ fn supporting(world: &mut World, as_of: Option<&Date>) -> Vec<(NodeRef, ValidTim
         Some(as_of) => g.walk_as_of(&f1, &["supports<-"], 1, 1000, as_of),
     }
     .unwrap()
+    .nodes
 }
 
 fn keys(nodes: &[(NodeRef, ValidTime)]) -> BTreeSet<String> {
@@ -3184,7 +3190,7 @@ fn same_answers(world: &mut World) {
         let mut links = HashSet::new();
         for (statement, _, _) in &stream.arrivals {
             let root = NodeRef::new("statement", statement.clone());
-            for (parent, _) in g.walk(&root, &["answers"], 1, usize::MAX).unwrap() {
+            for (parent, _) in g.walk(&root, &["answers"], 1, usize::MAX).unwrap().nodes {
                 let link = g
                     .find_link("answers", statement, &parent.key)
                     .unwrap()
