@@ -2,8 +2,8 @@
 //! and reported against its NFR's target: the measured value, the target, and whether the value
 //! meets the bound. Each test fails when a value misses its bound.
 //!
-//! They are not part of the library and do not run in CI: they need legion's store, macOS's
-//! `/usr/bin/time -l` and a machine running nothing else. Run them at verify time with
+//! They are not part of the library and do not run in CI: they need legion's store and a machine
+//! running nothing else. They run on Linux, macOS and Windows. Run them at verify time with
 //!
 //! ```text
 //! cargo test --release --test measure -- --ignored --nocapture --test-threads=1
@@ -122,12 +122,15 @@ impl Burst {
 
 // ---------- NFR-RANNOCH-011 and 012: legion's store ----------
 
-/// legion's store, where legion keeps it: `LEGION_DATA_DIR`, else legion's data directory.
+/// legion's store, where legion keeps it: `LEGION_DATA_DIR`, else `legion` in the platform's data
+/// directory (`~/Library/Application Support` on macOS, `$XDG_DATA_HOME` or `~/.local/share` on
+/// Linux, `%APPDATA%` on Windows).
 fn legion_store() -> PathBuf {
     let dir = std::env::var_os("LEGION_DATA_DIR").map_or_else(
         || {
-            let home = std::env::var_os("HOME").expect("HOME is set");
-            Path::new(&home).join("Library/Application Support/legion")
+            dirs::data_dir()
+                .expect("the platform has a data directory")
+                .join("legion")
         },
         PathBuf::from,
     );
@@ -525,41 +528,79 @@ const STEP: &str = "RANNOCH_MEASURE_STEP";
 const FILE: &str = "RANNOCH_MEASURE_FILE";
 const ROOT: &str = "RANNOCH_MEASURE_ROOT";
 
-/// Runs one step of this test in a fresh process under `/usr/bin/time -l`, and returns its
-/// peak resident set in bytes.
+/// The line a step prints its own peak on, for the parent to read.
+const PEAK: &str = "peak resident set bytes:";
+
+/// This process's peak resident set in bytes: `VmHWM`, in kilobytes. Not `ru_maxrss`, which
+/// Linux carries over from the parent at `exec`, so a step would report the parent's peak.
+#[cfg(target_os = "linux")]
+fn peak_resident_set() -> u64 {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap();
+    let kilobytes: u64 = status
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("VmHWM:")?
+                .trim()
+                .strip_suffix("kB")?
+                .trim()
+                .parse()
+                .ok()
+        })
+        .unwrap_or_else(|| panic!("no VmHWM in:\n{status}"));
+    kilobytes * 1024
+}
+
+/// This process's peak resident set in bytes: `ru_maxrss`, which macOS reports in bytes.
+#[cfg(target_os = "macos")]
+fn peak_resident_set() -> u64 {
+    use nix::sys::resource::{UsageWho, getrusage};
+    u64::try_from(getrusage(UsageWho::RUSAGE_SELF).unwrap().max_rss()).unwrap()
+}
+
+/// This process's peak working set in bytes, Windows' resident set, read while the process is
+/// still alive: the kernel keeps it per process, and reading it needs no unsafe code this way.
+#[cfg(windows)]
+fn peak_resident_set() -> u64 {
+    let query = format!("(Get-Process -Id {}).PeakWorkingSet64", std::process::id());
+    let out = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &query])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    stdout
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("no peak working set in:\n{stdout}"))
+}
+
+/// Runs one step of this test in a fresh process, and returns the peak resident set in bytes
+/// that the step reports for itself.
 fn peak_in_fresh_process(step: &str, file: &Path, root: &str) -> u64 {
-    let out = Command::new("/usr/bin/time")
-        .arg("-l")
-        .arg(std::env::current_exe().unwrap())
+    let out = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "nfr_013_014", "--ignored", "--nocapture"])
         .env(STEP, step)
         .env(FILE, file)
         .env(ROOT, root)
         .output()
         .unwrap();
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         out.status.success(),
-        "step {step} failed:\n{}\n{stderr}",
-        String::from_utf8_lossy(&out.stdout)
+        "step {step} failed:\n{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
     );
-    let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("1 passed"),
         "step {step} ran no test:\n{stdout}"
     );
-    stderr
+    stdout
         .lines()
-        .find_map(|line| {
-            line.trim()
-                .strip_suffix("maximum resident set size")
-                .and_then(|n| n.trim().parse().ok())
-        })
-        .unwrap_or_else(|| panic!("no maximum resident set size in:\n{stderr}"))
+        .find_map(|line| line.trim().strip_prefix(PEAK)?.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no {PEAK} line in:\n{stdout}"))
 }
 
 #[test]
-#[ignore = "a measurement: run at verify time on macOS (see the module docs)"]
+#[ignore = "a measurement: run at verify time on a machine running nothing else (see the module docs)"]
 fn nfr_013_014() {
     if let Ok(step) = std::env::var(STEP) {
         let file = PathBuf::from(std::env::var(FILE).unwrap());
@@ -576,6 +617,7 @@ fn nfr_013_014() {
             }
             other => panic!("no step {other}"),
         }
+        println!("{PEAK} {}", peak_resident_set());
         return;
     }
     let dir = TempDir::new().unwrap();
