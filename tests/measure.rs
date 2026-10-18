@@ -4,8 +4,8 @@
 //!
 //! They are not part of the library and do not run in CI: they need legion's store and a machine
 //! running nothing else. They run on Linux, macOS and Windows, by hand from a terminal and never
-//! from a daemon: each memory step starts a fresh process, and on Windows that step also starts
-//! `powershell.exe` to read its peak. Run them at verify time with
+//! from a daemon: each memory step starts a fresh copy of this test binary. Run them at verify
+//! time with
 //!
 //! ```text
 //! cargo test --release --test measure -- --ignored --nocapture --test-threads=1
@@ -559,20 +559,53 @@ fn peak_resident_set() -> u64 {
     u64::try_from(getrusage(UsageWho::RUSAGE_SELF).unwrap().max_rss()).unwrap()
 }
 
-/// This process's peak working set in bytes, Windows' resident set, read while the process is
-/// still alive: the kernel keeps it per process, and reading it needs no unsafe code this way.
-#[cfg(windows)]
-fn peak_resident_set() -> u64 {
-    let query = format!("(Get-Process -Id {}).PeakWorkingSet64", std::process::id());
-    let out = Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &query])
-        .output()
-        .unwrap();
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    stdout
-        .trim()
-        .parse()
-        .unwrap_or_else(|_| panic!("no peak working set in:\n{stdout}"))
+/// Watches a step's peak resident set. Linux and macOS keep the peak themselves; on Windows a
+/// thread samples the working set every millisecond and keeps the highest.
+struct Peak {
+    #[cfg(windows)]
+    done: Arc<AtomicBool>,
+    #[cfg(windows)]
+    sampler: JoinHandle<u64>,
+}
+
+impl Peak {
+    #[cfg(unix)]
+    fn watch() -> Peak {
+        Peak {}
+    }
+
+    #[cfg(unix)]
+    fn bytes(self) -> u64 {
+        let Peak {} = self;
+        peak_resident_set()
+    }
+
+    #[cfg(windows)]
+    fn watch() -> Peak {
+        let done = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&done);
+        let sampler = std::thread::spawn(move || {
+            let mut highest = 0;
+            loop {
+                let stopping = flag.load(Ordering::SeqCst);
+                let now = memory_stats::memory_stats()
+                    .expect("the working set")
+                    .physical_mem;
+                highest = highest.max(now as u64);
+                if stopping {
+                    return highest;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        Peak { done, sampler }
+    }
+
+    #[cfg(windows)]
+    fn bytes(self) -> u64 {
+        self.done.store(true, Ordering::SeqCst);
+        self.sampler.join().unwrap()
+    }
 }
 
 /// Runs one step of this test in a fresh process, and returns the peak resident set in bytes
@@ -606,6 +639,7 @@ fn peak_in_fresh_process(step: &str, file: &Path, root: &str) -> u64 {
 fn nfr_013_014() {
     if let Ok(step) = std::env::var(STEP) {
         let file = PathBuf::from(std::env::var(FILE).unwrap());
+        let peak = Peak::watch();
         match step.as_str() {
             "baseline" => baseline(&file),
             "one" => {
@@ -619,7 +653,7 @@ fn nfr_013_014() {
             }
             other => panic!("no step {other}"),
         }
-        println!("{PEAK} {}", peak_resident_set());
+        println!("{PEAK} {}", peak.bytes());
         return;
     }
     let dir = TempDir::new().unwrap();
