@@ -3,7 +3,9 @@
 //! meets the bound. Each test fails when a value misses its bound.
 //!
 //! They are not part of the library and do not run in CI: they need legion's store and a machine
-//! running nothing else. They run on Linux, macOS and Windows. Run them at verify time with
+//! running nothing else. They run on Linux, macOS and Windows, by hand from a terminal and never
+//! from a daemon: each memory step starts a fresh process, and on Windows that step also starts
+//! `powershell.exe` to read its peak. Run them at verify time with
 //!
 //! ```text
 //! cargo test --release --test measure -- --ignored --nocapture --test-threads=1
