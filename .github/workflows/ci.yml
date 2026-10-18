@@ -24,3 +24,19 @@ jobs:
       - run: cargo clippy --all-targets --all-features
       - run: cargo nextest run --all-features --no-tests=pass
       - run: cargo test --doc --all-features
+
+  # The measurements (tests/measure.rs) run at verify time on Linux, macOS or Windows. Each
+  # platform compiles and lints its own code for them, all three side by side with `check`.
+  platforms:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets --all-features
