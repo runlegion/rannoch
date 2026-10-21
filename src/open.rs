@@ -6,29 +6,248 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rusqlite::Connection;
+use rusqlite::types::ToSqlOutput;
+use rusqlite::{Connection, Row, ToSql};
 use serde::{Deserialize, Serialize};
 
 use crate::events::{Events, OWN_TABLES};
 use crate::write::Error;
 
-/// A class: a kind of node, with its natural key and a set of properties.
+/// A class: a kind of node, with its natural key, its properties and each one's value type,
+/// and the key its history is ordered by.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Class {
     pub name: String,
-    pub properties: BTreeSet<String>,
+    /// Each property and its value type. A store written before value types existed lists its
+    /// properties by name alone; each of those reads as text.
+    #[serde(deserialize_with = "properties")]
+    pub properties: BTreeMap<String, ValueType>,
+    /// The key the class's history is ordered by; recording order when it declares none.
+    #[serde(default)]
+    pub history: HistoryKey,
 }
 
 impl Class {
+    /// A class whose properties are all text and whose history is in recording order.
     pub fn new<P: Into<String>>(
         name: impl Into<String>,
         properties: impl IntoIterator<Item = P>,
     ) -> Self {
         Class {
             name: name.into(),
-            properties: properties.into_iter().map(Into::into).collect(),
+            properties: properties
+                .into_iter()
+                .map(|p| (p.into(), ValueType::Text))
+                .collect(),
+            history: HistoryKey::Recorded,
         }
     }
+}
+
+/// A class's properties as a map from name to type, or as the list of names a store written
+/// before value types existed holds, each of them text.
+fn properties<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<String, ValueType>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Either {
+        Typed(BTreeMap<String, ValueType>),
+        Names(BTreeSet<String>),
+    }
+    Ok(match Either::deserialize(deserializer)? {
+        Either::Typed(typed) => typed,
+        Either::Names(names) => names.into_iter().map(|p| (p, ValueType::Text)).collect(),
+    })
+}
+
+/// The one value type a property declares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValueType {
+    #[default]
+    Text,
+    /// 64-bit signed.
+    Integer,
+    /// Exact: read back with every digit it was written with.
+    Decimal,
+    /// 64-bit.
+    Float,
+    /// 64-bit floats, exactly this many.
+    FloatVector(usize),
+}
+
+/// What a class's history is ordered by. Where two events carry the same key, the order
+/// rannoch recorded them in breaks the tie.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryKey {
+    /// The order rannoch records the class's events in.
+    #[default]
+    Recorded,
+    /// An integer the writer supplies with each write.
+    Integer,
+    /// A time the writer supplies with each write: UTC, millisecond precision.
+    Time,
+}
+
+/// A property's value, of its property's declared type.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "Wire", into = "Wire")]
+pub enum Value {
+    Text(String),
+    Integer(i64),
+    /// The digits as written.
+    Decimal(String),
+    Float(f64),
+    FloatVector(Vec<f64>),
+}
+
+/// A value as events encode it: text as a bare string, as every event before value types
+/// holds it, and every other type tagged with its name.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum Wire {
+    Text(String),
+    Typed(Typed),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Typed {
+    Integer(i64),
+    Decimal(String),
+    Float(f64),
+    FloatVector(Vec<f64>),
+}
+
+impl From<Wire> for Value {
+    fn from(wire: Wire) -> Value {
+        match wire {
+            Wire::Text(text) => Value::Text(text),
+            Wire::Typed(Typed::Integer(n)) => Value::Integer(n),
+            Wire::Typed(Typed::Decimal(d)) => Value::Decimal(d),
+            Wire::Typed(Typed::Float(f)) => Value::Float(f),
+            Wire::Typed(Typed::FloatVector(v)) => Value::FloatVector(v),
+        }
+    }
+}
+
+impl From<Value> for Wire {
+    fn from(value: Value) -> Wire {
+        match value {
+            Value::Text(text) => Wire::Text(text),
+            Value::Integer(n) => Wire::Typed(Typed::Integer(n)),
+            Value::Decimal(d) => Wire::Typed(Typed::Decimal(d)),
+            Value::Float(f) => Wire::Typed(Typed::Float(f)),
+            Value::FloatVector(v) => Wire::Typed(Typed::FloatVector(v)),
+        }
+    }
+}
+
+/// Floats compare by their bits, so a value equals itself and the graph's types keep `Eq`.
+impl PartialEq for Value {
+    fn eq(&self, other: &Value) -> bool {
+        let bits = |v: &[f64]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+        match (self, other) {
+            (Value::Text(a), Value::Text(b)) | (Value::Decimal(a), Value::Decimal(b)) => a == b,
+            (Value::Integer(a), Value::Integer(b)) => a == b,
+            (Value::Float(a), Value::Float(b)) => a.to_bits() == b.to_bits(),
+            (Value::FloatVector(a), Value::FloatVector(b)) => bits(a) == bits(b),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Value {}
+
+impl From<&str> for Value {
+    fn from(text: &str) -> Value {
+        Value::Text(text.to_string())
+    }
+}
+
+impl From<String> for Value {
+    fn from(text: String) -> Value {
+        Value::Text(text)
+    }
+}
+
+impl Value {
+    /// Whether the value is of type `of`, a float vector also of its length.
+    pub(crate) fn is(&self, of: ValueType) -> bool {
+        match (self, of) {
+            (Value::Text(_), ValueType::Text)
+            | (Value::Integer(_), ValueType::Integer)
+            | (Value::Decimal(_), ValueType::Decimal)
+            | (Value::Float(_), ValueType::Float) => true,
+            (Value::FloatVector(v), ValueType::FloatVector(len)) => v.len() == len,
+            _ => false,
+        }
+    }
+
+    /// Reads the value of type `of` from column `i` of `row`, or `None` when it is null.
+    pub(crate) fn read(row: &Row, i: usize, of: ValueType) -> rusqlite::Result<Option<Value>> {
+        Ok(match of {
+            ValueType::Text => row.get::<_, Option<String>>(i)?.map(Value::Text),
+            ValueType::Integer => row.get::<_, Option<i64>>(i)?.map(Value::Integer),
+            ValueType::Decimal => row.get::<_, Option<String>>(i)?.map(Value::Decimal),
+            ValueType::Float => row.get::<_, Option<f64>>(i)?.map(Value::Float),
+            ValueType::FloatVector(_) => row.get::<_, Option<Vec<u8>>>(i)?.map(|bytes| {
+                Value::FloatVector(
+                    bytes
+                        .as_chunks::<8>()
+                        .0
+                        .iter()
+                        .map(|b| f64::from_le_bytes(*b))
+                        .collect(),
+                )
+            }),
+        })
+    }
+}
+
+/// Text and decimals are held as text, so a decimal keeps every digit; a float vector as its
+/// floats' little-endian bytes.
+impl ToSql for Value {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(match self {
+            Value::Text(s) | Value::Decimal(s) => ToSqlOutput::from(s.as_str()),
+            Value::Integer(n) => ToSqlOutput::from(*n),
+            Value::Float(f) => ToSqlOutput::from(*f),
+            Value::FloatVector(v) => {
+                ToSqlOutput::from(v.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>())
+            }
+        })
+    }
+}
+
+impl ValueType {
+    /// The column type that holds values of this type.
+    pub(crate) fn column(self) -> &'static str {
+        match self {
+            ValueType::Text | ValueType::Decimal => "TEXT",
+            ValueType::Integer => "INTEGER",
+            ValueType::Float => "REAL",
+            ValueType::FloatVector(_) => "BLOB",
+        }
+    }
+}
+
+/// The properties of `class` held in `row` from column `first` on, in the class's order; a
+/// property that is null is absent.
+pub(crate) fn read_properties(
+    class: &Class,
+    row: &Row,
+    first: usize,
+) -> rusqlite::Result<BTreeMap<String, Value>> {
+    let mut properties = BTreeMap::new();
+    for (i, (name, of)) in class.properties.iter().enumerate() {
+        if let Some(value) = Value::read(row, first + i, *of)? {
+            properties.insert(name.clone(), value);
+        }
+    }
+    Ok(properties)
 }
 
 /// A relation: links from a node of one class to a node of another. A containment relation
@@ -268,6 +487,27 @@ mod tests {
             [] as [(&str, &str); 0],
             ValidTime::On(Date::day(2026, 1, 1)),
         )
+    }
+
+    #[test]
+    fn a_value_survives_its_encoding_and_bare_text_is_text()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::Value;
+        for value in [
+            Value::Text("1".into()),
+            Value::Integer(9_007_199_254_740_993),
+            Value::Decimal("12345678901234567890.0000000001".into()),
+            Value::Float(-0.1),
+            Value::FloatVector(vec![1.5, -2.25, 0.125]),
+        ] {
+            let back: Value = serde_json::from_str(&serde_json::to_string(&value)?)?;
+            assert_eq!(back, value);
+        }
+        assert_eq!(
+            serde_json::from_str::<Value>("\"412\"")?,
+            Value::from("412")
+        );
+        Ok(())
     }
 
     #[test]

@@ -7,7 +7,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::open::{
-    Graph, Ontology, Relation, class_table, concat, property_column, relation_table,
+    Graph, Ontology, Relation, Value, class_table, concat, property_column, read_properties,
+    relation_table,
 };
 use crate::write::{Date, Error, ValidTime, node_id};
 
@@ -33,7 +34,7 @@ impl NodeRef {
 pub struct Node {
     pub class: String,
     pub key: String,
-    pub properties: BTreeMap<String, String>,
+    pub properties: BTreeMap<String, Value>,
     pub source: String,
     pub valid: ValidTime,
     pub recorded: SystemTime,
@@ -66,7 +67,7 @@ pub struct Link {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Description {
     pub node: NodeRef,
-    pub properties: BTreeMap<String, String>,
+    pub properties: BTreeMap<String, Value>,
     /// Links from the node, by relation: only relations it has a link of.
     pub relations_out: BTreeMap<String, u64>,
     /// Links to the node, by relation: only relations it has a link of.
@@ -209,22 +210,19 @@ fn find_in(
     let class = ontology.class(class)?;
     let sql = format!(
         "SELECT source, valid, recorded{} FROM {} WHERE key = ?1",
-        concat(&class.properties, |p| format!(", {}", property_column(p))),
+        concat(class.properties.keys(), |p| format!(
+            ", {}",
+            property_column(p)
+        )),
         class_table(&class.name)
     );
     Ok(conn
         .prepare_cached(&sql)?
         .query_row(params![key], |row| {
-            let mut properties = BTreeMap::new();
-            for (i, name) in class.properties.iter().enumerate() {
-                if let Some(value) = row.get::<_, Option<String>>(3 + i)? {
-                    properties.insert(name.clone(), value);
-                }
-            }
             Ok(Node {
                 class: class.name.clone(),
                 key: key.to_string(),
-                properties,
+                properties: read_properties(class, row, 3)?,
                 source: row.get(0)?,
                 valid: ValidTime::from_sql(row.get(1)?),
                 recorded: recorded(row.get(2)?),
@@ -657,7 +655,7 @@ fn count_query(ontology: &Ontology, count: &Count) -> Result<String, Error> {
         None => "NULL".to_string(),
         Some(group) => {
             let class = ontology.class(&group.class)?;
-            if !class.properties.contains(&group.property) {
+            if !class.properties.contains_key(&group.property) {
                 return Err(Error::Refused(format!(
                     "class {} has no property {}",
                     class.name, group.property

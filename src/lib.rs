@@ -38,7 +38,7 @@ mod write;
 pub use events::{
     Change, Cursor, Event, EventId, Events, Fact, LinkFact, NodeFact, WrongKind, rebuild,
 };
-pub use open::{Class, Graph, Ontology, Relation, open};
+pub use open::{Class, Graph, HistoryKey, Ontology, Relation, Value, ValueType, open};
 pub use read::{
     Count, Description, Filter, GroupBy, Link, Node, NodeRef, OpenLink, PartOf, Step, Tally, Walk,
 };
