@@ -539,6 +539,8 @@ struct World {
     flushed: Option<Ticket>,
     heard: Arc<Mutex<Vec<Heard>>>,
     snapshot: Option<Snapshot>,
+    stored_cursor: String,
+    bound: Cursor,
 }
 
 #[rstest::fixture]
@@ -581,6 +583,8 @@ fn world() -> World {
         flushed: None,
         heard: Arc::new(Mutex::new(Vec::new())),
         snapshot: None,
+        stored_cursor: String::new(),
+        bound: Cursor::START,
     }
 }
 
@@ -3497,6 +3501,154 @@ fn writes_text_for_integer(world: &mut World) {
         world,
         Unit::new("item", "i1", [("v", "nine")], day(2026, 1, 1)),
     );
+}
+
+// ---------- events: following from a stored cursor ----------
+
+/// Stores `cursor` the way an app does, by serializing it.
+fn store_cursor(world: &mut World, cursor: Cursor) {
+    world.stored_cursor = serde_json::to_string(&cursor).unwrap();
+}
+
+fn stored_cursor(world: &World) -> Cursor {
+    serde_json::from_str(&world.stored_cursor).unwrap()
+}
+
+/// The events of the log written before `World::log` was taken, after `cursor`.
+fn logged_after(world: &World, cursor: Cursor) -> Vec<Event> {
+    world
+        .log
+        .iter()
+        .filter(|e| e.cursor > cursor)
+        .cloned()
+        .collect()
+}
+
+#[given("a follower that has stored its cursor")]
+fn follower_stored_cursor(world: &mut World) {
+    events_around_cursor(world);
+    store_cursor(world, world.cursor);
+    world.graph = None;
+}
+
+#[when("the follower restarts from the stored cursor")]
+fn follower_restarts(world: &mut World) {
+    let cursor = stored_cursor(world);
+    world.read = world.open().events().since(cursor).unwrap();
+}
+
+#[then("it reads only the events after that cursor")]
+fn reads_only_after_stored(world: &mut World) {
+    let expected = logged_after(world, stored_cursor(world));
+    // The five statements written after the cursor.
+    assert_eq!(expected.len(), 5);
+    assert_eq!(world.read, expected);
+}
+
+#[when("the app reads events since a cursor up to a bound")]
+fn reads_up_to_bound(world: &mut World) {
+    world.bound = world.log[world.log.len() - 3].cursor;
+    let (cursor, bound) = (world.cursor, world.bound);
+    world.read = world
+        .g()
+        .events()
+        .since_until(cursor, bound, |_| true)
+        .unwrap();
+}
+
+#[then("no event past the bound is returned")]
+fn none_past_bound(world: &mut World) {
+    let (cursor, bound) = (world.cursor, world.bound);
+    assert!(world.read.iter().all(|e| e.cursor <= bound));
+    let expected: Vec<Event> = logged_after(world, cursor)
+        .into_iter()
+        .filter(|e| e.cursor <= bound)
+        .collect();
+    assert_eq!(expected.len(), 3);
+    assert_eq!(world.read, expected);
+}
+
+#[given("a graph with events of several kinds")]
+fn events_of_several_kinds(world: &mut World) {
+    events_around_cursor(world);
+    let declared = |e: &Event| matches!(e.change, Change::Declared(_));
+    assert!(world.log.iter().any(declared));
+    assert!(world.log.iter().any(|e| !declared(e)));
+}
+
+#[when("the app reads events since a cursor with a filter")]
+fn reads_with_filter(world: &mut World) {
+    let last = world.log.last().unwrap().cursor;
+    world.read = world
+        .g()
+        .events()
+        .since_until(Cursor::START, last, |change| {
+            matches!(change, Change::Declared(_))
+        })
+        .unwrap();
+}
+
+#[then("only events the filter asks about are returned")]
+fn only_filtered(world: &mut World) {
+    let expected: Vec<Event> = world
+        .log
+        .iter()
+        .filter(|e| matches!(e.change, Change::Declared(_)))
+        .cloned()
+        .collect();
+    assert_eq!(expected.len(), t9b().len());
+    assert_eq!(world.read, expected);
+}
+
+#[given("a follower whose stored cursor is older than a snapshot")]
+fn follower_behind_snapshot(world: &mut World) {
+    events_around_cursor(world);
+    store_cursor(world, world.log[5].cursor);
+    take_snapshot(world);
+    assert!(stored_cursor(world) < world.snapshot.as_ref().unwrap().cursor());
+}
+
+#[when("the follower reads since its stored cursor")]
+fn follower_reads_since_stored(world: &mut World) {
+    let cursor = stored_cursor(world);
+    world.read = world.g().events().since(cursor).unwrap();
+}
+
+#[then("it reads every event after its cursor")]
+fn reads_every_event_after(world: &mut World) {
+    let expected = logged_after(world, stored_cursor(world));
+    assert_eq!(expected.len(), world.log.len() - 6);
+    assert_eq!(world.read, expected);
+}
+
+#[given("a follower that stored its cursor and a graph that is then rebuilt")]
+fn follower_then_rebuild(world: &mut World) {
+    events_around_cursor(world);
+    take_snapshot(world);
+    // A cursor two events past the snapshot's, so the rebuild must keep the later events'
+    // places for the stored cursor to name the same one.
+    let after = world
+        .log
+        .iter()
+        .position(|e| e.cursor == world.cursor)
+        .unwrap()
+        + 2;
+    store_cursor(world, world.log[after].cursor);
+    rebuild_from_snapshot(world);
+}
+
+#[when("the follower reads the rebuilt graph's events since its stored cursor")]
+fn follower_reads_rebuilt(world: &mut World) {
+    let cursor = stored_cursor(world);
+    let rebuilt = world.rebuilt.as_ref().expect("the graph was rebuilt");
+    world.read = rebuilt.events().since(cursor).unwrap();
+}
+
+#[then("it reads the events that came after that cursor before the rebuild")]
+fn reads_events_after_rebuild(world: &mut World) {
+    let expected = logged_after(world, stored_cursor(world));
+    assert_eq!(expected.len(), 3);
+    assert_eq!(world.read, expected);
 }
 
 // ---------- queue: a heartbeat commits the in-memory write queue ----------
