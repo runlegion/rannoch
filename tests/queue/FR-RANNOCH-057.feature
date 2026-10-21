@@ -1,4 +1,4 @@
-# Generated from legion requirement FR-RANNOCH-057, revision 2026-10-21T21:02:17.358539+00:00.
+# Generated from legion requirement FR-RANNOCH-057, revision 2026-10-21T21:20:47.900140+00:00.
 # Do not edit: regenerate with scripts/features.mjs.
 
 Feature: Writes go to an in-memory queue that a heartbeat commits, then the committed watermark advances and subscribers fire
