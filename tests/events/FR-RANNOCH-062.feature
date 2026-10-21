@@ -1,4 +1,4 @@
-# Generated from legion requirement FR-RANNOCH-062, revision 2026-10-21T20:46:52.340452+00:00.
+# Generated from legion requirement FR-RANNOCH-062, revision 2026-10-21T21:03:35.987989+00:00.
 # Do not edit: regenerate with scripts/features.mjs.
 
 Feature: The store keeps every event; compaction is a snapshot that deletes nothing
@@ -38,3 +38,9 @@ Feature: The store keeps every event; compaction is a snapshot that deletes noth
     Given a graph with a snapshot at a cursor and events after it
     When a new reader starts from the snapshot
     Then the reader receives only the events after the snapshot's cursor
+
+  @criterion-01a16046-ccaf-77f0-adf5-9a99473b1df5 @module-events
+  Scenario: a snapshot keeps each node's fate
+    Given a graph with one node forgotten and one node replaced before a snapshot's cursor
+    When the graph is rebuilt from the snapshot and the events after its cursor
+    Then the forgotten node resolves as forgotten and the replaced node resolves to its replacement, as in the live graph

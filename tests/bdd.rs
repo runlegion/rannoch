@@ -2128,6 +2128,45 @@ fn rebuilt_matches_live(world: &mut World) {
     assert_eq!(rebuilt.open_links().unwrap(), live.open_links().unwrap());
 }
 
+#[given("a graph with one node forgotten and one node replaced before a snapshot's cursor")]
+fn fates_before_snapshot(world: &mut World) {
+    events_around_cursor(world);
+    let g = world.g();
+    g.forget(&NodeRef::new("statement", "s0"), "living", "eavesdrop")
+        .unwrap();
+    g.replace("statement", "s1", "s2").unwrap();
+    snapshot_at_end(world);
+}
+
+#[then(
+    "the forgotten node resolves as forgotten and the replaced node resolves to its replacement, as in the live graph"
+)]
+fn fates_survive_snapshot(world: &mut World) {
+    let rebuilt = world.dir.path().join("rebuilt.rannoch");
+    let mut referrer = rannoch::open(world.dir.path().join("referrer.rannoch")).unwrap();
+    referrer.mount("live", world.path()).unwrap();
+    referrer.mount("rebuilt", rebuilt).unwrap();
+    for (key, fate) in [
+        (
+            "s0",
+            Fate::Forgotten {
+                rule: "living".into(),
+            },
+        ),
+        (
+            "s1",
+            Fate::Replaced {
+                by: NodeRef::new("statement", "s2"),
+            },
+        ),
+    ] {
+        let target = NodeRef::new("statement", key);
+        let live = referrer.resolve("live", &target).unwrap();
+        assert_eq!(live, fate, "{key} in the live graph");
+        assert_eq!(referrer.resolve("rebuilt", &target).unwrap(), live, "{key}");
+    }
+}
+
 #[given("a graph whose class was declared before a snapshot's cursor")]
 fn class_before_snapshot(world: &mut World) {
     let g = world.open();

@@ -188,11 +188,15 @@ impl Events<'_> {
 /// # Errors
 /// The file cannot be opened as a graph file, or an event cannot be replayed into it.
 pub fn rebuild(events: &[Event], empty_path: impl AsRef<Path>) -> Result<Graph, Error> {
-    replay_into(open(empty_path)?, events, true)
+    replay_into(open(empty_path)?, events, |_| true)
 }
 
-/// Replays `events` into `graph` in one transaction, storing each one when `keep` is set.
-fn replay_into(mut graph: Graph, events: &[Event], keep: bool) -> Result<Graph, Error> {
+/// Replays `events` into `graph` in one transaction, storing each one `keep` holds for.
+fn replay_into(
+    mut graph: Graph,
+    events: &[Event],
+    keep: impl Fn(&Change) -> bool,
+) -> Result<Graph, Error> {
     let tx = graph
         .conn
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -203,7 +207,7 @@ fn replay_into(mut graph: Graph, events: &[Event], keep: bool) -> Result<Graph, 
         if matches!(event.change, Change::Declared(_)) {
             ontology = Ontology::load(&tx)?;
         }
-        if keep {
+        if keep(&event.change) {
             store(&tx, event.id, event.change.clone())?;
         }
     }
@@ -213,8 +217,9 @@ fn replay_into(mut graph: Graph, events: &[Event], keep: bool) -> Result<Graph, 
 }
 
 /// A graph's state at a cursor, in a file of its own: its ontology, nodes, links, open links and
-/// replacements, and none of its events. A new reader or a rebuild starts from it and takes only the
-/// events after its cursor.
+/// each node's fate. Of the events, it holds only the forget events, which carry no content and
+/// are what a forgotten node's fate is read from. A new reader or a rebuild starts from it and
+/// takes only the events after its cursor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
     cursor: Cursor,
@@ -242,7 +247,7 @@ impl Snapshot {
             Error::Refused(format!("the path {} is not UTF-8", empty_path.display()))
         })?;
         Connection::open(&self.path)?.execute("VACUUM INTO ?1", params![target])?;
-        replay_into(open(empty_path)?, later, true)
+        replay_into(open(empty_path)?, later, |_| true)
     }
 }
 
@@ -261,7 +266,10 @@ impl Graph {
     ) -> Result<Snapshot, Error> {
         let mut events = self.events().since(Cursor::START)?;
         events.retain(|event| event.cursor <= cursor);
-        replay_into(open(&empty_path)?, &events, false)?;
+        // A forget event holds no content and is where a forgotten node's fate is read from.
+        replay_into(open(&empty_path)?, &events, |change| {
+            matches!(change, Change::Forgot { .. })
+        })?;
         Ok(Snapshot {
             cursor,
             path: empty_path.as_ref().to_path_buf(),
