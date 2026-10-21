@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
-use sysinfo::{MemoryRefreshKind, System};
+use sysinfo::{MemoryRefreshKind, ProcessRefreshKind, ProcessesToUpdate, System};
 
 /// The bytes written and durably flushed once to time one flush.
 const FLUSH_BYTES: usize = 4 * 1024;
@@ -73,13 +73,27 @@ pub fn memory(cap: Option<u64>) -> Memory {
     let mut system = System::new();
     system.refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
     let total = system.total_memory();
-    let limit = system.cgroup_limits().map(|limits| limits.total_memory);
     Memory {
         os: std::env::consts::OS.to_owned(),
         taken_at: SystemTime::now(),
         total,
-        allowed: allowed(total, limit, cap),
+        allowed: allowed(total, limit(&mut system), cap),
     }
+}
+
+/// The memory limit the process's container or job sets: the least limit on its cgroup and the
+/// cgroup's ancestors. Only Linux sets one this way; elsewhere there is none.
+fn limit(system: &mut System) -> Option<u64> {
+    let pid = sysinfo::get_current_pid().ok()?;
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        false,
+        ProcessRefreshKind::nothing(),
+    );
+    system
+        .process(pid)?
+        .cgroup_limits()
+        .map(|limits| limits.total_memory)
 }
 
 /// The least of the total and whichever of the limit and the cap are set.
