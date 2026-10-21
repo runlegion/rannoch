@@ -1,0 +1,23 @@
+[package]
+name = "rannoch-probe"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+repository = "https://github.com/runlegion/rannoch"
+authors = ["Sean Silvius"]
+description = "Measures what a host allows: its memory, and how fast a directory takes durable writes."
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+thiserror = "2"
+uuid = { version = "1", features = ["v7"] }
+
+[dev-dependencies]
+serde_json = "1"
+tempfile = "3"
+
+[lints]
+workspace = true

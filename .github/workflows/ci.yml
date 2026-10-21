@@ -22,12 +22,13 @@ jobs:
         with:
           tool: cargo-nextest
       - run: cargo fmt --all --check
-      - run: cargo clippy --all-targets --all-features
-      - run: cargo nextest run --all-features --no-tests=pass
-      - run: cargo test --doc --all-features
+      - run: cargo clippy --workspace --all-targets --all-features
+      - run: cargo nextest run --workspace --all-features --no-tests=pass
+      - run: cargo test --workspace --doc --all-features
 
   # The measurements (tests/measure.rs) run at verify time on Linux, macOS or Windows. Each
-  # platform compiles and lints its own code for them, all three side by side with `check`.
+  # platform compiles and lints its own code for them, all three side by side with `check`, and
+  # runs the probe's tests, which measure the machine they run on.
   platforms:
     strategy:
       fail-fast: false
@@ -40,4 +41,5 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets --all-features
+      - run: cargo clippy --workspace --all-targets --all-features
+      - run: cargo test -p rannoch-probe

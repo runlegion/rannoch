@@ -24,12 +24,18 @@ rstest-bdd = "0.6"
 rstest-bdd-macros = "0.6"
 tempfile = "3"
 
-[lints.rust]
+[lints]
+workspace = true
+
+[workspace]
+members = ["crates/rannoch-probe"]
+
+[workspace.lints.rust]
 unsafe_code = "forbid"
 unreachable_pub = "warn"
 missing_debug_implementations = "warn"
 
-[lints.clippy]
+[workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 unwrap_used = "warn"
 expect_used = "warn"
