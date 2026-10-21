@@ -3484,7 +3484,7 @@ fn q(world: &World) -> &Queue {
 /// Queues a write of node `item` `key`, keeping its ticket.
 fn enqueue(world: &mut World, key: &str) {
     let unit = Unit::new("item", key, [("v", key)], day(2026, 1, 1));
-    let ticket = q(world).write(Write::new("app").unit(unit));
+    let ticket = q(world).write(Write::new("app").unit(unit)).unwrap();
     world.tickets.push(ticket);
 }
 
