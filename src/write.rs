@@ -388,12 +388,10 @@ pub(crate) fn node_id(tx: &Connection, class: &str, key: &str) -> Result<Option<
         .optional()?)
 }
 
-/// Checks a whole write before any piece commits: refuses it when a unit's node does not carry
-/// exactly the properties its class declares, each a value of its declared type, when a unit's
-/// or a link's valid time is not a real date, or when one of its links has a source that is not
-/// of its relation's declared source class. A target is named by kind and key, so a
-/// target key not yet a node of the declared target class leaves the link open.
-fn check(conn: &Connection, ontology: &Ontology, write: &Write) -> Result<(), Error> {
+/// Checks `write` against what `ontology` declares, reading nothing from the store: each node's
+/// class is declared, it carries every property its class declares and no other, and each value
+/// is of its declared type.
+pub(crate) fn check_declared(ontology: &Ontology, write: &Write) -> Result<(), Error> {
     for node in write.units.iter().map(|u| &u.node) {
         let class = ontology.class(&node.class)?;
         for (property, value) in &node.properties {
@@ -421,6 +419,16 @@ fn check(conn: &Connection, ontology: &Ontology, write: &Write) -> Result<(), Er
             )));
         }
     }
+    Ok(())
+}
+
+/// Checks a whole write before any piece commits: refuses it when a unit's node does not carry
+/// exactly the properties its class declares, each a value of its declared type, when a unit's
+/// or a link's valid time is not a real date, or when one of its links has a source that is not
+/// of its relation's declared source class. A target is named by kind and key, so a
+/// target key not yet a node of the declared target class leaves the link open.
+fn check(conn: &Connection, ontology: &Ontology, write: &Write) -> Result<(), Error> {
+    check_declared(ontology, write)?;
     let valid_times = write
         .units
         .iter()

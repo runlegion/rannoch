@@ -13,17 +13,17 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use rannoch::{
     Change, Class, Count, Cursor, Date, Declaration, Description, Error, Event, EventId, Fact,
     Fate, Graph, GroupBy, Link, LinkFact, Node, NodeRef, OpenLink, PartOf, Relation, Snapshot,
     Step, Tally, Unit, ValidTime, Value, Write, WriteError,
 };
-use rannoch::{HistoryKey, NodeFact, ValueType};
+use rannoch::{HistoryKey, NodeFact, Queue, Ticket, ValueType};
 use rstest_bdd_macros::{given, scenarios, then, when};
 use tempfile::TempDir;
 
@@ -496,6 +496,9 @@ fn link_facts(link: Link) -> (String, NodeRef, NodeRef, String, ValidTime) {
 
 // ---------- the world ----------
 
+/// What a subscriber was given, and what another handle read up to it as it was given.
+type Heard = (Cursor, Vec<Event>);
+
 struct World {
     dir: TempDir,
     graph: Option<Graph>,
@@ -529,6 +532,10 @@ struct World {
     shared: Option<Graph>,
     fates: Vec<Fate>,
     references: Vec<Node>,
+    queue: Option<Queue>,
+    tickets: Vec<Ticket>,
+    flushed: Option<Ticket>,
+    heard: Arc<Mutex<Vec<Heard>>>,
     snapshot: Option<Snapshot>,
 }
 
@@ -567,6 +574,10 @@ fn world() -> World {
         shared: None,
         fates: Vec::new(),
         references: Vec::new(),
+        queue: None,
+        tickets: Vec::new(),
+        flushed: None,
+        heard: Arc::new(Mutex::new(Vec::new())),
         snapshot: None,
     }
 }
@@ -3481,6 +3492,148 @@ fn writes_text_for_integer(world: &mut World) {
         world,
         Unit::new("item", "i1", [("v", "nine")], day(2026, 1, 1)),
     );
+}
+
+// ---------- queue: a heartbeat commits the in-memory write queue ----------
+
+/// A heartbeat long enough that no scenario races it: those scenarios commit by flushing.
+const NEVER: Duration = Duration::from_secs(3_600);
+
+/// Declares class `item` (property `v`) and hands the graph to a queue beating every `interval`.
+fn queued(world: &mut World, interval: Duration) {
+    class_with(world, ValueType::Text);
+    let graph = world.graph.take().expect("the graph is open");
+    world.queue = Some(Queue::open(graph, interval));
+}
+
+fn q(world: &World) -> &Queue {
+    world.queue.as_ref().expect("the queue is open")
+}
+
+/// Queues a write of node `item` `key`, keeping its ticket.
+fn enqueue(world: &mut World, key: &str) {
+    let unit = Unit::new("item", key, [("v", key)], day(2026, 1, 1));
+    let ticket = q(world).write(Write::new("app").unit(unit)).unwrap();
+    world.tickets.push(ticket);
+}
+
+/// Whether another handle on the file reads node `item` `key`: it is committed.
+fn committed_elsewhere(world: &World, key: &str) -> bool {
+    rannoch::open(world.path())
+        .unwrap()
+        .find("item", key)
+        .unwrap()
+        .is_some()
+}
+
+/// Waits up to five seconds for `done`.
+fn wait_for(mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !done() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the heartbeat"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+#[given("an open graph with its queue")]
+fn graph_with_queue(world: &mut World) {
+    queued(world, NEVER);
+}
+
+#[when("the app writes a node and the write returns")]
+fn queue_writes(world: &mut World) {
+    enqueue(world, "i1");
+}
+
+#[then("the committed watermark has not yet passed that write")]
+fn watermark_not_passed(world: &mut World) {
+    assert!(q(world).committed() < Some(world.tickets[0]));
+    assert!(!committed_elsewhere(world, "i1"));
+}
+
+#[given("an open graph with an accepted write in its queue")]
+fn graph_with_accepted_write(world: &mut World) {
+    queued(world, Queue::INTERVAL);
+    enqueue(world, "i1");
+}
+
+#[when("the next heartbeat runs")]
+fn next_heartbeat(world: &mut World) {
+    let ticket = world.tickets[0];
+    wait_for(|| q(world).committed() >= Some(ticket));
+}
+
+#[then("the committed watermark has passed that write")]
+fn watermark_passed(world: &mut World) {
+    assert!(q(world).committed() >= Some(world.tickets[0]));
+    assert!(committed_elsewhere(world, "i1"));
+}
+
+#[given("an open graph with a subscriber")]
+fn graph_with_subscriber(world: &mut World) {
+    queued(world, Queue::INTERVAL);
+    let (path, heard) = (world.path(), Arc::clone(&world.heard));
+    q(world).subscribe(move |cursor| {
+        // What another handle reads up to the cursor the subscriber was given, as it is given.
+        let committed: Vec<Event> = rannoch::open(&path)
+            .unwrap()
+            .events()
+            .since(Cursor::START)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.cursor <= cursor)
+            .collect();
+        heard.lock().unwrap().push((cursor, committed));
+    });
+}
+
+#[when("the app writes a node and the subscriber receives its event")]
+fn subscriber_receives(world: &mut World) {
+    enqueue(world, "i1");
+    let heard = Arc::clone(&world.heard);
+    wait_for(|| !heard.lock().unwrap().is_empty());
+}
+
+#[then("the committed watermark has passed that event")]
+fn watermark_passed_event(world: &mut World) {
+    assert!(q(world).committed() >= Some(world.tickets[0]));
+    let heard = world.heard.lock().unwrap();
+    let (cursor, committed) = &heard[0];
+    let wrote_i1 = |e: &Event| match &e.change {
+        Change::Wrote { added, .. } => added
+            .iter()
+            .any(|f| matches!(f, Fact::Node(n) if n.key == "i1")),
+        _ => false,
+    };
+    let event = committed
+        .iter()
+        .find(|e| wrote_i1(e))
+        .expect("the event was committed when the subscriber received it");
+    assert!(event.cursor <= *cursor);
+}
+
+#[given("an open graph with accepted writes in its queue")]
+fn graph_with_accepted_writes(world: &mut World) {
+    queued(world, NEVER);
+    for key in ["i1", "i2", "i3"] {
+        enqueue(world, key);
+    }
+}
+
+#[when("the app flushes")]
+fn app_flushes(world: &mut World) {
+    world.flushed = q(world).flush();
+}
+
+#[then("every write accepted before the flush is committed when the flush returns")]
+fn flushed_committed(world: &mut World) {
+    assert!(world.flushed >= world.tickets.last().copied());
+    for key in ["i1", "i2", "i3"] {
+        assert!(committed_elsewhere(world, key), "{key} is not committed");
+    }
 }
 
 scenarios!("tests", fixtures = [world: World]);
