@@ -3792,4 +3792,96 @@ fn flushed_committed(world: &mut World) {
     }
 }
 
+// ---------- queue: dropping or closing the queue commits what it holds ----------
+
+/// How the short-lived process ends, and the graph file it writes to.
+const PROCESS_END: &str = "RANNOCH_PROCESS_END";
+const PROCESS_FILE: &str = "RANNOCH_PROCESS_FILE";
+const PROCESS_PANIC: &str = "the short-lived process panics";
+/// The code the process exits with when it does not unwind, so the scenario knows it got there.
+const PROCESS_EXIT: i32 = 3;
+const PROCESS_KEYS: [&str; 3] = ["p1", "p2", "p3"];
+
+/// The short-lived process: run only by [`run_process`], in a fresh process. It writes to the
+/// graph through a queue whose heartbeat never beats, then ends as `PROCESS_END` says.
+#[test]
+#[ignore = "run in its own process by the FR-RANNOCH-061 scenarios"]
+fn short_lived_process() {
+    let graph = rannoch::open(std::env::var(PROCESS_FILE).unwrap()).unwrap();
+    let queue = Queue::open(graph, NEVER);
+    for key in PROCESS_KEYS {
+        let unit = Unit::new("item", key, [("v", key)], day(2026, 1, 1));
+        queue.write(Write::new("app").unit(unit)).unwrap();
+    }
+    match std::env::var(PROCESS_END).unwrap().as_str() {
+        "return" => {}
+        "panic" => panic!("{PROCESS_PANIC}"),
+        "exit" => {
+            queue.close();
+            std::process::exit(PROCESS_EXIT);
+        }
+        other => panic!("unknown end {other}"),
+    }
+}
+
+/// Runs [`short_lived_process`] in a fresh process on the world's graph, ending as `end` says,
+/// and returns its exit code and its output.
+fn run_process(world: &World, end: &str) -> (Option<i32>, String) {
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "short_lived_process", "--ignored", "--nocapture"])
+        .env(PROCESS_END, end)
+        .env(PROCESS_FILE, world.path())
+        .output()
+        .unwrap();
+    let output = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (out.status.code(), output)
+}
+
+#[given("a short-lived process that writes to a graph")]
+fn short_lived_process_graph(world: &mut World) {
+    class_with(world, ValueType::Text);
+    world.graph = None;
+}
+
+#[when("the process returns")]
+fn process_returns(world: &mut World) {
+    let (code, output) = run_process(world, "return");
+    assert_eq!(code, Some(0), "the process did not return:\n{output}");
+    assert!(
+        output.contains("1 passed"),
+        "the process ran no test:\n{output}"
+    );
+}
+
+#[when("the process panics with unwinding")]
+fn process_panics(world: &mut World) {
+    let (code, output) = run_process(world, "panic");
+    assert_ne!(code, Some(0), "the process did not panic:\n{output}");
+    assert!(
+        output.contains(PROCESS_PANIC),
+        "the process did not panic:\n{output}"
+    );
+}
+
+#[when("the process closes the queue and then exits without unwinding")]
+fn process_closes_and_exits(world: &mut World) {
+    let (code, output) = run_process(world, "exit");
+    assert_eq!(
+        code,
+        Some(PROCESS_EXIT),
+        "the process did not exit:\n{output}"
+    );
+}
+
+#[then("every write it made is committed")]
+fn process_writes_committed(world: &mut World) {
+    for key in PROCESS_KEYS {
+        assert!(committed_elsewhere(world, key), "{key} is not committed");
+    }
+}
+
 scenarios!("tests", fixtures = [world: World]);
