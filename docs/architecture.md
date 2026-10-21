@@ -29,7 +29,7 @@ The name: Rannoch, the geth home world in Mass Effect; it means walled garden.
 7. **Forgetting strips content.** Forgetting follows the app's rule. The forgotten node and its links leave live state; earlier events keep their ids, kinds and endpoints and lose their content, so numbers an app derived can subtract exactly what was removed. What was forgotten stays gone through every replay.
 8. **References cross files.** An app mounts another graph file by name, and a graph can refer to a node in it by class and key. Replacing a node by another under a different key is its own event naming both keys; a new version under the same key is not a replacement. The reference resolves from the target file's own facts: live, forgotten (with its rule) or replaced (with what replaced it). The referring file never changes.
 9. **Relays are the app's.** rannoch keeps no relay and runs no fold. What a relay needs from rannoch is events whose ids name the relation and both ends of every link, so an app can filter before its own fold.
-10. **Compaction keeps state.** An app may compact a graph's events up to a cursor it picks; the state they built is kept as the base, and the base plus the later events gives the same state and counts.
+10. **The store keeps every event; a snapshot deletes nothing.** An app may take a snapshot of a graph's state at a cursor it picks, into a file of its own, carrying the ontology. A new reader or a rebuild starts from the snapshot and takes only the events after its cursor; the snapshot plus those events gives the same state as live. No call deletes an event.
 
 ## How a node reads
 
@@ -42,7 +42,7 @@ One crate:
 - `open`: opens a graph file and knows its classes and relations.
 - `write`: units, pieces, refusals; owns typed refusals.
 - `read`: walks, counts, describing a node in ontology terms, reading as of a valid time.
-- `events`: the log, cursors, replay, forgetting, compaction; owns rannoch's own tables (events, the ontology, fates, open links).
+- `events`: the log, cursors, replay, forgetting, snapshots; owns rannoch's own tables (events, the ontology, fates, open links).
 - `refs`: references into other graph files.
 
 rannoch's own tables start with `_`; every other table is a class or a relation an app declared.
