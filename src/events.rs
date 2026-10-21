@@ -187,7 +187,8 @@ impl Events<'_> {
 /// Each event lands in the new file under its own id. The events land together or not at all.
 ///
 /// # Errors
-/// The file cannot be opened as a graph file, or an event cannot be replayed into it.
+/// [`Error::Refused`] naming the event when an event carries a property its class does not
+/// declare; the file cannot be opened as a graph file, or an event cannot be replayed into it.
 pub fn rebuild(events: &[Event], empty_path: impl AsRef<Path>) -> Result<Graph, Error> {
     replay_into(open(empty_path)?, events, |_| true)
 }
@@ -204,6 +205,24 @@ fn replay_into(
     let mut ontology = Ontology::load(&tx)?;
     let recorded = now_millis();
     for event in events {
+        if let Change::Wrote { added, .. } = &event.change {
+            for node in added.iter().filter_map(|fact| match fact {
+                Fact::Node(node) => Some(node),
+                _ => None,
+            }) {
+                let class = ontology.class(&node.class)?;
+                if let Some(property) = node
+                    .properties
+                    .keys()
+                    .find(|p| !class.properties.contains_key(*p))
+                {
+                    return Err(Error::Refused(format!(
+                        "event {} carries property {property}, which class {} does not declare",
+                        event.id, class.name
+                    )));
+                }
+            }
+        }
         replay(&tx, &ontology, recorded, &event.change)?;
         if matches!(event.change, Change::Declared(_)) {
             ontology = Ontology::load(&tx)?;
@@ -482,6 +501,41 @@ mod tests {
         assert!(
             back.iter().all(|e| !matches!(e.change, Change::Closed(_))),
             "a link the forget removed never closes onto the returning key: {back:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_rebuild_refuses_an_event_carrying_an_undeclared_property_and_names_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = |name: &str| {
+            std::env::temp_dir().join(format!("rannoch-{name}-{}.db", uuid::Uuid::now_v7()))
+        };
+        let mut g = open(temp("undeclared"))?;
+        g.declare(&Declaration::Class(Class::new("person", ["name"])))?;
+        g.write(&Write::new("tree").unit(Unit::new(
+            "person",
+            "p01",
+            [("name", "Ana")],
+            ValidTime::Unknown,
+        )))?;
+        let mut events = g.events().since(crate::Cursor::START)?;
+        let last = events.len() - 1;
+        let Change::Wrote { added, .. } = &mut events[last].change else {
+            panic!("expected a write event, got {:?}", events[last].change);
+        };
+        let Some(crate::Fact::Node(node)) = added.first_mut() else {
+            panic!("expected a node fact, got {added:?}");
+        };
+        node.properties.insert("age".to_string(), "40".into());
+
+        let Err(error) = crate::rebuild(&events, temp("undeclared-rebuilt")) else {
+            panic!("the rebuild dropped the undeclared property instead of failing");
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains(&events[last].id.to_string()) && message.contains("age"),
+            "{message}"
         );
         Ok(())
     }

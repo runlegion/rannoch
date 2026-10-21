@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
@@ -565,7 +566,13 @@ impl Graph {
         while let Some(row) = rows.next()? {
             let root: String = row.get(0)?;
             let end: i64 = row.get(1)?;
-            let group: Option<String> = row.get(2)?;
+            // A group is read as its value's text, whatever its property's declared type.
+            let group = match row.get_ref(2)? {
+                ValueRef::Null => None,
+                ValueRef::Integer(n) => Some(n.to_string()),
+                ValueRef::Real(f) => Some(f.to_string()),
+                ValueRef::Text(_) | ValueRef::Blob(_) => Some(row.get::<_, String>(2)?),
+            };
             let paths = u64::try_from(row.get::<_, i64>(3)?).unwrap_or(0);
             let tally = tallies.entry(root.clone()).or_insert_with(|| Tally {
                 root: root.clone(),
@@ -764,6 +771,7 @@ mod tests {
         a.declare(&Declaration::Property {
             class: "voice".to_string(),
             property: "region".to_string(),
+            of: crate::ValueType::Text,
         })?;
         let when = ValidTime::On(Date::day(2026, 1, 1));
         a.write(&Write::new("a").unit(Unit::new(
@@ -787,6 +795,55 @@ mod tests {
         assert_eq!(
             tallies[0].groups,
             BTreeMap::from([(Some("north".to_string()), (1, 1))])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_count_groups_by_an_integer_property() -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = open(temp("integer-groups"))?;
+        let mut voice = Class::new("voice", NONE.map(|(p, _)| p));
+        voice
+            .properties
+            .insert("age".to_string(), crate::ValueType::Integer);
+        g.declare(&Declaration::Class(voice))?;
+        g.declare(&Declaration::Class(Class::new(
+            "finding",
+            NONE.map(|(p, _)| p),
+        )))?;
+        g.declare(&Declaration::Relation(Relation::new(
+            "supports", "voice", "finding", false,
+        )))?;
+        let mut write = Write::new("a").unit(Unit::new("finding", "f1", NONE, ValidTime::Unknown));
+        for (key, age) in [("v1", 30), ("v2", 30), ("v3", 41)] {
+            write = write.unit(
+                Unit::new(
+                    "voice",
+                    key,
+                    [("age", crate::Value::Integer(age))],
+                    ValidTime::Unknown,
+                )
+                .link("supports", key, "f1", ValidTime::Unknown),
+            );
+        }
+        g.write(&write)?;
+
+        let tallies = g.count(&Count {
+            class: "finding".to_string(),
+            roots: vec!["f1".to_string()],
+            path: vec![Step::new("supports<-")],
+            group_by: Some(GroupBy {
+                class: "voice".to_string(),
+                property: "age".to_string(),
+            }),
+            as_of: None,
+        })?;
+        assert_eq!(
+            tallies[0].groups,
+            BTreeMap::from([
+                (Some("30".to_string()), (2, 2)),
+                (Some("41".to_string()), (1, 1)),
+            ])
         );
         Ok(())
     }
