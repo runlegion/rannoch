@@ -31,8 +31,11 @@ pub(crate) const OWN_TABLES: &str = "
         class TEXT NOT NULL, key TEXT NOT NULL, replaced_by TEXT NOT NULL,
         PRIMARY KEY(class, key)) WITHOUT ROWID;";
 
-/// A place in a graph's event log. Reading since a cursor returns the events after it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// A place in a graph's event log. Reading since a cursor returns the events after it. An app
+/// stores a cursor by serializing it, and a graph rebuilt from the log keeps each event's place,
+/// so a stored cursor names the same place in the rebuilt graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct Cursor(i64);
 
 impl Cursor {
@@ -138,14 +141,23 @@ pub(crate) struct Stored {
 
 /// Appends one event inside the caller's transaction, so it lands only if that transaction does.
 pub(crate) fn append(tx: &Connection, change: Change) -> Result<Event, Error> {
-    store(tx, EventId(Uuid::now_v7()), change)
+    store(tx, EventId(Uuid::now_v7()), None, change)
 }
 
-/// Appends one event under the id it already has, inside the caller's transaction.
-fn store(tx: &Connection, id: EventId, change: Change) -> Result<Event, Error> {
+/// Appends one event under the id it already has, inside the caller's transaction: at `place`
+/// when it has one, otherwise at the end of the log.
+fn store(
+    tx: &Connection,
+    id: EventId,
+    place: Option<Cursor>,
+    change: Change,
+) -> Result<Event, Error> {
     let stored = Stored { id, change };
-    tx.prepare_cached("INSERT INTO _events(body) VALUES (?1)")?
-        .execute(params![serde_json::to_string(&stored)?])?;
+    tx.prepare_cached("INSERT INTO _events(seq, body) VALUES (?1, ?2)")?
+        .execute(params![
+            place.map(|cursor| cursor.0),
+            serde_json::to_string(&stored)?
+        ])?;
     Ok(Event {
         id: stored.id,
         cursor: Cursor(tx.last_insert_rowid()),
@@ -165,18 +177,34 @@ impl Events<'_> {
     /// # Errors
     /// The graph file cannot be read, or an event in it cannot be decoded.
     pub fn since(&self, cursor: Cursor) -> Result<Vec<Event>, Error> {
-        let mut statement = self
-            .conn
-            .prepare_cached("SELECT seq, body FROM _events WHERE seq > ?1 ORDER BY seq")?;
-        let mut rows = statement.query(params![cursor.0])?;
+        self.since_until(cursor, Cursor(i64::MAX), |_| true)
+    }
+
+    /// The events after `cursor` and up to `until`, `until` included, whose change `keep`
+    /// holds for, in the order they were written. No event past `until` is read.
+    ///
+    /// # Errors
+    /// The graph file cannot be read, or an event in it cannot be decoded.
+    pub fn since_until(
+        &self,
+        cursor: Cursor,
+        until: Cursor,
+        keep: impl Fn(&Change) -> bool,
+    ) -> Result<Vec<Event>, Error> {
+        let mut statement = self.conn.prepare_cached(
+            "SELECT seq, body FROM _events WHERE seq > ?1 AND seq <= ?2 ORDER BY seq",
+        )?;
+        let mut rows = statement.query(params![cursor.0, until.0])?;
         let mut events = Vec::new();
         while let Some(row) = rows.next()? {
             let stored: Stored = serde_json::from_str(&row.get::<_, String>(1)?)?;
-            events.push(Event {
-                id: stored.id,
-                cursor: Cursor(row.get(0)?),
-                change: stored.change,
-            });
+            if keep(&stored.change) {
+                events.push(Event {
+                    id: stored.id,
+                    cursor: Cursor(row.get(0)?),
+                    change: stored.change,
+                });
+            }
         }
         Ok(events)
     }
@@ -184,15 +212,18 @@ impl Events<'_> {
 
 /// Rebuilds a graph file at `empty_path` from `events` alone, replaying them in order: its
 /// ontology from the declaration events, and its nodes, links and open links from the rest.
-/// Each event lands in the new file under its own id. The events land together or not at all.
+/// Each event lands in the new file under its own id and at its own place in the log. The
+/// events land together or not at all.
 ///
 /// # Errors
-/// The file cannot be opened as a graph file, or an event cannot be replayed into it.
+/// [`Error::Refused`] naming the event when an event carries a property its class does not
+/// declare; the file cannot be opened as a graph file, or an event cannot be replayed into it.
 pub fn rebuild(events: &[Event], empty_path: impl AsRef<Path>) -> Result<Graph, Error> {
     replay_into(open(empty_path)?, events, |_| true)
 }
 
-/// Replays `events` into `graph` in one transaction, storing each one `keep` holds for.
+/// Replays `events` into `graph` in one transaction, storing each one `keep` holds for under its
+/// own place in the log, so a cursor names the same event in the new file as in the source.
 fn replay_into(
     mut graph: Graph,
     events: &[Event],
@@ -204,12 +235,30 @@ fn replay_into(
     let mut ontology = Ontology::load(&tx)?;
     let recorded = now_millis();
     for event in events {
+        if let Change::Wrote { added, .. } = &event.change {
+            for node in added.iter().filter_map(|fact| match fact {
+                Fact::Node(node) => Some(node),
+                _ => None,
+            }) {
+                let class = ontology.class(&node.class)?;
+                if let Some(property) = node
+                    .properties
+                    .keys()
+                    .find(|p| !class.properties.contains_key(*p))
+                {
+                    return Err(Error::Refused(format!(
+                        "event {} carries property {property}, which class {} does not declare",
+                        event.id, class.name
+                    )));
+                }
+            }
+        }
         replay(&tx, &ontology, recorded, &event.change)?;
         if matches!(event.change, Change::Declared(_)) {
             ontology = Ontology::load(&tx)?;
         }
         if keep(&event.change) {
-            store(&tx, event.id, event.change.clone())?;
+            store(&tx, event.id, Some(event.cursor), event.change.clone())?;
         }
     }
     tx.commit()?;
@@ -482,6 +531,41 @@ mod tests {
         assert!(
             back.iter().all(|e| !matches!(e.change, Change::Closed(_))),
             "a link the forget removed never closes onto the returning key: {back:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_rebuild_refuses_an_event_carrying_an_undeclared_property_and_names_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = |name: &str| {
+            std::env::temp_dir().join(format!("rannoch-{name}-{}.db", uuid::Uuid::now_v7()))
+        };
+        let mut g = open(temp("undeclared"))?;
+        g.declare(&Declaration::Class(Class::new("person", ["name"])))?;
+        g.write(&Write::new("tree").unit(Unit::new(
+            "person",
+            "p01",
+            [("name", "Ana")],
+            ValidTime::Unknown,
+        )))?;
+        let mut events = g.events().since(crate::Cursor::START)?;
+        let last = events.len() - 1;
+        let Change::Wrote { added, .. } = &mut events[last].change else {
+            panic!("expected a write event, got {:?}", events[last].change);
+        };
+        let Some(crate::Fact::Node(node)) = added.first_mut() else {
+            panic!("expected a node fact, got {added:?}");
+        };
+        node.properties.insert("age".to_string(), "40".into());
+
+        let Err(error) = crate::rebuild(&events, temp("undeclared-rebuilt")) else {
+            panic!("the rebuild dropped the undeclared property instead of failing");
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains(&events[last].id.to_string()) && message.contains("age"),
+            "{message}"
         );
         Ok(())
     }
