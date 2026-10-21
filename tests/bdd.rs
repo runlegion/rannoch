@@ -3467,9 +3467,6 @@ fn writes_text_for_integer(world: &mut World) {
 /// A heartbeat long enough that no scenario races it: those scenarios commit by flushing.
 const NEVER: Duration = Duration::from_secs(3_600);
 
-/// A heartbeat short enough that a scenario waits for it.
-const BEAT: Duration = Duration::from_millis(20);
-
 /// Declares class `item` (property `v`) and hands the graph to a queue beating every `interval`.
 fn queued(world: &mut World, interval: Duration) {
     class_with(world, ValueType::Text);
@@ -3527,7 +3524,7 @@ fn watermark_not_passed(world: &mut World) {
 
 #[given("an open graph with an accepted write in its queue")]
 fn graph_with_accepted_write(world: &mut World) {
-    queued(world, BEAT);
+    queued(world, Queue::INTERVAL);
     enqueue(world, "i1");
 }
 
@@ -3545,7 +3542,7 @@ fn watermark_passed(world: &mut World) {
 
 #[given("an open graph with a subscriber")]
 fn graph_with_subscriber(world: &mut World) {
-    queued(world, BEAT);
+    queued(world, Queue::INTERVAL);
     let (path, heard) = (world.path(), Arc::clone(&world.heard));
     q(world).subscribe(move |cursor| {
         // What another handle reads up to the cursor the subscriber was given, as it is given.
