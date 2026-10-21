@@ -388,11 +388,39 @@ pub(crate) fn node_id(tx: &Connection, class: &str, key: &str) -> Result<Option<
         .optional()?)
 }
 
-/// Checks a whole write before any piece commits: refuses it when a unit's or a link's valid
-/// time is not a real date, or when one of its links has a source that is not of its relation's
-/// declared source class. A target is named by kind and key, so a
+/// Checks a whole write before any piece commits: refuses it when a unit's node does not carry
+/// exactly the properties its class declares, each a value of its declared type, when a unit's
+/// or a link's valid time is not a real date, or when one of its links has a source that is not
+/// of its relation's declared source class. A target is named by kind and key, so a
 /// target key not yet a node of the declared target class leaves the link open.
 fn check(conn: &Connection, ontology: &Ontology, write: &Write) -> Result<(), Error> {
+    for node in write.units.iter().map(|u| &u.node) {
+        let class = ontology.class(&node.class)?;
+        for (property, value) in &node.properties {
+            let Some(of) = class.properties.get(property) else {
+                return Err(Error::Refused(format!(
+                    "class {} has no property {property}",
+                    class.name
+                )));
+            };
+            if !value.is(*of) {
+                return Err(Error::Refused(format!(
+                    "property {property} of class {} is declared {of:?}; {value:?} is not",
+                    class.name
+                )));
+            }
+        }
+        if let Some(missing) = class
+            .properties
+            .keys()
+            .find(|p| !node.properties.contains_key(*p))
+        {
+            return Err(Error::Refused(format!(
+                "class {} declares property {missing}; node {} does not carry it",
+                class.name, node.key
+            )));
+        }
+    }
     let valid_times = write
         .units
         .iter()
@@ -456,20 +484,6 @@ impl<'a> Piece<'a> {
     /// Writes a node, or a new version of it. Returns the node's id and whether it is new.
     fn node(&mut self, node: &NodeFact) -> Result<(i64, bool), Error> {
         let class = self.ontology.class(&node.class)?;
-        for (property, value) in &node.properties {
-            let Some(of) = class.properties.get(property) else {
-                return Err(Error::Refused(format!(
-                    "class {} has no property {property}",
-                    class.name
-                )));
-            };
-            if !value.is(*of) {
-                return Err(Error::Refused(format!(
-                    "property {property} of class {} is declared {of:?}; {value:?} is not",
-                    class.name
-                )));
-            }
-        }
         let table = class_table(&class.name);
         let columns: Vec<String> = class
             .properties
@@ -829,8 +843,9 @@ impl Graph {
     /// `Wrote` event, apart from what the piece added.
     ///
     /// # Errors
-    /// [`WriteError`] holding [`Error::Refused`] and no events when a unit's or a link's valid
-    /// time is not a real date (a month outside 1 to 12, or a day past its month's end), or a
+    /// [`WriteError`] holding [`Error::Refused`] and no events when a unit's node lacks a
+    /// property its class declares, carries one it does not declare, or carries a value of
+    /// another type than declared; when a unit's or a link's valid time is not a real date (a month outside 1 to 12, or a day past its month's end), or a
     /// link's source is not of its relation's declared source class: the write is checked before
     /// any piece commits, so it lands nothing.
     /// [`WriteError`] when a piece fails: the pieces before it are kept, and the error holds

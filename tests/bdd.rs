@@ -1602,6 +1602,7 @@ fn writes_wrong_class_link(world: &mut World) {
 }
 
 #[then("the write is refused")]
+#[then("the write is refused when it is written")]
 fn write_refused(world: &mut World) {
     let error = world.write_error.as_ref().unwrap();
     assert!(
@@ -2651,9 +2652,12 @@ fn inside_link_waits(world: &mut World) {
     let when = day(2021, 3, 2);
     world
         .g()
-        .write(&Write::new("swtor").unit(
-            Unit::new("statement", "s9", NONE, when.clone()).link("inside", "s9", "c9", when),
-        ))
+        .write(
+            &Write::new("swtor").unit(
+                Unit::new("statement", "s9", [("text", "hi")], when.clone())
+                    .link("inside", "s9", "c9", when),
+            ),
+        )
         .unwrap();
     assert_eq!(world.g().open_links().unwrap().len(), 1);
 }
@@ -3415,6 +3419,35 @@ fn store_011_whole(world: &mut World) {
         written
             .iter()
             .all(|n| n.properties.values().all(|v| matches!(v, Value::Text(_))))
+    );
+}
+
+// ---------- write: refused when it breaks its class's declaration ----------
+
+fn write_refusing(world: &mut World, unit: Unit) {
+    world.write_error = Some(
+        world
+            .g()
+            .write(&Write::new("app").unit(unit))
+            .expect_err("the write is refused"),
+    );
+}
+
+#[given("a class that declares a property")]
+fn class_with_text(world: &mut World) {
+    class_with(world, ValueType::Text);
+}
+
+#[when("the app writes a node of that class without the property")]
+fn writes_without_property(world: &mut World) {
+    write_refusing(world, Unit::new("item", "i1", NONE, day(2026, 1, 1)));
+}
+
+#[when("the app writes a node of that class with text for the property")]
+fn writes_text_for_integer(world: &mut World) {
+    write_refusing(
+        world,
+        Unit::new("item", "i1", [("v", "nine")], day(2026, 1, 1)),
     );
 }
 

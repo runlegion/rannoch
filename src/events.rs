@@ -384,8 +384,6 @@ mod tests {
         Change, Class, Date, Declaration, NodeRef, Relation, Unit, ValidTime, Write, open,
     };
 
-    const NONE: [(&str, &str); 0] = [];
-
     #[test]
     fn a_forget_takes_the_nodes_open_links_with_it() -> Result<(), Box<dyn std::error::Error>> {
         let path = std::env::temp_dir().join(format!("rannoch-forget-{}.db", uuid::Uuid::now_v7()));
@@ -409,7 +407,12 @@ mod tests {
             "no open link names the forgotten person"
         );
 
-        g.write(&Write::new("tree").unit(Unit::new("place", "pl-late", NONE, when.clone())))?;
+        g.write(&Write::new("tree").unit(Unit::new(
+            "place",
+            "pl-late",
+            [("name", "Lochend")],
+            when.clone(),
+        )))?;
         let back = g.write(&Write::new("tree").unit(fiona()))?;
         assert!(
             back.iter().all(|e| !matches!(e.change, Change::Closed(_))),
