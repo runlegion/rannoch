@@ -263,6 +263,7 @@ fn t2(g: &mut Graph) -> Vec<Event> {
         .declare(&Declaration::Property {
             class: "voice".into(),
             property: "name".into(),
+            of: ValueType::Text,
         })
         .unwrap()
         .into_iter()
@@ -753,6 +754,7 @@ fn declares_need(world: &mut World) {
     world.declare(Declaration::Property {
         class: "statement".into(),
         property: "need".into(),
+        of: ValueType::Text,
     });
 }
 
@@ -764,7 +766,8 @@ fn one_declaration_event(world: &mut World) {
         events.last().unwrap().change,
         Change::Declared(Declaration::Property {
             class: "statement".into(),
-            property: "need".into()
+            property: "need".into(),
+            of: ValueType::Text,
         })
     );
 }
@@ -867,6 +870,7 @@ fn statement_need_mid_stream(world: &mut World) {
     g.declare(&Declaration::Property {
         class: "statement".into(),
         property: "need".into(),
+        of: ValueType::Text,
     })
     .unwrap();
     world.mark_events();
