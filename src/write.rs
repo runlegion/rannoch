@@ -155,10 +155,13 @@ impl ValidTime {
 pub enum Declaration {
     Class(Class),
     Relation(Relation),
-    /// A property added to a declared class.
+    /// A property added to a declared class, of value type `of`: text when the declaration
+    /// names none, as every declaration before value types holds it.
     Property {
         class: String,
         property: String,
+        #[serde(default)]
+        of: ValueType,
     },
 }
 
@@ -255,18 +258,30 @@ pub(crate) fn build(
             ))?;
             save(tx, RELATION, &relation.name, relation)?;
         }
-        Declaration::Property { class, property } => {
+        Declaration::Property {
+            class,
+            property,
+            of,
+        } => {
             let have = ontology.class(class)?;
-            if have.properties.contains_key(property) {
-                return Ok(false);
+            match have.properties.get(property) {
+                Some(declared) if declared == of => return Ok(false),
+                Some(declared) => {
+                    return Err(Error::Refused(format!(
+                        "property {property} of class {class} is already declared {declared:?}; \
+                         this declaration has {of:?}"
+                    )));
+                }
+                None => {}
             }
             tx.execute_batch(&format!(
-                "ALTER TABLE {} ADD COLUMN {} TEXT;",
+                "ALTER TABLE {} ADD COLUMN {} {};",
                 class_table(class),
-                property_column(property)
+                property_column(property),
+                of.column()
             ))?;
             let mut grown = have.clone();
-            grown.properties.insert(property.clone(), ValueType::Text);
+            grown.properties.insert(property.clone(), *of);
             save(tx, CLASS, class, &grown)?;
         }
     }
@@ -405,6 +420,18 @@ pub(crate) fn check_declared(ontology: &Ontology, write: &Write) -> Result<(), E
             if !value.is(*of) {
                 return Err(Error::Refused(format!(
                     "property {property} of class {} is declared {of:?}; {value:?} is not",
+                    class.name
+                )));
+            }
+            let finite = match value {
+                Value::Float(f) => f.is_finite(),
+                Value::FloatVector(v) => v.iter().all(|f| f.is_finite()),
+                _ => true,
+            };
+            if !finite {
+                return Err(Error::Refused(format!(
+                    "property {property} of class {} carries {value:?}; \
+                     NaN and infinities are not values",
                     class.name
                 )));
             }
@@ -854,10 +881,10 @@ impl Graph {
     /// # Errors
     /// [`WriteError`] holding [`Error::Refused`] and no events when a unit's node lacks a
     /// property its class declares, carries one it does not declare, or carries a value of
-    /// another type than declared; when a unit's or a link's valid time is not a real date (a
-    /// month outside 1 to 12, or a day past its month's end); or when a link's source is not of
-    /// its relation's declared source class: the write is checked before any piece commits, so
-    /// it lands nothing.
+    /// another type than declared, or a float that is NaN or an infinity; when a unit's or a
+    /// link's valid time is not a real date (a month outside 1 to 12, or a day past its month's
+    /// end); or when a link's source is not of its relation's declared source class: the write is
+    /// checked before any piece commits, so it lands nothing.
     /// [`WriteError`] when a piece fails: the pieces before it are kept, and the error holds
     /// their events.
     pub fn write(&mut self, write: &Write) -> Result<Vec<Event>, WriteError> {
@@ -1011,7 +1038,7 @@ fn put(
 mod tests {
     use crate::{
         Change, Class, Cursor, Date, Declaration, Error, Fact, Graph, NodeRef, Relation, Unit,
-        ValidTime, Write, WriteError, open, rebuild,
+        ValidTime, Value, ValueType, Write, WriteError, open, rebuild,
     };
 
     /// A graph with class `item` holding nodes `x` and `y`.
@@ -1196,6 +1223,93 @@ mod tests {
         ));
         assert!(matches!(
             Date::month(2020, 0).parts(),
+            Err(Error::Refused(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn a_nan_or_an_infinity_is_refused_when_it_is_written() -> Result<(), Error> {
+        let mut g = graph("non-finite")?;
+        for (property, of) in [
+            ("score", ValueType::Float),
+            ("at", ValueType::FloatVector(2)),
+        ] {
+            g.declare(&Declaration::Property {
+                class: "item".to_string(),
+                property: property.to_string(),
+                of,
+            })?;
+        }
+        let item = |score: f64, at: Vec<f64>| {
+            Unit::new(
+                "item",
+                "a",
+                [
+                    ("name", Value::from("a")),
+                    ("score", Value::Float(score)),
+                    ("at", Value::FloatVector(at)),
+                ],
+                ValidTime::Unknown,
+            )
+        };
+        for (score, at) in [
+            (f64::NAN, vec![0.0, 0.0]),
+            (f64::INFINITY, vec![0.0, 0.0]),
+            (f64::NEG_INFINITY, vec![0.0, 0.0]),
+            (1.0, vec![0.0, f64::NAN]),
+            (1.0, vec![f64::INFINITY, 0.0]),
+        ] {
+            let before = g.events().since(Cursor::START)?;
+            let refused = g.write(&Write::new("src").unit(item(score, at.clone())));
+            assert!(
+                matches!(&refused, Err(WriteError { events, cause: Error::Refused(_) })
+                    if events.is_empty()),
+                "{score} and {at:?}: {refused:?}"
+            );
+            assert_eq!(g.events().since(Cursor::START)?, before);
+        }
+        g.write(&Write::new("src").unit(item(1.5, vec![0.5, -0.5])))
+            .map_err(|e| e.cause)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_property_declared_later_carries_its_value_type() -> Result<(), Error> {
+        let mut g = graph("typed-later")?;
+        g.declare(&Declaration::Property {
+            class: "item".to_string(),
+            property: "count".to_string(),
+            of: ValueType::Integer,
+        })?;
+        let item = |count: Value| {
+            Unit::new(
+                "item",
+                "a",
+                [("name", Value::from("a")), ("count", count)],
+                ValidTime::Unknown,
+            )
+        };
+        assert!(matches!(
+            g.write(&Write::new("src").unit(item(Value::from("7")))),
+            Err(WriteError {
+                cause: Error::Refused(_),
+                ..
+            })
+        ));
+        g.write(&Write::new("src").unit(item(Value::Integer(9_007_199_254_740_993))))
+            .map_err(|e| e.cause)?;
+        assert_eq!(
+            g.find("item", "a")?
+                .and_then(|n| n.properties.get("count").cloned()),
+            Some(Value::Integer(9_007_199_254_740_993))
+        );
+        assert!(matches!(
+            g.declare(&Declaration::Property {
+                class: "item".to_string(),
+                property: "count".to_string(),
+                of: ValueType::Text,
+            }),
             Err(Error::Refused(_))
         ));
         Ok(())
