@@ -17,7 +17,8 @@ use sysinfo::{MemoryRefreshKind, ProcessRefreshKind, ProcessesToUpdate, System};
 
 /// The bytes written and durably flushed once to time one flush.
 const FLUSH_BYTES: usize = 4 * 1024;
-/// The bytes written and durably flushed in each round of the rate measurement.
+/// The most bytes written and durably flushed in one round of the rate measurement. Rounds start
+/// at [`FLUSH_BYTES`] and double while the budget fits them.
 const ROUND_BYTES: usize = 1024 * 1024;
 /// The most bytes the rate measurement writes, however much budget remains.
 const MAX_BYTES: u64 = 64 * 1024 * 1024;
@@ -119,11 +120,25 @@ pub fn disk(directory: &Path, budget: Duration) -> Result<Disk, Error> {
     let chunk = vec![0; ROUND_BYTES];
     let mut written: u64 = 0;
     let mut spent = Duration::ZERO;
-    let mut last = flush;
-    while written < MAX_BYTES && start.elapsed() + last * 2 < budget {
-        last = probe.round(&chunk)?;
-        spent += last;
-        written += ROUND_BYTES as u64;
+    let mut last = (flush, FLUSH_BYTES);
+    let mut size = FLUSH_BYTES;
+    // A round fits when twice the time it is predicted to take, scaled from the last round's
+    // bytes, still lands inside the budget.
+    let fits = |bytes: usize, (took, of): (Duration, usize)| {
+        let predicted = took.as_nanos() * bytes as u128 / of as u128;
+        start.elapsed().as_nanos() + predicted * 2 < budget.as_nanos()
+    };
+    while written < MAX_BYTES {
+        let grown = (size * 2).min(ROUND_BYTES);
+        if fits(grown, last) {
+            size = grown;
+        } else if !fits(size, last) {
+            break;
+        }
+        let took = probe.round(&chunk[..size])?;
+        spent += took;
+        written += size as u64;
+        last = (took, size);
     }
     if written == 0 || start.elapsed() > budget {
         return Err(Error::Budget(budget));

@@ -43,3 +43,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets --all-features
       - run: cargo test -p rannoch-probe
+      # The memory allowed under a real limit: one probe test runs as root in a systemd scope
+      # whose MemoryMax is 512 MiB, and is told to expect it.
+      - if: runner.os == 'Linux'
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: sudo systemd-run --scope --quiet -p MemoryMax=536870912 env RANNOCH_PROBE_EXPECT_LIMIT=536870912
+        run: cargo test -p rannoch-probe --test probe -- --exact memory_allows_no_more_than_the_cgroup_limit

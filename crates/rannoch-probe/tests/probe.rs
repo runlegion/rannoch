@@ -25,6 +25,18 @@ fn memory_allows_no_more_than_the_cap() {
     assert_eq!(measured.allowed, 1024);
 }
 
+/// Run under a memory limit with `RANNOCH_PROBE_EXPECT_LIMIT` naming it in bytes; skipped
+/// otherwise. CI runs it in a systemd scope with `MemoryMax` set.
+#[cfg(target_os = "linux")]
+#[test]
+fn memory_allows_no_more_than_the_cgroup_limit() {
+    let Ok(expected) = std::env::var("RANNOCH_PROBE_EXPECT_LIMIT") else {
+        return;
+    };
+    let expected: u64 = expected.parse().unwrap();
+    assert!(memory(None).allowed <= expected);
+}
+
 #[test]
 fn disk_reports_a_rate_and_a_flush_and_leaves_no_file() {
     let directory = tempfile::tempdir().unwrap();
@@ -36,6 +48,17 @@ fn disk_reports_a_rate_and_a_flush_and_leaves_no_file() {
     assert!(measured.flush > Duration::ZERO);
     assert_eq!(measured.directory, directory.path());
     assert_eq!(measured.os, std::env::consts::OS);
+    assert_eq!(entries(directory.path()), 0);
+}
+
+#[test]
+fn disk_within_a_tight_budget_returns_within_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let budget = Duration::from_millis(250);
+    let start = Instant::now();
+    let measured = disk(directory.path(), budget).unwrap();
+    assert!(start.elapsed() <= budget);
+    assert!(measured.bytes_per_second > 0);
     assert_eq!(entries(directory.path()), 0);
 }
 
