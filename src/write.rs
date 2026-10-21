@@ -845,9 +845,10 @@ impl Graph {
     /// # Errors
     /// [`WriteError`] holding [`Error::Refused`] and no events when a unit's node lacks a
     /// property its class declares, carries one it does not declare, or carries a value of
-    /// another type than declared; when a unit's or a link's valid time is not a real date (a month outside 1 to 12, or a day past its month's end), or a
-    /// link's source is not of its relation's declared source class: the write is checked before
-    /// any piece commits, so it lands nothing.
+    /// another type than declared; when a unit's or a link's valid time is not a real date (a
+    /// month outside 1 to 12, or a day past its month's end); or when a link's source is not of
+    /// its relation's declared source class: the write is checked before any piece commits, so
+    /// it lands nothing.
     /// [`WriteError`] when a piece fails: the pieces before it are kept, and the error holds
     /// their events.
     pub fn write(&mut self, write: &Write) -> Result<Vec<Event>, WriteError> {
