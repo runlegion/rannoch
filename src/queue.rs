@@ -18,8 +18,8 @@ pub struct Ticket(u64);
 type Subscriber = Box<dyn FnMut(Cursor) + Send>;
 
 /// One process's queue of writes to a graph, held in memory only, and the heartbeat that
-/// commits it. The queue owns the graph: [`Graph::write`] is the synchronous commit the
-/// heartbeat uses, and other handles on the same file read what it commits.
+/// commits it, each batch as one transaction with a savepoint per write. The queue owns the
+/// graph, and other handles on the same file read what it commits.
 pub struct Queue {
     /// The graph's ontology when the queue took it, which a write is checked against at once.
     ontology: Ontology,
@@ -137,10 +137,31 @@ impl Shared {
             return;
         };
         // A write that fails at commit is kept, not dropped; reporting it is FR-RANNOCH-075's.
-        let failed: Vec<(Ticket, WriteError)> = batch
-            .iter()
-            .filter_map(|(ticket, write)| graph.write(write).err().map(|e| (*ticket, e)))
-            .collect();
+        let failed: Vec<(Ticket, WriteError)> =
+            match graph.write_batch(batch.iter().map(|(_, write)| write)) {
+                Ok(results) => batch
+                    .iter()
+                    .zip(results)
+                    .filter_map(|((ticket, _), result)| {
+                        let cause = result.err()?;
+                        Some((
+                            *ticket,
+                            WriteError {
+                                events: Vec::new(),
+                                cause,
+                            },
+                        ))
+                    })
+                    .collect(),
+                // The batch's transaction failed, so none of it landed; its last ticket keeps why.
+                Err(cause) => vec![(
+                    last,
+                    WriteError {
+                        events: Vec::new(),
+                        cause,
+                    },
+                )],
+            };
         let cursor = {
             let mut state = lock(&self.state);
             state.committed = Some(last);
