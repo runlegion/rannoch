@@ -137,31 +137,25 @@ impl Shared {
             return;
         };
         // A write that fails at commit is kept, not dropped; reporting it is FR-RANNOCH-075's.
-        let failed: Vec<(Ticket, WriteError)> =
+        let failed: Vec<(Ticket, Error)> =
             match graph.write_batch(batch.iter().map(|(_, write)| write)) {
                 Ok(results) => batch
                     .iter()
                     .zip(results)
-                    .filter_map(|((ticket, _), result)| {
-                        let cause = result.err()?;
-                        Some((
-                            *ticket,
-                            WriteError {
-                                events: Vec::new(),
-                                cause,
-                            },
-                        ))
-                    })
+                    .filter_map(|((ticket, _), result)| result.err().map(|cause| (*ticket, cause)))
                     .collect(),
                 // The batch's transaction failed, so none of it landed; its last ticket keeps why.
-                Err(cause) => vec![(
-                    last,
-                    WriteError {
-                        events: Vec::new(),
-                        cause,
-                    },
-                )],
+                Err(cause) => vec![(last, cause)],
             };
+        let failed = failed.into_iter().map(|(ticket, cause)| {
+            (
+                ticket,
+                WriteError {
+                    events: Vec::new(),
+                    cause,
+                },
+            )
+        });
         let cursor = {
             let mut state = lock(&self.state);
             state.committed = Some(last);
