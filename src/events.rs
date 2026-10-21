@@ -213,7 +213,7 @@ fn replay_into(mut graph: Graph, events: &[Event], keep: bool) -> Result<Graph, 
 }
 
 /// A graph's state at a cursor, in a file of its own: its ontology, nodes, links, open links and
-/// fates, and none of its events. A new reader or a rebuild starts from it and takes only the
+/// replacements, and none of its events. A new reader or a rebuild starts from it and takes only the
 /// events after its cursor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
