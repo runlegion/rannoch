@@ -207,6 +207,15 @@ pub fn rebuild(events: &[Event], empty_path: impl AsRef<Path>) -> Result<Graph, 
 }
 
 impl Graph {
+    /// The cursor of the last event in the log, or [`Cursor::START`] when it holds none.
+    pub(crate) fn last_cursor(&self) -> Result<Cursor, Error> {
+        Ok(Cursor(
+            self.conn
+                .prepare_cached("SELECT COALESCE(MAX(seq), 0) FROM _events")?
+                .query_row([], |row| row.get(0))?,
+        ))
+    }
+
     /// Compacts the graph's events up to `cursor`, a place the app picks: the events up to it
     /// are deleted, and the state they built is kept as the base. Counts read after compaction
     /// equal the counts before it, and numbers an app folds from the base plus the events after
