@@ -109,11 +109,14 @@ fn allowed(total: u64, limit: Option<u64>, cap: Option<u64>) -> u64 {
 /// # Errors
 ///
 /// [`Error::Io`] when the file cannot be created, written, flushed or removed, and
-/// [`Error::Budget`] when the budget runs out before the rate can be measured.
+/// [`Error::Budget`] when the budget runs out before the rate can be measured or before the file
+/// is removed.
 pub fn disk(directory: &Path, budget: Duration) -> Result<Disk, Error> {
     let start = Instant::now();
     let taken_at = SystemTime::now();
     let mut probe = Probe::create(directory)?;
+    // Closing and removing the file must fit too; reserve twice what creating it took.
+    let reserve = start.elapsed().as_nanos() * 2;
 
     let flush = probe.round(&[0; FLUSH_BYTES])?;
 
@@ -122,11 +125,11 @@ pub fn disk(directory: &Path, budget: Duration) -> Result<Disk, Error> {
     let mut spent = Duration::ZERO;
     let mut last = (flush, FLUSH_BYTES);
     let mut size = FLUSH_BYTES;
-    // A round fits when twice the time it is predicted to take, scaled from the last round's
-    // bytes, still lands inside the budget.
+    // A round fits when four times the time it is predicted to take, scaled from the last
+    // round's bytes, and the reserve still land inside the budget.
     let fits = |bytes: usize, (took, of): (Duration, usize)| {
         let predicted = took.as_nanos() * bytes as u128 / of as u128;
-        start.elapsed().as_nanos() + predicted * 2 < budget.as_nanos()
+        start.elapsed().as_nanos() + predicted * 4 + reserve < budget.as_nanos()
     };
     while written < MAX_BYTES {
         let grown = (size * 2).min(ROUND_BYTES);
@@ -140,10 +143,10 @@ pub fn disk(directory: &Path, budget: Duration) -> Result<Disk, Error> {
         written += size as u64;
         last = (took, size);
     }
+    probe.remove()?;
     if written == 0 || start.elapsed() > budget {
         return Err(Error::Budget(budget));
     }
-    probe.remove()?;
 
     let nanos = spent.as_nanos().max(1);
     let bytes_per_second =

@@ -52,13 +52,16 @@ fn disk_reports_a_rate_and_a_flush_and_leaves_no_file() {
 }
 
 #[test]
-fn disk_within_a_tight_budget_returns_within_it() {
+fn disk_within_a_tight_budget_returns_within_it_measured_or_not() {
     let directory = tempfile::tempdir().unwrap();
     let budget = Duration::from_millis(250);
     let start = Instant::now();
-    let measured = disk(directory.path(), budget).unwrap();
+    match disk(directory.path(), budget) {
+        Ok(measured) => assert!(measured.bytes_per_second > 0),
+        Err(Error::Budget(_)) => {}
+        Err(error) => panic!("{error}"),
+    }
     assert!(start.elapsed() <= budget);
-    assert!(measured.bytes_per_second > 0);
     assert_eq!(entries(directory.path()), 0);
 }
 
