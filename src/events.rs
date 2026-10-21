@@ -283,6 +283,15 @@ impl Snapshot {
 }
 
 impl Graph {
+    /// The cursor of the last event in the log, or [`Cursor::START`] when it holds none.
+    pub(crate) fn last_cursor(&self) -> Result<Cursor, Error> {
+        Ok(Cursor(
+            self.conn
+                .prepare_cached("SELECT COALESCE(MAX(seq), 0) FROM _events")?
+                .query_row([], |row| row.get(0))?,
+        ))
+    }
+
     /// Takes a snapshot of the graph's state at `cursor`, a place the app picks, into a new file
     /// at `empty_path`. It deletes nothing: every event stays in the store. It reads this graph's
     /// log and writes only the new file, so it never takes this graph's write lock.
