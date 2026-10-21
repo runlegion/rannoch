@@ -20,8 +20,8 @@ use std::time::SystemTime;
 
 use rannoch::{
     Change, Class, Count, Cursor, Date, Declaration, Description, Error, Event, EventId, Fact,
-    Fate, Graph, GroupBy, Link, LinkFact, Node, NodeRef, OpenLink, PartOf, Relation, Step, Tally,
-    Unit, ValidTime, Value, Write, WriteError,
+    Fate, Graph, GroupBy, Link, LinkFact, Node, NodeRef, OpenLink, PartOf, Relation, Snapshot,
+    Step, Tally, Unit, ValidTime, Value, Write, WriteError,
 };
 use rannoch::{HistoryKey, NodeFact, ValueType};
 use rstest_bdd_macros::{given, scenarios, then, when};
@@ -529,7 +529,7 @@ struct World {
     shared: Option<Graph>,
     fates: Vec<Fate>,
     references: Vec<Node>,
-    before: Vec<Tally>,
+    snapshot: Option<Snapshot>,
 }
 
 #[rstest::fixture]
@@ -567,7 +567,7 @@ fn world() -> World {
         shared: None,
         fates: Vec::new(),
         references: Vec::new(),
-        before: Vec::new(),
+        snapshot: None,
     }
 }
 
@@ -2006,15 +2006,28 @@ fn earlier_events_keep_ids(world: &mut World) {
     assert_eq!(naming(&earlier, &forgotten()), world.named);
 }
 
-// ---------- events: compaction ----------
+// ---------- events: snapshots ----------
 
-#[given("a graph with events before and after a cursor")]
+/// The T9b declarations, voices v0..v9 and statements s0..s4 said by them up to the cursor;
+/// statements s5..s9 said by v5..v9 after it, so links after the cursor reach nodes before it.
 fn events_around_cursor(world: &mut World) {
     let when = day(2026, 10, 14);
     let g = world.open();
     for d in t9b() {
         g.declare(&d).unwrap();
     }
+    let said = |s: usize| {
+        let statement = format!("s{s}");
+        Write::new("eavesdrop").unit(
+            Unit::new(
+                "statement",
+                statement.clone(),
+                [("text", "words")],
+                when.clone(),
+            )
+            .link("said", format!("v{s}"), statement, when.clone()),
+        )
+    };
     for v in 0..10 {
         g.write(&Write::new("eavesdrop").unit(Unit::new(
             "voice",
@@ -2024,194 +2037,213 @@ fn events_around_cursor(world: &mut World) {
         )))
         .unwrap();
     }
+    for s in 0..5 {
+        g.write(&said(s)).unwrap();
+    }
     world.cursor = world.all_events().last().unwrap().cursor;
-    for s in 0..10 {
-        let statement = format!("s{s}");
-        world
-            .g()
-            .write(
-                &Write::new("eavesdrop").unit(
-                    Unit::new(
-                        "statement",
-                        statement.clone(),
-                        [("text", "words")],
-                        when.clone(),
-                    )
-                    .link("said", format!("v{s}"), statement, when.clone()),
-                ),
-            )
-            .unwrap();
+    for s in 5..10 {
+        world.g().write(&said(s)).unwrap();
     }
     world.log = world.all_events();
 }
 
-#[when("the app compacts at the cursor")]
-fn compacts_at_the_cursor(world: &mut World) {
+fn take_snapshot(world: &mut World) {
+    let (cursor, path) = (world.cursor, world.dir.path().join("snapshot.rannoch"));
+    world.snapshot = Some(world.g().snapshot(cursor, path).unwrap());
+}
+
+/// Takes a snapshot at the end of the graph's log.
+fn snapshot_at_end(world: &mut World) {
+    world.cursor = world.all_events().last().unwrap().cursor;
+    take_snapshot(world);
+}
+
+fn rebuild_from_snapshot(world: &mut World) -> &mut Graph {
+    let snapshot = world.snapshot.clone().expect("the app took a snapshot");
+    let later = world.g().events().since(snapshot.cursor()).unwrap();
+    let path = world.dir.path().join("rebuilt.rannoch");
+    world.rebuilt = Some(snapshot.rebuild(&later, path).unwrap());
+    world.rebuilt.as_mut().unwrap()
+}
+
+#[given("a graph with events")]
+fn graph_with_events(world: &mut World) {
+    events_around_cursor(world);
+}
+
+#[when("the app takes a snapshot at a cursor")]
+fn takes_snapshot(world: &mut World) {
+    take_snapshot(world);
+}
+
+#[then("every event before the cursor is still in the store")]
+fn every_event_kept(world: &mut World) {
     let cursor = world.cursor;
-    world.g().compact(cursor).unwrap();
-    world.read = world.all_events();
+    let before = |events: Vec<Event>| -> Vec<Event> {
+        events.into_iter().filter(|e| e.cursor <= cursor).collect()
+    };
+    let kept = before(world.all_events());
+    // 9 declarations, 10 voices and 5 statements were written up to the cursor.
+    assert_eq!(kept.len(), 24);
+    assert_eq!(kept, before(world.log.clone()));
+    assert_eq!(world.all_events(), world.log);
 }
 
-#[then("reading the events returns no event up to the cursor")]
-fn none_up_to_cursor(world: &mut World) {
-    // 9 declarations and 10 voices were written up to the cursor.
-    let up_to = world.log.iter().filter(|e| e.cursor <= world.cursor);
-    assert_eq!(up_to.count(), 19);
-    assert!(world.read.iter().all(|e| e.cursor > world.cursor));
+#[given("a graph with a snapshot at a cursor and events after it")]
+fn snapshot_with_later_events(world: &mut World) {
+    events_around_cursor(world);
+    take_snapshot(world);
 }
 
-#[then("it returns every event after the cursor")]
-fn every_after_cursor(world: &mut World) {
+#[when("the graph is rebuilt from the snapshot and the events after its cursor")]
+#[when("the graph is rebuilt from the snapshot")]
+fn rebuilt_from_snapshot(world: &mut World) {
+    rebuild_from_snapshot(world);
+}
+
+#[then("the rebuilt graph holds every node and link the live graph holds")]
+fn rebuilt_matches_live(world: &mut World) {
+    let (live, rebuilt) = world.both();
+    let voices = (0..10).map(|v| ("voice", format!("v{v}")));
+    let statements = (0..10).map(|s| ("statement", format!("s{s}")));
+    for (class, key) in voices.chain(statements) {
+        let have = live.find(class, &key).unwrap().unwrap();
+        let back = rebuilt.find(class, &key).unwrap();
+        assert_eq!(
+            back.map(node_facts),
+            Some(node_facts(have)),
+            "{class} {key}"
+        );
+    }
+    for s in 0..10 {
+        let (from, to) = (format!("v{s}"), format!("s{s}"));
+        let have = live.find_link("said", &from, &to).unwrap().unwrap();
+        let back = rebuilt.find_link("said", &from, &to).unwrap();
+        assert_eq!(
+            back.map(link_facts),
+            Some(link_facts(have)),
+            "said {from} {to}"
+        );
+    }
+    assert_eq!(rebuilt.open_links().unwrap(), live.open_links().unwrap());
+}
+
+#[given("a graph with one node forgotten and one node replaced before a snapshot's cursor")]
+fn fates_before_snapshot(world: &mut World) {
+    events_around_cursor(world);
+    let g = world.g();
+    g.forget(&NodeRef::new("statement", "s0"), "living", "eavesdrop")
+        .unwrap();
+    g.replace("statement", "s1", "s2").unwrap();
+    snapshot_at_end(world);
+}
+
+#[then(
+    "the forgotten node resolves as forgotten and the replaced node resolves to its replacement, as in the live graph"
+)]
+fn fates_survive_snapshot(world: &mut World) {
+    let rebuilt = world.dir.path().join("rebuilt.rannoch");
+    let mut referrer = rannoch::open(world.dir.path().join("referrer.rannoch")).unwrap();
+    referrer.mount("live", world.path()).unwrap();
+    referrer.mount("rebuilt", rebuilt).unwrap();
+    for (key, fate) in [
+        (
+            "s0",
+            Fate::Forgotten {
+                rule: "living".into(),
+            },
+        ),
+        (
+            "s1",
+            Fate::Replaced {
+                by: NodeRef::new("statement", "s2"),
+            },
+        ),
+    ] {
+        let target = NodeRef::new("statement", key);
+        let live = referrer.resolve("live", &target).unwrap();
+        assert_eq!(live, fate, "{key} in the live graph");
+        assert_eq!(referrer.resolve("rebuilt", &target).unwrap(), live, "{key}");
+    }
+}
+
+#[given("a graph whose class was declared before a snapshot's cursor")]
+fn class_before_snapshot(world: &mut World) {
+    let g = world.open();
+    for d in t9b() {
+        g.declare(&d).unwrap();
+    }
+    snapshot_at_end(world);
+}
+
+#[when("the graph is rebuilt from the snapshot and the app writes a node of that class")]
+fn rebuilt_and_writes(world: &mut World) {
+    let unit = Unit::new("voice", "v1", NONE, day(2026, 10, 21));
+    world.written = rebuild_from_snapshot(world)
+        .write(&Write::new("eavesdrop").unit(unit))
+        .unwrap();
+}
+
+#[then("the write is accepted")]
+fn write_accepted(world: &mut World) {
+    assert_eq!(world.written.len(), 1);
+    let (_, rebuilt) = world.both();
+    assert!(rebuilt.find("voice", "v1").unwrap().is_some());
+}
+
+#[given("a graph whose class was declared with its history axis before a snapshot's cursor")]
+fn history_before_snapshot(world: &mut World) {
+    world.open();
+    let mut class = Class::new("reading", ["value"]);
+    class.history = HistoryKey::Integer;
+    declare_class(world, class);
+    snapshot_at_end(world);
+}
+
+#[then("the class's history axis reads back from the rebuilt graph's ontology")]
+fn history_from_rebuilt(world: &mut World) {
+    let (_, rebuilt) = world.both();
+    assert_eq!(
+        rebuilt.ontology().classes["reading"].history,
+        HistoryKey::Integer
+    );
+}
+
+#[given("a graph whose class declared a property as a number before a snapshot's cursor")]
+fn number_before_snapshot(world: &mut World) {
+    class_with(world, ValueType::Integer);
+    snapshot_at_end(world);
+}
+
+#[when(
+    "the graph is rebuilt from the snapshot and the app writes a node of that class with text for the property"
+)]
+fn rebuilt_and_writes_text(world: &mut World) {
+    let unit = Unit::new("item", "i1", [("v", "nine")], day(2026, 1, 1));
+    world.write_error = Some(
+        rebuild_from_snapshot(world)
+            .write(&Write::new("app").unit(unit))
+            .expect_err("the write is refused"),
+    );
+}
+
+#[when("a new reader starts from the snapshot")]
+fn new_reader_from_snapshot(world: &mut World) {
+    let cursor = world.snapshot.as_ref().unwrap().cursor();
+    world.read = world.g().events().since(cursor).unwrap();
+}
+
+#[then("the reader receives only the events after the snapshot's cursor")]
+fn reader_gets_later_events(world: &mut World) {
     let after: Vec<Event> = world
         .log
         .iter()
         .filter(|e| e.cursor > world.cursor)
         .cloned()
         .collect();
-    assert_eq!(after.len(), 10);
+    // Statements s5..s9 were written after the cursor.
+    assert_eq!(after.len(), 5);
     assert_eq!(world.read, after);
-}
-
-/// Per finding, all 1,000 of T4's: distinct voices with the total, grouped by place.
-fn count_t4_findings(g: &Graph) -> Vec<Tally> {
-    g.count(&Count {
-        class: "finding".into(),
-        roots: (0..1000).map(|f| format!("f{f}")).collect(),
-        path: vec![Step::new("supports<-"), Step::new("said<-")],
-        group_by: Some(GroupBy {
-            class: "statement".into(),
-            property: "place".into(),
-        }),
-        as_of: None,
-    })
-    .unwrap()
-}
-
-/// Compacts at the cursor of the last event, so every event up to now is removed.
-fn compact_at_end(world: &mut World) {
-    world.cursor = world.all_events().last().unwrap().cursor;
-    let cursor = world.cursor;
-    world.g().compact(cursor).unwrap();
-    assert!(world.all_events().is_empty());
-}
-
-#[given("a graph of 100,000 voices and its live count for each of the 1,000 findings")]
-fn t4_with_live_counts(world: &mut World) {
-    world.source = t4(world);
-    world.before = count_t4_findings(world.g());
-}
-
-#[when("the app compacts at a cursor")]
-fn compacts_at_a_cursor(world: &mut World) {
-    compact_at_end(world);
-}
-
-#[then("the count for each of the 1,000 findings equals its count before compaction")]
-fn counts_unchanged(world: &mut World) {
-    let after = count_t4_findings(world.g());
-    assert_eq!(world.before.len(), 1000);
-    assert!(world.before.iter().any(|t| t.distinct > 0));
-    assert_eq!(after, world.before);
-}
-
-#[given(
-    "a graph compacted at a cursor, and the count for each of the 1,000 findings taken right after compaction"
-)]
-fn t4_compacted_with_counts(world: &mut World) {
-    world.source = t4(world);
-    compact_at_end(world);
-    world.before = count_t4_findings(world.g());
-}
-
-#[when("the app writes more statements and folds the events after the cursor onto those counts")]
-fn writes_and_folds(world: &mut World) {
-    let when = day(2026, 10, 15);
-    let mut rng = fastrand::Rng::with_seed(43);
-    let mut write = Write::new("t4");
-    for v in 100_000..100_200 {
-        let voice = format!("v{v}");
-        write = write.unit(Unit::new("voice", voice.clone(), NONE, when.clone()));
-        for k in 0..rng.usize(1..4) {
-            let statement = format!("v{v}s{k}");
-            let finding = format!("f{}", rng.usize(..1000));
-            let place = PLACES[rng.usize(..PLACES.len())];
-            write = write.unit(
-                Unit::new(
-                    "statement",
-                    statement.clone(),
-                    [("place", place)],
-                    when.clone(),
-                )
-                .link("said", voice.clone(), statement.clone(), when.clone())
-                .link("supports", statement, finding, when.clone()),
-            );
-        }
-    }
-    world.g().write(&write).unwrap();
-
-    // The app's fold: statements' places, their voices and the findings they support.
-    let mut place_of: HashMap<String, Option<String>> = HashMap::new();
-    let mut voice_of: HashMap<String, String> = HashMap::new();
-    let mut supports: Vec<(String, String)> = Vec::new();
-    let cursor = world.cursor;
-    for event in world.g().events().since(cursor).unwrap() {
-        let Change::Wrote { added, .. } = event.change else {
-            continue;
-        };
-        for fact in added {
-            match fact {
-                Fact::Node(node) if node.class == "statement" => {
-                    place_of.insert(node.key, node.properties.get("place").map(text));
-                }
-                Fact::Link(link) if link.relation == "said" => {
-                    voice_of.insert(link.to.key, link.from.key);
-                }
-                Fact::Link(link) if link.relation == "supports" => {
-                    supports.push((link.from.key, link.to.key));
-                }
-                _ => {}
-            }
-        }
-    }
-    // The voices written after the cursor are new, so none is in the base's distinct counts.
-    let mut voices: HashMap<String, HashSet<String>> = HashMap::new();
-    let mut by_place: HashMap<(String, Option<String>), HashSet<String>> = HashMap::new();
-    let mut tallies: HashMap<String, Tally> = world
-        .before
-        .iter()
-        .map(|t| (t.root.clone(), t.clone()))
-        .collect();
-    for (statement, finding) in supports {
-        let voice = voice_of[&statement].clone();
-        let place = place_of[&statement].clone();
-        let tally = tallies.get_mut(&finding).unwrap();
-        tally.total += 1;
-        let group = tally.groups.entry(place.clone()).or_default();
-        group.1 += 1;
-        if by_place
-            .entry((finding.clone(), place))
-            .or_default()
-            .insert(voice.clone())
-        {
-            group.0 += 1;
-        }
-        if voices.entry(finding).or_default().insert(voice) {
-            tally.distinct += 1;
-        }
-    }
-    world.tallies = world
-        .before
-        .iter()
-        .map(|t| tallies.remove(&t.root).unwrap())
-        .collect();
-}
-
-#[then("its per-finding numbers equal the live counts for all 1,000 findings")]
-fn fold_on_base_equals_live(world: &mut World) {
-    let live = count_t4_findings(world.g());
-    assert_eq!(live.len(), 1000);
-    assert_ne!(live, world.before);
-    assert_eq!(world.tallies, live);
 }
 
 // ---------- read: walks ----------
