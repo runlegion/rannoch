@@ -1,5 +1,6 @@
 //! The log: every change to a graph is an event, read in order from a cursor and kept; a
-//! snapshot of state at a cursor the app picks is where a new reader or a rebuild starts. This module owns rannoch's own tables, whose names start with `_`.
+//! snapshot of state at a cursor the app picks is where a new reader or a rebuild starts. This
+//! module owns rannoch's own tables, whose names start with `_`.
 
 use std::collections::BTreeMap;
 use std::fmt;
