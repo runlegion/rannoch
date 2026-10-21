@@ -1,9 +1,10 @@
-//! The log: every change to a graph is an event, read in order from a cursor, and compacted up
-//! to a cursor the app picks. This module owns rannoch's own tables, whose names start with `_`.
+//! The log: every change to a graph is an event, read in order from a cursor and kept; a
+//! snapshot of state at a cursor the app picks is where a new reader or a rebuild starts. This
+//! module owns rannoch's own tables, whose names start with `_`.
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -15,7 +16,7 @@ use crate::write::{Declaration, Error, ValidTime, now_millis, replay};
 
 /// rannoch's own tables: the event log, the ontology, links waiting for an end, and the fates of
 /// nodes that were replaced. An event's place is never reused, so a cursor stays a place in the
-/// log after compaction removes the events up to it.
+/// log.
 pub(crate) const OWN_TABLES: &str = "
     CREATE TABLE IF NOT EXISTS _events(seq INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS _ontology(
@@ -188,7 +189,15 @@ impl Events<'_> {
 /// # Errors
 /// The file cannot be opened as a graph file, or an event cannot be replayed into it.
 pub fn rebuild(events: &[Event], empty_path: impl AsRef<Path>) -> Result<Graph, Error> {
-    let mut graph = open(empty_path)?;
+    replay_into(open(empty_path)?, events, |_| true)
+}
+
+/// Replays `events` into `graph` in one transaction, storing each one `keep` holds for.
+fn replay_into(
+    mut graph: Graph,
+    events: &[Event],
+    keep: impl Fn(&Change) -> bool,
+) -> Result<Graph, Error> {
     let tx = graph
         .conn
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -199,11 +208,48 @@ pub fn rebuild(events: &[Event], empty_path: impl AsRef<Path>) -> Result<Graph, 
         if matches!(event.change, Change::Declared(_)) {
             ontology = Ontology::load(&tx)?;
         }
-        store(&tx, event.id, event.change.clone())?;
+        if keep(&event.change) {
+            store(&tx, event.id, event.change.clone())?;
+        }
     }
     tx.commit()?;
     graph.ontology = ontology;
     Ok(graph)
+}
+
+/// A graph's state at a cursor, in a file of its own: its ontology, nodes, links, open links and
+/// each node's fate. Of the events, it holds only the forget events, which carry no content and
+/// are what a forgotten node's fate is read from. A new reader or a rebuild starts from it and
+/// takes only the events after its cursor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Snapshot {
+    cursor: Cursor,
+    path: PathBuf,
+}
+
+impl Snapshot {
+    /// The place in the source graph's log the snapshot was taken at: a reader starting from
+    /// the snapshot reads the source's events since it.
+    #[must_use]
+    pub fn cursor(&self) -> Cursor {
+        self.cursor
+    }
+
+    /// Rebuilds a graph file at `empty_path` from the snapshot and `later`, the source's events
+    /// after the snapshot's cursor, replayed in order and kept in the new file's log. The
+    /// snapshot file is left as it was.
+    ///
+    /// # Errors
+    /// [`Error::Refused`] when `empty_path` is not UTF-8; the snapshot cannot be copied, the
+    /// file cannot be opened as a graph file, or an event cannot be replayed into it.
+    pub fn rebuild(&self, later: &[Event], empty_path: impl AsRef<Path>) -> Result<Graph, Error> {
+        let empty_path = empty_path.as_ref();
+        let target = empty_path.to_str().ok_or_else(|| {
+            Error::Refused(format!("the path {} is not UTF-8", empty_path.display()))
+        })?;
+        Connection::open(&self.path)?.execute("VACUUM INTO ?1", params![target])?;
+        replay_into(open(empty_path)?, later, |_| true)
+    }
 }
 
 impl Graph {
@@ -216,18 +262,28 @@ impl Graph {
         ))
     }
 
-    /// Compacts the graph's events up to `cursor`, a place the app picks: the events up to it
-    /// are deleted, and the state they built is kept as the base. Counts read after compaction
-    /// equal the counts before it, and numbers an app folds from the base plus the events after
-    /// `cursor` equal live state.
+    /// Takes a snapshot of the graph's state at `cursor`, a place the app picks, into a new file
+    /// at `empty_path`. It deletes nothing: every event stays in the store. It reads this graph's
+    /// log and writes only the new file, so it never takes this graph's write lock.
     ///
     /// # Errors
-    /// The graph file cannot be written.
-    pub fn compact(&mut self, cursor: Cursor) -> Result<(), Error> {
-        self.conn
-            .prepare_cached("DELETE FROM _events WHERE seq <= ?1")?
-            .execute(params![cursor.0])?;
-        Ok(())
+    /// The graph file cannot be read, the new file cannot be opened as a graph file, or an
+    /// event cannot be replayed into it.
+    pub fn snapshot(
+        &self,
+        cursor: Cursor,
+        empty_path: impl AsRef<Path>,
+    ) -> Result<Snapshot, Error> {
+        let mut events = self.events().since(Cursor::START)?;
+        events.retain(|event| event.cursor <= cursor);
+        // A forget event holds no content and is where a forgotten node's fate is read from.
+        replay_into(open(&empty_path)?, &events, |change| {
+            matches!(change, Change::Forgot { .. })
+        })?;
+        Ok(Snapshot {
+            cursor,
+            path: empty_path.as_ref().to_path_buf(),
+        })
     }
 
     /// Forgets `target` under the app's own `rule`, from `source`. The node and its links leave
