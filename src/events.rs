@@ -9,7 +9,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::open::{Graph, Ontology, class_table, open, relation_table, schema_version};
+use crate::open::{Graph, Ontology, Value, class_table, open, relation_table, schema_version};
 use crate::read::NodeRef;
 use crate::write::{Declaration, Error, ValidTime, now_millis, replay};
 
@@ -116,7 +116,7 @@ pub struct WrongKind {
 pub struct NodeFact {
     pub class: String,
     pub key: String,
-    pub properties: BTreeMap<String, String>,
+    pub properties: BTreeMap<String, Value>,
     pub valid: ValidTime,
 }
 

@@ -236,12 +236,13 @@ fn load_legion(copy: &Path, graph: &Path) -> (usize, usize) {
     let mut links = 0;
     for r in &reflections {
         let valid = valid_from(&r.created);
-        let mut unit = Unit::new("reflection", &r.id, [("text", &r.text)], valid.clone()).link(
-            "about",
+        let mut unit = Unit::new(
+            "reflection",
             &r.id,
-            &r.repo,
+            [("text", r.text.as_str())],
             valid.clone(),
-        );
+        )
+        .link("about", &r.id, &r.repo, valid.clone());
         links += 1;
         if let Some(parent) = &r.parent {
             unit = unit.link("follows", &r.id, parent, valid.clone());
@@ -492,7 +493,7 @@ fn baseline(path: &Path) {
     let g = rannoch::open(path).unwrap();
     let properties: Vec<String> = g.ontology().classes["statement"]
         .properties
-        .iter()
+        .keys()
         .map(|p| format!("s.{}", ident(&format!("p:{p}"))))
         .collect();
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();

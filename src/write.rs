@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::events::{Change, Event, Fact, LinkFact, NodeFact, WrongKind, append};
 use crate::open::{
-    CLASS, Class, Graph, Ontology, RELATION, Relation, class_table, concat, property_column,
-    relation_index, relation_table, schema_version,
+    CLASS, Class, Graph, Ontology, RELATION, Relation, Value, ValueType, class_table, concat,
+    property_column, read_properties, relation_index, relation_table, schema_version,
 };
 use crate::read::NodeRef;
 
@@ -161,8 +161,14 @@ pub enum Declaration {
     },
 }
 
-fn list(names: &BTreeSet<String>) -> String {
-    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+fn list(properties: &BTreeMap<String, ValueType>) -> String {
+    let names: Vec<String> = properties
+        .iter()
+        .map(|(name, of)| match of {
+            ValueType::Text => name.clone(),
+            other => format!("{name} as {other:?}"),
+        })
+        .collect();
     format!("[{}]", names.join(", "))
 }
 
@@ -193,18 +199,21 @@ pub(crate) fn build(
     match declaration {
         Declaration::Class(class) => {
             if let Some(have) = ontology.classes.get(&class.name) {
-                if have.properties == class.properties {
+                if have == class {
                     return Ok(false);
                 }
                 return Err(Error::Refused(format!(
-                    "class {} is already declared with properties {}; this declaration has {}",
+                    "class {} is already declared with properties {} and history {:?}; \
+                     this declaration has {} and {:?}",
                     class.name,
                     list(&have.properties),
-                    list(&class.properties)
+                    have.history,
+                    list(&class.properties),
+                    class.history
                 )));
             }
-            let columns = concat(&class.properties, |p| {
-                format!(", {} TEXT", property_column(p))
+            let columns = concat(&class.properties, |(p, of)| {
+                format!(", {} {}", property_column(p), of.column())
             });
             tx.execute_batch(&format!(
                 "CREATE TABLE {}(id INTEGER PRIMARY KEY, key TEXT NOT NULL UNIQUE, \
@@ -247,7 +256,7 @@ pub(crate) fn build(
         }
         Declaration::Property { class, property } => {
             let have = ontology.class(class)?;
-            if have.properties.contains(property) {
+            if have.properties.contains_key(property) {
                 return Ok(false);
             }
             tx.execute_batch(&format!(
@@ -256,7 +265,7 @@ pub(crate) fn build(
                 property_column(property)
             ))?;
             let mut grown = have.clone();
-            grown.properties.insert(property.clone());
+            grown.properties.insert(property.clone(), ValueType::Text);
             save(tx, CLASS, class, &grown)?;
         }
     }
@@ -281,7 +290,7 @@ pub struct Unit {
 
 impl Unit {
     /// A node of `class` under natural key `key`, true from `valid`.
-    pub fn new<K: Into<String>, V: Into<String>>(
+    pub fn new<K: Into<String>, V: Into<Value>>(
         class: impl Into<String>,
         key: impl Into<String>,
         properties: impl IntoIterator<Item = (K, V)>,
@@ -447,20 +456,24 @@ impl<'a> Piece<'a> {
     /// Writes a node, or a new version of it. Returns the node's id and whether it is new.
     fn node(&mut self, node: &NodeFact) -> Result<(i64, bool), Error> {
         let class = self.ontology.class(&node.class)?;
-        if let Some(unknown) = node
-            .properties
-            .keys()
-            .find(|p| !class.properties.contains(*p))
-        {
-            return Err(Error::Refused(format!(
-                "class {} has no property {unknown}",
-                class.name
-            )));
+        for (property, value) in &node.properties {
+            let Some(of) = class.properties.get(property) else {
+                return Err(Error::Refused(format!(
+                    "class {} has no property {property}",
+                    class.name
+                )));
+            };
+            if !value.is(*of) {
+                return Err(Error::Refused(format!(
+                    "property {property} of class {} is declared {of:?}; {value:?} is not",
+                    class.name
+                )));
+            }
         }
         let table = class_table(&class.name);
         let columns: Vec<String> = class
             .properties
-            .iter()
+            .keys()
             .map(|p| property_column(p))
             .collect();
         let select = format!(
@@ -471,25 +484,19 @@ impl<'a> Piece<'a> {
             .tx
             .prepare_cached(&select)?
             .query_row(params![node.key], |row| {
-                let mut properties = BTreeMap::new();
-                for (i, name) in class.properties.iter().enumerate() {
-                    if let Some(value) = row.get::<_, Option<String>>(3 + i)? {
-                        properties.insert(name.clone(), value);
-                    }
-                }
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
                     ValidTime::from_sql(row.get(2)?),
-                    properties,
+                    read_properties(class, row, 3)?,
                 ))
             })
             .optional()?;
         let valid = node.valid.to_sql();
-        let values: Vec<Option<&str>> = class
+        let values: Vec<Option<&Value>> = class
             .properties
-            .iter()
-            .map(|p| node.properties.get(p).map(String::as_str))
+            .keys()
+            .map(|p| node.properties.get(p))
             .collect();
         let (id, new) = match have {
             Some((id, source, valid, properties))

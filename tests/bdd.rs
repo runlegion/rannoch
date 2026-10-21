@@ -21,8 +21,9 @@ use std::time::SystemTime;
 use rannoch::{
     Change, Class, Count, Cursor, Date, Declaration, Description, Error, Event, EventId, Fact,
     Fate, Graph, GroupBy, Link, LinkFact, Node, NodeRef, OpenLink, PartOf, Relation, Step, Tally,
-    Unit, ValidTime, Write, WriteError,
+    Unit, ValidTime, Value, Write, WriteError,
 };
+use rannoch::{HistoryKey, NodeFact, ValueType};
 use rstest_bdd_macros::{given, scenarios, then, when};
 use tempfile::TempDir;
 
@@ -32,6 +33,14 @@ const NONE: [(&str, &str); 0] = [];
 const PIECE_CHANGES: usize = 1_000;
 
 // ---------- fixtures ----------
+
+/// A text value's text.
+fn text(value: &Value) -> String {
+    match value {
+        Value::Text(text) => text.clone(),
+        other => panic!("expected text, got {other:?}"),
+    }
+}
 
 /// The T9b declarations (t9b-direct, 2026-10-14): 5 classes and 4 relations.
 fn t9b() -> Vec<Declaration> {
@@ -470,7 +479,7 @@ fn t9b_instances(g: &mut Graph) -> Instances {
 }
 
 /// A node without the time rannoch recorded it, which no event carries.
-fn node_facts(node: Node) -> (String, String, BTreeMap<String, String>, String, ValidTime) {
+fn node_facts(node: Node) -> (String, String, BTreeMap<String, Value>, String, ValidTime) {
     (
         node.class,
         node.key,
@@ -765,10 +774,10 @@ fn need_absent(world: &mut World) {
     assert!(
         world.g().ontology().classes["statement"]
             .properties
-            .contains("need")
+            .contains_key("need")
     );
     let s1 = world.find("statement", "s1");
-    assert_eq!(s1.properties.get("text").map(String::as_str), Some("hi"));
+    assert_eq!(s1.properties.get("text"), Some(&Value::from("hi")));
     assert_eq!(s1.properties.get("need"), None);
 }
 
@@ -1335,7 +1344,10 @@ fn rewrites_s05(world: &mut World) {
 #[then("s05 reports valid time 2024-05-01")]
 fn s05_still_2024(world: &mut World) {
     let s05 = world.find("statement", "s05");
-    assert_eq!(s05.properties["text"], "text of s05, corrected");
+    assert_eq!(
+        s05.properties["text"],
+        Value::from("text of s05, corrected")
+    );
     assert_eq!(s05.valid, day(2024, 5, 1));
 }
 
@@ -2148,7 +2160,7 @@ fn writes_and_folds(world: &mut World) {
         for fact in added {
             match fact {
                 Fact::Node(node) if node.class == "statement" => {
-                    place_of.insert(node.key, node.properties.get("place").cloned());
+                    place_of.insert(node.key, node.properties.get("place").map(text));
                 }
                 Fact::Link(link) if link.relation == "said" => {
                     voice_of.insert(link.to.key, link.from.key);
@@ -2525,7 +2537,10 @@ fn s05_rewritten(world: &mut World) {
 #[then("the node returned carries the corrected text and valid time 2024-05-01")]
 fn s05_corrected(world: &mut World) {
     let s05 = world.found.as_ref().unwrap();
-    assert_eq!(s05.properties["text"], "text of s05, corrected");
+    assert_eq!(
+        s05.properties["text"],
+        Value::from("text of s05, corrected")
+    );
     assert_eq!(s05.valid, day(2024, 5, 1));
 }
 
@@ -2663,7 +2678,7 @@ fn gives_class_and_text(world: &mut World) {
     assert_eq!(d.node, NodeRef::new("statement", "s1"));
     assert_eq!(
         d.properties,
-        BTreeMap::from([("text".to_string(), "the respec cost is absurd".to_string())])
+        BTreeMap::from([("text".to_string(), Value::from("the respec cost is absurd"))])
     );
 }
 
@@ -2716,11 +2731,7 @@ fn node_ref_texts(node: &NodeRef) -> [String; 2] {
 
 fn description_texts(d: &Description) -> Vec<String> {
     let mut texts = node_ref_texts(&d.node).to_vec();
-    texts.extend(
-        d.properties
-            .iter()
-            .flat_map(|(k, v)| [k.clone(), v.clone()]),
-    );
+    texts.extend(d.properties.iter().flat_map(|(k, v)| [k.clone(), text(v)]));
     texts.extend(d.relations_out.keys().cloned());
     texts.extend(d.relations_in.keys().cloned());
     for p in &d.part_of {
@@ -2790,7 +2801,12 @@ fn runs_every_read_and_a_refused_write(world: &mut World) {
         found.source,
         format!("{:?}", found.valid),
     ]);
-    texts.extend(found.properties.into_iter().flat_map(|(k, v)| [k, v]));
+    texts.extend(
+        found
+            .properties
+            .iter()
+            .flat_map(|(k, v)| [k.clone(), text(v)]),
+    );
     let walked = g
         .walk(&NodeRef::new("statement", "s1"), &["inside", "at"], 2, 200)
         .unwrap()
@@ -2918,7 +2934,7 @@ impl World {
             .find("mention", from)
             .unwrap()
             .expect("the mention");
-        let property = |name: &str| mention.properties[name].clone();
+        let property = |name: &str| text(&mention.properties[name]);
         (
             property("graph"),
             NodeRef::new(property("class"), property("key")),
@@ -2977,7 +2993,7 @@ fn shared_s10_new_version(world: &mut World) {
         .unwrap();
     assert_eq!(events.len(), 1, "the new version lands as one event");
     let s10 = world.shared().find("statement", "s10").unwrap().unwrap();
-    assert_eq!(s10.properties["text"], "changed");
+    assert_eq!(s10.properties["text"], Value::from("changed"));
 }
 
 #[given("the local file holds 300 references into the shared file")]
@@ -3240,6 +3256,166 @@ fn counts_as_of_t(world: &mut World) {
 fn not_counted(world: &mut World) {
     assert_eq!(world.tallies[0].distinct, 0);
     assert_eq!(world.tallies[0].total, 0);
+}
+
+// ---------- open: value types and history keys ----------
+
+fn declare_class(world: &mut World, class: Class) {
+    world.g().declare(&Declaration::Class(class)).unwrap();
+}
+
+fn history_after_reopen(world: &mut World) -> HistoryKey {
+    world.open().ontology().classes["reading"].history
+}
+
+#[when("the app declares a class whose history is ordered by an integer key the writer supplies")]
+fn declares_integer_history(world: &mut World) {
+    let mut class = Class::new("reading", ["value"]);
+    class.history = HistoryKey::Integer;
+    declare_class(world, class);
+}
+
+#[then("the graph's ontology names a writer-supplied integer key as that class's history order")]
+fn history_is_integer(world: &mut World) {
+    assert_eq!(history_after_reopen(world), HistoryKey::Integer);
+}
+
+#[when("the app declares a class without a history key")]
+fn declares_no_history(world: &mut World) {
+    declare_class(world, Class::new("reading", ["value"]));
+}
+
+#[then("the graph's ontology names recording order as that class's history order")]
+fn history_is_recorded(world: &mut World) {
+    assert_eq!(history_after_reopen(world), HistoryKey::Recorded);
+}
+
+fn class_with(world: &mut World, of: ValueType) {
+    world.open();
+    let mut class = Class::new("item", [] as [&str; 0]);
+    class.properties.insert("v".to_string(), of);
+    declare_class(world, class);
+}
+
+fn write_and_read(world: &mut World, value: Value) {
+    let unit = Unit::new("item", "i1", [("v", value)], day(2026, 1, 1));
+    world.g().write(&Write::new("app").unit(unit)).unwrap();
+    world.found = world.g().find("item", "i1").unwrap();
+}
+
+fn read_back(world: &World) -> &Value {
+    &world.found.as_ref().expect("the node was found").properties["v"]
+}
+
+#[given("a class with a property declared as an integer")]
+fn class_with_integer(world: &mut World) {
+    class_with(world, ValueType::Integer);
+}
+
+#[when(
+    "the app writes a node of that class with 9007199254740993 for the property and reads it back"
+)]
+fn writes_integer(world: &mut World) {
+    write_and_read(world, Value::Integer(9_007_199_254_740_993));
+}
+
+#[then("the property reads back as the integer 9007199254740993")]
+fn integer_back(world: &mut World) {
+    assert_eq!(read_back(world), &Value::Integer(9_007_199_254_740_993));
+}
+
+#[given("a class with a property declared as a decimal")]
+fn class_with_decimal(world: &mut World) {
+    class_with(world, ValueType::Decimal);
+}
+
+#[when(
+    "the app writes a node of that class with 12345678901234567890.0000000001 for the property and reads it back"
+)]
+fn writes_decimal(world: &mut World) {
+    write_and_read(
+        world,
+        Value::Decimal("12345678901234567890.0000000001".to_string()),
+    );
+}
+
+#[then("the property reads back as the decimal 12345678901234567890.0000000001")]
+fn decimal_back(world: &mut World) {
+    assert_eq!(
+        read_back(world),
+        &Value::Decimal("12345678901234567890.0000000001".to_string())
+    );
+}
+
+#[given("a class with a property declared as a float vector of length 3")]
+fn class_with_vector(world: &mut World) {
+    class_with(world, ValueType::FloatVector(3));
+}
+
+#[when(
+    "the app writes a node of that class with 1.5, -2.25 and 0.125 for the property and reads it back"
+)]
+fn writes_vector(world: &mut World) {
+    write_and_read(world, Value::FloatVector(vec![1.5, -2.25, 0.125]));
+}
+
+#[then("the property reads back as a float vector of length 3 holding 1.5, -2.25 and 0.125")]
+fn vector_back(world: &mut World) {
+    let Value::FloatVector(floats) = read_back(world) else {
+        panic!("expected a float vector, got {:?}", read_back(world));
+    };
+    assert_eq!(floats.len(), 3);
+    assert_eq!(floats, &vec![1.5, -2.25, 0.125]);
+}
+
+/// `tests/fixtures/store-0.1.1.rannoch` was written by rannoch at tag v0.1.1: class book with
+/// properties title and pages, then two writes of books b1, b2 and b3; 3 events. It is copied,
+/// since opening a file writes to it.
+#[given("a store written by rannoch 0.1.1 with a class, its properties and nodes")]
+fn store_011(world: &mut World) {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/store-0.1.1.rannoch"
+    );
+    std::fs::copy(fixture, world.path()).unwrap();
+}
+
+#[when("the store is opened")]
+fn store_opened(world: &mut World) {
+    world.open();
+}
+
+#[then(
+    "every event it held is still read, each of the class's properties reads as text and the class is ordered by recording order"
+)]
+fn store_011_whole(world: &mut World) {
+    let events = world.all_events();
+    assert_eq!(events.len(), 3);
+    let written: Vec<&NodeFact> = events
+        .iter()
+        .flat_map(|e| match &e.change {
+            Change::Wrote { added, .. } => added.iter().collect(),
+            _ => Vec::new(),
+        })
+        .filter_map(|f| match f {
+            Fact::Node(node) => Some(node),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(written.len(), 3);
+    let book = world.g().ontology().classes["book"].clone();
+    assert_eq!(book.history, HistoryKey::Recorded);
+    assert!(book.properties.values().all(|of| *of == ValueType::Text));
+    for (key, title) in [("b1", "Dune"), ("b2", "Emma"), ("b3", "Ubik")] {
+        let node = world.find("book", key);
+        assert_eq!(node.properties["title"], Value::from(title));
+        assert!(matches!(node.properties["pages"], Value::Text(_)));
+    }
+    assert!(
+        written
+            .iter()
+            .all(|n| n.properties.values().all(|v| matches!(v, Value::Text(_))))
+    );
 }
 
 scenarios!("tests", fixtures = [world: World]);
