@@ -8,7 +8,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
-use crate::events::{Change, Event, Fact, LinkFact, NodeFact, WrongKind, append};
+use crate::events::{
+    Change, Event, EventId, Fact, LinkFact, NodeFact, WrongKind, append, holds, keep_derived,
+};
 use crate::open::{
     CLASS, Class, Graph, Ontology, RELATION, Relation, Value, ValueType, class_table, concat,
     property_column, read_properties, relation_index, relation_table, schema_version,
@@ -320,6 +322,7 @@ impl Unit {
                     .map(|(k, v)| (k.into(), v.into()))
                     .collect(),
                 valid,
+                derived_from: Vec::new(),
             },
             links: Vec::new(),
         }
@@ -349,11 +352,12 @@ impl Unit {
     }
 }
 
-/// A write: whole units from one source.
+/// A write: whole units from one source, and the events its nodes were derived from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Write {
     source: String,
     units: Vec<Unit>,
+    derived_from: Vec<EventId>,
 }
 
 impl Write {
@@ -361,12 +365,20 @@ impl Write {
         Write {
             source: source.into(),
             units: Vec::new(),
+            derived_from: Vec::new(),
         }
     }
 
     #[must_use]
     pub fn unit(mut self, unit: Unit) -> Self {
         self.units.push(unit);
+        self
+    }
+
+    /// Names the events the write's nodes were derived from: each node keeps them.
+    #[must_use]
+    pub fn derived_from(mut self, events: impl IntoIterator<Item = EventId>) -> Self {
+        self.derived_from.extend(events);
         self
     }
 }
@@ -451,11 +463,19 @@ pub(crate) fn check_declared(ontology: &Ontology, write: &Write) -> Result<(), E
 
 /// Checks a whole write before any piece commits: refuses it when a unit's node does not carry
 /// exactly the properties its class declares, each a value of its declared type, when a unit's
-/// or a link's valid time is not a real date, or when one of its links has a source that is not
-/// of its relation's declared source class. A target is named by kind and key, so a
-/// target key not yet a node of the declared target class leaves the link open.
+/// or a link's valid time is not a real date, when it names as its source an event the graph does
+/// not hold, or when one of its links has a source that is not of its relation's declared
+/// source class. A target is named by kind and key, so a target key not yet a node of the
+/// declared target class leaves the link open.
 fn check(conn: &Connection, ontology: &Ontology, write: &Write) -> Result<(), Error> {
     check_declared(ontology, write)?;
+    for event in &write.derived_from {
+        if !holds(conn, *event)? {
+            return Err(Error::Refused(format!(
+                "the write names event {event} as its source; the graph holds no such event"
+            )));
+        }
+    }
     let valid_times = write
         .units
         .iter()
@@ -580,6 +600,7 @@ impl<'a> Piece<'a> {
                 (self.tx.last_insert_rowid(), true)
             }
         };
+        keep_derived(self.tx, node)?;
         self.added.push(Fact::Node(node.clone()));
         Ok((id, new))
     }
@@ -882,7 +903,8 @@ impl Graph {
     /// property its class declares, carries one it does not declare, or carries a value of
     /// another type than declared, or a float that is NaN or an infinity; when a unit's or a
     /// link's valid time is not a real date (a month outside 1 to 12, or a day past its month's
-    /// end); or when a link's source is not of its relation's declared source class: the write is
+    /// end); when it names as its source an event the graph does not hold; or when a link's
+    /// source is not of its relation's declared source class: the write is
     /// checked before any piece commits, so it lands nothing.
     /// [`WriteError`] when a piece fails: the pieces before it are kept, and the error holds
     /// their events.
@@ -901,7 +923,7 @@ impl Graph {
             if i > 0 {
                 std::thread::sleep(BETWEEN_PIECES);
             }
-            match self.piece(&write.source, piece) {
+            match self.piece(&write.source, &write.derived_from, piece) {
                 Ok(written) => events.extend(written),
                 Err(cause) => return Err(WriteError { events, cause }),
             }
@@ -909,13 +931,22 @@ impl Graph {
         Ok(events)
     }
 
-    fn piece(&mut self, source: &str, units: &[Unit]) -> Result<Vec<Event>, Error> {
+    fn piece(
+        &mut self,
+        source: &str,
+        derived_from: &[EventId],
+        units: &[Unit],
+    ) -> Result<Vec<Event>, Error> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut piece = Piece::new(&tx, &self.ontology, source, now_millis());
         for unit in units {
-            let (_, new) = piece.node(&unit.node)?;
+            let node = NodeFact {
+                derived_from: derived_from.to_vec(),
+                ..unit.node.clone()
+            };
+            let (_, new) = piece.node(&node)?;
             if new {
                 piece.arrived(&unit.node.class, &unit.node.key)?;
             }

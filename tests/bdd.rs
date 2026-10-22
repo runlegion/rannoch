@@ -540,6 +540,7 @@ struct World {
     snapshot: Option<Snapshot>,
     stored_cursor: String,
     bound: Cursor,
+    derived: Vec<NodeRef>,
 }
 
 #[rstest::fixture]
@@ -584,6 +585,7 @@ fn world() -> World {
         snapshot: None,
         stored_cursor: String::new(),
         bound: Cursor::START,
+        derived: Vec::new(),
     }
 }
 
@@ -2263,6 +2265,122 @@ fn reader_gets_later_events(world: &mut World) {
     // Statements s5..s9 were written after the cursor.
     assert_eq!(after.len(), 5);
     assert_eq!(world.read, after);
+}
+
+// ---------- events: derived from ----------
+
+/// Classes statement and finding; statements s1 and s2, each written as its own event, which
+/// `world.log` holds.
+fn two_statements(world: &mut World) {
+    let g = world.open();
+    g.declare(&Declaration::Class(Class::new("statement", ["text"])))
+        .unwrap();
+    g.declare(&Declaration::Class(Class::new("finding", ["text"])))
+        .unwrap();
+    let mut events = Vec::new();
+    for key in ["s1", "s2"] {
+        events.extend(
+            g.write(&Write::new("eavesdrop").unit(Unit::new(
+                "statement",
+                key,
+                [("text", "words")],
+                day(2026, 10, 21),
+            )))
+            .unwrap(),
+        );
+    }
+    world.log = events;
+}
+
+/// Finding f1 derived from `events`.
+fn finding_from(events: &[Event]) -> Write {
+    Write::new("analyst")
+        .unit(Unit::new(
+            "finding",
+            "f1",
+            [("text", "knowledge")],
+            day(2026, 10, 21),
+        ))
+        .derived_from(events.iter().map(|e| e.id))
+}
+
+fn ids(events: &[Event]) -> HashSet<EventId> {
+    events.iter().map(|e| e.id).collect()
+}
+
+#[given("a graph with two events")]
+fn graph_with_two_events(world: &mut World) {
+    two_statements(world);
+}
+
+#[when("the app writes a node derived from both events")]
+fn writes_from_both(world: &mut World) {
+    let write = finding_from(&world.log);
+    world.write(&write);
+}
+
+#[then("the node reads back naming both events as its source")]
+fn names_both(world: &mut World) {
+    let node = world.find("finding", "f1");
+    assert_eq!(node.derived_from.len(), 2);
+    assert_eq!(
+        node.derived_from.into_iter().collect::<HashSet<_>>(),
+        ids(&world.log)
+    );
+}
+
+#[given("a graph with a node derived from an event")]
+fn node_from_an_event(world: &mut World) {
+    two_statements(world);
+    let write = finding_from(&world.log[..1]);
+    world.write(&write);
+}
+
+#[when("the app asks what was derived from that event")]
+fn asks_derived(world: &mut World) {
+    let event = world.log[0].id;
+    world.derived = world.g().derived(event).unwrap();
+}
+
+#[then("the answer names that node")]
+fn answer_names_node(world: &mut World) {
+    assert_eq!(world.derived, [NodeRef::new("finding", "f1")]);
+    let other = world.log[1].id;
+    assert!(world.g().derived(other).unwrap().is_empty());
+}
+
+#[when("the app writes a node derived from an event id the graph does not hold")]
+fn writes_from_foreign_event(world: &mut World) {
+    let mut other = rannoch::open(world.dir.path().join("other.rannoch")).unwrap();
+    let foreign = other
+        .declare(&Declaration::Class(Class::new(
+            "elsewhere",
+            [] as [&str; 0],
+        )))
+        .unwrap()
+        .expect("a new declaration is an event");
+    let write = Write::new("eavesdrop")
+        .unit(Unit::new("voice", "v-new", NONE, day(2026, 10, 21)))
+        .derived_from([foreign.id]);
+    world.write_error = Some(world.g().write(&write).expect_err("the write is refused"));
+}
+
+#[given("a graph with a node derived from an event and a snapshot after it")]
+fn derived_before_snapshot(world: &mut World) {
+    node_from_an_event(world);
+    snapshot_at_end(world);
+}
+
+#[then("the node reads back naming the same event as its source")]
+fn same_source_after_rebuild(world: &mut World) {
+    let source = world.log[0].id;
+    let (live, rebuilt) = world.both();
+    let back = rebuilt.find("finding", "f1").unwrap().unwrap();
+    assert_eq!(back.derived_from, [source]);
+    assert_eq!(
+        back.derived_from,
+        live.find("finding", "f1").unwrap().unwrap().derived_from
+    );
 }
 
 // ---------- read: walks ----------

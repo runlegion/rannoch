@@ -14,9 +14,9 @@ use crate::open::{Graph, Ontology, Value, class_table, open, relation_table, sch
 use crate::read::NodeRef;
 use crate::write::{Declaration, Error, ValidTime, now_millis, replay};
 
-/// rannoch's own tables: the event log, the ontology, links waiting for an end, and the fates of
-/// nodes that were replaced. An event's place is never reused, so a cursor stays a place in the
-/// log.
+/// rannoch's own tables: the event log, the ontology, links waiting for an end, the fates of
+/// nodes that were replaced, and the events each node was derived from. An event's place is
+/// never reused, so a cursor stays a place in the log.
 pub(crate) const OWN_TABLES: &str = "
     CREATE TABLE IF NOT EXISTS _events(seq INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS _ontology(
@@ -29,7 +29,11 @@ pub(crate) const OWN_TABLES: &str = "
     CREATE INDEX IF NOT EXISTS _open_to ON _open(rel, to_key);
     CREATE TABLE IF NOT EXISTS _fates(
         class TEXT NOT NULL, key TEXT NOT NULL, replaced_by TEXT NOT NULL,
-        PRIMARY KEY(class, key)) WITHOUT ROWID;";
+        PRIMARY KEY(class, key)) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS _derived(
+        class TEXT NOT NULL, key TEXT NOT NULL, event TEXT NOT NULL,
+        PRIMARY KEY(class, key, event)) WITHOUT ROWID;
+    CREATE INDEX IF NOT EXISTS _derived_event ON _derived(event);";
 
 /// A place in a graph's event log. Reading since a cursor returns the events after it. An app
 /// stores a cursor by serializing it, and a graph rebuilt from the log keeps each event's place,
@@ -122,6 +126,9 @@ pub struct NodeFact {
     pub key: String,
     pub properties: BTreeMap<String, Value>,
     pub valid: ValidTime,
+    /// The events the node was derived from.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub derived_from: Vec<EventId>,
 }
 
 /// A link, named by its relation and both of its endpoints.
@@ -301,7 +308,43 @@ impl Snapshot {
     }
 }
 
+/// Whether the log holds the event `id`.
+pub(crate) fn holds(conn: &Connection, id: EventId) -> Result<bool, Error> {
+    Ok(naming_key(conn, &id.to_string())?
+        .iter()
+        .any(|(_, stored)| stored.id == id))
+}
+
+/// Keeps `node`'s derived-from events as the events it was derived from now. Writing a node and
+/// replaying its write both keep them through here.
+pub(crate) fn keep_derived(tx: &Connection, node: &NodeFact) -> Result<(), Error> {
+    tx.prepare_cached("DELETE FROM _derived WHERE class = ?1 AND key = ?2")?
+        .execute(params![node.class, node.key])?;
+    for event in &node.derived_from {
+        tx.prepare_cached("INSERT OR IGNORE INTO _derived(class, key, event) VALUES (?1, ?2, ?3)")?
+            .execute(params![node.class, node.key, event.to_string()])?;
+    }
+    Ok(())
+}
+
 impl Graph {
+    /// The nodes derived from the event `event`, by class and key.
+    ///
+    /// # Errors
+    /// The graph file cannot be read.
+    pub fn derived(&self, event: EventId) -> Result<Vec<NodeRef>, Error> {
+        Ok(self
+            .conn
+            .prepare_cached("SELECT class, key FROM _derived WHERE event = ?1 ORDER BY class, key")?
+            .query_map(params![event.to_string()], |row| {
+                Ok(NodeRef::new(
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                ))
+            })?
+            .collect::<Result<_, _>>()?)
+    }
+
     /// The cursor of the last event in the log, or [`Cursor::START`] when it holds none.
     pub(crate) fn last_cursor(&self) -> Result<Cursor, Error> {
         Ok(Cursor(
