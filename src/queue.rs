@@ -29,8 +29,9 @@ pub enum Failure {
         #[source]
         error: WriteError,
     },
-    /// The heartbeat panicked, with the panic's text, and stopped; what is queued after commits
-    /// only through a flush, a close or a drop.
+    /// The heartbeat panicked, with the panic's text, and stopped. A batch it was writing went
+    /// back to the front of the queue; what is queued commits only through a flush, a close or a
+    /// drop.
     #[error("the queue's heartbeat panicked: {0}")]
     Heartbeat(String),
     /// A subscriber panicked, with the panic's text, when fired for the commit through `ticket`.
@@ -68,7 +69,8 @@ struct Shared {
     stopped: Condvar,
     subscribers: Mutex<Vec<Subscriber>>,
     handler: Mutex<Option<Handler>>,
-    /// Makes the next heartbeat panic, so a test can see one reported.
+    /// Makes the next commit panic once it has taken its batch, so a test can see the panic
+    /// reported and the batch kept.
     #[cfg(test)]
     panic_beat: std::sync::atomic::AtomicBool,
 }
@@ -117,10 +119,6 @@ impl Queue {
                 }
                 drop(state);
                 let beaten = catch_unwind(AssertUnwindSafe(|| {
-                    #[cfg(test)]
-                    if beat.panic_beat.load(std::sync::atomic::Ordering::SeqCst) {
-                        std::panic::resume_unwind(Box::new("the heartbeat panics"));
-                    }
                     beat.commit();
                 }));
                 if let Err(panic) = beaten {
@@ -232,27 +230,45 @@ impl Shared {
         let Some(&(last, _)) = batch.last() else {
             return;
         };
+        // A panic while the batch is written rolls its transaction back; the batch goes back to
+        // the front of the queue, in order, for the next flush, close or drop to commit.
+        let written = catch_unwind(AssertUnwindSafe(|| {
+            #[cfg(test)]
+            if self
+                .panic_beat
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                std::panic::resume_unwind(Box::new("the heartbeat panics"));
+            }
+            graph.write_batch(batch.iter().map(|(_, write)| write))
+        }));
+        let written = match written {
+            Ok(written) => written,
+            Err(panic) => {
+                lock(&self.state).queued.splice(0..0, batch);
+                std::panic::resume_unwind(panic);
+            }
+        };
         // A write that fails at commit is kept, not dropped; reporting it is FR-RANNOCH-075's.
-        let failed: Vec<(Ticket, Error)> =
-            match graph.write_batch(batch.iter().map(|(_, write)| write)) {
-                Ok(results) => batch
+        let failed: Vec<(Ticket, Error)> = match written {
+            Ok(results) => batch
+                .iter()
+                .zip(results)
+                .filter_map(|((ticket, _), result)| result.err().map(|cause| (*ticket, cause)))
+                .collect(),
+            // The batch's transaction failed, so none of it landed: every ticket fails, and
+            // the last keeps the cause itself.
+            Err(cause) => {
+                let text = format!("the batch's transaction failed: {cause}");
+                let mut failed: Vec<(Ticket, Error)> = batch
                     .iter()
-                    .zip(results)
-                    .filter_map(|((ticket, _), result)| result.err().map(|cause| (*ticket, cause)))
-                    .collect(),
-                // The batch's transaction failed, so none of it landed: every ticket fails, and
-                // the last keeps the cause itself.
-                Err(cause) => {
-                    let text = format!("the batch's transaction failed: {cause}");
-                    let mut failed: Vec<(Ticket, Error)> = batch
-                        .iter()
-                        .take(batch.len() - 1)
-                        .map(|(ticket, _)| (*ticket, batch_failed(&text)))
-                        .collect();
-                    failed.push((last, cause));
-                    failed
-                }
-            };
+                    .take(batch.len() - 1)
+                    .map(|(ticket, _)| (*ticket, batch_failed(&text)))
+                    .collect();
+                failed.push((last, cause));
+                failed
+            }
+        };
         let failed = failed.into_iter().map(|(ticket, cause)| Failure::Write {
             ticket,
             error: WriteError {
@@ -451,6 +467,7 @@ mod tests {
             .shared
             .panic_beat
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        queue.write(item("i1"))?;
         let mut taken = Vec::new();
         wait_for(|| {
             taken.extend(queue.take_failures());
@@ -460,6 +477,34 @@ mod tests {
             matches!(&taken[..], [Failure::Heartbeat(message)] if message == "the heartbeat panics"),
             "{taken:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_batch_taken_by_a_panicking_heartbeat_is_committed_by_the_next_flush()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let queue = beating(&dir)?;
+        queue
+            .shared
+            .panic_beat
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        queue.write(item("i1"))?;
+        let ticket = queue.write(item("i2"))?;
+        let mut taken = Vec::new();
+        wait_for(|| {
+            taken.extend(queue.take_failures());
+            !taken.is_empty()
+        });
+        assert!(matches!(&taken[..], [Failure::Heartbeat(_)]), "{taken:?}");
+        assert_eq!(queue.committed(), None);
+        let (committed, failed) = queue.flush();
+        assert_eq!(committed, Some(ticket));
+        assert!(failed.is_empty(), "{failed:?}");
+        let g = open(dir.path().join("graph.rannoch"))?;
+        for key in ["i1", "i2"] {
+            assert!(g.find("item", key)?.is_some(), "{key} is not committed");
+        }
         Ok(())
     }
 
@@ -474,6 +519,7 @@ mod tests {
             .shared
             .panic_beat
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        queue.write(item("i1"))?;
         wait_for(|| {
             queue
                 .heartbeat
