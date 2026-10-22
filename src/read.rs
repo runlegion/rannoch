@@ -264,14 +264,15 @@ impl Graph {
     /// version only: past versions are not readable yet.
     ///
     /// It answers with the current version when that version was valid on or before `as_of`,
-    /// and with none when the node had no version by then: it was never written, its valid time
-    /// is unknown, or its only version is valid after `as_of`. When the current version is valid
-    /// after `as_of` and the node had an earlier version, the version that held then is a past
-    /// one, so the read is refused rather than answered wrong. A month stands for its first day.
+    /// and with none when the node had no version by then: it was never written, or its only
+    /// version is valid after `as_of` or has an unknown valid time. When the current version is
+    /// valid after `as_of` or has an unknown valid time and the node had an earlier version, the
+    /// version that held then may be a past one, so the read is refused rather than answered
+    /// wrong. A month stands for its first day.
     ///
     /// # Errors
     /// [`Error::Refused`] when `as_of` is not a real date, or when the version that held on
-    /// `as_of` is a past one; the class is not declared, or the graph file cannot be read.
+    /// `as_of` may be a past one; the class is not declared, or the graph file cannot be read.
     pub fn find_as_of(&self, class: &str, key: &str, as_of: &Date) -> Result<Option<Node>, Error> {
         let parts = as_of.parts()?;
         let Some(node) = self.find(class, key)? else {
@@ -279,7 +280,7 @@ impl Graph {
         };
         match &node.valid {
             ValidTime::On(date) if on_or_before(date, parts) => Ok(Some(node)),
-            ValidTime::On(_) if self.had_earlier_version(&node)? => Err(Error::Refused(format!(
+            _ if self.had_earlier_version(&node)? => Err(Error::Refused(format!(
                 "{class} {key} as of {}: past versions are not readable yet",
                 as_of.as_str()
             ))),
@@ -1153,6 +1154,35 @@ mod tests {
             "find_as_of: {found:?}"
         );
         assert!(g.find_as_of("item", "v", &Date::day(2022, 1, 1))?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn an_as_of_read_refuses_when_the_current_version_has_no_date_and_an_earlier_one_held()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = items(vec![item("u", &Date::day(2020, 1, 1))])?;
+        g.write(&Write::new("src").unit(Unit::new(
+            "item",
+            "u",
+            [("name", "u")],
+            ValidTime::Unknown,
+        )))?;
+        let found = g.find_as_of("item", "u", &Date::day(2021, 1, 1));
+        assert!(
+            matches!(&found, Err(Error::Refused(why))
+                if why == "item u as of 2021-01-01: past versions are not readable yet"),
+            "find_as_of: {found:?}"
+        );
+        let only = items(vec![Unit::new(
+            "item",
+            "w",
+            [("name", "w")],
+            ValidTime::Unknown,
+        )])?;
+        assert!(
+            only.find_as_of("item", "w", &Date::day(2021, 1, 1))?
+                .is_none()
+        );
         Ok(())
     }
 
