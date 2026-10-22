@@ -537,6 +537,7 @@ struct World {
     queue: Option<Queue>,
     tickets: Vec<Ticket>,
     flushed: Option<Ticket>,
+    failed: Vec<Ticket>,
     heard: Arc<Mutex<Vec<Heard>>>,
     snapshot: Option<Snapshot>,
     stored_cursor: String,
@@ -581,6 +582,7 @@ fn world() -> World {
         queue: None,
         tickets: Vec::new(),
         flushed: None,
+        failed: Vec::new(),
         heard: Arc::new(Mutex::new(Vec::new())),
         snapshot: None,
         stored_cursor: String::new(),
@@ -3782,7 +3784,9 @@ fn graph_with_accepted_writes(world: &mut World) {
 
 #[when("the app flushes")]
 fn app_flushes(world: &mut World) {
-    world.flushed = q(world).flush();
+    let (committed, failed) = q(world).flush();
+    world.flushed = committed;
+    world.failed = failed.into_iter().map(|(ticket, _)| ticket).collect();
 }
 
 #[then("every write accepted before the flush is committed when the flush returns")]
@@ -3818,7 +3822,7 @@ fn batch_with_failing_write(world: &mut World) {
 
 #[when("the heartbeat commits the batch")]
 fn heartbeat_commits_batch(world: &mut World) {
-    world.flushed = q(world).flush();
+    world.flushed = q(world).flush().0;
 }
 
 #[then("every other write in the batch is committed")]
@@ -3870,7 +3874,7 @@ fn commits_while_reading(world: &mut World) {
             }
         }
     });
-    world.flushed = q(world).flush();
+    world.flushed = q(world).flush().0;
     world.burst_done.store(true, Ordering::SeqCst);
     world.reads = reader.join().unwrap();
 }
@@ -3919,6 +3923,98 @@ fn link_not_in_graph(world: &mut World) {
     assert!(g.find("item", "i2").unwrap().is_none());
 }
 
+// ---------- queue: a write that fails at commit is reported, never dropped in silence ----------
+
+#[given("a process whose queue holds writes whose final commit will fail")]
+fn final_commit_will_fail(world: &mut World) {
+    queued(world, NEVER);
+    // The file rolls back the whole transaction, as a full disk can: the final commit fails.
+    rusqlite::Connection::open(world.path())
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER bad_rolls_back BEFORE INSERT ON \"class:item\" \
+             WHEN NEW.key = 'bad' BEGIN SELECT RAISE(ROLLBACK, 'database or disk is full'); END;",
+        )
+        .unwrap();
+    for key in ["i1", "bad", "i3"] {
+        enqueue(world, key);
+    }
+}
+
+#[when("the process closes the queue")]
+fn process_closes(world: &mut World) {
+    app_closes(world);
+}
+
+#[then("the process is told the final commit failed")]
+fn told_final_commit_failed(world: &mut World) {
+    assert_eq!(world.failed, world.tickets);
+    for key in ["i1", "bad", "i3"] {
+        assert!(!committed_elsewhere(world, key), "{key} is committed");
+    }
+}
+
+#[given("a queue holding a write that will fail at commit")]
+fn write_will_fail(world: &mut World) {
+    queued(world, Queue::INTERVAL);
+    item_fails_at_commit(world, "bad");
+    enqueue(world, "i1");
+    enqueue(world, "bad");
+}
+
+#[when("the app closes the queue")]
+fn app_closes(world: &mut World) {
+    let queue = world.queue.take().expect("the queue is open");
+    world.failed = queue
+        .close()
+        .into_iter()
+        .map(|(ticket, _)| ticket)
+        .collect();
+}
+
+#[when("the heartbeat commits and the app takes the queue's failures")]
+fn heartbeat_then_take(world: &mut World) {
+    let ticket = world.tickets[1];
+    wait_for(|| q(world).committed() >= Some(ticket));
+    world.failed = q(world)
+        .take_failures()
+        .into_iter()
+        .map(|(ticket, _)| ticket)
+        .collect();
+}
+
+/// The failing write, and only it, is reported, and it is not in the graph.
+fn bad_reported(world: &World) {
+    assert_eq!(world.failed, [world.tickets[1]]);
+    assert!(!committed_elsewhere(world, "bad"));
+    assert!(committed_elsewhere(world, "i1"));
+}
+
+#[then("the flush returns that write as failed")]
+fn flush_returns_failed(world: &mut World) {
+    bad_reported(world);
+}
+
+#[then("the close returns that write as failed")]
+fn close_returns_failed(world: &mut World) {
+    bad_reported(world);
+}
+
+#[then("the app receives that write as failed")]
+fn app_receives_failed(world: &mut World) {
+    bad_reported(world);
+}
+
+#[then("the flush returns the node and the link as failed")]
+fn flush_returns_dependents(world: &mut World) {
+    assert_eq!(world.failed, world.tickets);
+}
+
+#[then("the close returns the node and the link as failed")]
+fn close_returns_dependents(world: &mut World) {
+    assert_eq!(world.failed, world.tickets);
+}
+
 // ---------- queue: dropping or closing the queue commits what it holds ----------
 
 /// How the short-lived process ends, and the graph file it writes to.
@@ -3944,7 +4040,7 @@ fn short_lived_process() {
         "return" => {}
         "panic" => panic!("{PROCESS_PANIC}"),
         "exit" => {
-            queue.close();
+            assert!(queue.close().is_empty());
             std::process::exit(PROCESS_EXIT);
         }
         other => panic!("unknown end {other}"),
