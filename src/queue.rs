@@ -125,6 +125,13 @@ impl Queue {
     pub fn subscribe(&self, subscriber: impl FnMut(Cursor) + Send + 'static) {
         lock(&self.shared.subscribers).push(Box::new(subscriber));
     }
+
+    /// Stops the heartbeat and commits everything queued, as dropping the queue does. A process
+    /// that exits without unwinding (`std::process::exit`, `panic = "abort"`) runs no drop, so it
+    /// closes the queue first.
+    pub fn close(self) {
+        drop(self);
+    }
 }
 
 impl Shared {
@@ -160,13 +167,15 @@ impl Shared {
 }
 
 impl Drop for Queue {
-    /// Stops the heartbeat. Committing what is still queued on drop is FR-RANNOCH-061's.
+    /// Stops the heartbeat, then commits what is still queued, so a process that returns or
+    /// panics with unwinding loses no write.
     fn drop(&mut self) {
         lock(&self.shared.state).stop = true;
         self.shared.stopped.notify_all();
         if let Some(heartbeat) = self.heartbeat.take() {
             let _ = heartbeat.join();
         }
+        self.shared.commit();
     }
 }
 
