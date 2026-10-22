@@ -542,6 +542,8 @@ struct World {
     snapshot: Option<Snapshot>,
     stored_cursor: String,
     bound: Cursor,
+    follower: Option<std::process::Child>,
+    followed: Followed,
 }
 
 #[rstest::fixture]
@@ -587,6 +589,8 @@ fn world() -> World {
         snapshot: None,
         stored_cursor: String::new(),
         bound: Cursor::START,
+        follower: None,
+        followed: Followed::default(),
     }
 }
 
@@ -4108,6 +4112,196 @@ fn process_writes_committed(world: &mut World) {
     for key in PROCESS_KEYS {
         assert!(committed_elsewhere(world, key), "{key} is not committed");
     }
+}
+
+// ---------- events: another process follows commits through the committed watermark ----------
+
+/// How the follower process reads (`poll` until it sees the last key, or `once`), and the file.
+const FOLLOW_MODE: &str = "RANNOCH_FOLLOW_MODE";
+const FOLLOW_FILE: &str = "RANNOCH_FOLLOW_FILE";
+/// The key the writer writes last, after which a polling follower stops.
+const FOLLOW_LAST: &str = "last";
+
+/// What the follower process reported: each watermark it read, and each event it took, by id,
+/// with the keys of the nodes it wrote.
+#[derive(Debug, Default)]
+struct Followed {
+    marks: Vec<Cursor>,
+    events: Vec<(EventId, Vec<String>)>,
+}
+
+/// The keys of the nodes an event wrote.
+fn node_keys(event: &Event) -> Vec<String> {
+    match &event.change {
+        Change::Wrote { added, .. } => added
+            .iter()
+            .filter_map(|fact| match fact {
+                Fact::Node(node) => Some(node.key.clone()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The follower: run only by [`spawn_follower`], in its own process. Each read takes the
+/// committed watermark, the events after its cursor up to it, and moves its cursor to it; it
+/// prints each mark and each event as one line of JSON. Polling, it stops one read after the
+/// read that took the last key, so an event taken twice would show.
+#[test]
+#[ignore = "run in its own process by the FR-RANNOCH-064 scenarios"]
+fn follower_process() {
+    let graph = rannoch::open(std::env::var(FOLLOW_FILE).unwrap()).unwrap();
+    let once = std::env::var(FOLLOW_MODE).unwrap() == "once";
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut cursor = Cursor::START;
+    let mut seen_last = false;
+    loop {
+        let finishing = once || seen_last;
+        let mark = graph.events().committed().unwrap();
+        println!("{}", serde_json::json!({ "mark": mark }));
+        for event in graph.events().since_until(cursor, mark, |_| true).unwrap() {
+            let keys = node_keys(&event);
+            seen_last |= keys.iter().any(|k| k == FOLLOW_LAST);
+            println!("{}", serde_json::json!({ "event": event.id, "keys": keys }));
+        }
+        cursor = mark;
+        if finishing {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the follower never saw {FOLLOW_LAST}"
+        );
+        std::thread::sleep(Duration::from_millis(if seen_last { 50 } else { 5 }));
+    }
+}
+
+/// Starts [`follower_process`] in its own process on the world's graph, reading as `mode` says.
+fn spawn_follower(world: &mut World, mode: &str) {
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "follower_process", "--ignored", "--nocapture"])
+        .env(FOLLOW_MODE, mode)
+        .env(FOLLOW_FILE, world.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    world.follower = Some(child);
+}
+
+/// Waits for the follower process to end and keeps what it reported.
+fn followed(world: &mut World) {
+    let out = world
+        .follower
+        .take()
+        .expect("the follower is running")
+        .wait_with_output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let output = format!("{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "the follower failed:\n{output}");
+    assert!(
+        output.contains("1 passed"),
+        "the follower ran no test:\n{output}"
+    );
+    for line in stdout.lines().filter(|l| l.starts_with('{')) {
+        let value: serde_json::Value = serde_json::from_str(line).unwrap();
+        if let Some(mark) = value.get("mark") {
+            world
+                .followed
+                .marks
+                .push(serde_json::from_value(mark.clone()).unwrap());
+        } else {
+            world.followed.events.push((
+                serde_json::from_value(value["event"].clone()).unwrap(),
+                serde_json::from_value(value["keys"].clone()).unwrap(),
+            ));
+        }
+    }
+}
+
+#[given("a writer process and a follower in another process reading the committed watermark")]
+fn writer_and_follower(world: &mut World) {
+    queued(world, NEVER);
+    spawn_follower(world, "poll");
+}
+
+#[when("the writer commits events")]
+fn writer_commits(world: &mut World) {
+    for batch in [
+        ["c1", "c2", "c3"],
+        ["c4", "c5", "c6"],
+        ["c7", "c8", FOLLOW_LAST],
+    ] {
+        for key in batch {
+            enqueue(world, key);
+        }
+        q(world).flush();
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[then("the follower sees each committed event exactly once")]
+fn follower_sees_each_once(world: &mut World) {
+    followed(world);
+    let committed: Vec<EventId> = rannoch::open(world.path())
+        .unwrap()
+        .events()
+        .since(Cursor::START)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.id)
+        .collect();
+    let seen: Vec<EventId> = world.followed.events.iter().map(|(id, _)| *id).collect();
+    assert_eq!(seen, committed, "the follower saw a different log");
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for key in world.followed.events.iter().flat_map(|(_, keys)| keys) {
+        *counts.entry(key).or_default() += 1;
+    }
+    for key in ["c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", FOLLOW_LAST] {
+        assert_eq!(counts.get(key), Some(&1), "{key}: {counts:?}");
+    }
+    assert!(
+        world
+            .followed
+            .marks
+            .windows(2)
+            .filter(|w| w[0] < w[1])
+            .count()
+            > 1,
+        "the follower saw the commits land in one read, not follow them: {:?}",
+        world.followed.marks
+    );
+}
+
+#[given(
+    "a writer process with accepted writes not yet committed, and a follower in another process"
+)]
+fn writer_with_uncommitted(world: &mut World) {
+    queued(world, NEVER);
+    world.cursor = rannoch::open(world.path())
+        .unwrap()
+        .events()
+        .committed()
+        .unwrap();
+    for key in ["u1", "u2", "u3"] {
+        enqueue(world, key);
+    }
+}
+
+#[when("the follower reads the committed watermark")]
+fn follower_reads_watermark(world: &mut World) {
+    spawn_follower(world, "once");
+    followed(world);
+}
+
+#[then("the follower sees none of the uncommitted writes")]
+fn follower_sees_no_uncommitted(world: &mut World) {
+    assert_eq!(q(world).committed(), None, "the writes were committed");
+    assert_eq!(world.followed.marks, vec![world.cursor]);
+    let keys: Vec<&String> = world.followed.events.iter().flat_map(|(_, k)| k).collect();
+    assert!(keys.is_empty(), "the follower saw {keys:?}");
 }
 
 scenarios!("tests", fixtures = [world: World]);
