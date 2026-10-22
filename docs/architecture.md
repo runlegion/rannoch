@@ -42,7 +42,7 @@ One crate:
 - `open`: opens a graph file and knows its classes and relations.
 - `write`: units, pieces, refusals; owns typed refusals.
 - `read`: walks, counts, describing a node in ontology terms, reading as of a valid time.
-- `events`: the log, cursors, replay, forgetting, snapshots; owns rannoch's own tables (events, the ontology, fates, open links).
+- `events`: the log, cursors, replay, forgetting, snapshots; owns rannoch's own tables (events, the ontology, fates, open links, `_followers`).
 - `refs`: references into other graph files.
 
 rannoch's own tables start with `_`; every other table is a class or a relation an app declared.
