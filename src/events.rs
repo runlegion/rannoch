@@ -172,6 +172,21 @@ pub struct Events<'g> {
 }
 
 impl Events<'_> {
+    /// The committed watermark: the cursor of the last committed event, or [`Cursor::START`]
+    /// when none is. Another process on the same file learns of a commit by reading it, then
+    /// reads [`Events::since_until`] its own cursor up to it; an event not yet committed is
+    /// never under it.
+    ///
+    /// # Errors
+    /// The graph file cannot be read.
+    pub fn committed(&self) -> Result<Cursor, Error> {
+        Ok(Cursor(
+            self.conn
+                .prepare_cached("SELECT COALESCE(MAX(seq), 0) FROM _events")?
+                .query_row([], |row| row.get(0))?,
+        ))
+    }
+
     /// Every event after `cursor`, in the order they were written.
     ///
     /// # Errors
@@ -304,11 +319,7 @@ impl Snapshot {
 impl Graph {
     /// The cursor of the last event in the log, or [`Cursor::START`] when it holds none.
     pub(crate) fn last_cursor(&self) -> Result<Cursor, Error> {
-        Ok(Cursor(
-            self.conn
-                .prepare_cached("SELECT COALESCE(MAX(seq), 0) FROM _events")?
-                .query_row([], |row| row.get(0))?,
-        ))
+        self.events().committed()
     }
 
     /// Takes a snapshot of the graph's state at `cursor`, a place the app picks, into a new file
