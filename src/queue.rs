@@ -414,6 +414,32 @@ mod tests {
         }
     }
 
+    /// Takes the queue's failures until there is at least one.
+    fn taken(queue: &Queue) -> Vec<Failure> {
+        let mut taken = Vec::new();
+        wait_for(|| {
+            taken.extend(queue.take_failures());
+            !taken.is_empty()
+        });
+        taken
+    }
+
+    /// Registers a failure handler on `queue` and returns what it receives.
+    fn collected(queue: &Queue) -> Arc<Mutex<Vec<Failure>>> {
+        let handled = Arc::new(Mutex::new(Vec::new()));
+        let into = Arc::clone(&handled);
+        queue.on_failure(move |failure| super::lock(&into).push(failure));
+        handled
+    }
+
+    /// Makes the queue's next commit panic once it has taken its batch.
+    fn panic_next_beat(queue: &Queue) {
+        queue
+            .shared
+            .panic_beat
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// A graph with class `item` and a queue on it beating every [`Queue::INTERVAL`].
     fn beating(dir: &tempfile::TempDir) -> Result<Queue, Box<dyn std::error::Error>> {
         let mut g = open(dir.path().join("graph.rannoch"))?;
@@ -427,11 +453,7 @@ mod tests {
         let queue = beating(&dir)?;
         queue.subscribe(|_| panic!("a subscriber panics"));
         let ticket = queue.write(item("i1"))?;
-        let mut taken = Vec::new();
-        wait_for(|| {
-            taken.extend(queue.take_failures());
-            !taken.is_empty()
-        });
+        let taken = taken(&queue);
         assert!(
             matches!(&taken[..], [Failure::Subscriber { ticket: t, message }]
                 if *t == ticket && message == "a subscriber panics"),
@@ -444,9 +466,7 @@ mod tests {
     fn a_subscriber_panic_reaches_the_handler() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let queue = beating(&dir)?;
-        let handled = Arc::new(Mutex::new(Vec::new()));
-        let into = Arc::clone(&handled);
-        queue.on_failure(move |failure| super::lock(&into).push(failure));
+        let handled = collected(&queue);
         queue.subscribe(|_| panic!("a subscriber panics"));
         queue.write(item("i1"))?;
         wait_for(|| !super::lock(&queue.shared.state).failed.is_empty());
@@ -463,16 +483,9 @@ mod tests {
     fn a_heartbeat_panic_is_taken() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let queue = beating(&dir)?;
-        queue
-            .shared
-            .panic_beat
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        panic_next_beat(&queue);
         queue.write(item("i1"))?;
-        let mut taken = Vec::new();
-        wait_for(|| {
-            taken.extend(queue.take_failures());
-            !taken.is_empty()
-        });
+        let taken = taken(&queue);
         assert!(
             matches!(&taken[..], [Failure::Heartbeat(message)] if message == "the heartbeat panics"),
             "{taken:?}"
@@ -485,17 +498,10 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let queue = beating(&dir)?;
-        queue
-            .shared
-            .panic_beat
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        panic_next_beat(&queue);
         queue.write(item("i1"))?;
         let ticket = queue.write(item("i2"))?;
-        let mut taken = Vec::new();
-        wait_for(|| {
-            taken.extend(queue.take_failures());
-            !taken.is_empty()
-        });
+        let taken = taken(&queue);
         assert!(matches!(&taken[..], [Failure::Heartbeat(_)]), "{taken:?}");
         assert_eq!(queue.committed(), None);
         let (committed, failed) = queue.flush();
@@ -512,13 +518,8 @@ mod tests {
     fn a_heartbeat_panic_reaches_the_handler() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let queue = beating(&dir)?;
-        let handled = Arc::new(Mutex::new(Vec::new()));
-        let into = Arc::clone(&handled);
-        queue.on_failure(move |failure| super::lock(&into).push(failure));
-        queue
-            .shared
-            .panic_beat
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let handled = collected(&queue);
+        panic_next_beat(&queue);
         queue.write(item("i1"))?;
         wait_for(|| {
             queue
@@ -560,9 +561,7 @@ mod tests {
     fn a_drop_hands_untaken_failures_to_the_handler() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let queue = queue_failing_bad(&dir)?;
-        let handled = Arc::new(Mutex::new(Vec::new()));
-        let into = Arc::clone(&handled);
-        queue.on_failure(move |failure| super::lock(&into).push(failure));
+        let handled = collected(&queue);
         queue.write(item("i1"))?;
         let bad = queue.write(item("bad"))?;
         drop(queue);
