@@ -359,9 +359,9 @@ fn replay_into(
 }
 
 /// A graph's state at a cursor, in a file of its own: its ontology, nodes, links, open links,
-/// each node's fate and the registered followers. Of the events, it holds only the forget events, which carry no content and
-/// are what a forgotten node's fate is read from. A new reader or a rebuild starts from it and
-/// takes only the events after its cursor.
+/// each node's fate and the registered followers. Of the events, it holds only the forget events,
+/// which carry no content and are what a forgotten node's fate is read from. A new reader or a
+/// rebuild starts from it and takes only the events after its cursor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
     cursor: Cursor,
