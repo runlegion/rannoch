@@ -14,9 +14,9 @@ use crate::open::{Graph, Ontology, Value, class_table, open, relation_table, sch
 use crate::read::NodeRef;
 use crate::write::{Declaration, Error, ValidTime, now_millis, replay};
 
-/// rannoch's own tables: the event log, the ontology, links waiting for an end, and the fates of
-/// nodes that were replaced. An event's place is never reused, so a cursor stays a place in the
-/// log.
+/// rannoch's own tables: the event log, the ontology, links waiting for an end, the fates of
+/// nodes that were replaced, and the events each node was derived from. An event's place is
+/// never reused, so a cursor stays a place in the log.
 pub(crate) const OWN_TABLES: &str = "
     CREATE TABLE IF NOT EXISTS _events(seq INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS _ontology(
@@ -29,7 +29,11 @@ pub(crate) const OWN_TABLES: &str = "
     CREATE INDEX IF NOT EXISTS _open_to ON _open(rel, to_key);
     CREATE TABLE IF NOT EXISTS _fates(
         class TEXT NOT NULL, key TEXT NOT NULL, replaced_by TEXT NOT NULL,
-        PRIMARY KEY(class, key)) WITHOUT ROWID;";
+        PRIMARY KEY(class, key)) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS _derived(
+        class TEXT NOT NULL, key TEXT NOT NULL, event TEXT NOT NULL,
+        PRIMARY KEY(class, key, event)) WITHOUT ROWID;
+    CREATE INDEX IF NOT EXISTS _derived_event ON _derived(event);";
 
 /// A place in a graph's event log. Reading since a cursor returns the events after it. An app
 /// stores a cursor by serializing it, and a graph rebuilt from the log keeps each event's place,
@@ -122,6 +126,9 @@ pub struct NodeFact {
     pub key: String,
     pub properties: BTreeMap<String, Value>,
     pub valid: ValidTime,
+    /// The events the node was derived from.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub derived_from: Vec<EventId>,
 }
 
 /// A link, named by its relation and both of its endpoints.
@@ -316,7 +323,60 @@ impl Snapshot {
     }
 }
 
+/// Whether the log holds the event `id`.
+pub(crate) fn holds(conn: &Connection, id: EventId) -> Result<bool, Error> {
+    Ok(naming_key(conn, &id.to_string())?
+        .iter()
+        .any(|(_, stored)| stored.id == id))
+}
+
+/// Keeps `node`'s derived-from events as the events it was derived from now. Writing a node and
+/// replaying its write both keep them through here.
+pub(crate) fn keep_derived(tx: &Connection, node: &NodeFact) -> Result<(), Error> {
+    drop_derived(tx, &node.class, &node.key)?;
+    add_derived(tx, node)?;
+    Ok(())
+}
+
+/// Adds `node`'s derived-from events to those it already names. Returns whether any was new.
+pub(crate) fn add_derived(tx: &Connection, node: &NodeFact) -> Result<bool, Error> {
+    let mut added = false;
+    for event in &node.derived_from {
+        added |= tx
+            .prepare_cached(
+                "INSERT OR IGNORE INTO _derived(class, key, event) VALUES (?1, ?2, ?3)",
+            )?
+            .execute(params![node.class, node.key, event.to_string()])?
+            > 0;
+    }
+    Ok(added)
+}
+
+/// Removes every derived-from event the node `key` of `class` names.
+fn drop_derived(tx: &Connection, class: &str, key: &str) -> Result<(), Error> {
+    tx.prepare_cached("DELETE FROM _derived WHERE class = ?1 AND key = ?2")?
+        .execute(params![class, key])?;
+    Ok(())
+}
+
 impl Graph {
+    /// The nodes derived from the event `event`, by class and key.
+    ///
+    /// # Errors
+    /// The graph file cannot be read.
+    pub fn derived(&self, event: EventId) -> Result<Vec<NodeRef>, Error> {
+        Ok(self
+            .conn
+            .prepare_cached("SELECT class, key FROM _derived WHERE event = ?1 ORDER BY class, key")?
+            .query_map(params![event.to_string()], |row| {
+                Ok(NodeRef::new(
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                ))
+            })?
+            .collect::<Result<_, _>>()?)
+    }
+
     /// The cursor of the last event in the log, or [`Cursor::START`] when it holds none.
     pub(crate) fn last_cursor(&self) -> Result<Cursor, Error> {
         self.events().committed()
@@ -381,8 +441,9 @@ impl Graph {
     }
 }
 
-/// Removes `target` and its links from live state and returns the links, or `None` when no node
-/// of its class has its key. Forgetting and replaying a forget both remove through here.
+/// Removes `target`, its links and the events it was derived from from live state and returns
+/// the links, or `None` when no node of its class has its key. Forgetting and replaying a forget
+/// both remove through here.
 pub(crate) fn remove(
     tx: &Connection,
     ontology: &Ontology,
@@ -399,6 +460,7 @@ pub(crate) fn remove(
     let links = unlink(tx, ontology, target, id)?;
     tx.prepare_cached(&format!("DELETE FROM {table} WHERE id = ?1"))?
         .execute(params![id])?;
+    drop_derived(tx, &target.class, &target.key)?;
     Ok(Some(links))
 }
 
@@ -578,6 +640,54 @@ mod tests {
             message.contains(&events[last].id.to_string()) && message.contains("age"),
             "{message}"
         );
+        Ok(())
+    }
+
+    /// A graph with class note, and notes n1 and n2 each written as its own event.
+    fn two_notes() -> Result<(crate::Graph, Vec<crate::Event>), Box<dyn std::error::Error>> {
+        let path =
+            std::env::temp_dir().join(format!("rannoch-derived-{}.db", uuid::Uuid::now_v7()));
+        let mut g = open(path)?;
+        g.declare(&Declaration::Class(Class::new("note", ["text"])))?;
+        let mut sources = Vec::new();
+        for key in ["n1", "n2"] {
+            sources.extend(g.write(&Write::new("app").unit(note(key)))?);
+        }
+        Ok((g, sources))
+    }
+
+    fn note(key: &str) -> Unit {
+        Unit::new("note", key, [("text", "words")], ValidTime::Unknown)
+    }
+
+    #[test]
+    fn an_identical_rewrite_naming_new_sources_keeps_them() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (mut g, sources) = two_notes()?;
+        let (first, second) = (sources[0].id, sources[1].id);
+        g.write(&Write::new("app").unit(note("n3")).derived_from([first]))?;
+        let events = g.write(&Write::new("app").unit(note("n3")).derived_from([second]))?;
+        assert_eq!(events.len(), 1, "the new source is recorded as an event");
+        let found = g.find("note", "n3")?.map(|n| n.derived_from);
+        assert_eq!(found.map(|ids| ids.len()), Some(2));
+        assert_eq!(g.derived(second)?, [NodeRef::new("note", "n3")]);
+        let again = g.write(&Write::new("app").unit(note("n3")).derived_from([second]))?;
+        assert!(again.is_empty(), "a source already recorded adds nothing");
+        Ok(())
+    }
+
+    #[test]
+    fn a_forget_leaves_no_derived_from_behind() -> Result<(), Box<dyn std::error::Error>> {
+        let (mut g, sources) = two_notes()?;
+        let source = sources[0].id;
+        g.write(&Write::new("app").unit(note("n3")).derived_from([source]))?;
+        g.forget(&NodeRef::new("note", "n3"), "retention", "app")?;
+        assert!(g.derived(source)?.is_empty());
+        let rebuilt = crate::rebuild(
+            &g.events().since(crate::Cursor::START)?,
+            std::env::temp_dir().join(format!("rannoch-derived-{}.db", uuid::Uuid::now_v7())),
+        )?;
+        assert!(rebuilt.derived(source)?.is_empty());
         Ok(())
     }
 }
