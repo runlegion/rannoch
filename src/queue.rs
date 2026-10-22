@@ -433,6 +433,30 @@ mod tests {
     }
 
     #[test]
+    fn the_heartbeat_outlives_a_panicking_subscriber() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let mut g = open(dir.path().join("graph.rannoch"))?;
+        g.declare(&Declaration::Class(Class::new("item", ["v"])))?;
+        let queue = Queue::open(g, Queue::INTERVAL);
+        let heard = Arc::new(Mutex::new(0));
+        let into = Arc::clone(&heard);
+        queue.subscribe(|_| panic!("a subscriber panics"));
+        queue.subscribe(move |_| *super::lock(&into) += 1);
+        for (key, beats) in [("i1", 1), ("i2", 2)] {
+            queue.write(item(key))?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while *super::lock(&heard) < beats {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the heartbeat stopped"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn a_subscriber_panic_in_an_unwinding_drop_does_not_abort()
     -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
