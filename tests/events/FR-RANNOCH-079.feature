@@ -1,4 +1,4 @@
-# Generated from legion requirement FR-RANNOCH-079, revision 2026-10-22T19:55:06.801241+00:00.
+# Generated from legion requirement FR-RANNOCH-079, revision 2026-10-22T20:43:41.004764+00:00.
 # Do not edit: regenerate with scripts/features.mjs.
 
 Feature: What every registered follower has read is one mark the graph reports
