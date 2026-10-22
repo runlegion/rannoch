@@ -64,13 +64,17 @@ pub enum Error {
         source: io::Error,
     },
     /// The budget ran out before the directory could be measured. A durable flush cannot be
-    /// interrupted, so the measurement can overrun the budget by the one in progress.
+    /// interrupted, so the measurement can overrun the budget by the one in progress and by
+    /// creating and removing the probe's file.
     #[error("the budget of {budget:?} ran out before the directory could be measured")]
     Budget {
         /// The budget the caller passed.
         budget: Duration,
-        /// How long the last write and durable flush took: the most the budget was overrun by.
+        /// How long the last durable flush took, with its write; zero when the budget ran out
+        /// before the first.
         flush: Duration,
+        /// How far past the budget the measurement returned.
+        overrun: Duration,
     },
 }
 
@@ -117,13 +121,21 @@ fn allowed(total: u64, limit: Option<u64>, cap: Option<u64>) -> u64 {
 /// [`Error::Io`] when the file cannot be created, written, flushed or removed, and
 /// [`Error::Budget`] when the budget runs out before the rate can be measured or before the file
 /// is removed. The measurement returns within the budget, overrunning it by at most the one
-/// durable flush already in progress.
+/// durable flush in progress and the creation and removal of the probe's file.
 pub fn disk(directory: &Path, budget: Duration) -> Result<Disk, Error> {
     let start = Instant::now();
     let taken_at = SystemTime::now();
     let mut probe = Probe::create(directory)?;
     // Closing and removing the file must fit too; reserve twice what creating it took.
     let reserve = start.elapsed().as_nanos() * 2;
+    if start.elapsed() > budget {
+        probe.remove()?;
+        return Err(Error::Budget {
+            budget,
+            flush: Duration::ZERO,
+            overrun: start.elapsed().saturating_sub(budget),
+        });
+    }
 
     let flush = probe.round(&[0; FLUSH_BYTES])?;
 
@@ -155,6 +167,7 @@ pub fn disk(directory: &Path, budget: Duration) -> Result<Disk, Error> {
         return Err(Error::Budget {
             budget,
             flush: last.0,
+            overrun: start.elapsed().saturating_sub(budget),
         });
     }
 

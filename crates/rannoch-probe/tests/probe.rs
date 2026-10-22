@@ -70,10 +70,18 @@ fn disk_within_a_tight_budget_returns_within_it_measured_or_not() {
 }
 
 #[test]
-fn disk_that_runs_out_of_budget_fails_and_leaves_no_file() {
+fn disk_that_runs_out_of_budget_fails_reports_its_overrun_and_leaves_no_file() {
     let directory = tempfile::tempdir().unwrap();
-    let result = disk(directory.path(), Duration::from_nanos(1));
-    assert!(matches!(result, Err(Error::Budget { .. })));
+    // Below the time creating and removing the probe's file takes.
+    let budget = Duration::from_nanos(1);
+    let start = Instant::now();
+    let result = disk(directory.path(), budget);
+    let measured = start.elapsed().saturating_sub(budget);
+    let Err(Error::Budget { overrun, .. }) = result else {
+        panic!("expected Err(Budget), got {result:?}");
+    };
+    assert!(overrun + Duration::from_millis(1) >= measured);
+    assert!(overrun <= measured);
     assert_eq!(entries(directory.path()), 0);
 }
 
