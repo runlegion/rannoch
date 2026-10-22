@@ -151,8 +151,18 @@ impl Shared {
                     .zip(results)
                     .filter_map(|((ticket, _), result)| result.err().map(|cause| (*ticket, cause)))
                     .collect(),
-                // The batch's transaction failed, so none of it landed; its last ticket keeps why.
-                Err(cause) => vec![(last, cause)],
+                // The batch's transaction failed, so none of it landed: every ticket fails, and
+                // the last keeps the cause itself.
+                Err(cause) => {
+                    let text = format!("the batch's transaction failed: {cause}");
+                    let mut failed: Vec<(Ticket, Error)> = batch
+                        .iter()
+                        .take(batch.len() - 1)
+                        .map(|(ticket, _)| (*ticket, batch_failed(&text)))
+                        .collect();
+                    failed.push((last, cause));
+                    failed
+                }
             };
         let failed = failed.into_iter().map(|(ticket, cause)| {
             (
@@ -179,6 +189,14 @@ impl Shared {
             subscriber(cursor);
         }
     }
+}
+
+/// A storage failure carrying `text`, for each write of a batch whose transaction failed.
+fn batch_failed(text: &str) -> Error {
+    Error::Storage(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ABORT),
+        Some(text.to_string()),
+    ))
 }
 
 impl Drop for Queue {
@@ -211,6 +229,37 @@ mod tests {
 
     use super::Queue;
     use crate::{Class, Date, Declaration, Error, Unit, ValidTime, ValueType, Write, open};
+
+    #[test]
+    fn a_batch_that_fails_whole_fails_every_ticket() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("graph.rannoch");
+        let mut g = open(&path)?;
+        g.declare(&Declaration::Class(Class::new("item", ["v"])))?;
+        rusqlite::Connection::open(&path)?.execute_batch(
+            "CREATE TRIGGER bad_rolls_back BEFORE INSERT ON \"class:item\" \
+             WHEN NEW.key = 'bad' BEGIN SELECT RAISE(ROLLBACK, 'database or disk is full'); END;",
+        )?;
+        let queue = Queue::open(g, Duration::from_secs(3_600));
+        let mut tickets = Vec::new();
+        for key in ["i1", "bad", "i3"] {
+            let unit = Unit::new(
+                "item",
+                key,
+                [("v", key)],
+                ValidTime::On(Date::day(2026, 1, 1)),
+            );
+            tickets.push(queue.write(Write::new("app").unit(unit))?);
+        }
+        queue.flush();
+        let failed: Vec<_> = super::lock(&queue.shared.state)
+            .failed
+            .iter()
+            .map(|(ticket, _)| *ticket)
+            .collect();
+        assert_eq!(failed, tickets);
+        Ok(())
+    }
 
     #[test]
     fn a_wrongly_typed_value_is_refused_when_queued() -> Result<(), Box<dyn std::error::Error>> {

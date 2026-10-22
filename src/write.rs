@@ -922,7 +922,7 @@ impl Graph {
     /// Commits a heartbeat's batch as one transaction, each write unsplit under a savepoint of
     /// its own: a write that fails rolls back alone, the others commit, and a reader sees the
     /// whole batch land at once. A write that links from a node a failed write in the batch
-    /// brought fails with it. Returns, per write in order, its events or why it failed.
+    /// would have brought new fails with it. Returns, per write in order, its events or why it failed.
     ///
     /// # Errors
     /// The graph file fails to begin or commit the transaction; nothing in the batch lands.
@@ -954,12 +954,13 @@ impl Graph {
                     if tx.is_autocommit() {
                         return Err(cause);
                     }
-                    failed.extend(
-                        write
-                            .units
-                            .iter()
-                            .map(|u| (u.node.class.clone(), u.node.key.clone())),
-                    );
+                    // Only a node this write would have brought new stays unheard; one already
+                    // in the graph is still a heard source for the links that follow.
+                    for node in write.units.iter().map(|u| &u.node) {
+                        if node_id(&tx, &node.class, &node.key)?.is_none() {
+                            failed.insert((node.class.clone(), node.key.clone()));
+                        }
+                    }
                     results.push(Err(cause));
                 }
             }
@@ -971,7 +972,7 @@ impl Graph {
 }
 
 /// Refuses `write` when one of its links is from a node that a write which failed earlier in the
-/// same batch brought, unless `write` brings that node itself.
+/// same batch would have brought new, unless `write` brings that node itself.
 fn follows_failed(
     ontology: &Ontology,
     write: &Write,
@@ -1147,6 +1148,34 @@ mod tests {
             "expected a refusal for {reason}, got {refused:?}"
         );
         assert_eq!(g.events().since(Cursor::START)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn a_link_from_a_heard_node_survives_a_failed_rewrite_of_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = graph("rewrite-fails")?;
+        let when = Date::day(2026, 1, 1);
+        g.write(&Write::new("src").unit(unit("i1", when.clone())))?;
+        g.conn.execute_batch(
+            "CREATE TRIGGER i1_fails BEFORE UPDATE ON \"class:item\" \
+             WHEN NEW.key = 'i1' BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END;",
+        )?;
+        let rewrite = Unit::new(
+            "item",
+            "i1",
+            [("name", "renamed")],
+            ValidTime::On(when.clone()),
+        );
+        let link = unit("i2", when.clone()).link("part", "i1", "i2", ValidTime::On(when));
+        let writes = [
+            Write::new("src").unit(rewrite),
+            Write::new("src").unit(link),
+        ];
+        let results = g.write_batch(&writes)?;
+        assert!(results[0].is_err(), "the rewrite of i1 should fail");
+        assert!(results[1].is_ok(), "{:?}", results[1]);
+        assert!(g.find_link("part", "i1", "i2")?.is_some());
         Ok(())
     }
 
