@@ -249,7 +249,7 @@ impl Shared {
                 std::panic::resume_unwind(panic);
             }
         };
-        // A write that fails at commit is kept, not dropped; reporting it is FR-RANNOCH-075's.
+        // A write that fails at commit is kept as a failure, not dropped, until it is reported.
         let failed: Vec<(Ticket, Error)> = match written {
             Ok(results) => batch
                 .iter()
@@ -323,8 +323,8 @@ fn batch_failed(text: &str) -> Error {
 
 impl Drop for Queue {
     /// Stops the heartbeat, then commits what is still queued, so a process that returns or
-    /// panics with unwinding loses no write. Every write that failed at commit and the app has
-    /// not taken goes to the failure handler, or to stderr when none is registered.
+    /// panics with unwinding loses no write. Every failure the app has not taken goes to the
+    /// failure handler, or to stderr when none is registered.
     fn drop(&mut self) {
         self.stop();
         let failed = self.take_failures();
@@ -634,23 +634,14 @@ mod tests {
     #[test]
     fn the_heartbeat_outlives_a_panicking_subscriber() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
-        let mut g = open(dir.path().join("graph.rannoch"))?;
-        g.declare(&Declaration::Class(Class::new("item", ["v"])))?;
-        let queue = Queue::open(g, Queue::INTERVAL);
+        let queue = beating(&dir)?;
         let heard = Arc::new(Mutex::new(0));
         let into = Arc::clone(&heard);
         queue.subscribe(|_| panic!("a subscriber panics"));
         queue.subscribe(move |_| *super::lock(&into) += 1);
         for (key, beats) in [("i1", 1), ("i2", 2)] {
             queue.write(item(key))?;
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            while *super::lock(&heard) < beats {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "the heartbeat stopped"
-                );
-                std::thread::sleep(Duration::from_millis(2));
-            }
+            wait_for(|| *super::lock(&heard) >= beats);
         }
         Ok(())
     }
