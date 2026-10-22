@@ -18,8 +18,8 @@ pub struct Ticket(u64);
 type Subscriber = Box<dyn FnMut(Cursor) + Send>;
 
 /// One process's queue of writes to a graph, held in memory only, and the heartbeat that
-/// commits it. The queue owns the graph: [`Graph::write`] is the synchronous commit the
-/// heartbeat uses, and other handles on the same file read what it commits.
+/// commits it, each batch as one transaction with a savepoint per write. The queue owns the
+/// graph, and other handles on the same file read what it commits.
 pub struct Queue {
     /// The graph's ontology when the queue took it, which a write is checked against at once.
     ontology: Ontology,
@@ -144,10 +144,35 @@ impl Shared {
             return;
         };
         // A write that fails at commit is kept, not dropped; reporting it is FR-RANNOCH-075's.
-        let failed: Vec<(Ticket, WriteError)> = batch
-            .iter()
-            .filter_map(|(ticket, write)| graph.write(write).err().map(|e| (*ticket, e)))
-            .collect();
+        let failed: Vec<(Ticket, Error)> =
+            match graph.write_batch(batch.iter().map(|(_, write)| write)) {
+                Ok(results) => batch
+                    .iter()
+                    .zip(results)
+                    .filter_map(|((ticket, _), result)| result.err().map(|cause| (*ticket, cause)))
+                    .collect(),
+                // The batch's transaction failed, so none of it landed: every ticket fails, and
+                // the last keeps the cause itself.
+                Err(cause) => {
+                    let text = format!("the batch's transaction failed: {cause}");
+                    let mut failed: Vec<(Ticket, Error)> = batch
+                        .iter()
+                        .take(batch.len() - 1)
+                        .map(|(ticket, _)| (*ticket, batch_failed(&text)))
+                        .collect();
+                    failed.push((last, cause));
+                    failed
+                }
+            };
+        let failed = failed.into_iter().map(|(ticket, cause)| {
+            (
+                ticket,
+                WriteError {
+                    events: Vec::new(),
+                    cause,
+                },
+            )
+        });
         let cursor = {
             let mut state = lock(&self.state);
             state.committed = Some(last);
@@ -164,6 +189,14 @@ impl Shared {
             subscriber(cursor);
         }
     }
+}
+
+/// A storage failure carrying `text`, for each write of a batch whose transaction failed.
+fn batch_failed(text: &str) -> Error {
+    Error::Storage(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ABORT),
+        Some(text.to_string()),
+    ))
 }
 
 impl Drop for Queue {
@@ -198,6 +231,37 @@ mod tests {
     use crate::{Class, Date, Declaration, Error, Unit, ValidTime, ValueType, Write, open};
 
     #[test]
+    fn a_batch_that_fails_whole_fails_every_ticket() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("graph.rannoch");
+        let mut g = open(&path)?;
+        g.declare(&Declaration::Class(Class::new("item", ["v"])))?;
+        rusqlite::Connection::open(&path)?.execute_batch(
+            "CREATE TRIGGER bad_rolls_back BEFORE INSERT ON \"class:item\" \
+             WHEN NEW.key = 'bad' BEGIN SELECT RAISE(ROLLBACK, 'database or disk is full'); END;",
+        )?;
+        let queue = Queue::open(g, Duration::from_secs(3_600));
+        let mut tickets = Vec::new();
+        for key in ["i1", "bad", "i3"] {
+            let unit = Unit::new(
+                "item",
+                key,
+                [("v", key)],
+                ValidTime::On(Date::day(2026, 1, 1)),
+            );
+            tickets.push(queue.write(Write::new("app").unit(unit))?);
+        }
+        queue.flush();
+        let failed: Vec<_> = super::lock(&queue.shared.state)
+            .failed
+            .iter()
+            .map(|(ticket, _)| *ticket)
+            .collect();
+        assert_eq!(failed, tickets);
+        Ok(())
+    }
+
+    #[test]
     fn a_wrongly_typed_value_is_refused_when_queued() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let mut g = open(dir.path().join("graph.rannoch"))?;
@@ -217,6 +281,65 @@ mod tests {
             "expected a refusal, got {refused:?}"
         );
         assert_eq!(queue.flush(), None);
+        Ok(())
+    }
+
+    /// A graph with class item and item i1 written as its own event, and that event.
+    fn with_source(
+        path: &std::path::Path,
+    ) -> Result<(crate::Graph, crate::Event), Box<dyn std::error::Error>> {
+        let mut g = open(path)?;
+        g.declare(&Declaration::Class(Class::new("item", [] as [&str; 0])))?;
+        let source = g.write(&Write::new("app").unit(item("i1")))?.remove(0);
+        Ok((g, source))
+    }
+
+    fn item(key: &str) -> Unit {
+        Unit::new("item", key, [] as [(&str, &str); 0], ValidTime::Unknown)
+    }
+
+    #[test]
+    fn a_queued_write_keeps_its_derived_from() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("graph.rannoch");
+        let (g, source) = with_source(&path)?;
+        let queue = Queue::open(g, Duration::from_secs(3_600));
+        queue.write(Write::new("app").unit(item("i2")).derived_from([source.id]))?;
+        queue.flush();
+        let reader = open(&path)?;
+        let found = reader.find("item", "i2")?.map(|n| n.derived_from);
+        assert_eq!(found, Some(vec![source.id]));
+        assert_eq!(
+            reader.derived(source.id)?,
+            [crate::NodeRef::new("item", "i2")]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_queued_write_naming_an_unknown_event_is_refused() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("graph.rannoch");
+        let (g, _) = with_source(&path)?;
+        let (_, foreign) = with_source(&dir.path().join("other.rannoch"))?;
+        let queue = Queue::open(g, Duration::from_secs(3_600));
+        let ticket = queue.write(
+            Write::new("app")
+                .unit(item("i2"))
+                .derived_from([foreign.id]),
+        )?;
+        queue.flush();
+        let state = super::lock(&queue.shared.state);
+        assert!(
+            matches!(
+                state.failed.as_slice(),
+                [(failed, error)] if *failed == ticket && matches!(error.cause, Error::Refused(_))
+            ),
+            "expected the write refused, got {:?}",
+            state.failed
+        );
+        assert!(open(&path)?.find("item", "i2")?.is_none());
         Ok(())
     }
 }

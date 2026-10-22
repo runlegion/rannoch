@@ -2,8 +2,9 @@
 //! legion requirement; a scenario with no matching step code fails, naming the scenario.
 //!
 //! Steps act and observe through rannoch's public API. Only fixture setup touches the file
-//! directly: the trigger that makes a write's third piece fail, and reading the file's table
-//! and column names so an answer or a refusal can be checked against them.
+//! directly: the triggers that make a write's third piece, or one write of a heartbeat's batch,
+//! fail, and reading the file's table and column names so an answer or a refusal can be checked
+//! against them.
 
 #![allow(
     clippy::expect_used,
@@ -3908,6 +3909,132 @@ fn flushed_committed(world: &mut World) {
     for key in ["i1", "i2", "i3"] {
         assert!(committed_elsewhere(world, key), "{key} is not committed");
     }
+}
+
+// ---------- write: a heartbeat's batch is one transaction, a savepoint per write ----------
+
+/// Makes the file refuse node `item` `key` at commit, as a full disk would; the statement aborts
+/// and the transaction around it stays open.
+fn item_fails_at_commit(world: &World, key: &str) {
+    rusqlite::Connection::open(world.path())
+        .unwrap()
+        .execute_batch(&format!(
+            "CREATE TRIGGER {key}_fails BEFORE INSERT ON \"class:item\" \
+             WHEN NEW.key = '{key}' BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END;"
+        ))
+        .unwrap();
+}
+
+#[given("an open graph with a batch of writes in its queue, one of which fails when committed")]
+fn batch_with_failing_write(world: &mut World) {
+    queued(world, NEVER);
+    item_fails_at_commit(world, "bad");
+    for key in ["i1", "bad", "i3"] {
+        enqueue(world, key);
+    }
+}
+
+#[when("the heartbeat commits the batch")]
+fn heartbeat_commits_batch(world: &mut World) {
+    world.flushed = q(world).flush();
+}
+
+#[then("every other write in the batch is committed")]
+fn others_committed(world: &mut World) {
+    assert!(world.flushed >= world.tickets.last().copied());
+    for key in ["i1", "i3"] {
+        assert!(committed_elsewhere(world, key), "{key} is not committed");
+    }
+    assert!(!committed_elsewhere(world, "bad"));
+}
+
+/// The batch's size in changes: more than three pieces' worth.
+const LARGE_BATCH: usize = 3 * PIECE_CHANGES + 1;
+
+#[given("an open graph with more than 1,000 changes in its queue")]
+fn graph_with_large_batch(world: &mut World) {
+    queued(world, NEVER);
+    let mut write = Write::new("app");
+    for i in 0..LARGE_BATCH {
+        let key = format!("i{i}");
+        write = write.unit(Unit::new(
+            "item",
+            key.clone(),
+            [("v", key)],
+            day(2026, 1, 1),
+        ));
+    }
+    let ticket = q(world).write(write).unwrap();
+    world.tickets.push(ticket);
+}
+
+#[when("the heartbeat commits the batch while a reader reads")]
+fn commits_while_reading(world: &mut World) {
+    let (path, done) = (world.path(), Arc::clone(&world.burst_done));
+    let last = format!("i{}", LARGE_BATCH - 1);
+    let reader = std::thread::spawn(move || {
+        let reader = rannoch::open(path).unwrap();
+        let (mut reads, mut partial, mut whole) = (0, 0, 0);
+        loop {
+            let finished = done.load(Ordering::SeqCst);
+            // The first unit, then the last: once the first is visible, all of it must be.
+            let first = reader.find("item", "i0").unwrap().is_some();
+            let last = reader.find("item", &last).unwrap().is_some();
+            reads += 1;
+            partial += usize::from(first && !last);
+            whole += usize::from(first && last);
+            if finished {
+                return (reads, partial, whole);
+            }
+        }
+    });
+    world.flushed = q(world).flush();
+    world.burst_done.store(true, Ordering::SeqCst);
+    world.reads = reader.join().unwrap();
+}
+
+#[then("the reader sees either none of the batch or all of it")]
+fn none_or_all(world: &mut World) {
+    let (reads, partial, whole) = world.reads;
+    assert!(world.flushed >= world.tickets.last().copied());
+    assert_eq!(
+        partial, 0,
+        "{partial} of {reads} reads saw part of the batch"
+    );
+    assert!(whole > 0, "no read saw the whole batch");
+}
+
+#[given("a queue holding a node and then a link from it, where the node will fail at commit")]
+fn link_after_failing_node(world: &mut World) {
+    class_with(world, ValueType::Text);
+    world
+        .g()
+        .declare(&Declaration::Relation(Relation::new(
+            "next", "item", "item", false,
+        )))
+        .unwrap();
+    let graph = world.graph.take().expect("the graph is open");
+    world.queue = Some(Queue::open(graph, NEVER));
+    item_fails_at_commit(world, "bad");
+    enqueue(world, "bad");
+    let unit = Unit::new("item", "i2", [("v", "i2")], day(2026, 1, 1)).link(
+        "next",
+        "bad",
+        "i2",
+        day(2026, 1, 1),
+    );
+    let ticket = q(world).write(Write::new("app").unit(unit)).unwrap();
+    world.tickets.push(ticket);
+}
+
+#[then("the link is not in the graph")]
+fn link_not_in_graph(world: &mut World) {
+    assert!(world.flushed >= world.tickets.last().copied());
+    let g = rannoch::open(world.path()).unwrap();
+    assert!(g.find("item", "bad").unwrap().is_none());
+    assert!(g.find_link("next", "bad", "i2").unwrap().is_none());
+    assert!(g.open_links().unwrap().is_empty(), "the link was left open");
+    assert!(g.find("item", "i2").unwrap().is_none());
 }
 
 // ---------- queue: dropping or closing the queue commits what it holds ----------

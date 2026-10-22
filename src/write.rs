@@ -1,5 +1,6 @@
 //! Declarations and writes. A declaration is one event; a write is whole units committed in
-//! pieces, each piece one transaction whose events land only if it lands.
+//! pieces, each piece one transaction whose events land only if it lands; a heartbeat's batch of
+//! writes is one transaction, with a savepoint per write.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -945,43 +946,139 @@ impl Graph {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut piece = Piece::new(&tx, &self.ontology, source, now_millis());
-        for unit in units {
-            let node = NodeFact {
-                derived_from: derived_from.to_vec(),
-                ..unit.node.clone()
-            };
-            let (_, new) = piece.node(&node)?;
-            if new {
-                piece.arrived(&unit.node.class, &unit.node.key)?;
-            }
-            for link in &unit.links {
-                piece.link(link)?;
-            }
-        }
-        let Piece {
-            added,
-            wrong_kind,
-            closed,
-            ..
-        } = piece;
-        let mut events = Vec::new();
-        if !added.is_empty() || !wrong_kind.is_empty() {
-            events.push(append(
-                &tx,
-                Change::Wrote {
-                    source: source.to_string(),
-                    added,
-                    wrong_kind,
-                },
-            )?);
-        }
-        for link in closed {
-            events.push(append(&tx, Change::Closed(link))?);
-        }
+        let events = put(&tx, &self.ontology, source, derived_from, units)?;
         tx.commit()?;
         Ok(events)
     }
+
+    /// Commits a heartbeat's batch as one transaction, each write unsplit under a savepoint of
+    /// its own: a write that fails rolls back alone, the others commit, and a reader sees the
+    /// whole batch land at once. A write that links from a node a failed write in the batch
+    /// would have brought new fails with it. Returns, per write in order, its events or why it failed.
+    ///
+    /// # Errors
+    /// The graph file fails to begin or commit the transaction; nothing in the batch lands.
+    pub(crate) fn write_batch<'w>(
+        &mut self,
+        writes: impl IntoIterator<Item = &'w Write>,
+    ) -> Result<Vec<Result<Vec<Event>, Error>>, Error> {
+        let mut tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let version = schema_version(&tx)?;
+        let ontology = Ontology::load(&tx)?;
+        let mut failed: BTreeSet<(String, String)> = BTreeSet::new();
+        let mut results = Vec::new();
+        for write in writes {
+            let savepoint = tx.savepoint()?;
+            let result = follows_failed(&ontology, write, &failed)
+                .and_then(|()| check(&savepoint, &ontology, write))
+                .and_then(|()| {
+                    put(
+                        &savepoint,
+                        &ontology,
+                        &write.source,
+                        &write.derived_from,
+                        &write.units,
+                    )
+                });
+            match result {
+                Ok(events) => {
+                    savepoint.commit()?;
+                    results.push(Ok(events));
+                }
+                Err(cause) => {
+                    drop(savepoint);
+                    // The file rolled back the whole transaction (a full disk can): the writes
+                    // before this one are gone too, and a later savepoint would begin a second.
+                    if tx.is_autocommit() {
+                        return Err(cause);
+                    }
+                    // Only a node this write would have brought new stays unheard; one already
+                    // in the graph is still a heard source for the links that follow.
+                    for node in write.units.iter().map(|u| &u.node) {
+                        if node_id(&tx, &node.class, &node.key)?.is_none() {
+                            failed.insert((node.class.clone(), node.key.clone()));
+                        }
+                    }
+                    results.push(Err(cause));
+                }
+            }
+        }
+        tx.commit()?;
+        self.loaded(version, ontology);
+        Ok(results)
+    }
+}
+
+/// Refuses `write` when one of its links is from a node that a write which failed earlier in the
+/// same batch would have brought new, unless `write` brings that node itself.
+fn follows_failed(
+    ontology: &Ontology,
+    write: &Write,
+    failed: &BTreeSet<(String, String)>,
+) -> Result<(), Error> {
+    for link in write.units.iter().flat_map(|u| &u.links) {
+        let class = &ontology.relation(&link.relation)?.from;
+        let brought = write
+            .units
+            .iter()
+            .any(|u| &u.node.class == class && u.node.key == link.from);
+        if !brought && failed.contains(&(class.clone(), link.from.clone())) {
+            return Err(Error::Refused(format!(
+                "{class} {} failed earlier in the batch; a link from it fails with it",
+                link.from
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Writes whole `units` from `source`, each node derived from `derived_from`, inside `tx` and
+/// appends their events: one for what they added and one per open link they closed. The caller
+/// commits.
+fn put(
+    tx: &Connection,
+    ontology: &Ontology,
+    source: &str,
+    derived_from: &[EventId],
+    units: &[Unit],
+) -> Result<Vec<Event>, Error> {
+    let mut piece = Piece::new(tx, ontology, source, now_millis());
+    for unit in units {
+        let node = NodeFact {
+            derived_from: derived_from.to_vec(),
+            ..unit.node.clone()
+        };
+        let (_, new) = piece.node(&node)?;
+        if new {
+            piece.arrived(&unit.node.class, &unit.node.key)?;
+        }
+        for link in &unit.links {
+            piece.link(link)?;
+        }
+    }
+    let Piece {
+        added,
+        wrong_kind,
+        closed,
+        ..
+    } = piece;
+    let mut events = Vec::new();
+    if !added.is_empty() || !wrong_kind.is_empty() {
+        events.push(append(
+            tx,
+            Change::Wrote {
+                source: source.to_string(),
+                added,
+                wrong_kind,
+            },
+        )?);
+    }
+    for link in closed {
+        events.push(append(tx, Change::Closed(link))?);
+    }
+    Ok(events)
 }
 
 #[cfg(test)]
@@ -1097,6 +1194,53 @@ mod tests {
             "expected a refusal for {reason}, got {refused:?}"
         );
         assert_eq!(g.events().since(Cursor::START)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn a_link_from_a_heard_node_survives_a_failed_rewrite_of_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = graph("rewrite-fails")?;
+        let when = Date::day(2026, 1, 1);
+        g.write(&Write::new("src").unit(unit("i1", when.clone())))?;
+        g.conn.execute_batch(
+            "CREATE TRIGGER i1_fails BEFORE UPDATE ON \"class:item\" \
+             WHEN NEW.key = 'i1' BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END;",
+        )?;
+        let rewrite = Unit::new(
+            "item",
+            "i1",
+            [("name", "renamed")],
+            ValidTime::On(when.clone()),
+        );
+        let link = unit("i2", when.clone()).link("part", "i1", "i2", ValidTime::On(when));
+        let writes = [
+            Write::new("src").unit(rewrite),
+            Write::new("src").unit(link),
+        ];
+        let results = g.write_batch(&writes)?;
+        assert!(results[0].is_err(), "the rewrite of i1 should fail");
+        assert!(results[1].is_ok(), "{:?}", results[1]);
+        assert!(g.find_link("part", "i1", "i2")?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn a_batch_rolled_back_whole_lands_nothing() -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = graph("batch-rollback")?;
+        g.conn.execute_batch(
+            "CREATE TRIGGER bad_rolls_back BEFORE INSERT ON \"class:item\" \
+             WHEN NEW.key = 'bad' BEGIN SELECT RAISE(ROLLBACK, 'database or disk is full'); END;",
+        )?;
+        let when = Date::day(2026, 1, 1);
+        let writes: Vec<Write> = ["i1", "bad", "i3"]
+            .into_iter()
+            .map(|key| Write::new("src").unit(unit(key, when.clone())))
+            .collect();
+        assert!(g.write_batch(&writes).is_err());
+        for key in ["i1", "i3"] {
+            assert!(g.find("item", key)?.is_none(), "{key} landed");
+        }
         Ok(())
     }
 
