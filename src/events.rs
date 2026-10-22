@@ -389,7 +389,15 @@ impl Snapshot {
             Error::Refused(format!("the path {} is not UTF-8", empty_path.display()))
         })?;
         Connection::open(&self.path)?.execute("VACUUM INTO ?1", params![target])?;
-        replay_into(open(empty_path)?, later, |_| true)
+        let graph = replay_into(open(empty_path)?, later, |_| true)?;
+        // A carried follower cursor past what the rebuilt graph holds is lowered to its
+        // watermark, so the mark never claims an event the rebuilt graph has not read.
+        let committed = graph.events().committed()?;
+        graph
+            .conn
+            .prepare_cached("UPDATE _followers SET cursor = ?1 WHERE cursor > ?1")?
+            .execute(params![committed.0])?;
+        Ok(graph)
     }
 }
 
@@ -631,14 +639,29 @@ mod tests {
         g.events().register("reader")?;
         g.declare(&Declaration::Class(Class::new("person", ["name"])))?;
         let at = g.events().committed()?;
-        g.events().advance("reader", at)?;
-
+        g.declare(&Declaration::Class(Class::new("place", ["name"])))?;
+        let last = g.events().committed()?;
+        g.events().advance("reader", last)?;
         let snapshot = g.snapshot(at, temp("followers-snapshot"))?;
-        let carried = snapshot.rebuild(&[], temp("followers-from-snapshot"))?;
+
+        // With every later event, the carried cursor names a place the rebuilt graph holds.
+        let full = snapshot.rebuild(&g.events().since(at)?, temp("followers-full"))?;
         assert_eq!(
-            carried.events().followers()?,
-            vec![("reader".to_string(), at)]
+            full.events().followers()?,
+            vec![("reader".to_string(), last)]
         );
+
+        // With none, it is lowered to the rebuilt graph's watermark.
+        let short = snapshot.rebuild(&[], temp("followers-short"))?;
+        let watermark = short.events().committed()?;
+        assert!(watermark < last);
+        assert_eq!(
+            short.events().followers()?,
+            vec![("reader".to_string(), watermark)]
+        );
+        assert!(short.events().processed()? <= Some(watermark));
+        short.events().advance("reader", watermark)?;
+
         let rebuilt = crate::rebuild(
             &g.events().since(crate::Cursor::START)?,
             temp("followers-rebuilt"),
