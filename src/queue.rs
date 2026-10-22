@@ -694,13 +694,9 @@ mod tests {
         path: &std::path::Path,
     ) -> Result<(crate::Graph, crate::Event), Box<dyn std::error::Error>> {
         let mut g = open(path)?;
-        g.declare(&Declaration::Class(Class::new("item", [] as [&str; 0])))?;
-        let source = g.write(&Write::new("app").unit(item("i1")))?.remove(0);
+        g.declare(&Declaration::Class(Class::new("item", ["v"])))?;
+        let source = g.write(&item("i1"))?.remove(0);
         Ok((g, source))
-    }
-
-    fn item(key: &str) -> Unit {
-        Unit::new("item", key, [] as [(&str, &str); 0], ValidTime::Unknown)
     }
 
     #[test]
@@ -709,8 +705,9 @@ mod tests {
         let path = dir.path().join("graph.rannoch");
         let (g, source) = with_source(&path)?;
         let queue = Queue::open(g, Duration::from_secs(3_600));
-        queue.write(Write::new("app").unit(item("i2")).derived_from([source.id]))?;
-        queue.flush();
+        queue.write(item("i2").derived_from([source.id]))?;
+        let (_, failed) = queue.flush();
+        assert!(failed.is_empty(), "{failed:?}");
         let reader = open(&path)?;
         let found = reader.find("item", "i2")?.map(|n| n.derived_from);
         assert_eq!(found, Some(vec![source.id]));
@@ -729,20 +726,15 @@ mod tests {
         let (g, _) = with_source(&path)?;
         let (_, foreign) = with_source(&dir.path().join("other.rannoch"))?;
         let queue = Queue::open(g, Duration::from_secs(3_600));
-        let ticket = queue.write(
-            Write::new("app")
-                .unit(item("i2"))
-                .derived_from([foreign.id]),
-        )?;
-        queue.flush();
-        let state = super::lock(&queue.shared.state);
+        let ticket = queue.write(item("i2").derived_from([foreign.id]))?;
+        let (_, failed) = queue.flush();
         assert!(
             matches!(
-                state.failed.as_slice(),
-                [(failed, error)] if *failed == ticket && matches!(error.cause, Error::Refused(_))
+                failed.as_slice(),
+                [Failure::Write { ticket: t, error }]
+                    if *t == ticket && matches!(error.cause, Error::Refused(_))
             ),
-            "expected the write refused, got {:?}",
-            state.failed
+            "expected the write refused, got {failed:?}"
         );
         assert!(open(&path)?.find("item", "i2")?.is_none());
         Ok(())
