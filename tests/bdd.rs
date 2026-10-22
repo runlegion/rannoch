@@ -3655,6 +3655,99 @@ fn reads_events_after_rebuild(world: &mut World) {
     assert_eq!(world.read, expected);
 }
 
+// ---------- events: the processed mark across registered followers ----------
+
+/// The cursor after the `n`th event of the log (1-based).
+fn after_event(world: &World, n: usize) -> Cursor {
+    world.log[n - 1].cursor
+}
+
+fn mark(world: &mut World) -> Option<Cursor> {
+    world.g().events().processed().unwrap()
+}
+
+#[given("a graph with events and two registered followers")]
+fn events_and_two_followers(world: &mut World) {
+    events_around_cursor(world);
+    let events = world.g().events();
+    events.register("slow").unwrap();
+    events.register("fast").unwrap();
+}
+
+#[when("one follower stores a cursor after the third event and the other after the fifth")]
+fn followers_store_third_and_fifth(world: &mut World) {
+    let (third, fifth) = (after_event(world, 3), after_event(world, 5));
+    let events = world.g().events();
+    events.advance("slow", third).unwrap();
+    events.advance("fast", fifth).unwrap();
+}
+
+#[then("the graph's processed mark is the cursor after the third event")]
+fn mark_is_third(world: &mut World) {
+    let third = after_event(world, 3);
+    assert_eq!(mark(world), Some(third));
+}
+
+#[given("a graph whose processed mark is held by the slower of two registered followers")]
+fn mark_held_by_slower(world: &mut World) {
+    events_and_two_followers(world);
+    followers_store_third_and_fifth(world);
+    let third = after_event(world, 3);
+    assert_eq!(mark(world), Some(third));
+}
+
+#[when("the slower follower stores a cursor past the faster one")]
+fn slower_passes_faster(world: &mut World) {
+    let seventh = after_event(world, 7);
+    world.g().events().advance("slow", seventh).unwrap();
+}
+
+#[then("the graph's processed mark is the faster follower's cursor")]
+fn mark_is_faster(world: &mut World) {
+    let fifth = after_event(world, 5);
+    assert_eq!(mark(world), Some(fifth));
+}
+
+#[given("a graph with events and a registered follower that has read them all")]
+fn follower_read_all(world: &mut World) {
+    events_around_cursor(world);
+    let last = world.log.last().unwrap().cursor;
+    let events = world.g().events();
+    events.register("first").unwrap();
+    events.advance("first", last).unwrap();
+    assert_eq!(mark(world), Some(last));
+}
+
+#[when("a second follower registers without storing a cursor")]
+fn second_registers(world: &mut World) {
+    world.g().events().register("second").unwrap();
+}
+
+#[then("the graph's processed mark is the start of the events")]
+fn mark_is_start(world: &mut World) {
+    assert_eq!(mark(world), Some(Cursor::START));
+}
+
+#[given("a graph whose processed mark is held by one of two registered followers")]
+fn mark_held_by_one(world: &mut World) {
+    mark_held_by_slower(world);
+}
+
+#[when("that follower unregisters")]
+fn holder_unregisters(world: &mut World) {
+    world.g().events().unregister("slow").unwrap();
+}
+
+#[then("the graph's processed mark is the remaining follower's cursor")]
+fn mark_is_remaining(world: &mut World) {
+    let fifth = after_event(world, 5);
+    assert_eq!(
+        world.g().events().followers().unwrap(),
+        vec![("fast".to_string(), fifth)]
+    );
+    assert_eq!(mark(world), Some(fifth));
+}
+
 // ---------- queue: a heartbeat commits the in-memory write queue ----------
 
 /// A heartbeat long enough that no scenario races it: those scenarios commit by flushing.

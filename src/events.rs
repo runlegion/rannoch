@@ -14,8 +14,8 @@ use crate::open::{Graph, Ontology, Value, class_table, open, relation_table, sch
 use crate::read::NodeRef;
 use crate::write::{Declaration, Error, ValidTime, now_millis, replay};
 
-/// rannoch's own tables: the event log, the ontology, links waiting for an end, and the fates of
-/// nodes that were replaced. An event's place is never reused, so a cursor stays a place in the
+/// rannoch's own tables: the event log, the ontology, links waiting for an end, the fates of
+/// nodes that were replaced, and the registered followers with their stored cursors. An event's place is never reused, so a cursor stays a place in the
 /// log.
 pub(crate) const OWN_TABLES: &str = "
     CREATE TABLE IF NOT EXISTS _events(seq INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT NOT NULL);
@@ -29,7 +29,9 @@ pub(crate) const OWN_TABLES: &str = "
     CREATE INDEX IF NOT EXISTS _open_to ON _open(rel, to_key);
     CREATE TABLE IF NOT EXISTS _fates(
         class TEXT NOT NULL, key TEXT NOT NULL, replaced_by TEXT NOT NULL,
-        PRIMARY KEY(class, key)) WITHOUT ROWID;";
+        PRIMARY KEY(class, key)) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS _followers(name TEXT PRIMARY KEY, cursor INTEGER NOT NULL)
+        WITHOUT ROWID;";
 
 /// A place in a graph's event log. Reading since a cursor returns the events after it. An app
 /// stores a cursor by serializing it, and a graph rebuilt from the log keeps each event's place,
@@ -225,6 +227,74 @@ impl Events<'_> {
     }
 }
 
+impl Events<'_> {
+    /// Registers the follower `name`. A follower that has stored no cursor holds the processed
+    /// mark at [`Cursor::START`]; registering a name already registered keeps its cursor.
+    ///
+    /// # Errors
+    /// The graph file cannot be written.
+    pub fn register(&self, name: &str) -> Result<(), Error> {
+        self.conn
+            .prepare_cached("INSERT OR IGNORE INTO _followers(name, cursor) VALUES (?1, 0)")?
+            .execute(params![name])?;
+        Ok(())
+    }
+
+    /// Stores `cursor` as what the registered follower `name` has read. It may move back.
+    ///
+    /// # Errors
+    /// [`Error::Refused`] when `name` is not registered; the graph file cannot be written.
+    pub fn advance(&self, name: &str, cursor: Cursor) -> Result<(), Error> {
+        let changed = self
+            .conn
+            .prepare_cached("UPDATE _followers SET cursor = ?2 WHERE name = ?1")?
+            .execute(params![name, cursor.0])?;
+        if changed == 0 {
+            return Err(Error::Refused(format!(
+                "no follower named {name} is registered"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Unregisters the follower `name`, releasing its hold on the processed mark.
+    ///
+    /// # Errors
+    /// The graph file cannot be written.
+    pub fn unregister(&self, name: &str) -> Result<(), Error> {
+        self.conn
+            .prepare_cached("DELETE FROM _followers WHERE name = ?1")?
+            .execute(params![name])?;
+        Ok(())
+    }
+
+    /// Every registered follower and its stored cursor, by name.
+    ///
+    /// # Errors
+    /// The graph file cannot be read.
+    pub fn followers(&self) -> Result<Vec<(String, Cursor)>, Error> {
+        Ok(self
+            .conn
+            .prepare_cached("SELECT name, cursor FROM _followers ORDER BY name")?
+            .query_map([], |row| Ok((row.get(0)?, Cursor(row.get(1)?))))?
+            .collect::<Result<_, _>>()?)
+    }
+
+    /// The processed mark: the lowest stored cursor across every registered follower. Every
+    /// event at or before it has been read by every registered follower. `None` when no follower
+    /// is registered. It deletes nothing.
+    ///
+    /// # Errors
+    /// The graph file cannot be read.
+    pub fn processed(&self) -> Result<Option<Cursor>, Error> {
+        Ok(self
+            .conn
+            .prepare_cached("SELECT MIN(cursor) FROM _followers")?
+            .query_row([], |row| row.get::<_, Option<i64>>(0))?
+            .map(Cursor))
+    }
+}
+
 /// Rebuilds a graph file at `empty_path` from `events` alone, replaying them in order: its
 /// ontology from the declaration events, and its nodes, links and open links from the rest.
 /// Each event lands in the new file under its own id and at its own place in the log. The
@@ -337,9 +407,14 @@ impl Graph {
         let mut events = self.events().since(Cursor::START)?;
         events.retain(|event| event.cursor <= cursor);
         // A forget event holds no content and is where a forgotten node's fate is read from.
-        replay_into(open(&empty_path)?, &events, |change| {
+        let snapshot = replay_into(open(&empty_path)?, &events, |change| {
             matches!(change, Change::Forgot { .. })
         })?;
+        // Registrations are state about readers, not events: the snapshot carries them.
+        for (name, at) in self.events().followers()? {
+            snapshot.events().register(&name)?;
+            snapshot.events().advance(&name, at)?;
+        }
         Ok(Snapshot {
             cursor,
             path: empty_path.as_ref().to_path_buf(),
@@ -508,6 +583,37 @@ mod tests {
     use crate::{
         Change, Class, Date, Declaration, NodeRef, Relation, Unit, ValidTime, Write, open,
     };
+
+    #[test]
+    fn registrations_are_carried_by_a_snapshot_and_not_by_a_rebuild_from_events()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = |name: &str| {
+            std::env::temp_dir().join(format!("rannoch-{name}-{}.db", uuid::Uuid::now_v7()))
+        };
+        let mut g = open(temp("followers"))?;
+        assert_eq!(g.events().processed()?, None, "no follower, no mark");
+        assert!(matches!(
+            g.events().advance("typo", crate::Cursor::START),
+            Err(crate::Error::Refused(_))
+        ));
+        g.events().register("reader")?;
+        g.declare(&Declaration::Class(Class::new("person", ["name"])))?;
+        let at = g.events().committed()?;
+        g.events().advance("reader", at)?;
+
+        let snapshot = g.snapshot(at, temp("followers-snapshot"))?;
+        let carried = snapshot.rebuild(&[], temp("followers-from-snapshot"))?;
+        assert_eq!(
+            carried.events().followers()?,
+            vec![("reader".to_string(), at)]
+        );
+        let rebuilt = crate::rebuild(
+            &g.events().since(crate::Cursor::START)?,
+            temp("followers-rebuilt"),
+        )?;
+        assert!(rebuilt.events().followers()?.is_empty());
+        Ok(())
+    }
 
     #[test]
     fn a_forget_takes_the_nodes_open_links_with_it() -> Result<(), Box<dyn std::error::Error>> {
