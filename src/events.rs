@@ -241,8 +241,17 @@ impl Events<'_> {
     /// Stores `cursor` as what the registered follower `name` has read. It may move back.
     ///
     /// # Errors
-    /// [`Error::Refused`] when `name` is not registered; the graph file cannot be written.
+    /// [`Error::Refused`] when `name` is not registered, or when `cursor` is past the committed
+    /// watermark ([`Events::committed`]), so the mark never covers an event that has not arrived;
+    /// the graph file cannot be read or written.
     pub fn advance(&self, name: &str, cursor: Cursor) -> Result<(), Error> {
+        let committed = self.committed()?;
+        if cursor > committed {
+            return Err(Error::Refused(format!(
+                "cursor {} is past the committed watermark {}",
+                cursor.0, committed.0
+            )));
+        }
         let changed = self
             .conn
             .prepare_cached("UPDATE _followers SET cursor = ?2 WHERE name = ?1")?
@@ -408,10 +417,14 @@ impl Graph {
         let snapshot = replay_into(open(&empty_path)?, &events, |change| {
             matches!(change, Change::Forgot { .. })
         })?;
-        // Registrations are state about readers, not events: the snapshot carries them.
+        // Registrations are state about readers, not events: the snapshot carries them. Their
+        // cursors name places in this graph's log, which the snapshot's own log does not hold,
+        // so they are copied as they are rather than advanced against its watermark.
         for (name, at) in self.events().followers()? {
-            snapshot.events().register(&name)?;
-            snapshot.events().advance(&name, at)?;
+            snapshot
+                .conn
+                .prepare_cached("INSERT INTO _followers(name, cursor) VALUES (?1, ?2)")?
+                .execute(params![name, at.0])?;
         }
         Ok(Snapshot {
             cursor,
@@ -581,6 +594,27 @@ mod tests {
     use crate::{
         Change, Class, Date, Declaration, NodeRef, Relation, Unit, ValidTime, Write, open,
     };
+
+    #[test]
+    fn advancing_past_the_committed_watermark_is_refused_naming_both()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = std::env::temp_dir().join(format!("rannoch-past-{}.db", uuid::Uuid::now_v7()));
+        let mut g = open(path)?;
+        g.declare(&Declaration::Class(Class::new("person", ["name"])))?;
+        g.events().register("reader")?;
+        let committed = g.events().committed()?;
+        g.events().advance("reader", committed)?;
+        let past: crate::Cursor = serde_json::from_str("1000")?;
+        let Err(crate::Error::Refused(message)) = g.events().advance("reader", past) else {
+            panic!("a cursor past the committed watermark was stored");
+        };
+        assert!(
+            message.contains("1000") && message.contains(&serde_json::to_string(&committed)?),
+            "{message}"
+        );
+        assert_eq!(g.events().processed()?, Some(committed));
+        Ok(())
+    }
 
     #[test]
     fn registrations_are_carried_by_a_snapshot_and_not_by_a_rebuild_from_events()
