@@ -63,9 +63,15 @@ pub enum Error {
         /// The failure.
         source: io::Error,
     },
-    /// The budget ran out before one round of the rate measurement could finish.
-    #[error("the budget of {0:?} ran out before the directory could be measured")]
-    Budget(Duration),
+    /// The budget ran out before the directory could be measured. A durable flush cannot be
+    /// interrupted, so the measurement can overrun the budget by the one in progress.
+    #[error("the budget of {budget:?} ran out before the directory could be measured")]
+    Budget {
+        /// The budget the caller passed.
+        budget: Duration,
+        /// How long the last write and durable flush took: the most the budget was overrun by.
+        flush: Duration,
+    },
 }
 
 /// Measures the host's memory. `cap` is the caller's cap in bytes, where it passes one.
@@ -110,7 +116,8 @@ fn allowed(total: u64, limit: Option<u64>, cap: Option<u64>) -> u64 {
 ///
 /// [`Error::Io`] when the file cannot be created, written, flushed or removed, and
 /// [`Error::Budget`] when the budget runs out before the rate can be measured or before the file
-/// is removed.
+/// is removed. The measurement returns within the budget, overrunning it by at most the one
+/// durable flush already in progress.
 pub fn disk(directory: &Path, budget: Duration) -> Result<Disk, Error> {
     let start = Instant::now();
     let taken_at = SystemTime::now();
@@ -145,7 +152,10 @@ pub fn disk(directory: &Path, budget: Duration) -> Result<Disk, Error> {
     }
     probe.remove()?;
     if written == 0 || start.elapsed() > budget {
-        return Err(Error::Budget(budget));
+        return Err(Error::Budget {
+            budget,
+            flush: last.0,
+        });
     }
 
     let nanos = spent.as_nanos().max(1);

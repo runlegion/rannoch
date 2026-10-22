@@ -56,12 +56,16 @@ fn disk_within_a_tight_budget_returns_within_it_measured_or_not() {
     let directory = tempfile::tempdir().unwrap();
     let budget = Duration::from_millis(250);
     let start = Instant::now();
-    match disk(directory.path(), budget) {
-        Ok(measured) => assert!(measured.bytes_per_second > 0),
-        Err(Error::Budget(_)) => {}
+    let overrun = match disk(directory.path(), budget) {
+        Ok(measured) => {
+            assert!(measured.bytes_per_second > 0);
+            Duration::ZERO
+        }
+        // A durable flush cannot be interrupted: the one in progress may overrun the budget.
+        Err(Error::Budget { flush, .. }) => flush,
         Err(error) => panic!("{error}"),
-    }
-    assert!(start.elapsed() <= budget);
+    };
+    assert!(start.elapsed() <= budget + overrun);
     assert_eq!(entries(directory.path()), 0);
 }
 
@@ -69,7 +73,7 @@ fn disk_within_a_tight_budget_returns_within_it_measured_or_not() {
 fn disk_that_runs_out_of_budget_fails_and_leaves_no_file() {
     let directory = tempfile::tempdir().unwrap();
     let result = disk(directory.path(), Duration::from_nanos(1));
-    assert!(matches!(result, Err(Error::Budget(_))));
+    assert!(matches!(result, Err(Error::Budget { .. })));
     assert_eq!(entries(directory.path()), 0);
 }
 
