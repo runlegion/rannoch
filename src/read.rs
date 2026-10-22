@@ -7,7 +7,7 @@ use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
-use crate::events::EventId;
+use crate::events::{Change, EventId, Fact, naming_key};
 use crate::open::{
     Graph, Ontology, Relation, Value, class_table, concat, property_column, read_properties,
     relation_table,
@@ -249,7 +249,9 @@ fn find_in(
 }
 
 impl Graph {
-    /// The node of `class` with natural key `key`.
+    /// The node of `class` with natural key `key`: the version that arrived last. For a class
+    /// with a declared history key that is not necessarily the newest version on that axis,
+    /// until the history requirements land.
     ///
     /// # Errors
     /// The class is not declared, or the graph file cannot be read.
@@ -258,18 +260,48 @@ impl Graph {
         find_in(&self.conn, &ontology, class, key)
     }
 
-    /// The node of `class` with natural key `key` as of `as_of`: none when it was not yet
-    /// true then. A node whose valid time is unknown is never returned as of a date. A month
-    /// stands for its first day.
+    /// The node of `class` with natural key `key` as of `as_of`, read from its current
+    /// version only: past versions are not readable yet.
+    ///
+    /// It answers with the current version when that version was valid on or before `as_of`,
+    /// and with none when the node had no version by then: it was never written, its valid time
+    /// is unknown, or its only version is valid after `as_of`. When the current version is valid
+    /// after `as_of` and the node had an earlier version, the version that held then is a past
+    /// one, so the read is refused rather than answered wrong. A month stands for its first day.
     ///
     /// # Errors
-    /// [`Error::Refused`] when `as_of` is not a real date; the class is not declared, or the
-    /// graph file cannot be read.
+    /// [`Error::Refused`] when `as_of` is not a real date, or when the version that held on
+    /// `as_of` is a past one; the class is not declared, or the graph file cannot be read.
     pub fn find_as_of(&self, class: &str, key: &str, as_of: &Date) -> Result<Option<Node>, Error> {
-        let as_of = as_of.parts()?;
-        Ok(self
-            .find(class, key)?
-            .filter(|node| matches!(&node.valid, ValidTime::On(date) if on_or_before(date, as_of))))
+        let parts = as_of.parts()?;
+        let Some(node) = self.find(class, key)? else {
+            return Ok(None);
+        };
+        match &node.valid {
+            ValidTime::On(date) if on_or_before(date, parts) => Ok(Some(node)),
+            ValidTime::On(_) if self.had_earlier_version(&node)? => Err(Error::Refused(format!(
+                "{class} {key} as of {}: past versions are not readable yet",
+                as_of.as_str()
+            ))),
+            _ => Ok(None),
+        }
+    }
+
+    /// Whether the log holds a version of `node` other than its current one.
+    fn had_earlier_version(&self, node: &Node) -> Result<bool, Error> {
+        for (_, stored) in naming_key(&self.conn, &node.key)? {
+            let Change::Wrote { source, added, .. } = stored.change else {
+                continue;
+            };
+            if added.iter().any(|fact| {
+                matches!(fact, Fact::Node(n) if n.class == node.class && n.key == node.key
+                    && (source != node.source || n.valid != node.valid
+                        || n.properties != node.properties))
+            }) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// The link of `relation` from the node keyed `from` to the node keyed `to`.
@@ -1106,6 +1138,41 @@ mod tests {
             as_of: Some(month),
         })?;
         assert_eq!(tallies[0].distinct, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn an_as_of_read_refuses_when_the_version_that_held_is_a_past_one()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = items(vec![item("v", &Date::day(2020, 1, 1))])?;
+        g.write(&Write::new("src").unit(item("v", &Date::day(2022, 1, 1))))?;
+        let found = g.find_as_of("item", "v", &Date::day(2021, 1, 1));
+        assert!(
+            matches!(&found, Err(Error::Refused(why))
+                if why == "item v as of 2021-01-01: past versions are not readable yet"),
+            "find_as_of: {found:?}"
+        );
+        assert!(g.find_as_of("item", "v", &Date::day(2022, 1, 1))?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn an_as_of_read_of_a_node_with_one_version_answers_it_or_none()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let g = items(vec![item("o", &Date::day(2020, 6, 1))])?;
+        let found = g.find_as_of("item", "o", &Date::day(2020, 6, 1))?;
+        assert_eq!(
+            found.map(|n| n.valid),
+            Some(ValidTime::On(Date::day(2020, 6, 1)))
+        );
+        assert!(
+            g.find_as_of("item", "o", &Date::day(2020, 5, 31))?
+                .is_none()
+        );
+        assert!(
+            g.find_as_of("item", "absent", &Date::day(2020, 6, 1))?
+                .is_none()
+        );
         Ok(())
     }
 
