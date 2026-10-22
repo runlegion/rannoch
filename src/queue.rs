@@ -12,16 +12,45 @@ use crate::events::Cursor;
 use crate::open::{Graph, Ontology};
 use crate::write::{Error, Write, WriteError, check_declared};
 
-/// A write that failed at commit, with its ticket.
-type Failed = (Ticket, WriteError);
-
 /// A write's place in its queue. A later write has a greater ticket, so the committed watermark
 /// has passed a write once [`Queue::committed`] is at or above its ticket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Ticket(u64);
 
+/// Something that went wrong in the queue after a write returned. Each is reported once: by
+/// [`Queue::flush`], [`Queue::close`] or [`Queue::take_failures`], whichever takes it first, or
+/// when the queue drops, to the [`Queue::on_failure`] handler.
+#[derive(Debug, thiserror::Error)]
+pub enum Failure {
+    /// A write failed at commit and did not land.
+    #[error("a write failed at commit, {ticket:?}: {error}")]
+    Write {
+        ticket: Ticket,
+        #[source]
+        error: WriteError,
+    },
+    /// The heartbeat panicked, with the panic's text, and stopped; what is queued after commits
+    /// only through a flush, a close or a drop.
+    #[error("the queue's heartbeat panicked: {0}")]
+    Heartbeat(String),
+    /// A subscriber panicked, with the panic's text, when fired for the commit through `ticket`.
+    #[error("a subscriber panicked on the commit through {ticket:?}: {message}")]
+    Subscriber { ticket: Ticket, message: String },
+    /// The commit through `ticket` landed, but its subscribers did not fire: the committed
+    /// cursor could not be read.
+    #[error(
+        "the commit through {ticket:?} landed, but its subscribers did not fire: the committed \
+         cursor could not be read: {error}"
+    )]
+    Unfired {
+        ticket: Ticket,
+        #[source]
+        error: Error,
+    },
+}
+
 type Subscriber = Box<dyn FnMut(Cursor) + Send>;
-type Handler = Box<dyn FnMut(Ticket, WriteError) + Send>;
+type Handler = Box<dyn FnMut(Failure) + Send>;
 
 /// One process's queue of writes to a graph, held in memory only, and the heartbeat that
 /// commits it, each batch as one transaction with a savepoint per write. The queue owns the
@@ -39,6 +68,9 @@ struct Shared {
     stopped: Condvar,
     subscribers: Mutex<Vec<Subscriber>>,
     handler: Mutex<Option<Handler>>,
+    /// Makes the next heartbeat panic, so a test can see one reported.
+    #[cfg(test)]
+    panic_beat: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Default)]
@@ -46,8 +78,8 @@ struct State {
     queued: Vec<(Ticket, Write)>,
     last: u64,
     committed: Option<Ticket>,
-    /// Writes that failed at commit and the app has not yet taken.
-    failed: Vec<Failed>,
+    /// Failures the app has not yet taken, oldest first.
+    failed: Vec<Failure>,
     stop: bool,
 }
 
@@ -69,6 +101,8 @@ impl Queue {
             stopped: Condvar::new(),
             subscribers: Mutex::new(Vec::new()),
             handler: Mutex::new(None),
+            #[cfg(test)]
+            panic_beat: std::sync::atomic::AtomicBool::new(false),
         });
         let beat = Arc::clone(&shared);
         let heartbeat = std::thread::spawn(move || {
@@ -82,7 +116,17 @@ impl Queue {
                     return;
                 }
                 drop(state);
-                beat.commit();
+                let beaten = catch_unwind(AssertUnwindSafe(|| {
+                    #[cfg(test)]
+                    if beat.panic_beat.load(std::sync::atomic::Ordering::SeqCst) {
+                        std::panic::resume_unwind(Box::new("the heartbeat panics"));
+                    }
+                    beat.commit();
+                }));
+                if let Err(panic) = beaten {
+                    beat.failed(Failure::Heartbeat(message(&*panic).to_string()));
+                    return;
+                }
             }
         });
         Queue {
@@ -110,8 +154,7 @@ impl Queue {
 
     /// The committed watermark: the highest ticket the heartbeat or a flush has taken through a
     /// commit, or `None` before the first. A write that failed at commit is passed too, and is
-    /// not lost: the queue keeps it until [`Queue::flush`], [`Queue::close`] or
-    /// [`Queue::take_failures`] returns it, or a drop reports it.
+    /// not lost: the queue keeps its [`Failure`] until it is reported.
     #[must_use]
     pub fn committed(&self) -> Option<Ticket> {
         lock(&self.shared.state).committed
@@ -119,27 +162,27 @@ impl Queue {
 
     /// Commits everything queued now, without waiting for the heartbeat, and returns the
     /// committed watermark, which has passed every write accepted before the call, with every
-    /// write that failed at commit and the app has not yet taken, this flush's and the
-    /// heartbeat's. A write that failed comes with every later write in its batch that linked
-    /// from a node it would have brought. The queue keeps none of them after.
+    /// failure the app has not yet taken, this flush's and the heartbeat's. A write that failed
+    /// comes with every later write in its batch that linked from a node it would have brought.
+    /// The queue keeps none of them after.
     #[must_use]
-    pub fn flush(&self) -> (Option<Ticket>, Vec<(Ticket, WriteError)>) {
+    pub fn flush(&self) -> (Option<Ticket>, Vec<Failure>) {
         self.shared.commit();
         let mut state = lock(&self.shared.state);
         (state.committed, std::mem::take(&mut state.failed))
     }
 
-    /// Takes the writes that failed at commit, the heartbeat's or a flush's, that the app has not
-    /// yet taken, oldest first; the queue keeps none of them after.
+    /// Takes the failures the app has not yet taken, oldest first; the queue keeps none of them
+    /// after.
     #[must_use]
-    pub fn take_failures(&self) -> Vec<(Ticket, WriteError)> {
+    pub fn take_failures(&self) -> Vec<Failure> {
         std::mem::take(&mut lock(&self.shared.state).failed)
     }
 
-    /// Registers `handler` for the writes that failed at commit when the queue is dropped, which
-    /// cannot return them; without one, a drop writes them to stderr. A later call replaces the
-    /// handler. [`Queue::close`] returns them instead.
-    pub fn on_failure(&self, handler: impl FnMut(Ticket, WriteError) + Send + 'static) {
+    /// Registers `handler` for the failures still untaken when the queue is dropped, which cannot
+    /// return them; it receives each one. Without a handler, a drop writes them to stderr, the
+    /// last resort. A later call replaces the handler. [`Queue::close`] returns them instead.
+    pub fn on_failure(&self, handler: impl FnMut(Failure) + Send + 'static) {
         *lock(&self.shared.handler) = Some(Box::new(handler));
     }
 
@@ -151,33 +194,36 @@ impl Queue {
     }
 
     /// Stops the heartbeat and commits everything queued, as dropping the queue does, and returns
-    /// every write that failed at commit and the app has not yet taken, as [`Queue::flush`] does.
+    /// every failure the app has not yet taken, as [`Queue::flush`] does.
     /// A process that exits without unwinding (`std::process::exit`, `panic = "abort"`) runs no
     /// drop, so it closes the queue first.
     #[must_use]
-    pub fn close(mut self) -> Vec<(Ticket, WriteError)> {
+    pub fn close(mut self) -> Vec<Failure> {
         self.stop();
         self.take_failures()
     }
 
-    /// Stops the heartbeat, then commits what is still queued. A heartbeat that panicked is
-    /// reported on stderr. Stopping again does nothing more.
+    /// Stops the heartbeat, then commits what is still queued. A heartbeat that panicked is kept
+    /// as a failure. Stopping again does nothing more.
     fn stop(&mut self) {
         lock(&self.shared.state).stop = true;
         self.shared.stopped.notify_all();
         if let Some(heartbeat) = self.heartbeat.take()
             && let Err(panic) = heartbeat.join()
         {
-            eprintln!(
-                "rannoch: the queue's heartbeat panicked: {}",
-                message(&*panic)
-            );
+            self.shared
+                .failed(Failure::Heartbeat(message(&*panic).to_string()));
         }
         self.shared.commit();
     }
 }
 
 impl Shared {
+    /// Keeps `failure` for the app to take.
+    fn failed(&self, failure: Failure) {
+        lock(&self.state).failed.push(failure);
+    }
+
     /// Commits what is queued, then advances the watermark, then fires the subscribers. The
     /// graph's lock is held throughout, so commits and their firings never interleave.
     fn commit(&self) {
@@ -207,14 +253,12 @@ impl Shared {
                     failed
                 }
             };
-        let failed = failed.into_iter().map(|(ticket, cause)| {
-            (
-                ticket,
-                WriteError {
-                    events: Vec::new(),
-                    cause,
-                },
-            )
+        let failed = failed.into_iter().map(|(ticket, cause)| Failure::Write {
+            ticket,
+            error: WriteError {
+                events: Vec::new(),
+                cause,
+            },
         });
         {
             let mut state = lock(&self.state);
@@ -223,11 +267,11 @@ impl Shared {
         }
         let cursor = match graph.last_cursor() {
             Ok(cursor) => cursor,
-            Err(e) => {
-                eprintln!(
-                    "rannoch: the queue committed through {last:?}, but its subscribers did not \
-                     fire: the committed cursor could not be read: {e}"
-                );
+            Err(error) => {
+                self.failed(Failure::Unfired {
+                    ticket: last,
+                    error,
+                });
                 return;
             }
         };
@@ -235,10 +279,10 @@ impl Shared {
         // and a drop that is already unwinding does not abort.
         for subscriber in lock(&self.subscribers).iter_mut() {
             if let Err(panic) = catch_unwind(AssertUnwindSafe(|| subscriber(cursor))) {
-                eprintln!(
-                    "rannoch: a subscriber panicked on the commit through {last:?}: {}",
-                    message(&*panic)
-                );
+                self.failed(Failure::Subscriber {
+                    ticket: last,
+                    message: message(&*panic).to_string(),
+                });
             }
         }
     }
@@ -269,17 +313,17 @@ impl Drop for Queue {
         self.stop();
         let failed = self.take_failures();
         let mut handler = lock(&self.shared.handler);
-        for (ticket, error) in failed {
+        for failure in failed {
             match handler.as_mut() {
                 Some(handler) => {
-                    if let Err(panic) = catch_unwind(AssertUnwindSafe(|| handler(ticket, error))) {
+                    if let Err(panic) = catch_unwind(AssertUnwindSafe(|| handler(failure))) {
                         eprintln!(
-                            "rannoch: the queue's failure handler panicked on {ticket:?}: {}",
+                            "rannoch: the queue's failure handler panicked: {}",
                             message(&*panic)
                         );
                     }
                 }
-                None => eprintln!("rannoch: a write failed at commit, {ticket:?}: {error}"),
+                None => eprintln!("rannoch: {failure}"),
             }
         }
     }
@@ -301,7 +345,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use super::Queue;
+    use super::{Failure, JoinHandle, Queue, Ticket};
     use crate::{Class, Date, Declaration, Error, Unit, ValidTime, ValueType, Write, open};
 
     #[test]
@@ -326,11 +370,121 @@ mod tests {
             tickets.push(queue.write(Write::new("app").unit(unit))?);
         }
         let (_, failed) = queue.flush();
-        let failed: Vec<_> = failed.iter().map(|(ticket, _)| *ticket).collect();
-        assert_eq!(failed, tickets);
+        assert_eq!(written(failed), tickets);
         assert!(
             queue.take_failures().is_empty(),
             "a failure was returned twice"
+        );
+        Ok(())
+    }
+
+    /// The tickets of `failures`, each a write that failed at commit.
+    fn written(failures: Vec<Failure>) -> Vec<Ticket> {
+        failures
+            .into_iter()
+            .map(|failure| match failure {
+                Failure::Write { ticket, .. } => ticket,
+                other => panic!("expected a failed write, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// Waits up to five seconds for `done`.
+    fn wait_for(mut done: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "timed out");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// A graph with class `item` and a queue on it beating every [`Queue::INTERVAL`].
+    fn beating(dir: &tempfile::TempDir) -> Result<Queue, Box<dyn std::error::Error>> {
+        let mut g = open(dir.path().join("graph.rannoch"))?;
+        g.declare(&Declaration::Class(Class::new("item", ["v"])))?;
+        Ok(Queue::open(g, Queue::INTERVAL))
+    }
+
+    #[test]
+    fn a_subscriber_panic_is_taken() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let queue = beating(&dir)?;
+        queue.subscribe(|_| panic!("a subscriber panics"));
+        let ticket = queue.write(item("i1"))?;
+        let mut taken = Vec::new();
+        wait_for(|| {
+            taken.extend(queue.take_failures());
+            !taken.is_empty()
+        });
+        assert!(
+            matches!(&taken[..], [Failure::Subscriber { ticket: t, message }]
+                if *t == ticket && message == "a subscriber panics"),
+            "{taken:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_subscriber_panic_reaches_the_handler() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let queue = beating(&dir)?;
+        let handled = Arc::new(Mutex::new(Vec::new()));
+        let into = Arc::clone(&handled);
+        queue.on_failure(move |failure| super::lock(&into).push(failure));
+        queue.subscribe(|_| panic!("a subscriber panics"));
+        queue.write(item("i1"))?;
+        wait_for(|| !super::lock(&queue.shared.state).failed.is_empty());
+        drop(queue);
+        let handled = super::lock(&handled);
+        assert!(
+            matches!(&handled[..], [Failure::Subscriber { .. }]),
+            "{handled:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_heartbeat_panic_is_taken() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let queue = beating(&dir)?;
+        queue
+            .shared
+            .panic_beat
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut taken = Vec::new();
+        wait_for(|| {
+            taken.extend(queue.take_failures());
+            !taken.is_empty()
+        });
+        assert!(
+            matches!(&taken[..], [Failure::Heartbeat(message)] if message == "the heartbeat panics"),
+            "{taken:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_heartbeat_panic_reaches_the_handler() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let queue = beating(&dir)?;
+        let handled = Arc::new(Mutex::new(Vec::new()));
+        let into = Arc::clone(&handled);
+        queue.on_failure(move |failure| super::lock(&into).push(failure));
+        queue
+            .shared
+            .panic_beat
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        wait_for(|| {
+            queue
+                .heartbeat
+                .as_ref()
+                .is_some_and(JoinHandle::is_finished)
+        });
+        drop(queue);
+        let handled = super::lock(&handled);
+        assert!(
+            matches!(&handled[..], [Failure::Heartbeat(_)]),
+            "{handled:?}"
         );
         Ok(())
     }
@@ -362,11 +516,11 @@ mod tests {
         let queue = queue_failing_bad(&dir)?;
         let handled = Arc::new(Mutex::new(Vec::new()));
         let into = Arc::clone(&handled);
-        queue.on_failure(move |ticket, _| super::lock(&into).push(ticket));
+        queue.on_failure(move |failure| super::lock(&into).push(failure));
         queue.write(item("i1"))?;
         let bad = queue.write(item("bad"))?;
         drop(queue);
-        assert_eq!(*super::lock(&handled), [bad]);
+        assert_eq!(written(std::mem::take(&mut *super::lock(&handled))), [bad]);
         Ok(())
     }
 
@@ -408,10 +562,9 @@ mod tests {
         let queue = queue_failing_bad(&dir)?;
         let handled = Arc::new(Mutex::new(0));
         let into = Arc::clone(&handled);
-        queue.on_failure(move |_, _| *super::lock(&into) += 1);
+        queue.on_failure(move |_| *super::lock(&into) += 1);
         let bad = queue.write(item("bad"))?;
-        let failed: Vec<_> = queue.close().into_iter().map(|(t, _)| t).collect();
-        assert_eq!(failed, [bad]);
+        assert_eq!(written(queue.close()), [bad]);
         assert_eq!(*super::lock(&handled), 0);
         Ok(())
     }

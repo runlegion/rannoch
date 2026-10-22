@@ -24,7 +24,7 @@ use rannoch::{
     Fate, Graph, GroupBy, Link, LinkFact, Node, NodeRef, OpenLink, PartOf, Relation, Snapshot,
     Step, Tally, Unit, ValidTime, Value, Write, WriteError,
 };
-use rannoch::{HistoryKey, NodeFact, Queue, Ticket, ValueType};
+use rannoch::{Failure, HistoryKey, NodeFact, Queue, Ticket, ValueType};
 use rstest_bdd_macros::{given, scenarios, then, when};
 use tempfile::TempDir;
 
@@ -3786,7 +3786,7 @@ fn graph_with_accepted_writes(world: &mut World) {
 fn app_flushes(world: &mut World) {
     let (committed, failed) = q(world).flush();
     world.flushed = committed;
-    world.failed = failed.into_iter().map(|(ticket, _)| ticket).collect();
+    world.failed = written(failed);
 }
 
 #[then("every write accepted before the flush is committed when the flush returns")]
@@ -3925,6 +3925,17 @@ fn link_not_in_graph(world: &mut World) {
 
 // ---------- queue: a write that fails at commit is reported, never dropped in silence ----------
 
+/// The tickets of `failures`, each a write that failed at commit.
+fn written(failures: Vec<Failure>) -> Vec<Ticket> {
+    failures
+        .into_iter()
+        .map(|failure| match failure {
+            Failure::Write { ticket, .. } => ticket,
+            other => panic!("expected a failed write, got {other:?}"),
+        })
+        .collect()
+}
+
 #[given("a process whose queue holds writes whose final commit will fail")]
 fn final_commit_will_fail(world: &mut World) {
     queued(world, NEVER);
@@ -3965,22 +3976,14 @@ fn write_will_fail(world: &mut World) {
 #[when("the app closes the queue")]
 fn app_closes(world: &mut World) {
     let queue = world.queue.take().expect("the queue is open");
-    world.failed = queue
-        .close()
-        .into_iter()
-        .map(|(ticket, _)| ticket)
-        .collect();
+    world.failed = written(queue.close());
 }
 
 #[when("the heartbeat commits and the app takes the queue's failures")]
 fn heartbeat_then_take(world: &mut World) {
     let ticket = world.tickets[1];
     wait_for(|| q(world).committed() >= Some(ticket));
-    world.failed = q(world)
-        .take_failures()
-        .into_iter()
-        .map(|(ticket, _)| ticket)
-        .collect();
+    world.failed = written(q(world).take_failures());
 }
 
 /// The failing write, and only it, is reported, and it is not in the graph.
