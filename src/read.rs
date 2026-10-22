@@ -7,6 +7,7 @@ use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
+use crate::events::EventId;
 use crate::open::{
     Graph, Ontology, Relation, Value, class_table, concat, property_column, read_properties,
     relation_table,
@@ -39,6 +40,8 @@ pub struct Node {
     pub source: String,
     pub valid: ValidTime,
     pub recorded: SystemTime,
+    /// The events the node was derived from.
+    pub derived_from: Vec<EventId>,
 }
 
 /// A link still waiting for an end: its relation, both ends, and the end it waits on.
@@ -217,7 +220,7 @@ fn find_in(
         )),
         class_table(&class.name)
     );
-    Ok(conn
+    let Some(mut node) = conn
         .prepare_cached(&sql)?
         .query_row(params![key], |row| {
             Ok(Node {
@@ -227,9 +230,22 @@ fn find_in(
                 source: row.get(0)?,
                 valid: ValidTime::from_sql(row.get(1)?),
                 recorded: recorded(row.get(2)?),
+                derived_from: Vec::new(),
             })
         })
-        .optional()?)
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    let events: Vec<String> = conn
+        .prepare_cached("SELECT event FROM _derived WHERE class = ?1 AND key = ?2 ORDER BY event")?
+        .query_map(params![class.name, key], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    node.derived_from = events
+        .iter()
+        .map(|event| serde_json::from_value(event.as_str().into()))
+        .collect::<Result<_, _>>()?;
+    Ok(Some(node))
 }
 
 impl Graph {
