@@ -4237,7 +4237,8 @@ fn writer_commits(world: &mut World) {
         for key in batch {
             enqueue(world, key);
         }
-        q(world).flush();
+        let (_, failed) = q(world).flush();
+        assert!(failed.is_empty(), "{failed:?}");
         std::thread::sleep(Duration::from_millis(100));
     }
 }
