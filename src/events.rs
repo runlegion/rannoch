@@ -15,8 +15,8 @@ use crate::read::NodeRef;
 use crate::write::{Declaration, Error, ValidTime, now_millis, replay};
 
 /// rannoch's own tables: the event log, the ontology, links waiting for an end, the fates of
-/// nodes that were replaced, and the registered followers with their stored cursors. An event's place is never reused, so a cursor stays a place in the
-/// log.
+/// nodes that were replaced, and the registered followers with their stored cursors. An event's
+/// place is never reused, so a cursor stays a place in the log.
 pub(crate) const OWN_TABLES: &str = "
     CREATE TABLE IF NOT EXISTS _events(seq INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS _ontology(
@@ -225,9 +225,7 @@ impl Events<'_> {
         }
         Ok(events)
     }
-}
 
-impl Events<'_> {
     /// Registers the follower `name`. A follower that has stored no cursor holds the processed
     /// mark at [`Cursor::START`]; registering a name already registered keeps its cursor.
     ///
@@ -235,8 +233,8 @@ impl Events<'_> {
     /// The graph file cannot be written.
     pub fn register(&self, name: &str) -> Result<(), Error> {
         self.conn
-            .prepare_cached("INSERT OR IGNORE INTO _followers(name, cursor) VALUES (?1, 0)")?
-            .execute(params![name])?;
+            .prepare_cached("INSERT OR IGNORE INTO _followers(name, cursor) VALUES (?1, ?2)")?
+            .execute(params![name, Cursor::START.0])?;
         Ok(())
     }
 
