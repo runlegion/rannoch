@@ -40,7 +40,7 @@ pub use events::{
     Change, Cursor, Event, EventId, Events, Fact, LinkFact, NodeFact, Snapshot, WrongKind, rebuild,
 };
 pub use open::{Class, Graph, HistoryKey, Ontology, Relation, Value, ValueType, open};
-pub use queue::{Queue, Ticket};
+pub use queue::{Failure, Queue, Ticket};
 pub use read::{
     Count, Description, Filter, GroupBy, Link, Node, NodeRef, OpenLink, PartOf, Step, Tally, Walk,
 };
