@@ -318,12 +318,29 @@ pub(crate) fn holds(conn: &Connection, id: EventId) -> Result<bool, Error> {
 /// Keeps `node`'s derived-from events as the events it was derived from now. Writing a node and
 /// replaying its write both keep them through here.
 pub(crate) fn keep_derived(tx: &Connection, node: &NodeFact) -> Result<(), Error> {
-    tx.prepare_cached("DELETE FROM _derived WHERE class = ?1 AND key = ?2")?
-        .execute(params![node.class, node.key])?;
+    drop_derived(tx, &node.class, &node.key)?;
+    add_derived(tx, node)?;
+    Ok(())
+}
+
+/// Adds `node`'s derived-from events to those it already names. Returns whether any was new.
+pub(crate) fn add_derived(tx: &Connection, node: &NodeFact) -> Result<bool, Error> {
+    let mut added = false;
     for event in &node.derived_from {
-        tx.prepare_cached("INSERT OR IGNORE INTO _derived(class, key, event) VALUES (?1, ?2, ?3)")?
-            .execute(params![node.class, node.key, event.to_string()])?;
+        added |= tx
+            .prepare_cached(
+                "INSERT OR IGNORE INTO _derived(class, key, event) VALUES (?1, ?2, ?3)",
+            )?
+            .execute(params![node.class, node.key, event.to_string()])?
+            > 0;
     }
+    Ok(added)
+}
+
+/// Removes every derived-from event the node `key` of `class` names.
+fn drop_derived(tx: &Connection, class: &str, key: &str) -> Result<(), Error> {
+    tx.prepare_cached("DELETE FROM _derived WHERE class = ?1 AND key = ?2")?
+        .execute(params![class, key])?;
     Ok(())
 }
 
@@ -413,8 +430,9 @@ impl Graph {
     }
 }
 
-/// Removes `target` and its links from live state and returns the links, or `None` when no node
-/// of its class has its key. Forgetting and replaying a forget both remove through here.
+/// Removes `target`, its links and the events it was derived from from live state and returns
+/// the links, or `None` when no node of its class has its key. Forgetting and replaying a forget
+/// both remove through here.
 pub(crate) fn remove(
     tx: &Connection,
     ontology: &Ontology,
@@ -431,6 +449,7 @@ pub(crate) fn remove(
     let links = unlink(tx, ontology, target, id)?;
     tx.prepare_cached(&format!("DELETE FROM {table} WHERE id = ?1"))?
         .execute(params![id])?;
+    drop_derived(tx, &target.class, &target.key)?;
     Ok(Some(links))
 }
 
@@ -610,6 +629,54 @@ mod tests {
             message.contains(&events[last].id.to_string()) && message.contains("age"),
             "{message}"
         );
+        Ok(())
+    }
+
+    /// A graph with class note, and notes n1 and n2 each written as its own event.
+    fn two_notes() -> Result<(crate::Graph, Vec<crate::Event>), Box<dyn std::error::Error>> {
+        let path =
+            std::env::temp_dir().join(format!("rannoch-derived-{}.db", uuid::Uuid::now_v7()));
+        let mut g = open(path)?;
+        g.declare(&Declaration::Class(Class::new("note", ["text"])))?;
+        let mut sources = Vec::new();
+        for key in ["n1", "n2"] {
+            sources.extend(g.write(&Write::new("app").unit(note(key)))?);
+        }
+        Ok((g, sources))
+    }
+
+    fn note(key: &str) -> Unit {
+        Unit::new("note", key, [("text", "words")], ValidTime::Unknown)
+    }
+
+    #[test]
+    fn an_identical_rewrite_naming_new_sources_keeps_them() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (mut g, sources) = two_notes()?;
+        let (first, second) = (sources[0].id, sources[1].id);
+        g.write(&Write::new("app").unit(note("n3")).derived_from([first]))?;
+        let events = g.write(&Write::new("app").unit(note("n3")).derived_from([second]))?;
+        assert_eq!(events.len(), 1, "the new source is recorded as an event");
+        let found = g.find("note", "n3")?.map(|n| n.derived_from);
+        assert_eq!(found.map(|ids| ids.len()), Some(2));
+        assert_eq!(g.derived(second)?, [NodeRef::new("note", "n3")]);
+        let again = g.write(&Write::new("app").unit(note("n3")).derived_from([second]))?;
+        assert!(again.is_empty(), "a source already recorded adds nothing");
+        Ok(())
+    }
+
+    #[test]
+    fn a_forget_leaves_no_derived_from_behind() -> Result<(), Box<dyn std::error::Error>> {
+        let (mut g, sources) = two_notes()?;
+        let source = sources[0].id;
+        g.write(&Write::new("app").unit(note("n3")).derived_from([source]))?;
+        g.forget(&NodeRef::new("note", "n3"), "retention", "app")?;
+        assert!(g.derived(source)?.is_empty());
+        let rebuilt = crate::rebuild(
+            &g.events().since(crate::Cursor::START)?,
+            std::env::temp_dir().join(format!("rannoch-derived-{}.db", uuid::Uuid::now_v7())),
+        )?;
+        assert!(rebuilt.derived(source)?.is_empty());
         Ok(())
     }
 }

@@ -9,7 +9,8 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
 use crate::events::{
-    Change, Event, EventId, Fact, LinkFact, NodeFact, WrongKind, append, holds, keep_derived,
+    Change, Event, EventId, Fact, LinkFact, NodeFact, WrongKind, add_derived, append, holds,
+    keep_derived,
 };
 use crate::open::{
     CLASS, Class, Graph, Ontology, RELATION, Relation, Value, ValueType, class_table, concat,
@@ -573,6 +574,10 @@ impl<'a> Piece<'a> {
                     && valid == node.valid
                     && properties == node.properties =>
             {
+                // The same node naming sources it did not name yet records them.
+                if add_derived(self.tx, node)? {
+                    self.added.push(Fact::Node(node.clone()));
+                }
                 return Ok((id, false));
             }
             Some((id, ..)) => {
