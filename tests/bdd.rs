@@ -4053,10 +4053,12 @@ fn follower_sees_each_once(world: &mut World) {
     "a writer process with accepted writes not yet committed, and a follower in another process"
 )]
 fn writer_with_uncommitted(world: &mut World) {
-    class_with(world, ValueType::Text);
-    world.cursor = world.g().events().committed().unwrap();
-    let graph = world.graph.take().expect("the graph is open");
-    world.queue = Some(Queue::open(graph, NEVER));
+    queued(world, NEVER);
+    world.cursor = rannoch::open(world.path())
+        .unwrap()
+        .events()
+        .committed()
+        .unwrap();
     for key in ["u1", "u2", "u3"] {
         enqueue(world, key);
     }
