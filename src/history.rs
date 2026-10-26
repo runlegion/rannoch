@@ -1376,6 +1376,11 @@ mod tests {
         };
         let g = open(&path, Some(&crate::TEST_KEY))?;
         assert_eq!(read(&g)?, kept);
+        // A snapshot, and a graph rebuilt from it, are seen as the graph is.
+        let snapshot = g.snapshot(g.events().committed()?, dir.path().join("snap.rannoch"))?;
+        let back =
+            snapshot.rebuild(&[], dir.path().join("back.rannoch"), Some(&crate::TEST_KEY))?;
+        assert_eq!(read(&back)?, kept);
         for fixture in ["store-0.1.1.rannoch", "store-0.2.0.rannoch"] {
             let copy = dir.path().join(fixture);
             std::fs::copy(
