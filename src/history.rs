@@ -315,8 +315,9 @@ pub(crate) fn link_heard(
 }
 
 /// Records how a link came to an end, when `change` is an ending (at its point, with its valid
-/// time) or a correction (with neither), as the event `event`; any other change records nothing. The latest replaces any
-/// before it. Ending, correcting and replaying either record through here.
+/// time) or a correction (with neither), as the event `event`; any other change records
+/// nothing. The latest replaces any before it. Ending, correcting and replaying either record
+/// through here.
 pub(crate) fn conclude(tx: &Connection, event: EventId, change: &Change) -> Result<(), Error> {
     let (source, relation, from, to, at, valid) = match change {
         Change::Ended {
