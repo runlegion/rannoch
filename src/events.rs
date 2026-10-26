@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::history::{Key, aliases, hold_aliases, unhear};
-use crate::open::{Graph, Ontology, Value, class_table, open_keyed, relation_table};
+use crate::open::{Graph, Ontology, Value, class_table, open_keyed, relation_table, table};
 use crate::purge::Purge;
 use crate::read::NodeRef;
 use crate::write::{Declaration, Error, ValidTime, now_millis, replay};
@@ -21,7 +21,8 @@ use crate::write::{Declaration, Error, ValidTime, now_millis, replay};
 /// with their stored cursors, and every snapshot the store made, so a purge reaches it. An
 /// event's place is never reused, so a cursor stays a place in the log.
 pub(crate) const OWN_TABLES: &str = "
-    CREATE TABLE IF NOT EXISTS _events(seq INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS _events(
+        seq INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT NOT NULL, id TEXT);
     CREATE TABLE IF NOT EXISTS _ontology(
         kind TEXT NOT NULL, name TEXT NOT NULL, body TEXT NOT NULL,
         PRIMARY KEY(kind, name)) WITHOUT ROWID;
@@ -33,13 +34,56 @@ pub(crate) const OWN_TABLES: &str = "
     CREATE TABLE IF NOT EXISTS _fates(
         class TEXT NOT NULL, key TEXT NOT NULL, replaced_by TEXT NOT NULL,
         point INTEGER, event TEXT, PRIMARY KEY(class, key)) WITHOUT ROWID;
-    CREATE TABLE IF NOT EXISTS _derived(
-        class TEXT NOT NULL, key TEXT NOT NULL, event TEXT NOT NULL,
-        PRIMARY KEY(class, key, event)) WITHOUT ROWID;
-    CREATE INDEX IF NOT EXISTS _derived_event ON _derived(event);
     CREATE TABLE IF NOT EXISTS _followers(name TEXT PRIMARY KEY, cursor INTEGER NOT NULL)
         WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS _snapshots(path TEXT PRIMARY KEY, cursor INTEGER);";
+
+/// What [`upgrade`] makes once a store is up to date: the events each node or link was derived
+/// from, where `to_key` is '' for a node and the link's to-key for a link, whose `class` holds its
+/// relation and `key` its from-key; and the index that finds an event by its id.
+const UPGRADED: &str = "
+    CREATE TABLE IF NOT EXISTS _derived(
+        class TEXT NOT NULL, key TEXT NOT NULL, to_key TEXT NOT NULL DEFAULT '',
+        event TEXT NOT NULL,
+        PRIMARY KEY(class, key, to_key, event)) WITHOUT ROWID;
+    CREATE INDEX IF NOT EXISTS _derived_event ON _derived(event, to_key);
+    CREATE UNIQUE INDEX IF NOT EXISTS _events_id ON _events(id);";
+
+/// Brings a store written before links kept their derived-from ids, or before each event's id
+/// was its own column, up to date in one transaction: `_derived` gains its to-key, every
+/// existing row a node's, and each event's id is filled from its body.
+pub(crate) fn upgrade(conn: &mut Connection) -> Result<(), Error> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let has = |table: &str, column: &str| -> Result<bool, Error> {
+        Ok(tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+            params![table, column],
+            |row| row.get(0),
+        )?)
+    };
+    let old_derived = table(&tx, "_derived")? && !has("_derived", "to_key")?;
+    let unnamed = !has("_events", "id")?;
+    if old_derived {
+        tx.execute_batch(
+            "ALTER TABLE _derived RENAME TO _derived_old; DROP INDEX _derived_event;",
+        )?;
+    }
+    if unnamed {
+        tx.execute_batch(
+            "ALTER TABLE _events ADD COLUMN id TEXT; \
+             UPDATE _events SET id = json_extract(body, '$.id');",
+        )?;
+    }
+    tx.execute_batch(UPGRADED)?;
+    if old_derived {
+        tx.execute_batch(
+            "INSERT INTO _derived(class, key, event) SELECT class, key, event FROM _derived_old; \
+             DROP TABLE _derived_old;",
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
 
 /// A place in a graph's event log. Reading since a cursor returns the events after it. An app
 /// stores a cursor by serializing it, and a graph rebuilt from the log keeps each event's place,
@@ -201,6 +245,9 @@ pub struct LinkFact {
     pub from: NodeRef,
     pub to: NodeRef,
     pub valid: ValidTime,
+    /// The events the link was derived from.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub derived_from: Vec<EventId>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -257,10 +304,11 @@ pub(crate) fn store(
     change: Change,
 ) -> Result<Event, Error> {
     let stored = Stored { id, change };
-    tx.prepare_cached("INSERT INTO _events(seq, body) VALUES (?1, ?2)")?
+    tx.prepare_cached("INSERT INTO _events(seq, body, id) VALUES (?1, ?2, ?3)")?
         .execute(params![
             place.map(|cursor| cursor.0),
-            serde_json::to_string(&stored)?
+            serde_json::to_string(&stored)?,
+            id.to_string()
         ])?;
     Ok(Event {
         id: stored.id,
@@ -517,58 +565,96 @@ fn path_text(path: &Path) -> Result<&str, Error> {
         .ok_or_else(|| Error::Refused(format!("the path {} is not UTF-8", path.display())))
 }
 
-/// Whether the log holds the event `id`.
+/// The check [`holds`] runs: two index lookups, one by event id and one by alias.
+pub(crate) const HOLDS: &str = "SELECT EXISTS(SELECT 1 FROM _events WHERE id = ?1) \
+                                OR EXISTS(SELECT 1 FROM _aliases WHERE alias = ?1)";
+
+/// Whether the graph holds the event `id`: an event in its log, or an alias a hearing holds.
 pub(crate) fn holds(conn: &Connection, id: EventId) -> Result<bool, Error> {
-    Ok(naming_key(conn, &id.to_string())?
-        .iter()
-        .any(|(_, stored)| stored.id == id))
+    Ok(conn
+        .prepare_cached(HOLDS)?
+        .query_row(params![id.to_string()], |row| row.get(0))?)
 }
 
-/// Keeps `node`'s derived-from events as the events it was derived from now. Writing a node and
+/// A node or a link as `_derived` names it: its class, or a link's relation; its key, or a
+/// link's from-key; and '' for a node, or a link's to-key.
+pub(crate) type Derived<'a> = (&'a str, &'a str, &'a str);
+
+/// Keeps `events` as the events the fact `of` was derived from now. Writing a node or link and
 /// replaying its write both keep them through here.
-pub(crate) fn keep_derived(tx: &Connection, node: &NodeFact) -> Result<(), Error> {
-    drop_derived(tx, &node.class, &node.key)?;
-    add_derived(tx, node)?;
+pub(crate) fn keep_derived(tx: &Connection, of: Derived, events: &[EventId]) -> Result<(), Error> {
+    drop_derived(tx, of)?;
+    add_derived(tx, of, events)?;
     Ok(())
 }
 
-/// Adds `node`'s derived-from events to those it already names. Returns whether any was new.
-pub(crate) fn add_derived(tx: &Connection, node: &NodeFact) -> Result<bool, Error> {
+/// Adds `events` to those the fact `of` already names. Returns whether any was new.
+pub(crate) fn add_derived(
+    tx: &Connection,
+    (class, key, to_key): Derived,
+    events: &[EventId],
+) -> Result<bool, Error> {
     let mut added = false;
-    for event in &node.derived_from {
+    for event in events {
         added |= tx
             .prepare_cached(
-                "INSERT OR IGNORE INTO _derived(class, key, event) VALUES (?1, ?2, ?3)",
+                "INSERT OR IGNORE INTO _derived(class, key, to_key, event) \
+                 VALUES (?1, ?2, ?3, ?4)",
             )?
-            .execute(params![node.class, node.key, event.to_string()])?
+            .execute(params![class, key, to_key, event.to_string()])?
             > 0;
     }
     Ok(added)
 }
 
-/// Removes every derived-from event the node `key` of `class` names.
-pub(crate) fn drop_derived(tx: &Connection, class: &str, key: &str) -> Result<(), Error> {
-    tx.prepare_cached("DELETE FROM _derived WHERE class = ?1 AND key = ?2")?
-        .execute(params![class, key])?;
+/// Removes every derived-from event the fact `of` names.
+pub(crate) fn drop_derived(tx: &Connection, (class, key, to_key): Derived) -> Result<(), Error> {
+    tx.prepare_cached("DELETE FROM _derived WHERE class = ?1 AND key = ?2 AND to_key = ?3")?
+        .execute(params![class, key, to_key])?;
     Ok(())
 }
 
+/// A fact derived from an event: a node, or a link named by its relation and both ends.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum FactRef {
+    Node(NodeRef),
+    Link {
+        relation: String,
+        from: NodeRef,
+        to: NodeRef,
+    },
+}
+
 impl Graph {
-    /// The nodes derived from the event `event`, by class and key.
+    /// The nodes and links derived from the event `event`.
     ///
     /// # Errors
-    /// The graph file cannot be read.
-    pub fn derived(&self, event: EventId) -> Result<Vec<NodeRef>, Error> {
-        Ok(self
+    /// The graph file cannot be read, or a link names a relation the graph does not declare.
+    pub fn derived(&self, event: EventId) -> Result<Vec<FactRef>, Error> {
+        let ontology = self.current_ontology()?;
+        let rows: Vec<(String, String, String)> = self
             .conn
-            .prepare_cached("SELECT class, key FROM _derived WHERE event = ?1 ORDER BY class, key")?
+            .prepare_cached(
+                "SELECT class, key, to_key FROM _derived WHERE event = ?1 \
+                 ORDER BY class, key, to_key",
+            )?
             .query_map(params![event.to_string()], |row| {
-                Ok(NodeRef::new(
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                ))
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })?
-            .collect::<Result<_, _>>()?)
+            .collect::<Result<_, _>>()?;
+        rows.into_iter()
+            .map(|(class, key, to_key)| {
+                if to_key.is_empty() {
+                    return Ok(FactRef::Node(NodeRef::new(class, key)));
+                }
+                let relation = ontology.relation(&class)?;
+                Ok(FactRef::Link {
+                    from: NodeRef::new(&relation.from, key),
+                    to: NodeRef::new(&relation.to, to_key),
+                    relation: class,
+                })
+            })
+            .collect()
     }
 
     /// The cursor of the last event in the log, or [`Cursor::START`] when it holds none.
@@ -669,7 +755,10 @@ pub(crate) fn remove(
     let links = unlink(tx, ontology, target, id)?;
     tx.prepare_cached(&format!("DELETE FROM {table} WHERE id = ?1"))?
         .execute(params![id])?;
-    drop_derived(tx, &target.class, &target.key)?;
+    drop_derived(tx, (&target.class, &target.key, ""))?;
+    for link in &links {
+        drop_derived(tx, (&link.relation, &link.from.key, &link.to.key))?;
+    }
     unhear(tx, target, &links)?;
     Ok(Some(links))
 }
@@ -726,6 +815,7 @@ pub(crate) fn unlink(
                     from,
                     to,
                     valid: ValidTime::from_sql(valid),
+                    derived_from: Vec::new(),
                 });
             }
             tx.prepare_cached(&format!("DELETE FROM {table} WHERE {near} = ?1"))?
@@ -1025,7 +1115,10 @@ mod tests {
         assert_eq!(events.len(), 1, "the new source is recorded as an event");
         let found = g.find("note", "n3")?.map(|n| n.derived_from);
         assert_eq!(found.map(|ids| ids.len()), Some(2));
-        assert_eq!(g.derived(second)?, [NodeRef::new("note", "n3")]);
+        assert_eq!(
+            g.derived(second)?,
+            [crate::FactRef::Node(NodeRef::new("note", "n3"))]
+        );
         let before = g.events().committed()?;
         let again = g.write(&Write::new("app").unit(note("n3")).derived_from([second]))?;
         assert_eq!(
@@ -1034,6 +1127,50 @@ mod tests {
             "a source already recorded adds nothing"
         );
         assert_eq!(again, heard, "it returns the event the hearing is named by");
+        Ok(())
+    }
+
+    #[test]
+    fn a_store_from_before_ids_and_link_sources_holds_its_events_once_opened()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        for fixture in ["store-0.1.1.rannoch", "store-0.2.0.rannoch"] {
+            let copy = dir.path().join(fixture);
+            std::fs::copy(
+                format!("{}/tests/fixtures/{fixture}", env!("CARGO_MANIFEST_DIR")),
+                &copy,
+            )?;
+            let mut g = open(&copy, Some(&crate::TEST_KEY))?;
+            let events = g.events().since(crate::Cursor::START)?;
+            for event in &events {
+                assert!(super::holds(&g.conn, event.id)?, "{fixture}: {}", event.id);
+            }
+            let source = events[events.len() - 1].id;
+            let properties: Vec<(String, crate::Value)> = g.ontology().classes["book"]
+                .properties
+                .iter()
+                .map(|(name, of)| {
+                    let value = match of {
+                        crate::ValueType::Integer => crate::Value::Integer(1),
+                        _ => crate::Value::Text("derived".into()),
+                    };
+                    (name.clone(), value)
+                })
+                .collect();
+            let unit = Unit::new("book", "b-derived", properties, ValidTime::Unknown);
+            g.write(&Write::new("app").unit(unit).derived_from([source]))?;
+            assert_eq!(
+                g.derived(source)?,
+                [crate::FactRef::Node(NodeRef::new("book", "b-derived"))],
+                "{fixture}"
+            );
+            let indexed: String = g.conn.query_row(
+                "SELECT sql FROM sqlite_master WHERE name = '_derived_event'",
+                [],
+                |row| row.get(0),
+            )?;
+            assert!(indexed.contains("to_key"), "{fixture}: {indexed}");
+        }
         Ok(())
     }
 

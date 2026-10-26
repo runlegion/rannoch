@@ -36,6 +36,7 @@ pub(crate) const HISTORY_TABLES: &str = "
         identity BLOB NOT NULL, alias TEXT NOT NULL, point INTEGER,
         PRIMARY KEY(identity, alias)) WITHOUT ROWID;
     CREATE INDEX IF NOT EXISTS _aliases_at ON _aliases(identity, point);
+    CREATE INDEX IF NOT EXISTS _aliases_alias ON _aliases(alias);
     CREATE TABLE IF NOT EXISTS _ends(
         entity TEXT NOT NULL, key TEXT NOT NULL, to_key TEXT NOT NULL, event TEXT NOT NULL,
         source TEXT NOT NULL, point INTEGER, valid TEXT,
