@@ -60,6 +60,9 @@ impl Cursor {
 pub struct EventId(Uuid);
 
 impl EventId {
+    /// Mints a new id. `Uuid::now_v7` is monotonic within one process: within a millisecond it
+    /// fills the rest of the timestamp field with a counter, so ids minted later sort later.
+    /// Pinned by `ids_minted_by_one_process_order_as_minted`.
     pub(crate) fn now() -> EventId {
         EventId(Uuid::now_v7())
     }
@@ -780,6 +783,19 @@ mod tests {
     };
 
     #[test]
+    fn ids_minted_by_one_process_order_as_minted() {
+        let mut before = super::EventId::now();
+        for _ in 0..100_000 {
+            let next = super::EventId::now();
+            assert!(
+                next > before,
+                "{next} was minted after {before} but does not sort after it"
+            );
+            before = next;
+        }
+    }
+
+    #[test]
     fn advancing_past_the_committed_watermark_is_refused_naming_both()
     -> Result<(), Box<dyn std::error::Error>> {
         let path = std::env::temp_dir().join(format!("rannoch-past-{}.db", uuid::Uuid::now_v7()));
@@ -943,6 +959,27 @@ mod tests {
         let snapshot = live.snapshot(at, dir.path().join("snapshot.db"))?;
         let back = snapshot.rebuild(&[], dir.path().join("back.db"), Some(&crate::TEST_KEY))?;
         assert_eq!(back.hearings(&n2)?, live.hearings(&n2)?);
+        Ok(())
+    }
+
+    #[test]
+    fn an_identical_rewrite_on_a_graph_rebuilt_from_a_snapshot_returns_the_hearing_held()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let mut g = open(dir.path().join("live.db"), Some(&crate::TEST_KEY))?;
+        g.declare(&Declaration::Class(Class::new("note", ["text"])))?;
+        let first = g.write(&Write::new("app").unit(note("n1")))?;
+        let at = g.events().committed()?;
+        let snapshot = g.snapshot(at, dir.path().join("snapshot.db"))?;
+        // Nothing is replayed: the hearing's event reaches the rebuilt graph by the snapshot alone.
+        let mut back = snapshot.rebuild(&[], dir.path().join("back.db"), Some(&crate::TEST_KEY))?;
+
+        let on_source = g.write(&Write::new("app").unit(note("n1")))?;
+        assert_eq!(on_source, first);
+        let before = back.events().committed()?;
+        let on_back = back.write(&Write::new("app").unit(note("n1")))?;
+        assert_eq!(on_back, on_source);
+        assert_eq!(back.events().committed()?, before);
         Ok(())
     }
 
