@@ -693,3 +693,56 @@ fn nfr_013_014() {
         },
     ]);
 }
+
+/// The events `committed_read` reads the watermark of.
+const COMMITTED_EVENTS: usize = 100_000;
+
+/// A follower's hot read of the committed watermark (form 01a14656 claim 10): on a graph with
+/// 100,000 events, `committed()` called 100,000 times on a warm connection, reported as the mean.
+/// Run it with
+///
+/// ```text
+/// cargo test --release --test measure committed_read -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "a measurement: run at verify time on a machine running nothing else (see the module docs)"]
+fn committed_read() {
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("committed.rannoch");
+    let mut g = rannoch::open(&file, Some(&KEY)).unwrap();
+    g.declare(&Declaration::Class(Class::new(
+        "voice",
+        NONE.map(|(name, _)| name),
+    )))
+    .unwrap();
+    // Queued, so the 100,000 writes commit in a few transactions, each still its own event.
+    let queue = rannoch::Queue::open(g, Duration::from_secs(3_600));
+    for v in 0..COMMITTED_EVENTS {
+        queue
+            .write(Write::new("measure").unit(Unit::new(
+                "voice",
+                format!("v{v}"),
+                NONE,
+                day(2026, 10, 26),
+            )))
+            .unwrap();
+    }
+    assert!(queue.close().is_empty());
+    let g = rannoch::open(&file, Some(&KEY)).unwrap();
+    let events = g.events();
+    let last = events.committed().unwrap();
+    let start = Instant::now();
+    for _ in 0..COMMITTED_EVENTS {
+        assert_eq!(std::hint::black_box(events.committed().unwrap()), last);
+    }
+    let mean = start.elapsed().as_secs_f64() * 1e6 / COMMITTED_EVENTS as f64;
+    println!("committed_read: {COMMITTED_EVENTS} events, mean {mean:.3} us per committed() read");
+    record(&[Report {
+        nfr: "form 01a14656 claim 10",
+        what: "mean hot committed() read".into(),
+        value: mean,
+        unit: "us",
+        target: "<= 2 us",
+        met: mean <= 2.0,
+    }]);
+}
