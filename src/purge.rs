@@ -82,18 +82,18 @@ impl Purge {
     }
 }
 
-/// Each purge's standing rule: its rule, its kind, its targets as keyed match values (`b` empty
-/// for a kind with one), and the purge event. A hearing that arrives is looked up by
-/// (kind, a, b).
+/// Each purge's standing rule: its rule, its kind, its targets as keyed match values
+/// (`match_b` empty for a kind with one), and the purge event. A hearing that arrives is looked
+/// up by (`kind`, `match_a`, `match_b`).
 pub(crate) const PURGE_TABLES: &str = "
     CREATE TABLE IF NOT EXISTS _purge_rules(
-        rule TEXT NOT NULL, kind TEXT NOT NULL, a BLOB NOT NULL, b BLOB NOT NULL,
+        rule TEXT NOT NULL, kind TEXT NOT NULL, match_a BLOB NOT NULL, match_b BLOB NOT NULL,
         event TEXT NOT NULL);
-    CREATE INDEX IF NOT EXISTS _purge_rules_match ON _purge_rules(kind, a, b);";
+    CREATE INDEX IF NOT EXISTS _purge_rules_match ON _purge_rules(kind, match_a, match_b);";
 
-/// The kind and the values `a` and `b` a standing rule is kept and looked up under, from a purge
-/// whose targets are keyed match values: a node is its class's and its key's, a link its
-/// relation's and its two keys', end to end.
+/// The kind and the values `match_a` and `match_b` a standing rule is kept and looked up under,
+/// from a purge whose targets are keyed match values: a node is its class's and its key's, a link
+/// its relation's and its two keys', end to end.
 fn rule_of(matched: &Purge) -> Result<(&'static str, Vec<u8>, Vec<u8>), Error> {
     let value = |hex: &str| {
         blake3::Hash::from_hex(hex)
@@ -135,7 +135,7 @@ pub(crate) fn stand(
 fn keep_rule(tx: &Connection, rule: &str, matched: &Purge, event: &str) -> Result<(), Error> {
     let (kind, a, b) = rule_of(matched)?;
     tx.prepare_cached(
-        "INSERT INTO _purge_rules(rule, kind, a, b, event) VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO _purge_rules(rule, kind, match_a, match_b, event) VALUES (?1, ?2, ?3, ?4, ?5)",
     )?
     .execute(params![rule, kind, a, b, event])?;
     Ok(())
@@ -192,7 +192,7 @@ fn rule_matching(
         let (kind, a, b) = rule_of(&candidate.matched(key))?;
         let found = tx
             .prepare_cached(
-                "SELECT rule, event FROM _purge_rules WHERE kind = ?1 AND a = ?2 AND b = ?3 LIMIT 1",
+                "SELECT rule, event FROM _purge_rules WHERE kind = ?1 AND match_a = ?2 AND match_b = ?3 LIMIT 1",
             )?
             .query_row(params![kind, a, b], |row| Ok((row.get(0)?, row.get(1)?)))
             .optional()?;
