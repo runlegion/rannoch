@@ -14,7 +14,7 @@ use crate::events::{
     event_at, holds, keep_derived, next_cursor, store,
 };
 use crate::history::{
-    Held, Key, Of, alias, conclude, hear, link_heard, millis, newest, node_entity,
+    Held, Key, Of, alias, carry, conclude, hear, link_heard, millis, newest, node_entity,
 };
 use crate::open::{
     CLASS, Class, Graph, HistoryKey, Ontology, RELATION, Relation, Value, ValueType, class_table,
@@ -610,10 +610,13 @@ impl<'a> Piece<'a> {
         }
     }
 
-    /// Hears `of`: the identical hearing held, or a new one, which current state takes only
-    /// when it is now its node's or link's newest version.
+    /// Hears `of`: the identical hearing held when it is its node's or link's current version,
+    /// or when its writer supplied its point, which is then part of its identity; else a new
+    /// hearing, or a return to an older one, which this event is a new occurrence of. Current
+    /// state takes either only when it is now the newest version.
     pub(crate) fn hear(&self, of: &Of) -> Result<Heard, Error> {
         let identity = of.identity(self.key, self.source)?;
+        let (entity, key, to) = of.entity();
         if let Some(held) = hear(
             self.tx,
             identity,
@@ -622,9 +625,14 @@ impl<'a> Piece<'a> {
             of,
             self.ontology,
         )? {
-            return Ok(Heard::Held(held));
+            if of.time().is_some()
+                || newest(self.tx, (&entity, key, to))?
+                    .is_some_and(|(.., newest)| newest == identity)
+            {
+                return Ok(Heard::Held(held));
+            }
+            alias(self.tx, &held, self.stamp.id, self.stamp.cursor)?;
         }
-        let (entity, key, to) = of.entity();
         Ok(match newest(self.tx, (&entity, key, to))? {
             Some((.., newest)) if newest != identity => Heard::Older,
             _ => Heard::Newest,
@@ -699,7 +707,7 @@ impl<'a> Piece<'a> {
 
     /// Puts a version of the node keyed `key` into its class's table as its current state.
     /// Returns the node's id and whether it is new.
-    fn put(
+    pub(crate) fn put(
         &self,
         class: &Class,
         key: &str,
@@ -805,7 +813,7 @@ impl<'a> Piece<'a> {
     }
 
     /// Puts a link's current state: into its relation when `ends` are both present, else open.
-    fn current_link(
+    pub(crate) fn current_link(
         &self,
         fact: &LinkFact,
         ends: Option<(i64, i64)>,
@@ -913,7 +921,7 @@ impl<'a> Piece<'a> {
 /// Applies one event's change to the state in `tx`, as it was applied when the event was
 /// written: a declaration builds what it needs, a write puts what it added, a closing moves its
 /// open link into its relation, a forget removes the node and its links, a replacement records
-/// the node's fate. Facts are stamped as recorded at `recorded`. Returns false when the event is
+/// the node's fate, and a purge changes nothing. Facts are stamped as recorded at `recorded`. Returns false when the event is
 /// a write whose every fact is identical to a hearing held, so it adds nothing and its id is
 /// held only as an alias.
 pub(crate) fn replay(
@@ -976,7 +984,10 @@ pub(crate) fn replay(
         }
         Change::Replaced { class, old, new } => {
             record_fate(tx, class, old, new, event.id)?;
+            carry(tx, ontology, key, (class, old, new))?;
         }
+        // What a purge removed has already left every event before it.
+        Change::Purged { .. } => {}
         Change::Ended { .. } | Change::Corrected { .. } => conclude(tx, event.id, &event.change)?,
     }
     Ok(true)
@@ -1075,14 +1086,15 @@ impl Graph {
 
     /// Replaces the node `old` of `class` by the node `new` of the same class, under a different
     /// key, as one event naming the class, the old key and the new key. The old node stays in
-    /// the graph and describes as replaced by the new one. The event and the replacement land
-    /// together or not at all.
+    /// the graph and describes as replaced by the new one; its hearings and links move to the
+    /// new key. The event and the replacement land together or not at all.
     ///
     /// # Errors
-    /// `class` is not declared; [`Error::Refused`] when `old` and `new` are the same key;
-    /// [`Error::NotFound`] when no node of `class` has key `old`, or key `new`; the graph file
-    /// cannot be written.
+    /// [`Error::KeyMissing`] when the graph holds no key; `class` is not declared;
+    /// [`Error::Refused`] when `old` and `new` are the same key; [`Error::NotFound`] when no node
+    /// of `class` has key `old`, or key `new`; the graph file cannot be written.
     pub fn replace(&mut self, class: &str, old: &str, new: &str) -> Result<Event, Error> {
+        let key = self.key.as_ref().ok_or(Error::KeyMissing)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1103,6 +1115,7 @@ impl Graph {
                 });
             }
         }
+        carry(&tx, &ontology, key, (&class, old, new))?;
         let event = append(
             &tx,
             Change::Replaced {

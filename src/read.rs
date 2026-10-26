@@ -226,7 +226,27 @@ fn find_in(
 ) -> Result<Option<Node>, Error> {
     let class = ontology.class(class)?;
     let version = newest(conn, (&node_entity(&class.name), key, None))?;
-    node_in(conn, class, key, version)
+    if version.is_some() {
+        return node_in(conn, class, key, version);
+    }
+    // A replaced node keeps its row and nothing else: its history is the new key's now.
+    Ok(conn
+        .prepare_cached(&format!(
+            "SELECT source, valid, recorded FROM {} WHERE key = ?1",
+            class_table(&class.name)
+        ))?
+        .query_row(params![key], |row| {
+            Ok(Node {
+                class: class.name.clone(),
+                key: key.to_string(),
+                properties: BTreeMap::new(),
+                source: row.get(0)?,
+                valid: ValidTime::from_sql(row.get(1)?),
+                recorded: time(row.get(2)?),
+                derived_from: Vec::new(),
+            })
+        })
+        .optional()?)
 }
 
 /// The node keyed `key` in `class` as its `version` holds it.
