@@ -961,7 +961,8 @@ impl Graph {
         }))
     }
 
-    /// Every hearing of `node`, by point and then by event id.
+    /// Every hearing of `node`, in order on its class's axis: by integer key in an
+    /// integer-keyed class, then by point, then by event id.
     ///
     /// # Errors
     /// The class is not declared, or the graph file cannot be read.
@@ -971,7 +972,7 @@ impl Graph {
     }
 
     /// Every hearing of the link of `relation` from the node keyed `from` to the node keyed
-    /// `to`, by point and then by event id.
+    /// `to`, by point and then by event id (a link is never ordered by an integer key).
     ///
     /// # Errors
     /// The relation is not declared, or the graph file cannot be read.
@@ -990,10 +991,11 @@ impl Graph {
         type Row = ([u8; 32], String, String, Option<String>, i64, Option<i64>);
         let rows: Vec<Row> = self
             .conn
-            .prepare_cached(
+            .prepare_cached(&format!(
                 "SELECT identity, event, source, valid, point, integer FROM _hearings \
-                 WHERE entity = ?1 AND key = ?2 AND to_key IS ?3 ORDER BY point, event",
-            )?
+                 WHERE entity = ?1 AND key = ?2 AND to_key IS ?3 ORDER BY {}",
+                order("ASC")
+            ))?
             .query_map(params![entity, key, to], |row| {
                 Ok((
                     row.get(0)?,

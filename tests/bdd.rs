@@ -596,6 +596,8 @@ struct World {
     seen: Option<rannoch::Seen>,
     reads_link: bool,
     links: Vec<LinkAt>,
+    /// The node whose history a scenario walks.
+    walking: Option<NodeRef>,
 }
 
 #[rstest::fixture]
@@ -654,6 +656,7 @@ fn world() -> World {
         seen: None,
         reads_link: false,
         links: Vec::new(),
+        walking: None,
     }
 }
 
@@ -5161,6 +5164,128 @@ fn given_in_reverse(world: &mut World) {
         .collect();
     let path = world.dir.path().join("reversed.rannoch");
     world.rebuilt = Some(rannoch::rebuild(&events, path, Some(&KEY)).unwrap());
+}
+
+// ---------- history: the walk back to first heard (FR-RANNOCH-069) ----------
+
+/// Writes `unit` from `source`, then waits a few milliseconds so the next hearing's record
+/// time differs.
+fn hear(world: &mut World, source: &str, unit: Unit) {
+    world.write(&Write::new(source).unit(unit));
+    std::thread::sleep(Duration::from_millis(2));
+}
+
+#[given("a node heard more than once, not in axis order")]
+fn heard_out_of_axis_order(world: &mut World) {
+    declare_kind(world.open(), "integer-keyed");
+    for n in [30, 10, 40, 5, 20] {
+        let unit = unit_of(world.g(), "r1", &format!("at {n}"), n);
+        hear(world, "meter", unit);
+    }
+    world.walking = Some(NodeRef::new("reading", "r1"));
+}
+
+#[given("a node heard under one key and then replaced by a new key")]
+fn heard_then_replaced(world: &mut World) {
+    open_graph(world);
+    let unit = Unit::new("statement", "s8", [("text", "first")], day(2021, 3, 2));
+    hear(world, "swtor", unit);
+    let hearings = world
+        .g()
+        .hearings(&NodeRef::new("statement", "s8"))
+        .unwrap();
+    assert_eq!(hearings.len(), 1, "{hearings:?}");
+    world.hearings.insert("s8".into(), hearings);
+    s9(world);
+    replaces_s8_by_s9(world);
+    world.walking = Some(NodeRef::new("statement", "s9"));
+}
+
+#[given("a node first heard before a snapshot and heard again from another source after it")]
+fn heard_across_snapshot(world: &mut World) {
+    declare_kind(world.open(), "time-keyed");
+    let unit = unit_of(world.g(), "a", "before", 10);
+    hear(world, "crawler", unit);
+    let node = NodeRef::new("visit", "a");
+    let hearings = world.g().hearings(&node).unwrap();
+    world.hearings.insert("before".into(), hearings);
+    snapshot_at_end(world);
+    let unit = unit_of(world.g(), "a", "after", 20);
+    hear(world, "reddit", unit);
+    rebuild_from_snapshot(world);
+    world.walking = Some(node);
+}
+
+#[given("a node that has been heard from more than one source, with no snapshot taken")]
+fn heard_from_sources(world: &mut World) {
+    declare_kind(world.open(), "time-keyed");
+    for (source, n, month) in [("crawler", 30, 4), ("reddit", 10, 9), ("swtor", 20, 1)] {
+        let unit = Unit::new("visit", "a", [("text", source)], day(2025, month, 1)).at(at(n));
+        hear(world, source, unit);
+    }
+    world.walking = Some(NodeRef::new("visit", "a"));
+}
+
+#[when("the app walks its history")]
+#[when("the app walks the new key's history")]
+fn walks_history(world: &mut World) {
+    let node = world.walking.clone().expect("a scenario names the node");
+    let g = world.rebuilt.as_ref().or(world.graph.as_ref()).unwrap();
+    let hearings = g.hearings(&node).unwrap();
+    world.hearings.insert("walked".into(), hearings);
+}
+
+#[then("the walk returns every hearing in order on the class's declared axis")]
+fn walk_in_axis_order(world: &mut World) {
+    let integers: Vec<Option<i64>> = world.hearings["walked"].iter().map(|h| h.integer).collect();
+    assert_eq!(integers, [5, 10, 20, 30, 40].map(Some));
+}
+
+#[then("the walk reaches first heard under the old key")]
+fn walk_reaches_old_key(world: &mut World) {
+    let walked = &world.hearings["walked"];
+    assert_eq!(walked.len(), 2, "{walked:?}");
+    assert_eq!(walked[0], world.hearings["s8"][0]);
+}
+
+#[then("the walk reaches the first hearing recorded before the snapshot")]
+fn walk_reaches_before_snapshot(world: &mut World) {
+    let walked = &world.hearings["walked"];
+    assert_eq!(walked.len(), 2, "{walked:?}");
+    assert_eq!(walked[0], world.hearings["before"][0]);
+    assert_eq!(walked[1].source, "reddit");
+}
+
+#[then("each hearing returned matches the event that recorded it")]
+fn hearings_match_events(world: &mut World) {
+    let node = world.walking.clone().unwrap();
+    let walked = world.hearings["walked"].clone();
+    assert_eq!(walked.len(), 3, "{walked:?}");
+    let events = world.all_events();
+    let g = world.g();
+    for hearing in &walked {
+        let event = events.iter().find(|e| e.id == hearing.event).unwrap();
+        let Change::Wrote { source, added, .. } = &event.change else {
+            panic!("{event:?} is not a write");
+        };
+        let fact = added
+            .iter()
+            .find_map(|fact| match fact {
+                Fact::Node(n) if n.class == node.class && n.key == node.key => Some(n),
+                _ => None,
+            })
+            .unwrap();
+        let millis = hearing
+            .point
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap();
+        assert_eq!(source, &hearing.source);
+        assert_eq!(fact.valid, hearing.valid);
+        assert_eq!(fact.time, Some(i64::try_from(millis.as_millis()).unwrap()));
+        let version = g.state_at(&node, At::Time(hearing.point)).unwrap().unwrap();
+        assert_eq!(version.event, hearing.event);
+        assert_eq!(fact.properties, version.properties);
+    }
 }
 
 /// `tests/fixtures/store-0.2.0.rannoch` was written by rannoch at tag v0.2.0: class book (no
