@@ -1580,9 +1580,15 @@ mod tests {
         g.write(
             &Write::new("app")
                 .unit(note("n2"))
-                .unit(note("n1").link("cites", "n1", "n2", ValidTime::Unknown))
+                .unit(
+                    note("n1")
+                        .link("cites", "n1", "n2", ValidTime::Unknown)
+                        .link("cites", "n1", "n3", ValidTime::Unknown),
+                )
                 .derived_from([source]),
         )?;
+        // n3 arrives, closing the link that waited open for it.
+        g.write(&Write::new("app").unit(note("n3")))?;
         let snapshot_path = dir.path().join("snapshot.rannoch");
         g.snapshot(g.events().committed()?, &snapshot_path)?;
         let target = Target::Node(NodeRef::new("note", "e"));
@@ -1605,21 +1611,26 @@ mod tests {
         for graph in [&g, &open(&snapshot_path, Some(&crate::TEST_KEY))?] {
             let found = graph.find("note", "n1")?.ok_or("n1 was purged")?;
             assert!(found.derived_from.is_empty());
-            let links: Vec<LinkFact> = graph
-                .events()
-                .since(Cursor::START)?
-                .into_iter()
-                .flat_map(|e| match e.change {
-                    Change::Wrote { added, .. } => added,
-                    _ => Vec::new(),
-                })
-                .filter_map(|fact| match fact {
-                    Fact::Link(link) => Some(link),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(links.len(), 1, "the link remains");
-            assert!(links[0].derived_from.is_empty());
+            let mut links: Vec<LinkFact> = Vec::new();
+            let mut closed = 0;
+            for event in graph.events().since(Cursor::START)? {
+                match event.change {
+                    Change::Wrote { added, .. } => {
+                        links.extend(added.into_iter().filter_map(|fact| match fact {
+                            Fact::Link(link) | Fact::Opened(link) => Some(link),
+                            Fact::Node(_) => None,
+                        }));
+                    }
+                    Change::Closed(link) => {
+                        closed += 1;
+                        links.push(link);
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(closed, 1, "the open link closed when n3 arrived");
+            assert_eq!(links.len(), 3, "both links remain, one opened then closed");
+            assert!(links.iter().all(|link| link.derived_from.is_empty()));
         }
         Ok(())
     }
