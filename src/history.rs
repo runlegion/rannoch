@@ -66,6 +66,12 @@ impl Key {
             check: blake3::keyed_hash(bytes, CHECK_LABEL).to_hex().to_string(),
         }
     }
+
+    /// `text`'s keyed match value: its keyed hash under the key, so a purge names what it
+    /// matched without holding it.
+    pub(crate) fn matched(&self, text: &[u8]) -> blake3::Hash {
+        blake3::keyed_hash(&self.bytes, text)
+    }
 }
 
 impl fmt::Debug for Key {
@@ -80,7 +86,15 @@ pub(crate) enum Of<'a> {
     Link(&'a LinkFact),
 }
 
-impl Of<'_> {
+impl<'a> Of<'a> {
+    /// What `fact` is a hearing of: a node, or a link, open or not.
+    pub(crate) fn fact(fact: &'a Fact) -> Of<'a> {
+        match fact {
+            Fact::Node(node) => Of::Node(node),
+            Fact::Link(link) | Fact::Opened(link) => Of::Link(link),
+        }
+    }
+
     /// Its entity (a class or a relation), its key and, for a link, its target's key.
     pub(crate) fn entity(&self) -> (String, &str, Option<&str>) {
         match self {
@@ -627,10 +641,7 @@ pub(crate) fn take(conn: &mut Connection, key: &Key) -> Result<(), Error> {
         // Into the versions only, as a replay hears them: current state stays as it is.
         let mut piece = Piece::new(&tx, &ontology, key, source, stamp);
         for fact in added {
-            let of = match fact {
-                Fact::Node(node) => Of::Node(node),
-                Fact::Link(link) | Fact::Opened(link) => Of::Link(link),
-            };
+            let of = Of::fact(fact);
             if let Heard::Held(held) = piece.hear(&of)? {
                 piece.held(&held, false)?;
             }
@@ -667,34 +678,57 @@ pub(crate) fn see_all(conn: &mut Connection) -> Result<(), Error> {
         )?
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
         .collect::<Result<_, _>>()?;
-    let day = valid_day("valid");
     for (entity, key, to) in many {
-        let Some((first, last)) = edges(&tx, (&entity, &key, to.as_deref()))? else {
-            continue;
-        };
-        tx.prepare_cached(&format!(
-            "INSERT INTO _seen SELECT ?1, ?2, coalesce(?3, ''), ?4, ?5, ?6, ?7, \
-             (SELECT min(arrived) FROM _hearings WHERE entity = ?1 AND key = ?2 AND to_key IS ?3), \
-             (SELECT min(id) FROM _endings WHERE entity = ?1 AND key = ?2 AND to_key = ?3 \
-             AND NOT EXISTS (SELECT 1 FROM _hearings WHERE entity = ?1 AND key = ?2 \
-             AND to_key IS ?3)), (SELECT valid FROM (SELECT valid FROM _hearings \
-             WHERE entity = ?1 AND key = ?2 AND to_key IS ?3 UNION ALL SELECT valid \
-             FROM _endings WHERE entity = ?1 AND key = ?2 AND to_key = ?3) \
-             WHERE valid IS NOT NULL ORDER BY {day} LIMIT 1), \
-             (SELECT count(*) FROM _hearings WHERE entity = ?1 AND key = ?2 AND to_key IS ?3) \
-             + (SELECT count(*) FROM _endings WHERE entity = ?1 AND key = ?2 AND to_key = ?3)"
-        ))?
-        .execute(params![
-            entity,
-            key,
-            to,
-            first.hearing,
-            first.ending,
-            last.hearing,
-            last.ending
-        ])?;
+        see(&tx, (&entity, &key, to.as_deref()))?;
     }
     tx.commit()?;
+    Ok(())
+}
+
+/// Keeps what is seen of `of` (entity, key, target key) from its hearings and endings as they are
+/// now, when it has more than one fact; a node or link with one fact keeps no row. Its old row,
+/// if any, is dropped first.
+pub(crate) fn see(
+    tx: &Connection,
+    (entity, key, to): (&str, &str, Option<&str>),
+) -> Result<(), Error> {
+    tx.prepare_cached("DELETE FROM _seen WHERE entity = ?1 AND key = ?2 AND to_key = ?3")?
+        .execute(params![entity, key, to.unwrap_or_default()])?;
+    let facts: i64 = tx
+        .prepare_cached(
+            "SELECT (SELECT count(*) FROM _hearings WHERE entity = ?1 AND key = ?2 \
+             AND to_key IS ?3) + (SELECT count(*) FROM _endings WHERE entity = ?1 AND key = ?2 \
+             AND to_key = coalesce(?3, ''))",
+        )?
+        .query_row(params![entity, key, to], |row| row.get(0))?;
+    if facts < 2 {
+        return Ok(());
+    }
+    let Some((first, last)) = edges(tx, (entity, key, to))? else {
+        return Ok(());
+    };
+    let day = valid_day("valid");
+    tx.prepare_cached(&format!(
+        "INSERT INTO _seen SELECT ?1, ?2, coalesce(?3, ''), ?4, ?5, ?6, ?7, \
+         (SELECT min(arrived) FROM _hearings WHERE entity = ?1 AND key = ?2 AND to_key IS ?3), \
+         (SELECT min(id) FROM _endings WHERE entity = ?1 AND key = ?2 AND to_key = ?3 \
+         AND NOT EXISTS (SELECT 1 FROM _hearings WHERE entity = ?1 AND key = ?2 \
+         AND to_key IS ?3)), (SELECT valid FROM (SELECT valid FROM _hearings \
+         WHERE entity = ?1 AND key = ?2 AND to_key IS ?3 UNION ALL SELECT valid \
+         FROM _endings WHERE entity = ?1 AND key = ?2 AND to_key = ?3) \
+         WHERE valid IS NOT NULL ORDER BY {day} LIMIT 1), \
+         (SELECT count(*) FROM _hearings WHERE entity = ?1 AND key = ?2 AND to_key IS ?3) \
+         + (SELECT count(*) FROM _endings WHERE entity = ?1 AND key = ?2 AND to_key = ?3)"
+    ))?
+    .execute(params![
+        entity,
+        key,
+        to,
+        first.hearing,
+        first.ending,
+        last.hearing,
+        last.ending
+    ])?;
     Ok(())
 }
 
@@ -1572,7 +1606,7 @@ mod tests {
                 "pl1",
                 when.clone(),
             )))?;
-            g.forget(&NodeRef::new("visitor", "p05"), "living", "tree")?;
+            crate::events::forget_as_before(&mut g, &NodeRef::new("visitor", "p05"))?;
             // As a store written before keys: no check value and no hearings.
             g.conn.execute_batch(
                 "DELETE FROM _check; DELETE FROM _hearings; DELETE FROM _aliases;",
