@@ -670,6 +670,11 @@ fn rewrite(
 /// Runs `purge` on `conn` with `secure_delete` on, so every page it frees or rewrites is zeroed,
 /// restores the setting after and checkpoints the write-ahead log, truncating it, so no purged
 /// byte stays in the log.
+///
+/// # Errors
+/// [`Error::Refused`] when the purge committed but a reader still open kept the checkpoint from
+/// truncating the log once the busy handler gave up: the log still holds purged bytes until a
+/// checkpoint runs after the readers close.
 fn secure<T>(
     conn: &mut Connection,
     purge: impl FnOnce(&mut Connection) -> Result<T, Error>,
@@ -679,7 +684,15 @@ fn secure<T>(
     let purged = purge(conn);
     conn.pragma_update(None, "secure_delete", before)?;
     let purged = purged?;
-    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+    let busy: i64 = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+    if busy != 0 {
+        return Err(Error::Refused(format!(
+            "the purge committed, but the write-ahead log of {} still holds purged bytes: a \
+             reader is open, so the log could not be truncated; running the checkpoint again \
+             once the readers close clears it",
+            conn.path().unwrap_or("the graph file")
+        )));
+    }
     Ok(purged)
 }
 
@@ -693,7 +706,9 @@ impl Graph {
     ///
     /// # Errors
     /// [`Error::KeyMissing`] without a key; [`Error::Refused`] when the target's class or
-    /// relation is not declared; the graph file or a snapshot file cannot be read or written.
+    /// relation is not declared, or when the purge committed but a reader still open on the
+    /// store or a snapshot kept its write-ahead log from being truncated, so the log holds purged
+    /// bytes until a checkpoint runs after the readers close; the graph file or a snapshot file cannot be read or written.
     #[allow(
         clippy::needless_pass_by_value,
         reason = "the interface #85 names takes it by value"
@@ -732,5 +747,38 @@ impl Graph {
             })?;
         }
         Ok(event)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Class, Declaration, Error, NodeRef, Purge, Target, Unit, ValidTime, Write, open};
+
+    #[test]
+    fn a_purge_with_a_reader_open_says_the_log_still_holds_purged_bytes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("graph.rannoch");
+        let mut g = open(&path, Some(&crate::TEST_KEY))?;
+        g.declare(&Declaration::Class(Class::new("note", ["text"])))?;
+        g.write(&Write::new("app").unit(Unit::new(
+            "note",
+            "n1",
+            [("text", "zq-reader-token")],
+            ValidTime::Unknown,
+        )))?;
+        let reader = rusqlite::Connection::open(&path)?;
+        reader.execute_batch("BEGIN; SELECT count(*) FROM _events;")?;
+        let target = Target::Node(NodeRef::new("note", "n1"));
+        let Err(Error::Refused(why)) = g.purge(Purge::Entity { target }, "rule", "app") else {
+            panic!("a purge with a reader open reported that the log was truncated");
+        };
+        assert!(
+            why.contains("the purge committed") && why.contains("still holds purged bytes"),
+            "{why}"
+        );
+        assert_eq!(g.find("note", "n1")?, None, "the purge itself committed");
+        reader.execute_batch("COMMIT")?;
+        Ok(())
     }
 }
