@@ -6382,6 +6382,76 @@ fn both_ended_at_40(world: &mut World) {
     }
 }
 
+#[given(
+    "a node written by one source with content v1, then v2, then v1 again, each in its own commit"
+)]
+fn returns_to_v1(world: &mut World) {
+    for text in ["v1", "v2", "v1"] {
+        let unit = unit_of(world.g(), "k1", text, 0);
+        world.write(&Write::new("crawler").unit(unit));
+        assert_eq!(world.written.len(), 1, "{text} wrote its event");
+        std::thread::sleep(Duration::from_millis(3));
+    }
+}
+
+#[when("the node is read")]
+fn the_node_is_read(world: &mut World) {
+    let class = the_class(world.g()).name;
+    world.found = Some(world.find(&class, "k1"));
+}
+
+#[then("its current state is v1")]
+fn current_state_v1(world: &mut World) {
+    let node = world.found.as_ref().expect("the node was read");
+    assert_eq!(node.properties.get("text"), Some(&Value::Text("v1".into())));
+}
+
+#[then("it has one hearing of v1 with two occurrences and one hearing of v2")]
+fn v1_twice_v2_once(world: &mut World) {
+    let class = the_class(world.g()).name;
+    let hearings = world.g().hearings(&NodeRef::new(&class, "k1")).unwrap();
+    // A hearing occurs under its own event and under each alias.
+    let mut occurrences: Vec<usize> = hearings.iter().map(|h| 1 + h.aliases.len()).collect();
+    occurrences.sort_unstable();
+    assert_eq!(occurrences, [1, 2], "{hearings:?}");
+}
+
+/// `tests/fixtures/store-0.2.0-return.rannoch` was written by rannoch at tag v0.2.0: class book
+/// (no history key) with title (text), and book b1 written by source shelf with title v1, then
+/// v2, then v1 again, each in its own commit; 4 events, none carrying a point.
+#[given(
+    "a log written by rannoch 0.2.0 in which one source wrote a node with content v1, then v2, then v1 again"
+)]
+fn log_020_return(world: &mut World) {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/store-0.2.0-return.rannoch"
+    );
+    std::fs::copy(fixture, world.path()).unwrap();
+    world.open();
+    world.log = world.all_events();
+    assert_eq!(world.log.len(), 4);
+}
+
+#[when("a graph is rebuilt from that log")]
+fn rebuilt_from_log(world: &mut World) {
+    let path = world.dir.path().join("rebuilt.rannoch");
+    world.rebuilt = Some(rannoch::rebuild(&world.log, path, Some(&KEY)).unwrap());
+}
+
+#[then("the node's current state is v1")]
+fn rebuilt_reads_v1(world: &mut World) {
+    let rebuilt = world.rebuilt.as_ref().expect("the graph was rebuilt");
+    let node = rebuilt
+        .find("book", "b1")
+        .unwrap()
+        .expect("b1 is in the graph");
+    assert_eq!(
+        node.properties.get("title"),
+        Some(&Value::Text("v1".into()))
+    );
+}
+
 // FR-RANNOCH-084's other scenarios belong to #89, which brings their steps and drops this filter.
 scenarios!(
     "tests",

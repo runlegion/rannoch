@@ -605,10 +605,12 @@ impl<'a> Piece<'a> {
         }
     }
 
-    /// Hears `of`: the identical hearing held, or a new one, which current state takes only
-    /// when it is now its node's or link's newest version.
+    /// Hears `of`: the identical hearing held when it is its node's or link's current version;
+    /// else a new hearing, or a return to an older one, which this event is a new occurrence of.
+    /// Current state takes either only when it is now the newest version.
     pub(crate) fn hear(&self, of: &Of) -> Result<Heard, Error> {
         let identity = of.identity(self.key, self.source)?;
+        let (entity, key, to) = of.entity();
         if let Some(held) = hear(
             self.tx,
             identity,
@@ -617,9 +619,11 @@ impl<'a> Piece<'a> {
             of,
             self.ontology,
         )? {
-            return Ok(Heard::Held(held));
+            if newest(self.tx, (&entity, key, to))?.is_some_and(|(.., newest)| newest == identity) {
+                return Ok(Heard::Held(held));
+            }
+            alias(self.tx, &held, self.stamp.id, self.stamp.cursor)?;
         }
-        let (entity, key, to) = of.entity();
         Ok(match newest(self.tx, (&entity, key, to))? {
             Some((.., newest)) if newest != identity => Heard::Older,
             _ => Heard::Newest,

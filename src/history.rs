@@ -19,7 +19,8 @@ use crate::write::{Error, Heard, Piece, Stamp, ValidTime};
 
 /// The hearings, one version row each, with no valid-to: `arrived` counts up as this store
 /// records them, `integer` is set only in an integer-keyed class, and `properties` holds a
-/// node's. Then the other ids each arrived under; the latest conclusion to arrive for each link
+/// node's. Then the other ids each arrived under, each an occurrence of its hearing at its own
+/// point; the latest conclusion to arrive for each link
 /// that ended or was found wrong (`point` null for a correction, which masks its endings); every
 /// ending of a link, at its point (`valid` null when unknown); what is kept of when each node and
 /// link was seen (see [`saw`]); and the check value of the graph's key.
@@ -32,7 +33,8 @@ pub(crate) const HISTORY_TABLES: &str = "
     CREATE INDEX IF NOT EXISTS _hearings_at
         ON _hearings(entity, key, to_key, integer, point, event);
     CREATE TABLE IF NOT EXISTS _aliases(
-        identity BLOB NOT NULL, alias TEXT NOT NULL, PRIMARY KEY(identity, alias)) WITHOUT ROWID;
+        identity BLOB NOT NULL, alias TEXT NOT NULL, point INTEGER,
+        PRIMARY KEY(identity, alias)) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS _ends(
         entity TEXT NOT NULL, key TEXT NOT NULL, to_key TEXT NOT NULL, event TEXT NOT NULL,
         source TEXT NOT NULL, point INTEGER, valid TEXT,
@@ -268,16 +270,18 @@ fn saw(
 ) -> Result<(), Error> {
     let to = to.unwrap_or_default();
     let kept = tx
-        .prepare_cached(
+        .prepare_cached(&format!(
             "SELECT s.first_hearing, s.first_ending, fh.integer, coalesce(fh.point, fe.point), \
              coalesce(fh.event, fe.event), s.last_hearing, s.last_ending, lh.integer, \
-             coalesce(lh.point, le.point), coalesce(lh.event, le.event) FROM _seen s \
+             coalesce({}, le.point), coalesce({}, le.event) FROM _seen s \
              LEFT JOIN _hearings fh ON fh.arrived = s.first_hearing \
              LEFT JOIN _endings fe ON fe.id = s.first_ending \
              LEFT JOIN _hearings lh ON lh.arrived = s.last_hearing \
              LEFT JOIN _endings le ON le.id = s.last_ending \
              WHERE s.entity = ?1 AND s.key = ?2 AND s.to_key = ?3",
-        )?
+            newest_occurrence("s.last_hearing", "point"),
+            newest_occurrence("s.last_hearing", "event")
+        ))?
         .query_row(params![entity, key, to], |row| {
             Ok((Mark::row(row, 0)?, Mark::row(row, 5)?))
         })
@@ -370,8 +374,8 @@ fn reseen(tx: &Connection, identity: [u8; 32]) -> Result<(), Error> {
     Ok(())
 }
 
-/// The first and last facts of `of` (entity, key, target key), hearings and endings, by index
-/// seeks; `None` when it has none.
+/// The first and last facts of `of` (entity, key, target key), hearings by their occurrences
+/// and endings, by index seeks; `None` when it has none.
 fn edges(
     tx: &Connection,
     (entity, key, to): (&str, &str, Option<&str>),
@@ -379,8 +383,8 @@ fn edges(
     let edge = |direction: &str| -> Result<Option<Mark>, Error> {
         let hearing = tx
             .prepare_cached(&format!(
-                "SELECT arrived, NULL, integer, point, event FROM _hearings \
-                 WHERE entity = ?1 AND key = ?2 AND to_key IS ?3 ORDER BY {} LIMIT 1",
+                "SELECT arrived, NULL, integer, point, event FROM {} ORDER BY {} LIMIT 1",
+                occurrences_of(),
                 order(direction)
             ))?
             .query_row(params![entity, key, to], |row| Mark::row(row, 0))
@@ -417,9 +421,9 @@ fn decode(json: Option<&str>) -> Result<BTreeMap<String, Value>, Error> {
     Ok(serde_json::from_str(json.unwrap_or("{}"))?)
 }
 
-/// Holds `event`, at `cursor`, as an alias of `held`, whose content it arrived with. When
-/// `event` is the smaller id the hearing takes its name and its point, the id it was named by
-/// becomes the alias, and this returns true.
+/// Holds `event`, at `cursor`, as an alias of `held`, whose content it arrived with: an
+/// occurrence of the hearing at its own point. When `event` is the smaller id the hearing takes
+/// its name and its point, the id it was named by becomes the alias, and this returns true.
 pub(crate) fn alias(
     tx: &Connection,
     held: &Held,
@@ -440,31 +444,44 @@ pub(crate) fn alias(
             cursor.0,
             held.time.unwrap_or(event.millis())
         ])?;
-        reseen(tx, held.identity)?;
     }
     let alias = if renamed { held.event } else { event };
-    tx.prepare_cached("INSERT OR IGNORE INTO _aliases(identity, alias) VALUES (?1, ?2)")?
-        .execute(params![held.identity, alias.to_string()])?;
+    let new = tx
+        .prepare_cached(
+            "INSERT OR IGNORE INTO _aliases(identity, alias, point) VALUES (?1, ?2, ?3)",
+        )?
+        .execute(params![
+            held.identity,
+            alias.to_string(),
+            held.time.unwrap_or(alias.millis())
+        ])?;
+    if renamed || new == 1 {
+        reseen(tx, held.identity)?;
+    }
     Ok(renamed)
 }
 
-/// Every alias `conn` holds, with the identity of the hearing it is an alias of.
-pub(crate) fn aliases(conn: &Connection) -> Result<Vec<(Vec<u8>, String)>, Error> {
+/// An alias as a store holds it: the identity of the hearing it is an alias of, its event id
+/// and its point.
+pub(crate) type Alias = (Vec<u8>, String, Option<i64>);
+
+/// Every alias `conn` holds.
+pub(crate) fn aliases(conn: &Connection) -> Result<Vec<Alias>, Error> {
     Ok(conn
-        .prepare_cached("SELECT identity, alias FROM _aliases")?
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .prepare_cached("SELECT identity, alias, point FROM _aliases")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
         .collect::<Result<_, _>>()?)
 }
 
-/// Holds each of `aliases` whose hearing the graph holds, in one transaction.
-pub(crate) fn hold_aliases(conn: &Connection, aliases: &[(Vec<u8>, String)]) -> Result<(), Error> {
+/// Holds each of `aliases` whose hearing the graph holds, at its point, in one transaction.
+pub(crate) fn hold_aliases(conn: &Connection, aliases: &[Alias]) -> Result<(), Error> {
     let tx = conn.unchecked_transaction()?;
-    for (identity, alias) in aliases {
+    for (identity, alias, point) in aliases {
         tx.prepare_cached(
-            "INSERT OR IGNORE INTO _aliases(identity, alias) SELECT ?1, ?2 \
+            "INSERT OR IGNORE INTO _aliases(identity, alias, point) SELECT ?1, ?2, ?3 \
              WHERE EXISTS (SELECT 1 FROM _hearings WHERE identity = ?1)",
         )?
-        .execute(params![identity, alias])?;
+        .execute(params![identity, alias, point])?;
     }
     tx.commit()?;
     Ok(())
@@ -688,6 +705,28 @@ pub(crate) fn see_all(conn: &mut Connection) -> Result<(), Error> {
             last.ending
         ])?;
     }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Gives each alias of a store written before aliases kept a point the point of its event id,
+/// in one transaction, and indexes the aliases by hearing and point.
+pub(crate) fn point_aliases(conn: &mut Connection) -> Result<(), Error> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let pointed: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('_aliases') WHERE name = 'point')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !pointed {
+        tx.execute_batch("ALTER TABLE _aliases ADD COLUMN point INTEGER")?;
+        for (identity, alias, _) in aliases(&tx)? {
+            let id: EventId = serde_json::from_value(alias.clone().into())?;
+            tx.prepare_cached("UPDATE _aliases SET point = ?3 WHERE identity = ?1 AND alias = ?2")?
+                .execute(params![identity, alias, id.millis()])?;
+        }
+    }
+    tx.execute_batch("CREATE INDEX IF NOT EXISTS _aliases_at ON _aliases(identity, point)")?;
     tx.commit()?;
     Ok(())
 }
@@ -920,6 +959,34 @@ pub(crate) fn order(direction: &str) -> String {
     format!("integer {direction}, point {direction}, event {direction}")
 }
 
+/// Every occurrence of the hearings `filter` picks, over their `_hearings` row `h`: its own, at
+/// its row's point under its event, and each alias's, at the alias's point under the alias. A
+/// row carries its hearing's columns, `name` the event the hearing is named by, and the
+/// occurrence's `point` and `event`, which [`order`] picks by.
+fn occurrences(filter: &str) -> String {
+    let hearing = "h.arrived, h.identity, h.event AS name, h.source, h.valid, h.integer, \
+                   h.recorded, h.properties";
+    format!(
+        "(SELECT {hearing}, h.point AS point, h.event AS event FROM _hearings h WHERE {filter} \
+         UNION ALL SELECT {hearing}, a.point, a.alias FROM _hearings h \
+         JOIN _aliases a ON a.identity = h.identity WHERE {filter})"
+    )
+}
+
+/// The occurrences of the node or link `?1`, `?2`, `?3` (entity, key, target key).
+fn occurrences_of() -> String {
+    occurrences("h.entity = ?1 AND h.key = ?2 AND h.to_key IS ?3")
+}
+
+/// The `column` of the newest occurrence of the hearing whose `arrived` is `hearing` (SQL).
+fn newest_occurrence(hearing: &str, column: &str) -> String {
+    format!(
+        "(SELECT {column} FROM {} ORDER BY {} LIMIT 1)",
+        occurrences(&format!("h.arrived = {hearing}")),
+        order("DESC")
+    )
+}
+
 /// Picks the newest version row at or before the point `?4`, in a class not ordered by an
 /// integer key (and for a link, which is never ordered by one).
 fn by_point() -> String {
@@ -932,8 +999,9 @@ fn by_point() -> String {
 /// One version row: the version, when this store recorded it and its content identity.
 pub(crate) type Versioned = (Version, i64, [u8; 32]);
 
-/// Reads one version row of `entity` keyed `key` (and `to`, for a link), as `tail` picks it,
-/// with `bound` bound from `?4` on: see [`Versioned`].
+/// Reads one version row of `entity` keyed `key` (and `to`, for a link), as `tail` picks it
+/// among its hearings' occurrences, with `bound` bound from `?4` on: see [`Versioned`]. The
+/// version is named by its hearing's event, at the occurrence's point.
 fn version_row(
     conn: &Connection,
     (entity, key, to): (&str, &str, Option<&str>),
@@ -952,8 +1020,9 @@ fn version_row(
         [u8; 32],
     );
     let sql = format!(
-        "SELECT event, source, valid, point, integer, properties, recorded, identity \
-         FROM _hearings WHERE entity = ?1 AND key = ?2 AND to_key IS ?3 {tail}"
+        "SELECT name, source, valid, point, integer, properties, recorded, identity \
+         FROM {} WHERE true {tail}",
+        occurrences_of()
     );
     let mut statement = conn.prepare_cached(&sql)?;
     let read = |row: &rusqlite::Row| -> rusqlite::Result<Row> {
@@ -1151,11 +1220,11 @@ pub(crate) fn ending_sql(
 /// ended: count, first true, when it ended, then first heard, last heard and first recorded as
 /// event, source, valid time, point, integer key, properties and whether an ending.
 fn seen_sql() -> String {
-    let fact = |p: &str| {
+    let fact = |p: &str, point: &str| {
         format!(
             "coalesce({p}h.event, {p}e.event), coalesce({p}h.source, {p}e.source), \
              CASE WHEN {p}h.arrived IS NULL THEN {p}e.valid ELSE {p}h.valid END, \
-             coalesce({p}h.point, {p}e.point), {p}h.integer, {p}h.properties, \
+             coalesce({point}, {p}e.point), {p}h.integer, {p}h.properties, \
              {p}h.arrived IS NULL"
         )
     };
@@ -1178,9 +1247,10 @@ fn seen_sql() -> String {
         "SELECT s.count, s.first_true, (SELECT n.point FROM _endings n WHERE {ending}), \
          {}, {}, {} FROM _seen s {} {} {} WHERE s.entity = ?1 AND s.key = ?2 AND s.to_key = ?3 \
          {} {} LIMIT 1",
-        fact("f"),
-        fact("l"),
-        fact("r"),
+        fact("f", "fh.point"),
+        // A hearing heard again is last heard at its newest occurrence.
+        fact("l", &newest_occurrence("s.last_hearing", "point")),
+        fact("r", "rh.point"),
         join("f", "first"),
         join("l", "last"),
         join("r", "recorded"),
@@ -1488,12 +1558,124 @@ mod tests {
                 .query_map(rusqlite::params_from_iter(unbound), |row| row.get(3))?
                 .collect::<Result<_, _>>()?;
             println!("{}", plan.join("\n"));
-            assert!(plan.iter().all(|step| !step.contains("SCAN")), "{plan:#?}");
+            // A hearing's occurrences are sought by its row, then read in turn: no table is
+            // scanned.
+            let scans = |step: &&String| step.contains("SCAN") && !step.contains("(subquery-");
+            assert!(!plan.iter().any(|step| scans(&step)), "{plan:#?}");
             // The endings are read from after the last live hearing: the trailing run only.
             let mut endings = plan.iter().filter(|step| step.starts_with("SEARCH x "));
             assert!(endings.all(|step| step.contains("point>?")), "{plan:#?}");
             assert!(!sql.contains("_events"), "{sql}");
         }
+        Ok(())
+    }
+
+    /// A graph of a class with no key whose node k1 one source wrote as v1, then v2, then v1
+    /// again, each in its own commit a few milliseconds apart; with the events each wrote.
+    fn returned(
+        path: &std::path::Path,
+    ) -> Result<(crate::Graph, Vec<crate::Event>), Box<dyn std::error::Error>> {
+        let mut g = open(path, Some(&crate::TEST_KEY))?;
+        g.declare(&Declaration::Class(Class::new("note", ["text"])))?;
+        let mut written = Vec::new();
+        for text in ["v1", "v2", "v1"] {
+            let when = ValidTime::On(Date::day(2026, 10, 1));
+            let events = g.write(&Write::new("crawler").unit(Unit::new(
+                "note",
+                "k1",
+                [("text", text)],
+                when,
+            )))?;
+            assert_eq!(events.len(), 1, "{text} wrote its event");
+            written.extend(events);
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        Ok((g, written))
+    }
+
+    fn text(version: Option<crate::Version>) -> Option<crate::Value> {
+        version.and_then(|v| v.properties.get("text").cloned())
+    }
+
+    #[test]
+    fn a_return_holds_from_its_own_point_and_v2_holds_between()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let (g, written) = returned(&dir.path().join("return.rannoch"))?;
+        let k1 = NodeRef::new("note", "k1");
+        let point =
+            |i: usize| UNIX_EPOCH + Duration::from_millis(written[i].id.millis().cast_unsigned());
+        let between = super::At::Time(point(2) - Duration::from_millis(1));
+        assert!(point(1) <= point(2) - Duration::from_millis(1));
+        assert_eq!(text(g.state_at(&k1, between)?), Some("v2".into()));
+        assert_eq!(
+            text(g.state_at(&k1, super::At::Time(point(2)))?),
+            Some("v1".into())
+        );
+        let seen = g.seen(&k1)?.ok_or("k1 was seen")?;
+        assert_eq!(
+            (seen.count, seen.first_heard.point, seen.last_heard.point),
+            (2, point(0), point(2))
+        );
+        assert_eq!(
+            seen.last_heard.event, written[0].id,
+            "named by its hearing's event"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rewriting_the_current_version_after_a_return_writes_no_event()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let (mut g, written) = returned(&dir.path().join("rewrite.rannoch"))?;
+        let before = g.events().since(Cursor::START)?.len();
+        let again = g.write(&Write::new("crawler").unit(Unit::new(
+            "note",
+            "k1",
+            [("text", "v1")],
+            ValidTime::On(Date::day(2026, 10, 1)),
+        )))?;
+        assert_eq!(g.events().since(Cursor::START)?.len(), before);
+        let ids: Vec<_> = again.iter().map(|e| e.id).collect();
+        assert_eq!(ids, [written[0].id], "the held hearing's event is returned");
+        Ok(())
+    }
+
+    #[test]
+    fn a_store_whose_aliases_kept_no_point_points_them_at_their_event_ids()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("old-aliases.rannoch");
+        let written = {
+            let (g, written) = returned(&path)?;
+            // As a store written before aliases kept a point.
+            g.conn.execute_batch(
+                "CREATE TABLE old(identity BLOB NOT NULL, alias TEXT NOT NULL, \
+                 PRIMARY KEY(identity, alias)) WITHOUT ROWID; \
+                 INSERT INTO old SELECT identity, alias FROM _aliases; \
+                 DROP TABLE _aliases; ALTER TABLE old RENAME TO _aliases;",
+            )?;
+            written
+        };
+        let g = open(&path, Some(&crate::TEST_KEY))?;
+        let points: Vec<(String, Option<i64>)> = g
+            .conn
+            .prepare("SELECT alias, point FROM _aliases")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        assert_eq!(
+            points,
+            [(written[2].id.to_string(), Some(written[2].id.millis()))]
+        );
+        let indexed: bool = g.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_index_info('_aliases_at'))",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!(indexed);
+        let k1 = g.find("note", "k1")?.ok_or("k1 is in the graph")?;
+        assert_eq!(k1.properties.get("text"), Some(&"v1".into()));
         Ok(())
     }
 

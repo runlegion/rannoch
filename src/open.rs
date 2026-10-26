@@ -11,7 +11,7 @@ use rusqlite::{Connection, ToSql};
 use serde::{Deserialize, Serialize};
 
 use crate::events::{Events, OWN_TABLES};
-use crate::history::{HISTORY_TABLES, Key, see_all, take};
+use crate::history::{HISTORY_TABLES, Key, point_aliases, see_all, take};
 use crate::write::Error;
 
 /// A class: a kind of node, with its natural key, its properties and each one's value type,
@@ -404,6 +404,7 @@ pub(crate) fn open_file(path: impl AsRef<Path>) -> Result<Graph, Error> {
     // A store whose hearings were written before what is seen of them was kept.
     let unseen = table("_hearings")? && !table("_seen")?;
     conn.execute_batch(HISTORY_TABLES)?;
+    point_aliases(&mut conn)?;
     if unseen {
         see_all(&mut conn)?;
     }
