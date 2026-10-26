@@ -214,10 +214,7 @@ pub(crate) fn hear(
     } else {
         None
     };
-    let point = match of.time() {
-        Some(point) => point,
-        None => stamp.id.recorded()?,
-    };
+    let point = of.time().map_or_else(|| stamp.id.recorded(), Ok)?;
     tx.prepare_cached(
         "INSERT INTO _hearings(identity, entity, key, to_key, event, seq, source, valid, point, \
          integer, recorded, properties) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
@@ -460,7 +457,7 @@ pub(crate) fn alias(
             held.identity,
             event.to_string(),
             cursor.0,
-            point(held, event)?
+            held.time.map_or_else(|| event.recorded(), Ok)?
         ])?;
     }
     let alias = if renamed { held.event } else { event };
@@ -471,18 +468,12 @@ pub(crate) fn alias(
         .execute(params![
             held.identity,
             alias.to_string(),
-            point(held, alias)?
+            held.time.map_or_else(|| alias.recorded(), Ok)?
         ])?;
     if renamed || new == 1 {
         reseen(tx, held.identity)?;
     }
     Ok(renamed)
-}
-
-/// The point an occurrence of `held` as `event` is at: the hearing's own time, or else the
-/// record time of `event`.
-fn point(held: &Held, event: EventId) -> Result<i64, Error> {
-    held.time.map_or_else(|| event.recorded(), Ok)
 }
 
 /// An alias as a store holds it: the identity of the hearing it is an alias of, its event id
