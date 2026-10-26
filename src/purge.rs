@@ -54,7 +54,7 @@ impl Purge {
     /// records it: it names what it matched and holds none of it.
     pub(crate) fn matched(&self, key: &Key) -> Purge {
         let text = |text: &str| key.matched(text.as_bytes()).to_hex().to_string();
-        let node = |n: &NodeRef| NodeRef::new(text(&n.class), text(&n.key));
+        let node = |n: &NodeRef| matched_node(key, n);
         let target = |t: &Target| match t {
             Target::Node(n) => Target::Node(node(n)),
             Target::Link { relation, from, to } => Target::Link {
@@ -132,6 +132,24 @@ pub(crate) fn stand(
         "INSERT INTO _purge_rules(rule, kind, a, b, event) VALUES (?1, ?2, ?3, ?4, ?5)",
     )?
     .execute(params![rule, kind, a, b, event.to_string()])?;
+    Ok(())
+}
+
+/// Keeps a purge event's rules: `matched`, and each of the `parts` it removed with the whole,
+/// all as keyed match values.
+pub(crate) fn stand_purged(
+    tx: &Connection,
+    rule: &str,
+    (matched, parts): (&Purge, &[NodeRef]),
+    event: EventId,
+) -> Result<(), Error> {
+    stand(tx, rule, matched, event)?;
+    for part in parts {
+        let part = Purge::Entity {
+            target: Target::Node(part.clone()),
+        };
+        stand(tx, rule, &part, event)?;
+    }
     Ok(())
 }
 
@@ -358,7 +376,9 @@ pub(crate) fn stand_all(conn: &mut Connection, key: &Key) -> Result<(), Error> {
     events.extend(naming_key(&tx, "forgot")?);
     for stored in events.into_values() {
         match &stored.change {
-            Change::Purged { rule, purge, .. } => stand(&tx, rule, purge, stored.id)?,
+            Change::Purged {
+                rule, purge, parts, ..
+            } => stand_purged(&tx, rule, (purge, parts), stored.id)?,
             Change::Forgot { rule, nodes, .. } => {
                 for node in nodes {
                     let purge = Purge::Entity {
@@ -372,6 +392,12 @@ pub(crate) fn stand_all(conn: &mut Connection, key: &Key) -> Result<(), Error> {
     }
     tx.commit()?;
     Ok(())
+}
+
+/// `node` with its class and key as their keyed match values under `key`.
+fn matched_node(key: &Key, node: &NodeRef) -> NodeRef {
+    let text = |text: &str| key.matched(text.as_bytes()).to_hex().to_string();
+    NodeRef::new(text(&node.class), text(&node.key))
 }
 
 /// A node or a link as the hearings name it: its entity, its key and, for a link, its target's.
@@ -814,7 +840,13 @@ fn without(
 /// matched, the nodes and links that leave whole, what every event body holds of them, and each
 /// event id that then names nothing left; then puts back what is seen of every node and link it
 /// touched and their current state.
-fn purge_in(tx: &Connection, ontology: &Ontology, key: &Key, purge: &Purge) -> Result<(), Error> {
+/// Returns each node removed as a part of the whole `purge` names.
+fn purge_in(
+    tx: &Connection,
+    ontology: &Ontology,
+    key: &Key,
+    purge: &Purge,
+) -> Result<Vec<NodeRef>, Error> {
     let chosen = choose(tx, ontology, key, purge)?;
     // Every id each purged hearing goes by, with the identities that event's body loses, and the
     // events to read again: by place where the hearing names it, by id otherwise.
@@ -880,7 +912,18 @@ fn purge_in(tx: &Connection, ontology: &Ontology, key: &Key, purge: &Purge) -> R
             current(tx, ontology, key, of, &mut left)?;
         }
     }
-    rewrite(tx, key, (&chosen, &left), &stripped, (places, by_id))
+    rewrite(tx, key, (&chosen, &left), &stripped, (places, by_id))?;
+    let whole = match purge {
+        Purge::Entity {
+            target: Target::Node(node),
+        } => Some(NodeRef::new(&ontology.class(&node.class)?.name, &node.key)),
+        _ => None,
+    };
+    Ok(chosen
+        .nodes
+        .into_iter()
+        .filter(|node| Some(node) != whole.as_ref())
+        .collect())
 }
 
 /// Rewrites each event body the purge reaches without what it removed: each event a purged
@@ -1026,17 +1069,19 @@ impl Graph {
         let key = self.key.clone().ok_or(Error::KeyMissing)?;
         let (event, snapshots) = secure(&mut self.conn, |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            purge_in(&tx, &Ontology::load(&tx)?, &key, &target)?;
+            let parts = purge_in(&tx, &Ontology::load(&tx)?, &key, &target)?;
             let matched = target.matched(&key);
+            let parts: Vec<NodeRef> = parts.iter().map(|part| matched_node(&key, part)).collect();
             let event = append(
                 &tx,
                 Change::Purged {
                     source: source.to_string(),
                     rule: rule.to_string(),
                     purge: matched.clone(),
+                    parts: parts.clone(),
                 },
             )?;
-            stand(&tx, rule, &matched, event.id)?;
+            stand_purged(&tx, rule, (&matched, &parts), event.id)?;
             let snapshots: Vec<String> = tx
                 .prepare_cached("SELECT path FROM _snapshots ORDER BY path")?
                 .query_map([], |row| row.get(0))?
@@ -1246,6 +1291,63 @@ mod tests {
             rebuilt.events().since(Cursor::START)?.len(),
             events.len() - 2
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_part_a_purge_removed_stays_purged_when_it_comes_back_and_after_a_rebuild()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let mut g = people(&dir.path().join("graph.rannoch"))?;
+        g.write(&Write::new("app").unit(bare("house", "h1")))?;
+        g.write(&Write::new("app").unit(bare("room", "r1").link(
+            "in_house",
+            "r1",
+            "h1",
+            ValidTime::Unknown,
+        )))?;
+        g.write(&Write::new("app").unit(bare("shelf", "s1").link(
+            "in_room",
+            "s1",
+            "r1",
+            ValidTime::Unknown,
+        )))?;
+        let event = g.purge(
+            Purge::Entity {
+                target: Target::Node(NodeRef::new("house", "h1")),
+            },
+            "h1-gone",
+            "app",
+        )?;
+        let Change::Purged { parts, .. } = &event.change else {
+            panic!("{event:?}");
+        };
+        assert_eq!(parts.len(), 2, "the room and the shelf, as match values");
+        let body = serde_json::to_string(&event.change)?;
+        assert!(
+            !body.contains("\"r1\"") && !body.contains("\"s1\""),
+            "{body}"
+        );
+
+        let back = |g: &mut crate::Graph| -> Result<(), Box<dyn std::error::Error>> {
+            let shelf = bare("shelf", "s1").link("in_room", "s1", "r1", ValidTime::Unknown);
+            assert_eq!(g.write(&Write::new("app").unit(shelf))?, vec![]);
+            assert_eq!(
+                g.write(&Write::new("app").unit(bare("room", "r1")))?,
+                vec![]
+            );
+            assert_eq!(g.find("shelf", "s1")?, None);
+            assert_eq!(g.find("room", "r1")?, None);
+            Ok(())
+        };
+        let events = g.events().since(Cursor::START)?;
+        back(&mut g)?;
+        let mut rebuilt = rebuild(
+            &events,
+            dir.path().join("rebuilt.rannoch"),
+            Some(&crate::TEST_KEY),
+        )?;
+        back(&mut rebuilt)?;
         Ok(())
     }
 

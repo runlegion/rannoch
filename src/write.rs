@@ -20,7 +20,9 @@ use crate::open::{
     CLASS, Class, Graph, HistoryKey, Ontology, RELATION, Relation, Value, ValueType, class_table,
     concat, property_column, relation_index, relation_table, schema_version,
 };
-use crate::purge::{Purge, Target, concluded_by, part_of_purged, purged, stand, standing};
+use crate::purge::{
+    Purge, Target, concluded_by, part_of_purged, purged, stand, stand_purged, standing,
+};
 use crate::read::NodeRef;
 
 /// The most changes one piece holds (a node is one change, a link is one); a unit larger than
@@ -1011,7 +1013,9 @@ pub(crate) fn replay(
             record_fate(tx, class, old, new)?;
         }
         // What a purge removed has already left every event before it; it stands as a rule.
-        Change::Purged { rule, purge, .. } => stand(tx, rule, purge, event.id)?,
+        Change::Purged {
+            rule, purge, parts, ..
+        } => stand_purged(tx, rule, (purge, parts), event.id)?,
         Change::Ended { .. } | Change::Corrected { .. } => conclude(tx, event.id, &event.change)?,
     }
     Ok(true)

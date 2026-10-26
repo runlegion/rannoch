@@ -123,11 +123,14 @@ pub enum Change {
         links: Vec<LinkFact>,
     },
     /// A purge under the app's own `rule`, from `source`: its kind, with each target as its
-    /// keyed match value under the graph's key, never as content.
+    /// keyed match value under the graph's key, never as content, and each node it removed as
+    /// part of a whole, as keyed match values too, so each part stands under the rule as well.
     Purged {
         source: String,
         rule: String,
         purge: Purge,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        parts: Vec<NodeRef>,
     },
     /// The node `old` of `class` was replaced by the node `new` of the same class.
     Replaced {
