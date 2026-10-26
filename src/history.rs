@@ -777,12 +777,12 @@ pub(crate) fn see(
 }
 
 /// Moves the history and links of the node `old` of `class` to the node `new`, which replaced
-/// it: its hearings, and every link it is an end of, with their hearings, conclusions, endings
-/// and derivations, keep what they are under the new key. A moved link that lands on a link
-/// already held becomes that link, holding both sets of hearings; of two conclusions the one
-/// later by point and then event id is kept. What is seen of each and their current state are read again from their
-/// hearings. The old node keeps its row and nothing else. Replacing and replaying a replacement
-/// both move through here.
+/// it: its hearings and derivations, and every link it is an end of, with the link's hearings,
+/// conclusion, endings and place in live state, are the new key's. A moved link that lands on a
+/// link already held becomes that link, holding both sets of hearings; of two conclusions the
+/// one later by point and then event id is kept. What is seen of each, and its current state,
+/// are read again from its hearings. The old node keeps its row and nothing else. Replacing,
+/// replaying a replacement and taking a first key all move through here.
 pub(crate) fn carry(
     tx: &Connection,
     ontology: &Ontology,

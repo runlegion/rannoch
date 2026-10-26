@@ -1035,9 +1035,9 @@ impl Graph {
     /// new key. The event and the replacement land together or not at all.
     ///
     /// # Errors
-    /// [`Error::KeyMissing`] when the graph holds no key; `class` is not declared; [`Error::Refused`] when `old` and `new` are the same key;
-    /// [`Error::NotFound`] when no node of `class` has key `old`, or key `new`; the graph file
-    /// cannot be written.
+    /// [`Error::KeyMissing`] when the graph holds no key; `class` is not declared;
+    /// [`Error::Refused`] when `old` and `new` are the same key; [`Error::NotFound`] when no node
+    /// of `class` has key `old`, or key `new`; the graph file cannot be written.
     pub fn replace(&mut self, class: &str, old: &str, new: &str) -> Result<Event, Error> {
         let key = self.key.as_ref().ok_or(Error::KeyMissing)?;
         let tx = self
