@@ -10,7 +10,10 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::open::{Graph, Ontology, Value, class_table, open, relation_table, schema_version};
+use crate::history::{Key, unhear};
+use crate::open::{
+    Graph, Ontology, Value, class_table, open_keyed, relation_table, schema_version,
+};
 use crate::read::NodeRef;
 use crate::write::{Declaration, Error, ValidTime, now_millis, replay};
 
@@ -43,17 +46,35 @@ pub(crate) const OWN_TABLES: &str = "
 /// so a stored cursor names the same place in the rebuilt graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct Cursor(i64);
+pub struct Cursor(pub(crate) i64);
 
 impl Cursor {
     /// Before the first event.
     pub const START: Cursor = Cursor(0);
 }
 
-/// An event's own id (`UUIDv7`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// An event's own id (`UUIDv7`), minted when the event is written and never derived from its
+/// content. Ids order as they were minted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct EventId(Uuid);
+
+impl EventId {
+    pub(crate) fn now() -> EventId {
+        EventId(Uuid::now_v7())
+    }
+
+    /// The millisecond the id was minted at: when the store that minted it recorded its event.
+    pub(crate) fn millis(self) -> i64 {
+        self.0.get_timestamp().map_or(0, |at| {
+            let (seconds, nanos) = at.to_unix();
+            i64::try_from(seconds)
+                .unwrap_or(i64::MAX)
+                .saturating_mul(1_000)
+                .saturating_add(i64::from(nanos / 1_000_000))
+        })
+    }
+}
 
 impl fmt::Display for EventId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -82,6 +103,10 @@ pub enum Change {
         added: Vec<Fact>,
         #[serde(default)]
         wrong_kind: Vec<WrongKind>,
+        /// The check value of the content-identity key the writing store held, so a rebuild
+        /// under another key is refused. Events written before keys hold none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        check: Option<String>,
     },
     /// An open link whose missing end arrived: it now holds in its relation.
     Closed(LinkFact),
@@ -129,6 +154,12 @@ pub struct NodeFact {
     pub key: String,
     pub properties: BTreeMap<String, Value>,
     pub valid: ValidTime,
+    /// The time its writer supplied, in milliseconds since the Unix epoch (UTC).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time: Option<i64>,
+    /// The integer key its writer supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integer: Option<i64>,
     /// The events the node was derived from.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub derived_from: Vec<EventId>,
@@ -151,12 +182,39 @@ pub(crate) struct Stored {
 
 /// Appends one event inside the caller's transaction, so it lands only if that transaction does.
 pub(crate) fn append(tx: &Connection, change: Change) -> Result<Event, Error> {
-    store(tx, EventId(Uuid::now_v7()), None, change)
+    store(tx, EventId::now(), None, change)
+}
+
+/// The place the next event appended to the log takes.
+pub(crate) fn next_cursor(tx: &Connection) -> Result<Cursor, Error> {
+    Ok(Cursor(
+        tx.prepare_cached(
+            "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = '_events'), 0) + 1",
+        )?
+        .query_row([], |row| row.get(0))?,
+    ))
+}
+
+/// The event at `cursor`, if the log holds one there.
+pub(crate) fn event_at(conn: &Connection, cursor: Cursor) -> Result<Option<Event>, Error> {
+    let body: Option<String> = conn
+        .prepare_cached("SELECT body FROM _events WHERE seq = ?1")?
+        .query_row(params![cursor.0], |row| row.get(0))
+        .optional()?;
+    body.map(|body| {
+        let stored: Stored = serde_json::from_str(&body)?;
+        Ok(Event {
+            id: stored.id,
+            cursor,
+            change: stored.change,
+        })
+    })
+    .transpose()
 }
 
 /// Appends one event under the id it already has, inside the caller's transaction: at `place`
 /// when it has one, otherwise at the end of the log.
-fn store(
+pub(crate) fn store(
     tx: &Connection,
     id: EventId,
     place: Option<Cursor>,
@@ -310,16 +368,24 @@ impl Events<'_> {
     }
 }
 
-/// Rebuilds a graph file at `empty_path` from `events` alone, replaying them in order: its
-/// ontology from the declaration events, and its nodes, links and open links from the rest.
-/// Each event lands in the new file under its own id and at its own place in the log. The
-/// events land together or not at all.
+/// Rebuilds a graph file at `empty_path` from `events` alone, under the graph's content-identity
+/// `key`, replaying them in order: its ontology from the declaration events, and its nodes, links,
+/// open links and hearings from the rest. Each event lands in the new file under its own id and
+/// at its own place in the log, except one whose every fact is identical to a hearing already
+/// replayed, whose id is held as an alias of it. The events land together or not at all.
 ///
 /// # Errors
-/// [`Error::Refused`] naming the event when an event carries a property its class does not
-/// declare; the file cannot be opened as a graph file, or an event cannot be replayed into it.
-pub fn rebuild(events: &[Event], empty_path: impl AsRef<Path>) -> Result<Graph, Error> {
-    replay_into(open(empty_path)?, events, |_| true)
+/// [`Error::KeyMissing`] without a key; [`Error::KeyDiffers`] when an event was written under
+/// another key; [`Error::Refused`] naming the event when an event carries a property its class
+/// does not declare; the file cannot be opened as a graph file, or an event cannot be replayed
+/// into it.
+pub fn rebuild(
+    events: &[Event],
+    empty_path: impl AsRef<Path>,
+    key: Option<&[u8; 32]>,
+) -> Result<Graph, Error> {
+    let key = Key::new(key.ok_or(Error::KeyMissing)?);
+    replay_into(open_keyed(empty_path, &key)?, events, |_| true)
 }
 
 /// Replays `events` into `graph` in one transaction, storing each one `keep` holds for under its
@@ -329,13 +395,17 @@ fn replay_into(
     events: &[Event],
     keep: impl Fn(&Change) -> bool,
 ) -> Result<Graph, Error> {
+    let key = graph.key.clone().ok_or(Error::KeyMissing)?;
     let tx = graph
         .conn
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
     let mut ontology = Ontology::load(&tx)?;
     let recorded = now_millis();
     for event in events {
-        if let Change::Wrote { added, .. } = &event.change {
+        if let Change::Wrote { added, check, .. } = &event.change {
+            if check.as_ref().is_some_and(|check| *check != key.check) {
+                return Err(Error::KeyDiffers);
+            }
             for node in added.iter().filter_map(|fact| match fact {
                 Fact::Node(node) => Some(node),
                 _ => None,
@@ -353,11 +423,11 @@ fn replay_into(
                 }
             }
         }
-        replay(&tx, &ontology, recorded, &event.change)?;
+        let added = replay(&tx, &ontology, &key, recorded, event)?;
         if matches!(event.change, Change::Declared(_)) {
             ontology = Ontology::load(&tx)?;
         }
-        if keep(&event.change) {
+        if added && keep(&event.change) {
             store(&tx, event.id, Some(event.cursor), event.change.clone())?;
         }
     }
@@ -385,19 +455,27 @@ impl Snapshot {
     }
 
     /// Rebuilds a graph file at `empty_path` from the snapshot and `later`, the source's events
-    /// after the snapshot's cursor, replayed in order and kept in the new file's log. The
-    /// snapshot file is left as it was.
+    /// after the snapshot's cursor, replayed in order and kept in the new file's log, under the
+    /// graph's content-identity `key`. The snapshot file is left as it was.
     ///
     /// # Errors
-    /// [`Error::Refused`] when `empty_path` is not UTF-8; the snapshot cannot be copied, the
-    /// file cannot be opened as a graph file, or an event cannot be replayed into it.
-    pub fn rebuild(&self, later: &[Event], empty_path: impl AsRef<Path>) -> Result<Graph, Error> {
+    /// [`Error::KeyMissing`] without a key; [`Error::KeyDiffers`] when the snapshot or an event
+    /// was written under another key; [`Error::Refused`] when `empty_path` is not UTF-8; the
+    /// snapshot cannot be copied, the file cannot be opened as a graph file, or an event cannot
+    /// be replayed into it.
+    pub fn rebuild(
+        &self,
+        later: &[Event],
+        empty_path: impl AsRef<Path>,
+        key: Option<&[u8; 32]>,
+    ) -> Result<Graph, Error> {
+        let key = Key::new(key.ok_or(Error::KeyMissing)?);
         let empty_path = empty_path.as_ref();
         let target = empty_path.to_str().ok_or_else(|| {
             Error::Refused(format!("the path {} is not UTF-8", empty_path.display()))
         })?;
         Connection::open(&self.path)?.execute("VACUUM INTO ?1", params![target])?;
-        let graph = replay_into(open(empty_path)?, later, |_| true)?;
+        let graph = replay_into(open_keyed(empty_path, &key)?, later, |_| true)?;
         // A carried follower cursor past what the rebuilt graph holds is lowered to its
         // watermark, so the mark never claims an event the rebuilt graph has not read.
         let committed = graph.events().committed()?;
@@ -482,8 +560,9 @@ impl Graph {
     ) -> Result<Snapshot, Error> {
         let mut events = self.events().since(Cursor::START)?;
         events.retain(|event| event.cursor <= cursor);
+        let key = self.key.as_ref().ok_or(Error::KeyMissing)?;
         // A forget event holds no content and is where a forgotten node's fate is read from.
-        let snapshot = replay_into(open(&empty_path)?, &events, |change| {
+        let snapshot = replay_into(open_keyed(&empty_path, key)?, &events, |change| {
             matches!(change, Change::Forgot { .. })
         })?;
         // Registrations are state about readers, not events: the snapshot carries them. Their
@@ -556,6 +635,7 @@ pub(crate) fn remove(
     tx.prepare_cached(&format!("DELETE FROM {table} WHERE id = ?1"))?
         .execute(params![id])?;
     drop_derived(tx, &target.class, &target.key)?;
+    unhear(tx, target, &links)?;
     Ok(Some(links))
 }
 
@@ -670,7 +750,7 @@ mod tests {
     fn advancing_past_the_committed_watermark_is_refused_naming_both()
     -> Result<(), Box<dyn std::error::Error>> {
         let path = std::env::temp_dir().join(format!("rannoch-past-{}.db", uuid::Uuid::now_v7()));
-        let mut g = open(path)?;
+        let mut g = open(path, Some(&crate::TEST_KEY))?;
         g.declare(&Declaration::Class(Class::new("person", ["name"])))?;
         g.events().register("reader")?;
         let committed = g.events().committed()?;
@@ -693,7 +773,7 @@ mod tests {
         let temp = |name: &str| {
             std::env::temp_dir().join(format!("rannoch-{name}-{}.db", uuid::Uuid::now_v7()))
         };
-        let mut g = open(temp("followers"))?;
+        let mut g = open(temp("followers"), Some(&crate::TEST_KEY))?;
         assert_eq!(g.events().processed()?, None, "no follower, no mark");
         assert!(matches!(
             g.events().advance("typo", crate::Cursor::START),
@@ -708,14 +788,18 @@ mod tests {
         let snapshot = g.snapshot(at, temp("followers-snapshot"))?;
 
         // With every later event, the carried cursor names a place the rebuilt graph holds.
-        let full = snapshot.rebuild(&g.events().since(at)?, temp("followers-full"))?;
+        let full = snapshot.rebuild(
+            &g.events().since(at)?,
+            temp("followers-full"),
+            Some(&crate::TEST_KEY),
+        )?;
         assert_eq!(
             full.events().followers()?,
             vec![("reader".to_string(), last)]
         );
 
         // With none, it is lowered to the rebuilt graph's watermark.
-        let short = snapshot.rebuild(&[], temp("followers-short"))?;
+        let short = snapshot.rebuild(&[], temp("followers-short"), Some(&crate::TEST_KEY))?;
         let watermark = short.events().committed()?;
         assert!(watermark < last);
         assert_eq!(
@@ -728,6 +812,7 @@ mod tests {
         let rebuilt = crate::rebuild(
             &g.events().since(crate::Cursor::START)?,
             temp("followers-rebuilt"),
+            Some(&crate::TEST_KEY),
         )?;
         assert!(rebuilt.events().followers()?.is_empty());
         Ok(())
@@ -736,7 +821,7 @@ mod tests {
     #[test]
     fn a_forget_takes_the_nodes_open_links_with_it() -> Result<(), Box<dyn std::error::Error>> {
         let path = std::env::temp_dir().join(format!("rannoch-forget-{}.db", uuid::Uuid::now_v7()));
-        let mut g = open(path)?;
+        let mut g = open(path, Some(&crate::TEST_KEY))?;
         g.declare(&Declaration::Class(Class::new("person", ["name"])))?;
         g.declare(&Declaration::Class(Class::new("place", ["name"])))?;
         g.declare(&Declaration::Relation(Relation::new(
@@ -776,7 +861,7 @@ mod tests {
         let temp = |name: &str| {
             std::env::temp_dir().join(format!("rannoch-{name}-{}.db", uuid::Uuid::now_v7()))
         };
-        let mut g = open(temp("undeclared"))?;
+        let mut g = open(temp("undeclared"), Some(&crate::TEST_KEY))?;
         g.declare(&Declaration::Class(Class::new("person", ["name"])))?;
         g.write(&Write::new("tree").unit(Unit::new(
             "person",
@@ -794,7 +879,9 @@ mod tests {
         };
         node.properties.insert("age".to_string(), "40".into());
 
-        let Err(error) = crate::rebuild(&events, temp("undeclared-rebuilt")) else {
+        let Err(error) =
+            crate::rebuild(&events, temp("undeclared-rebuilt"), Some(&crate::TEST_KEY))
+        else {
             panic!("the rebuild dropped the undeclared property instead of failing");
         };
         let message = error.to_string();
@@ -809,7 +896,7 @@ mod tests {
     fn two_notes() -> Result<(crate::Graph, Vec<crate::Event>), Box<dyn std::error::Error>> {
         let path =
             std::env::temp_dir().join(format!("rannoch-derived-{}.db", uuid::Uuid::now_v7()));
-        let mut g = open(path)?;
+        let mut g = open(path, Some(&crate::TEST_KEY))?;
         g.declare(&Declaration::Class(Class::new("note", ["text"])))?;
         let mut sources = Vec::new();
         for key in ["n1", "n2"] {
@@ -827,14 +914,20 @@ mod tests {
     {
         let (mut g, sources) = two_notes()?;
         let (first, second) = (sources[0].id, sources[1].id);
-        g.write(&Write::new("app").unit(note("n3")).derived_from([first]))?;
+        let heard = g.write(&Write::new("app").unit(note("n3")).derived_from([first]))?;
         let events = g.write(&Write::new("app").unit(note("n3")).derived_from([second]))?;
         assert_eq!(events.len(), 1, "the new source is recorded as an event");
         let found = g.find("note", "n3")?.map(|n| n.derived_from);
         assert_eq!(found.map(|ids| ids.len()), Some(2));
         assert_eq!(g.derived(second)?, [NodeRef::new("note", "n3")]);
+        let before = g.events().committed()?;
         let again = g.write(&Write::new("app").unit(note("n3")).derived_from([second]))?;
-        assert!(again.is_empty(), "a source already recorded adds nothing");
+        assert_eq!(
+            g.events().committed()?,
+            before,
+            "a source already recorded adds nothing"
+        );
+        assert_eq!(again, heard, "it returns the event the hearing is named by");
         Ok(())
     }
 
@@ -848,6 +941,7 @@ mod tests {
         let rebuilt = crate::rebuild(
             &g.events().since(crate::Cursor::START)?,
             std::env::temp_dir().join(format!("rannoch-derived-{}.db", uuid::Uuid::now_v7())),
+            Some(&crate::TEST_KEY),
         )?;
         assert!(rebuilt.derived(source)?.is_empty());
         Ok(())

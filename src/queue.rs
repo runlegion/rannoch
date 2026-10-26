@@ -368,7 +368,7 @@ mod tests {
     fn a_batch_that_fails_whole_fails_every_ticket() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("graph.rannoch");
-        let mut g = open(&path)?;
+        let mut g = open(&path, Some(&crate::TEST_KEY))?;
         g.declare(&Declaration::Class(Class::new("item", ["v"])))?;
         rusqlite::Connection::open(&path)?.execute_batch(
             "CREATE TRIGGER bad_rolls_back BEFORE INSERT ON \"class:item\" \
@@ -442,7 +442,7 @@ mod tests {
 
     /// A graph with class `item` and a queue on it beating every [`Queue::INTERVAL`].
     fn beating(dir: &tempfile::TempDir) -> Result<Queue, Box<dyn std::error::Error>> {
-        let mut g = open(dir.path().join("graph.rannoch"))?;
+        let mut g = open(dir.path().join("graph.rannoch"), Some(&crate::TEST_KEY))?;
         g.declare(&Declaration::Class(Class::new("item", ["v"])))?;
         Ok(Queue::open(g, Queue::INTERVAL))
     }
@@ -507,7 +507,7 @@ mod tests {
         let (committed, failed) = queue.flush();
         assert_eq!(committed, Some(ticket));
         assert!(failed.is_empty(), "{failed:?}");
-        let g = open(dir.path().join("graph.rannoch"))?;
+        let g = open(dir.path().join("graph.rannoch"), Some(&crate::TEST_KEY))?;
         for key in ["i1", "i2"] {
             assert!(g.find("item", key)?.is_some(), "{key} is not committed");
         }
@@ -539,7 +539,7 @@ mod tests {
     /// A graph with class `item`, whose node `bad` fails at commit, and a queue on it.
     fn queue_failing_bad(dir: &tempfile::TempDir) -> Result<Queue, Box<dyn std::error::Error>> {
         let path = dir.path().join("graph.rannoch");
-        let mut g = open(&path)?;
+        let mut g = open(&path, Some(&crate::TEST_KEY))?;
         g.declare(&Declaration::Class(Class::new("item", ["v"])))?;
         rusqlite::Connection::open(&path)?.execute_batch(
             "CREATE TRIGGER bad_fails BEFORE INSERT ON \"class:item\" \
@@ -658,7 +658,7 @@ mod tests {
         }));
         assert!(unwound.is_err());
         assert!(
-            open(dir.path().join("graph.rannoch"))?
+            open(dir.path().join("graph.rannoch"), Some(&crate::TEST_KEY))?
                 .find("item", "i1")?
                 .is_some()
         );
@@ -668,7 +668,7 @@ mod tests {
     #[test]
     fn a_wrongly_typed_value_is_refused_when_queued() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
-        let mut g = open(dir.path().join("graph.rannoch"))?;
+        let mut g = open(dir.path().join("graph.rannoch"), Some(&crate::TEST_KEY))?;
         let mut class = Class::new("item", [] as [&str; 0]);
         class.properties.insert("v".to_string(), ValueType::Integer);
         g.declare(&Declaration::Class(class))?;
@@ -692,7 +692,7 @@ mod tests {
     fn with_source(
         path: &std::path::Path,
     ) -> Result<(crate::Graph, crate::Event), Box<dyn std::error::Error>> {
-        let mut g = open(path)?;
+        let mut g = open(path, Some(&crate::TEST_KEY))?;
         g.declare(&Declaration::Class(Class::new("item", ["v"])))?;
         let source = g.write(&item("i1"))?.remove(0);
         Ok((g, source))
@@ -707,7 +707,7 @@ mod tests {
         queue.write(item("i2").derived_from([source.id]))?;
         let (_, failed) = queue.flush();
         assert!(failed.is_empty(), "{failed:?}");
-        let reader = open(&path)?;
+        let reader = open(&path, Some(&crate::TEST_KEY))?;
         let found = reader.find("item", "i2")?.map(|n| n.derived_from);
         assert_eq!(found, Some(vec![source.id]));
         assert_eq!(
@@ -735,7 +735,11 @@ mod tests {
             ),
             "expected the write refused, got {failed:?}"
         );
-        assert!(open(&path)?.find("item", "i2")?.is_none());
+        assert!(
+            open(&path, Some(&crate::TEST_KEY))?
+                .find("item", "i2")?
+                .is_none()
+        );
         Ok(())
     }
 }

@@ -36,6 +36,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+/// The content-identity key the measurements open their graphs under.
+const KEY: [u8; 32] = *b"rannoch measurements' identity k";
+
 use rusqlite::{Connection, OpenFlags};
 use tempfile::TempDir;
 
@@ -106,7 +109,7 @@ impl Burst {
         let done = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&done);
         let handle = std::thread::spawn(move || {
-            let mut g = rannoch::open(path).unwrap();
+            let mut g = rannoch::open(path, Some(&KEY)).unwrap();
             g.write(&write).unwrap();
             flag.store(true, Ordering::SeqCst);
         });
@@ -203,7 +206,7 @@ fn load_legion(copy: &Path, graph: &Path) -> (usize, usize) {
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
-    let mut g = rannoch::open(graph).unwrap();
+    let mut g = rannoch::open(graph, Some(&KEY)).unwrap();
     for d in [
         Declaration::Class(Class::new("reflection", ["text"])),
         Declaration::Class(Class::new("repo", [] as [&str; 0])),
@@ -262,7 +265,7 @@ fn load_legion(copy: &Path, graph: &Path) -> (usize, usize) {
 /// A hook's lookup: a fresh connection, find by natural key, a 2-hop walk capped at 200.
 fn hook_lookup(graph: &Path) -> f64 {
     let start = Instant::now();
-    let g = rannoch::open(graph).unwrap();
+    let g = rannoch::open(graph, Some(&KEY)).unwrap();
     let root = g.find("repo", "legion").unwrap().expect("repo legion");
     let found = g
         .walk(
@@ -280,7 +283,7 @@ fn hook_lookup(graph: &Path) -> f64 {
 /// A hook's write: a fresh connection, one event plus its node in one transaction.
 fn hook_write(graph: &Path, i: usize) -> f64 {
     let start = Instant::now();
-    let mut g = rannoch::open(graph).unwrap();
+    let mut g = rannoch::open(graph, Some(&KEY)).unwrap();
     let events = g
         .write(&Write::new("hook").unit(Unit::new(
             "reflection",
@@ -425,7 +428,7 @@ fn t4(path: &Path) -> String {
     let histogram = histogram();
     let mut rng = fastrand::Rng::with_seed(4);
     let mut supported: HashMap<String, u64> = HashMap::new();
-    let mut g = rannoch::open(path).unwrap();
+    let mut g = rannoch::open(path, Some(&KEY)).unwrap();
     for d in [
         Declaration::Class(Class::new("voice", [] as [&str; 0])),
         Declaration::Class(Class::new("statement", ["place"])),
@@ -490,7 +493,7 @@ fn ident(name: &str) -> String {
 /// The baseline: every statement's voice and properties and every supports link, held in
 /// memory, read from the file with its own connection.
 fn baseline(path: &Path) {
-    let g = rannoch::open(path).unwrap();
+    let g = rannoch::open(path, Some(&KEY)).unwrap();
     let properties: Vec<String> = g.ontology().classes["statement"]
         .properties
         .keys()
@@ -646,12 +649,12 @@ fn nfr_013_014() {
         match step.as_str() {
             "baseline" => baseline(&file),
             "one" => {
-                let g = rannoch::open(&file).unwrap();
+                let g = rannoch::open(&file, Some(&KEY)).unwrap();
                 let tally = g.count(&count_one(&std::env::var(ROOT).unwrap())).unwrap();
                 println!("{tally:?}");
             }
             "all" => {
-                let g = rannoch::open(&file).unwrap();
+                let g = rannoch::open(&file, Some(&KEY)).unwrap();
                 println!("{} tallies", g.count(&count_all()).unwrap().len());
             }
             other => panic!("no step {other}"),

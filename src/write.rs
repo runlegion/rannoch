@@ -10,12 +10,13 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
 use crate::events::{
-    Change, Event, EventId, Fact, LinkFact, NodeFact, WrongKind, add_derived, append, holds,
-    keep_derived,
+    Change, Cursor, Event, EventId, Fact, LinkFact, NodeFact, WrongKind, add_derived, append,
+    event_at, holds, keep_derived, next_cursor, store,
 };
+use crate::history::{Held, Key, Of, alias, hear, millis};
 use crate::open::{
-    CLASS, Class, Graph, Ontology, RELATION, Relation, Value, ValueType, class_table, concat,
-    property_column, read_properties, relation_index, relation_table, schema_version,
+    CLASS, Class, Graph, HistoryKey, Ontology, RELATION, Relation, Value, ValueType, class_table,
+    concat, property_column, relation_index, relation_table, schema_version,
 };
 use crate::read::NodeRef;
 
@@ -43,6 +44,12 @@ pub enum Error {
     /// An event or an ontology entry could not be encoded or decoded.
     #[error("an event could not be encoded or decoded: {0}")]
     Encoding(#[from] serde_json::Error),
+    /// The graph was opened or rebuilt without its content-identity key.
+    #[error("the content-identity key is missing: the graph opens only under its key")]
+    KeyMissing,
+    /// The graph was opened or rebuilt under a content-identity key other than its own.
+    #[error("the content-identity key differs from the graph's")]
+    KeyDiffers,
 }
 
 /// A write that failed at a piece. The pieces before it landed, and these are their events, so
@@ -324,10 +331,26 @@ impl Unit {
                     .map(|(k, v)| (k.into(), v.into()))
                     .collect(),
                 valid,
+                time: None,
+                integer: None,
                 derived_from: Vec::new(),
             },
             links: Vec::new(),
         }
+    }
+
+    /// The time the node's write is at on the time axis, to millisecond precision: its point.
+    #[must_use]
+    pub fn at(mut self, time: SystemTime) -> Self {
+        self.node.time = Some(millis(time));
+        self
+    }
+
+    /// The integer key that orders the node's history in an integer-keyed class.
+    #[must_use]
+    pub fn integer(mut self, key: i64) -> Self {
+        self.node.integer = Some(key);
+        self
     }
 
     /// A link of `relation` from the node keyed `from` to the node keyed `to`, true from
@@ -418,11 +441,22 @@ pub(crate) fn node_id(tx: &Connection, class: &str, key: &str) -> Result<Option<
 }
 
 /// Checks `write` against what `ontology` declares, reading nothing from the store: each node's
-/// class is declared, it carries every property its class declares and no other, and each value
-/// is of its declared type.
+/// class is declared, it carries the key its class's history is ordered by, every property its
+/// class declares and no other, and each value is of its declared type.
 pub(crate) fn check_declared(ontology: &Ontology, write: &Write) -> Result<(), Error> {
     for node in write.units.iter().map(|u| &u.node) {
         let class = ontology.class(&node.class)?;
+        let missing = match class.history {
+            HistoryKey::Time if node.time.is_none() => Some("a time"),
+            HistoryKey::Integer if node.integer.is_none() => Some("an integer key"),
+            _ => None,
+        };
+        if let Some(missing) = missing {
+            return Err(Error::Refused(format!(
+                "class {} is ordered by {missing} the writer supplies; node {} carries none",
+                class.name, node.key
+            )));
+        }
         for (property, value) in &node.properties {
             let Some(of) = class.properties.get(property) else {
                 return Err(Error::Refused(format!(
@@ -514,97 +548,130 @@ fn check(conn: &Connection, ontology: &Ontology, write: &Write) -> Result<(), Er
     Ok(())
 }
 
-/// What a piece is writing: its transaction, source, recorded time and what it added so far.
+/// The event a piece writes or replays: its id, its place in the log, when its facts are
+/// recorded, and whether it arrived carrying its own id (a replay or a sync).
+struct Stamp {
+    id: EventId,
+    cursor: Cursor,
+    recorded: i64,
+    arrived: bool,
+}
+
+/// What a piece is writing: its transaction, source, event and what it added so far.
 struct Piece<'a> {
     tx: &'a Connection,
     ontology: &'a Ontology,
+    key: &'a Key,
     source: &'a str,
-    recorded: i64,
+    stamp: Stamp,
     added: Vec<Fact>,
     wrong_kind: Vec<WrongKind>,
     closed: Vec<LinkFact>,
+    /// The places of the events naming hearings identical to what a write heard again.
+    held: BTreeSet<Cursor>,
+    /// Whether an arriving event renamed a hearing it was identical to.
+    renamed: bool,
 }
 
 impl<'a> Piece<'a> {
-    fn new(tx: &'a Connection, ontology: &'a Ontology, source: &'a str, recorded: i64) -> Self {
+    fn new(
+        tx: &'a Connection,
+        ontology: &'a Ontology,
+        key: &'a Key,
+        source: &'a str,
+        stamp: Stamp,
+    ) -> Self {
         Piece {
             tx,
             ontology,
+            key,
             source,
-            recorded,
+            stamp,
             added: Vec::new(),
             wrong_kind: Vec::new(),
             closed: Vec::new(),
+            held: BTreeSet::new(),
+            renamed: false,
         }
     }
 
-    /// Writes a node, or a new version of it. Returns the node's id and whether it is new.
+    /// Hears `of`: `None` when it is a new hearing, else the identical hearing held.
+    fn hear(&self, of: &Of) -> Result<Option<Held>, Error> {
+        hear(
+            self.tx,
+            self.key,
+            self.stamp.id,
+            self.stamp.cursor,
+            self.source,
+            of,
+        )
+    }
+
+    /// Answers a hearing identical to what the piece heard: an event that arrived with its own
+    /// id, or one `written` for what else it adds, is held as an alias of it; otherwise the write
+    /// returns the event the hearing is named by.
+    fn held(&mut self, held: &Held, written: bool) -> Result<(), Error> {
+        if self.stamp.arrived || written {
+            self.renamed |= alias(self.tx, held, self.stamp.id, self.stamp.cursor)?;
+        } else {
+            self.held.insert(held.cursor);
+        }
+        Ok(())
+    }
+
+    /// Writes a node, or a new version of it. Returns the node's id and whether it is new. A
+    /// node identical to a hearing held is that hearing, and changes nothing but the sources it
+    /// names.
     fn node(&mut self, node: &NodeFact) -> Result<(i64, bool), Error> {
         let class = self.ontology.class(&node.class)?;
         let table = class_table(&class.name);
+        let have = node_id(self.tx, &class.name, &node.key)?;
+        if let Some(held) = self.hear(&Of::Node(node))? {
+            // Naming sources it did not name yet records them.
+            let derived = add_derived(self.tx, node)?;
+            if derived {
+                self.added.push(Fact::Node(node.clone()));
+            }
+            self.held(&held, derived)?;
+            let id = have.ok_or_else(|| Error::NotFound {
+                class: class.name.clone(),
+                key: node.key.clone(),
+            })?;
+            return Ok((id, false));
+        }
         let columns: Vec<String> = class
             .properties
             .keys()
             .map(|p| property_column(p))
             .collect();
-        let select = format!(
-            "SELECT id, source, valid{} FROM {table} WHERE key = ?1",
-            concat(&columns, |c| format!(", {c}"))
-        );
-        let have = self
-            .tx
-            .prepare_cached(&select)?
-            .query_row(params![node.key], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    ValidTime::from_sql(row.get(2)?),
-                    read_properties(class, row, 3)?,
-                ))
-            })
-            .optional()?;
         let valid = node.valid.to_sql();
         let values: Vec<Option<&Value>> = class
             .properties
             .keys()
             .map(|p| node.properties.get(p))
             .collect();
-        let (id, new) = match have {
-            Some((id, source, valid, properties))
-                if source == self.source
-                    && valid == node.valid
-                    && properties == node.properties =>
-            {
-                // The same node naming sources it did not name yet records them.
-                if add_derived(self.tx, node)? {
-                    self.added.push(Fact::Node(node.clone()));
-                }
-                return Ok((id, false));
-            }
-            Some((id, ..)) => {
-                let sets = concat(&columns, |c| format!(", {c} = ?"));
-                let update = format!(
-                    "UPDATE {table} SET source = ?, valid = ?, recorded = ?{sets} WHERE id = ?"
-                );
-                let mut args: Vec<&dyn rusqlite::ToSql> =
-                    vec![&self.source, &valid, &self.recorded];
-                args.extend(values.iter().map(|v| v as &dyn rusqlite::ToSql));
-                args.push(&id);
-                self.tx.prepare_cached(&update)?.execute(&args[..])?;
-                (id, false)
-            }
-            None => {
-                let insert = format!(
-                    "INSERT INTO {table}(key, source, valid, recorded{}) VALUES (?, ?, ?, ?{})",
-                    concat(&columns, |c| format!(", {c}")),
-                    ", ?".repeat(columns.len())
-                );
-                let mut args: Vec<&dyn rusqlite::ToSql> =
-                    vec![&node.key, &self.source, &valid, &self.recorded];
-                args.extend(values.iter().map(|v| v as &dyn rusqlite::ToSql));
-                self.tx.prepare_cached(&insert)?.execute(&args[..])?;
-                (self.tx.last_insert_rowid(), true)
-            }
+        let (id, new) = if let Some(id) = have {
+            let sets = concat(&columns, |c| format!(", {c} = ?"));
+            let update = format!(
+                "UPDATE {table} SET source = ?, valid = ?, recorded = ?{sets} WHERE id = ?"
+            );
+            let mut args: Vec<&dyn rusqlite::ToSql> =
+                vec![&self.source, &valid, &self.stamp.recorded];
+            args.extend(values.iter().map(|v| v as &dyn rusqlite::ToSql));
+            args.push(&id);
+            self.tx.prepare_cached(&update)?.execute(&args[..])?;
+            (id, false)
+        } else {
+            let insert = format!(
+                "INSERT INTO {table}(key, source, valid, recorded{}) VALUES (?, ?, ?, ?{})",
+                concat(&columns, |c| format!(", {c}")),
+                ", ?".repeat(columns.len())
+            );
+            let mut args: Vec<&dyn rusqlite::ToSql> =
+                vec![&node.key, &self.source, &valid, &self.stamp.recorded];
+            args.extend(values.iter().map(|v| v as &dyn rusqlite::ToSql));
+            self.tx.prepare_cached(&insert)?.execute(&args[..])?;
+            (self.tx.last_insert_rowid(), true)
         };
         keep_derived(self.tx, node)?;
         self.added.push(Fact::Node(node.clone()));
@@ -632,7 +699,7 @@ impl<'a> Piece<'a> {
             to,
             source,
             valid.to_sql(),
-            self.recorded
+            self.stamp.recorded
         ])?;
         Ok(changed > 0)
     }
@@ -648,13 +715,20 @@ impl<'a> Piece<'a> {
         };
         let from = node_id(self.tx, &relation.from, &link.from)?;
         let to = node_id(self.tx, &relation.to, &link.to)?;
-        if let (Some(from), Some(to)) = (from, to) {
-            if self.relate(&relation.name, from, to, self.source, &link.valid)? {
-                self.added.push(Fact::Link(fact));
-            }
-            return Ok(());
+        self.heard_link(fact, from.zip(to))
+    }
+
+    /// Hears a link. A new hearing goes into its relation when `ends` are both present, and
+    /// otherwise waits open; a link identical to a hearing held is that hearing.
+    fn heard_link(&mut self, fact: LinkFact, ends: Option<(i64, i64)>) -> Result<(), Error> {
+        if let Some(held) = self.hear(&Of::Link(&fact))? {
+            return self.held(&held, false);
         }
-        if self.open(&relation.name, &link.from, &link.to, &link.valid)? {
+        if let Some((from, to)) = ends {
+            self.relate(&fact.relation, from, to, self.source, &fact.valid)?;
+            self.added.push(Fact::Link(fact));
+        } else {
+            self.open(&fact.relation, &fact.from.key, &fact.to.key, &fact.valid)?;
             self.added.push(Fact::Opened(fact));
         }
         Ok(())
@@ -763,33 +837,41 @@ impl<'a> Piece<'a> {
 /// Applies one event's change to the state in `tx`, as it was applied when the event was
 /// written: a declaration builds what it needs, a write puts what it added, a closing moves its
 /// open link into its relation, a forget removes the node and its links, a replacement records
-/// the node's fate. Facts are stamped as recorded at `recorded`.
+/// the node's fate. Facts are stamped as recorded at `recorded`. Returns false when the event is
+/// a write whose every fact is identical to a hearing held, so it adds nothing and its id is
+/// held only as an alias.
 pub(crate) fn replay(
     tx: &Connection,
     ontology: &Ontology,
+    key: &Key,
     recorded: i64,
-    change: &Change,
-) -> Result<(), Error> {
-    match change {
+    event: &Event,
+) -> Result<bool, Error> {
+    let stamp = Stamp {
+        id: event.id,
+        cursor: event.cursor,
+        recorded,
+        arrived: true,
+    };
+    match &event.change {
         Change::Declared(declaration) => {
             build(tx, ontology, declaration)?;
         }
         Change::Wrote { source, added, .. } => {
-            let mut piece = Piece::new(tx, ontology, source, recorded);
+            let mut piece = Piece::new(tx, ontology, key, source, stamp);
             for fact in added {
                 match fact {
                     Fact::Node(node) => {
                         piece.node(node)?;
                     }
                     Fact::Link(link) => {
-                        let (from, to) = piece.ends(link)?;
-                        piece.relate(&link.relation, from, to, source, &link.valid)?;
+                        let ends = piece.ends(link)?;
+                        piece.heard_link(link.clone(), Some(ends))?;
                     }
-                    Fact::Opened(link) => {
-                        piece.open(&link.relation, &link.from.key, &link.to.key, &link.valid)?;
-                    }
+                    Fact::Opened(link) => piece.heard_link(link.clone(), None)?,
                 }
             }
+            return Ok(added.is_empty() || !piece.added.is_empty() || piece.renamed);
         }
         Change::Closed(link) => {
             let source: String = tx
@@ -799,7 +881,7 @@ pub(crate) fn replay(
                 .query_row(params![link.relation, link.from.key, link.to.key], |row| {
                     row.get(0)
                 })?;
-            let piece = Piece::new(tx, ontology, &source, recorded);
+            let piece = Piece::new(tx, ontology, key, &source, stamp);
             let (from, to) = piece.ends(link)?;
             piece.close(link, from, to, &source)?;
         }
@@ -812,7 +894,7 @@ pub(crate) fn replay(
             record_fate(tx, class, old, new)?;
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Records that the node `old` of `class` was replaced by the node `new`. Replacing and
@@ -899,14 +981,18 @@ impl Graph {
     }
 
     /// Writes whole units in pieces, each piece one transaction. Returns the events the pieces
-    /// wrote: per piece, one for what it added and one per open link it closed. A unit that adds
-    /// nothing new writes no event. A new node under the key an open link waits on, but of
-    /// another kind, leaves the link open and is reported as a [`WrongKind`] on its piece's
-    /// `Wrote` event, apart from what the piece added.
+    /// wrote: per piece, one for what it added and one per open link it closed. A unit identical
+    /// to a hearing the graph holds (its content and source, and the time and integer key its
+    /// writer supplied) writes no event; a write that writes no event returns the events those
+    /// hearings are named by.
+    /// A new node under the key an open link waits on, but of another kind, leaves the link open
+    /// and is reported as a [`WrongKind`] on its piece's `Wrote` event, apart from what the
+    /// piece added.
     ///
     /// # Errors
-    /// [`WriteError`] holding [`Error::Refused`] and no events when a unit's node lacks a
-    /// property its class declares, carries one it does not declare, or carries a value of
+    /// [`WriteError`] holding [`Error::Refused`] and no events when a unit's node lacks the
+    /// time or the integer key its class's history is ordered by, lacks a property its class
+    /// declares, carries one it does not declare, or carries a value of
     /// another type than declared, or a float that is NaN or an infinity; when a unit's or a
     /// link's valid time is not a real date (a month outside 1 to 12, or a day past its month's
     /// end); when it names as its source an event the graph does not hold; or when a link's
@@ -915,7 +1001,7 @@ impl Graph {
     /// [`WriteError`] when a piece fails: the pieces before it are kept, and the error holds
     /// their events.
     pub fn write(&mut self, write: &Write) -> Result<Vec<Event>, WriteError> {
-        let mut events = Vec::new();
+        let events = Vec::new();
         // The version is read before the load: a declaration landing between them leaves the
         // cached version behind the ontology, which costs the next read a reload and nothing more.
         match schema_version(&self.conn).and_then(|v| Ok((v, Ontology::load(&self.conn)?))) {
@@ -925,16 +1011,28 @@ impl Graph {
         if let Err(cause) = check(&self.conn, &self.ontology, write) {
             return Err(WriteError { events, cause });
         }
+        let mut put = Put {
+            wrote: events,
+            held: Vec::new(),
+        };
         for (i, piece) in pieces(&write.units).into_iter().enumerate() {
             if i > 0 {
                 std::thread::sleep(BETWEEN_PIECES);
             }
             match self.piece(&write.source, &write.derived_from, piece) {
-                Ok(written) => events.extend(written),
-                Err(cause) => return Err(WriteError { events, cause }),
+                Ok(piece) => {
+                    put.wrote.extend(piece.wrote);
+                    put.held.extend(piece.held);
+                }
+                Err(cause) => {
+                    return Err(WriteError {
+                        events: put.wrote,
+                        cause,
+                    });
+                }
             }
         }
-        Ok(events)
+        Ok(put.events())
     }
 
     fn piece(
@@ -942,11 +1040,12 @@ impl Graph {
         source: &str,
         derived_from: &[EventId],
         units: &[Unit],
-    ) -> Result<Vec<Event>, Error> {
+    ) -> Result<Put, Error> {
+        let key = self.key.as_ref().ok_or(Error::KeyMissing)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let events = put(&tx, &self.ontology, source, derived_from, units)?;
+        let events = put(&tx, &self.ontology, key, source, derived_from, units)?;
         tx.commit()?;
         Ok(events)
     }
@@ -962,6 +1061,7 @@ impl Graph {
         &mut self,
         writes: impl IntoIterator<Item = &'w Write>,
     ) -> Result<Vec<Result<Vec<Event>, Error>>, Error> {
+        let key = self.key.as_ref().ok_or(Error::KeyMissing)?;
         let mut tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -977,15 +1077,16 @@ impl Graph {
                     put(
                         &savepoint,
                         &ontology,
+                        key,
                         &write.source,
                         &write.derived_from,
                         &write.units,
                     )
                 });
             match result {
-                Ok(events) => {
+                Ok(put) => {
                     savepoint.commit()?;
-                    results.push(Ok(events));
+                    results.push(Ok(put.events()));
                 }
                 Err(cause) => {
                     drop(savepoint);
@@ -1034,17 +1135,44 @@ fn follows_failed(
     Ok(())
 }
 
+/// What [`put`] did: the events it wrote, and the events naming hearings identical to units it
+/// heard again.
+struct Put {
+    wrote: Vec<Event>,
+    held: Vec<Event>,
+}
+
+impl Put {
+    /// The events a write returns: those it wrote, or, when it wrote none, those it heard again.
+    fn events(self) -> Vec<Event> {
+        if self.wrote.is_empty() {
+            self.held
+        } else {
+            self.wrote
+        }
+    }
+}
+
 /// Writes whole `units` from `source`, each node derived from `derived_from`, inside `tx` and
 /// appends their events: one for what they added and one per open link they closed. The caller
 /// commits.
 fn put(
     tx: &Connection,
     ontology: &Ontology,
+    key: &Key,
     source: &str,
     derived_from: &[EventId],
     units: &[Unit],
-) -> Result<Vec<Event>, Error> {
-    let mut piece = Piece::new(tx, ontology, source, now_millis());
+) -> Result<Put, Error> {
+    let id = EventId::now();
+    let cursor = next_cursor(tx)?;
+    let stamp = Stamp {
+        id,
+        cursor,
+        recorded: id.millis(),
+        arrived: false,
+    };
+    let mut piece = Piece::new(tx, ontology, key, source, stamp);
     for unit in units {
         let node = NodeFact {
             derived_from: derived_from.to_vec(),
@@ -1062,23 +1190,30 @@ fn put(
         added,
         wrong_kind,
         closed,
+        held,
         ..
     } = piece;
     let mut events = Vec::new();
     if !added.is_empty() || !wrong_kind.is_empty() {
-        events.push(append(
-            tx,
-            Change::Wrote {
-                source: source.to_string(),
-                added,
-                wrong_kind,
-            },
-        )?);
+        let wrote = Change::Wrote {
+            source: source.to_string(),
+            added,
+            wrong_kind,
+            check: Some(key.check.clone()),
+        };
+        events.push(store(tx, id, Some(cursor), wrote)?);
     }
     for link in closed {
         events.push(append(tx, Change::Closed(link))?);
     }
-    Ok(events)
+    let mut heard = Vec::new();
+    for cursor in held {
+        heard.extend(event_at(tx, cursor)?);
+    }
+    Ok(Put {
+        wrote: events,
+        held: heard,
+    })
 }
 
 #[cfg(test)]
@@ -1092,7 +1227,7 @@ mod tests {
     fn items() -> Result<Graph, Box<dyn std::error::Error>> {
         let path =
             std::env::temp_dir().join(format!("rannoch-replace-{}.db", uuid::Uuid::now_v7()));
-        let mut g = open(path)?;
+        let mut g = open(path, Some(&crate::TEST_KEY))?;
         g.declare(&Declaration::Class(Class::new("item", ["name"])))?;
         let when = ValidTime::On(Date::day(2026, 1, 1));
         let unit = |key: &str| Unit::new("item", key, [("name", key)], when.clone());
@@ -1172,7 +1307,7 @@ mod tests {
 
     fn graph(name: &str) -> Result<Graph, Error> {
         let path = std::env::temp_dir().join(format!("rannoch-{name}-{}.db", uuid::Uuid::now_v7()));
-        let mut g = open(path)?;
+        let mut g = open(path, Some(&crate::TEST_KEY))?;
         g.declare(&Declaration::Class(Class::new("item", ["name"])))?;
         g.declare(&Declaration::Relation(Relation::new(
             "part", "item", "item", false,
@@ -1406,7 +1541,7 @@ mod tests {
         }
         let path =
             std::env::temp_dir().join(format!("rannoch-rebuilt-{}.db", uuid::Uuid::now_v7()));
-        let rebuilt = rebuild(&events, path)?;
+        let rebuilt = rebuild(&events, path, Some(&crate::TEST_KEY))?;
         assert_eq!(
             rebuilt.find("item", "a")?.map(|n| n.valid),
             Some(ValidTime::On(Date::month(2020, 13)))

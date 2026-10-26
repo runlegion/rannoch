@@ -43,6 +43,7 @@ One crate:
 - `write`: units, pieces, refusals; owns typed refusals.
 - `read`: walks, counts, describing a node in ontology terms, reading as of a valid time.
 - `events`: the log, cursors, replay, forgetting, snapshots; owns rannoch's own tables (events, the ontology, fates, open links, `_followers`).
+- `history`: hearings, each write's point on the time axis, content identity under the app's key, and aliases; owns `_hearings`, `_aliases` and the key's check value.
 - `refs`: references into other graph files.
 
 rannoch's own tables start with `_`; every other table is a class or a relation an app declared.

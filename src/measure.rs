@@ -116,7 +116,7 @@ fn build(shape: &Shape, path: &Path) -> String {
     let histogram = histogram();
     let mut rng = fastrand::Rng::with_seed(shape.seed);
     let mut backed: HashMap<String, u64> = HashMap::new();
-    let mut g = crate::open(path).unwrap();
+    let mut g = crate::open(path, Some(&crate::TEST_KEY)).unwrap();
     for d in [
         Declaration::Class(Class::new(&shape.speaker_class, [] as [&str; 0])),
         Declaration::Class(Class::new(&shape.utterance_class, [&shape.property])),
@@ -232,7 +232,7 @@ fn nfr_016() {
     let dir = TempDir::new().unwrap();
     let file = dir.path().join("t4.rannoch");
     let count = largest_count(&shape, &build(&shape, &file));
-    let reader = crate::open(&file).unwrap();
+    let reader = crate::open(&file, Some(&crate::TEST_KEY)).unwrap();
     reader.conn.busy_handler(Some(wait)).unwrap();
 
     let quiet: Vec<Read> = (0..20).map(|_| read(&reader, &count)).collect();
@@ -242,7 +242,7 @@ fn nfr_016() {
     let flag = Arc::clone(&done);
     let path = file.clone();
     let writer = std::thread::spawn(move || {
-        let mut g = crate::open(path).unwrap();
+        let mut g = crate::open(path, Some(&crate::TEST_KEY)).unwrap();
         g.write(&write).unwrap();
         flag.store(true, Ordering::SeqCst);
     });
