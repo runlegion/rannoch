@@ -1014,8 +1014,61 @@ fn rewrite(
         }
     }
     for id in removed {
+        underive(tx, &id)?;
         tx.prepare_cached("DELETE FROM _derived WHERE event = ?1")?
             .execute(params![id])?;
+    }
+    Ok(())
+}
+
+/// Drops the removed event `id` from the derived-from list of every node and link fact in the
+/// log that names it. `_derived` names each fact that lists `id`; that fact's hearings and their
+/// aliases name the events whose bodies carry it.
+fn underive(tx: &Connection, id: &str) -> Result<(), Error> {
+    let facts: Vec<(String, String, String)> = tx
+        .prepare_cached("SELECT class, key, to_key FROM _derived WHERE event = ?1")?
+        .query_map(params![id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<Result<_, _>>()?;
+    for (class, key, to_key) in facts {
+        let (entity, to) = if to_key.is_empty() {
+            (node_entity(&class), None)
+        } else {
+            (link_entity(&class), Some(to_key))
+        };
+        let bodies: Vec<(i64, String)> = tx
+            .prepare_cached(
+                "SELECT seq, body FROM _events WHERE id IN ( \
+                 SELECT event FROM _hearings WHERE entity = ?1 AND key = ?2 AND to_key IS ?3 \
+                 UNION SELECT a.alias FROM _aliases a JOIN _hearings h \
+                 ON h.identity = a.identity \
+                 WHERE h.entity = ?1 AND h.key = ?2 AND h.to_key IS ?3)",
+            )?
+            .query_map(params![entity, key, to], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .collect::<Result<_, _>>()?;
+        for (seq, body) in bodies {
+            let mut stored: Stored = serde_json::from_str(&body)?;
+            let Change::Wrote { added, .. } = &mut stored.change else {
+                continue;
+            };
+            let mut changed = false;
+            for fact in added {
+                let derived_from = match fact {
+                    Fact::Node(node) => &mut node.derived_from,
+                    Fact::Link(link) | Fact::Opened(link) => &mut link.derived_from,
+                };
+                let before = derived_from.len();
+                derived_from.retain(|event| event.to_string() != id);
+                changed |= derived_from.len() != before;
+            }
+            if changed {
+                tx.prepare_cached("UPDATE _events SET body = ?1 WHERE seq = ?2")?
+                    .execute(params![serde_json::to_string(&stored)?, seq])?;
+            }
+        }
     }
     Ok(())
 }
@@ -1509,6 +1562,65 @@ mod tests {
         );
         let wal = std::fs::read(format!("{}-wal", snapshot_path.display())).unwrap_or_default();
         assert!(!wal.windows(TOKEN.len()).any(|w| w == TOKEN));
+        Ok(())
+    }
+
+    #[test]
+    fn a_purged_event_leaves_no_copy_of_its_id_in_the_facts_derived_from_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("graph.rannoch");
+        let mut g = open(&path, Some(&crate::TEST_KEY))?;
+        g.declare(&Declaration::Class(Class::new("note", ["text"])))?;
+        g.declare(&Declaration::Relation(Relation::new(
+            "cites", "note", "note", false,
+        )))?;
+        let note = |key: &str| Unit::new("note", key, [("text", "words")], ValidTime::Unknown);
+        let source = g.write(&Write::new("app").unit(note("e")))?[0].id;
+        g.write(
+            &Write::new("app")
+                .unit(note("n2"))
+                .unit(note("n1").link("cites", "n1", "n2", ValidTime::Unknown))
+                .derived_from([source]),
+        )?;
+        let snapshot_path = dir.path().join("snapshot.rannoch");
+        g.snapshot(g.events().committed()?, &snapshot_path)?;
+        let target = Target::Node(NodeRef::new("note", "e"));
+        g.purge(Purge::Entity { target }, "retention", "app")?;
+
+        let id = source.to_string();
+        for file in [
+            path.clone(),
+            dir.path().join("graph.rannoch-wal"),
+            snapshot_path.clone(),
+            dir.path().join("snapshot.rannoch-wal"),
+        ] {
+            let bytes = std::fs::read(&file).unwrap_or_default();
+            assert!(
+                !bytes.windows(id.len()).any(|w| w == id.as_bytes()),
+                "{} still holds the purged event's id",
+                file.display()
+            );
+        }
+        for graph in [&g, &open(&snapshot_path, Some(&crate::TEST_KEY))?] {
+            let found = graph.find("note", "n1")?.ok_or("n1 was purged")?;
+            assert!(found.derived_from.is_empty());
+            let links: Vec<LinkFact> = graph
+                .events()
+                .since(Cursor::START)?
+                .into_iter()
+                .flat_map(|e| match e.change {
+                    Change::Wrote { added, .. } => added,
+                    _ => Vec::new(),
+                })
+                .filter_map(|fact| match fact {
+                    Fact::Link(link) => Some(link),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(links.len(), 1, "the link remains");
+            assert!(links[0].derived_from.is_empty());
+        }
         Ok(())
     }
 }
