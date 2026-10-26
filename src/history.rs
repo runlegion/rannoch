@@ -1681,6 +1681,63 @@ mod tests {
         Ok(())
     }
 
+    /// A graph that received note n1 from two other stores, under its own id and under one
+    /// minted later, larger first when `larger_first`, rebuilt again from its own events.
+    fn aliases_rebuilt(larger_first: bool) -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let mut g = open(dir.path().join("other.rannoch"), Some(&crate::TEST_KEY))?;
+        g.declare(&Declaration::Class(Class::new("note", ["text"])))?;
+        g.write(&Write::new("app").unit(Unit::new(
+            "note",
+            "n1",
+            [("text", "hello")],
+            ValidTime::Unknown,
+        )))?;
+        let mut events = g.events().since(Cursor::START)?;
+        let smaller = events[1].clone();
+        let mut larger = smaller.clone();
+        larger.id = crate::EventId::now();
+        let (mut first, mut second) = if larger_first {
+            (larger.clone(), smaller.clone())
+        } else {
+            (smaller.clone(), larger.clone())
+        };
+        first.cursor = Cursor(2);
+        second.cursor = Cursor(3);
+        events.truncate(1);
+        events.extend([first, second]);
+        let source = rebuild(
+            &events,
+            dir.path().join("source.rannoch"),
+            Some(&crate::TEST_KEY),
+        )?;
+        let n1 = NodeRef::new("note", "n1");
+        let held = source.hearings(&n1)?;
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert_eq!(held[0].event, smaller.id);
+        assert_eq!(held[0].aliases, [larger.id]);
+
+        let back = rebuild(
+            &source.events().since(Cursor::START)?,
+            dir.path().join("back.rannoch"),
+            Some(&crate::TEST_KEY),
+        )?;
+        assert_eq!(back.hearings(&n1)?, held);
+        Ok(())
+    }
+
+    #[test]
+    fn aliases_delivered_larger_first_survive_a_rebuild_from_events()
+    -> Result<(), Box<dyn std::error::Error>> {
+        aliases_rebuilt(true)
+    }
+
+    #[test]
+    fn aliases_delivered_smaller_first_survive_a_rebuild_from_events()
+    -> Result<(), Box<dyn std::error::Error>> {
+        aliases_rebuilt(false)
+    }
+
     #[test]
     fn an_ending_and_a_correction_rebuild_from_the_events() -> Result<(), Box<dyn std::error::Error>>
     {

@@ -404,7 +404,7 @@ impl Events<'_> {
 /// Rebuilds a graph file at `empty_path` from `events` alone, under the graph's content-identity
 /// `key`, replaying them in order: its ontology from the declaration events, and its nodes, links,
 /// open links and hearings from the rest. Each event lands in the new file under its own id and
-/// at its own place in the log, except one whose every fact is identical to a hearing already
+/// at its own place in the log, also one whose every fact is identical to a hearing already
 /// replayed, whose id is held as an alias of it. The events land together or not at all.
 ///
 /// # Errors
@@ -452,13 +452,11 @@ fn replay_into(mut graph: Graph, events: &[Event]) -> Result<Graph, Error> {
                 }
             }
         }
-        let added = replay(&tx, &ontology, &key, recorded, event)?;
+        replay(&tx, &ontology, &key, recorded, event)?;
         if matches!(event.change, Change::Declared(_)) {
             ontology = Ontology::load(&tx)?;
         }
-        if added {
-            store(&tx, event.id, Some(event.cursor), event.change.clone())?;
-        }
+        store(&tx, event.id, Some(event.cursor), event.change.clone())?;
     }
     tx.commit()?;
     graph.ontology = ontology;
