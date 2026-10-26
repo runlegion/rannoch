@@ -14,7 +14,7 @@ use rusqlite::{Connection, OptionalExtension, ToSql, TransactionBehavior, params
 use crate::events::{Change, Cursor, EventId, Events, Fact, LinkFact, NodeFact};
 use crate::open::{CLASS, Graph, HistoryKey, Ontology, RELATION, Value};
 use crate::read::NodeRef;
-use crate::write::{Error, Stamp, ValidTime};
+use crate::write::{Error, Heard, Piece, Stamp, ValidTime};
 
 /// The hearings, one version row each, with no valid-to: `arrived` counts up as this store
 /// records them, `integer` is set only in an integer-keyed class, and `properties` holds a
@@ -71,7 +71,7 @@ pub(crate) enum Of<'a> {
 
 impl Of<'_> {
     /// Its entity (a class or a relation), its key and, for a link, its target's key.
-    fn entity(&self) -> (String, &str, Option<&str>) {
+    pub(crate) fn entity(&self) -> (String, &str, Option<&str>) {
         match self {
             Of::Node(node) => (node_entity(&node.class), &node.key, None),
             Of::Link(link) => (
@@ -206,41 +206,13 @@ pub(crate) fn hear(
     Ok(None)
 }
 
-/// The newest version of what `of` is a hearing of, by its class's order: its identity, source,
-/// valid time, record time and properties.
-pub(crate) fn newest(tx: &Connection, of: &Of) -> Result<Option<Newest>, Error> {
-    let (entity, key, to) = of.entity();
-    Ok(tx
-        .prepare_cached(
-            "SELECT identity, source, valid, recorded, properties FROM _hearings \
-             WHERE entity = ?1 AND key = ?2 AND to_key IS ?3 \
-             ORDER BY integer DESC, point DESC, event DESC LIMIT 1",
-        )?
-        .query_row(params![entity, key, to], |row| {
-            Ok(Newest {
-                identity: row.get(0)?,
-                source: row.get(1)?,
-                valid: ValidTime::from_sql(row.get(2)?),
-                recorded: row.get(3)?,
-                properties: row.get(4)?,
-            })
-        })
-        .optional()?)
-}
-
-/// A node's or a link's newest version, as [`newest`] reads it.
-pub(crate) struct Newest {
-    pub(crate) identity: [u8; 32],
-    pub(crate) source: String,
-    pub(crate) valid: ValidTime,
-    pub(crate) recorded: i64,
-    properties: Option<String>,
-}
-
-impl Newest {
-    pub(crate) fn properties(&self) -> Result<BTreeMap<String, Value>, Error> {
-        decode(self.properties.as_deref())
-    }
+/// The current version of the node or link `of` (entity, key, target key): the newest by its
+/// class's order, as every read and write of current state chooses it.
+pub(crate) fn newest(
+    conn: &Connection,
+    of: (&str, &str, Option<&str>),
+) -> Result<Option<Versioned>, Error> {
+    version_row(conn, of, &format!("ORDER BY {}", order("DESC")), &[])
 }
 
 /// A version row's properties: a node's, or none for a link, whose row holds null.
@@ -397,14 +369,15 @@ pub(crate) fn take(conn: &mut Connection, key: &Key) -> Result<(), Error> {
             recorded: event.id.millis(),
             arrived: true,
         };
+        // Into the versions only, as a replay hears them: current state stays as it is.
+        let mut piece = Piece::new(&tx, &ontology, key, source, stamp);
         for fact in added {
             let of = match fact {
                 Fact::Node(node) => Of::Node(node),
                 Fact::Link(link) | Fact::Opened(link) => Of::Link(link),
             };
-            let identity = of.identity(key, source)?;
-            if let Some(held) = hear(&tx, identity, &stamp, source, &of, &ontology)? {
-                alias(&tx, &held, event.id, event.cursor)?;
+            if let Heard::Held(held) = piece.hear(&of)? {
+                piece.held(&held, false)?;
             }
         }
     }
@@ -421,7 +394,8 @@ pub(crate) fn millis(time: SystemTime) -> i64 {
     }
 }
 
-fn time(millis: i64) -> SystemTime {
+/// The time `millis` milliseconds from the Unix epoch: the inverse of [`millis`].
+pub(crate) fn time(millis: i64) -> SystemTime {
     let span = Duration::from_millis(millis.unsigned_abs());
     if millis < 0 {
         UNIX_EPOCH - span
@@ -614,20 +588,33 @@ pub struct Seen {
     pub first_true: ValidTime,
 }
 
+/// The order versions are chosen by, `DESC` putting the newest first: by integer key (only an
+/// integer-keyed class's rows hold one), then point, then event id.
+pub(crate) fn order(direction: &str) -> String {
+    format!("integer {direction}, point {direction}, event {direction}")
+}
+
 /// Picks the newest version row at or before the point `?4`, in a class not ordered by an
 /// integer key (and for a link, which is never ordered by one).
-const BY_POINT: &str =
-    "AND integer IS NULL AND point <= ?4 ORDER BY point DESC, event DESC LIMIT 1";
+fn by_point() -> String {
+    format!(
+        "AND integer IS NULL AND point <= ?4 ORDER BY {} LIMIT 1",
+        order("DESC")
+    )
+}
+
+/// One version row: the version, when this store recorded it and its content identity.
+pub(crate) type Versioned = (Version, i64, [u8; 32]);
 
 /// Reads one version row of `entity` keyed `key` (and `to`, for a link), as `tail` picks it,
-/// with `bound` bound from `?4` on: the version and when this store recorded it.
+/// with `bound` bound from `?4` on: see [`Versioned`].
 fn version_row(
     conn: &Connection,
     (entity, key, to): (&str, &str, Option<&str>),
     tail: &str,
     bound: &[&dyn ToSql],
-) -> Result<Option<(Version, i64)>, Error> {
-    /// A version row: event, source, valid time, point, integer key, properties, record time.
+) -> Result<Option<Versioned>, Error> {
+    /// A version row: event, source, valid, point, integer key, properties, recorded, identity.
     type Row = (
         String,
         String,
@@ -636,10 +623,11 @@ fn version_row(
         Option<i64>,
         Option<String>,
         i64,
+        [u8; 32],
     );
     let sql = format!(
-        "SELECT event, source, valid, point, integer, properties, recorded FROM _hearings \
-         WHERE entity = ?1 AND key = ?2 AND to_key IS ?3 {tail}"
+        "SELECT event, source, valid, point, integer, properties, recorded, identity \
+         FROM _hearings WHERE entity = ?1 AND key = ?2 AND to_key IS ?3 {tail}"
     );
     let mut statement = conn.prepare_cached(&sql)?;
     let read = |row: &rusqlite::Row| -> rusqlite::Result<Row> {
@@ -651,12 +639,13 @@ fn version_row(
             row.get(4)?,
             row.get(5)?,
             row.get(6)?,
+            row.get(7)?,
         ))
     };
     let mut all: Vec<&dyn ToSql> = vec![&entity, &key, &to];
     all.extend_from_slice(bound);
     let row = statement.query_row(all.as_slice(), read).optional()?;
-    let Some((event, source, valid, point, integer, properties, recorded)) = row else {
+    let Some((event, source, valid, point, integer, properties, recorded, identity)) = row else {
         return Ok(None);
     };
     let version = Version {
@@ -668,24 +657,24 @@ fn version_row(
         properties: decode(properties.as_deref())?,
         ended: false,
     };
-    Ok(Some((version, recorded)))
+    Ok(Some((version, recorded, identity)))
 }
 
 /// The version of the node keyed `key` in `class` that holds at `at` (a point, or an integer key
 /// when the class is ordered by one): the greatest by the class's order at or before it, ties
-/// going to the larger event id. At `i64::MAX` it is the node's current version.
-pub(crate) fn node_at(
+/// going to the larger event id.
+fn node_at(
     conn: &Connection,
     class: &crate::Class,
     key: &str,
     at: i64,
-) -> Result<Option<(Version, i64)>, Error> {
+) -> Result<Option<Versioned>, Error> {
     let tail = if class.history == HistoryKey::Integer {
-        "AND integer <= ?4 ORDER BY integer DESC, point DESC, event DESC LIMIT 1"
+        format!("AND integer <= ?4 ORDER BY {} LIMIT 1", order("DESC"))
     } else {
-        BY_POINT
+        by_point()
     };
-    version_row(conn, (&node_entity(&class.name), key, None), tail, &[&at])
+    version_row(conn, (&node_entity(&class.name), key, None), &tail, &[&at])
 }
 
 /// A valid time in `column` as `YYYY-MM-DD`: a month (7 characters) stands for its first day,
@@ -720,15 +709,15 @@ fn version_as_of(
     of: (&str, &str, Option<&str>),
     day: &str,
     known: Option<(&str, i64)>,
-) -> Result<Option<(Version, i64)>, Error> {
+) -> Result<Option<Versioned>, Error> {
     let valid = valid_day("valid");
-    let order = format!("ORDER BY {valid} DESC, integer DESC, point DESC, event DESC LIMIT 1");
+    let by = format!("ORDER BY {valid} DESC, {} LIMIT 1", order("DESC"));
     match known {
-        None => version_row(conn, of, &format!("AND {valid} <= ?4 {order}"), &[&day]),
+        None => version_row(conn, of, &format!("AND {valid} <= ?4 {by}"), &[&day]),
         Some((column, at)) => version_row(
             conn,
             of,
-            &format!("AND {valid} <= ?4 AND {column} <= ?5 {order}"),
+            &format!("AND {valid} <= ?4 AND {column} <= ?5 {by}"),
             &[&day, &at],
         ),
     }
@@ -742,7 +731,7 @@ pub(crate) fn node_as_of(
     key: &str,
     day: &str,
     known: Option<At>,
-) -> Result<Option<(Version, i64)>, Error> {
+) -> Result<Option<Versioned>, Error> {
     let known = known.map(|at| known_bound(Some(class), at)).transpose()?;
     version_as_of(conn, (&node_entity(&class.name), key, None), day, known)
 }
@@ -763,34 +752,56 @@ pub(crate) fn link_as_of(
 ) -> Result<Option<Version>, Error> {
     let known = known.map(|at| known_bound(None, at)).transpose()?;
     let entity = link_entity(relation);
-    let Some((mut version, _)) = version_as_of(conn, (&entity, from, Some(to)), day, known)? else {
+    let Some((mut version, ..)) = version_as_of(conn, (&entity, from, Some(to)), day, known)?
+    else {
         return Ok(None);
     };
-    let sql = format!(
-        "SELECT point, {} <= ?4 FROM _ends \
-         WHERE entity = ?1 AND key = ?2 AND to_key = ?3 AND point IS NOT NULL",
-        valid_day("valid")
-    );
-    let ending: Option<(i64, Option<bool>)> = conn
-        .prepare_cached(&sql)?
-        .query_row(params![entity, from, to, day], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })
-        .optional()?;
-    if let Some((point, ended)) = ending
-        && known.is_none_or(|(_, at)| point <= at)
-    {
-        version.ended = ended
-            .ok_or_else(|| unknown_ending(&format!("{relation} link from {from} to {to}"), day))?;
-    }
+    let known = known.map_or(i64::MAX, |(_, at)| at);
+    version.ended = ended(conn, relation, (from, to), known, Some(day))?;
     Ok(Some(version))
 }
 
-/// The refusal of a read as of `day` that would follow `link`, whose ending has an unknown
-/// valid time.
-pub(crate) fn unknown_ending(link: &str, day: &str) -> Error {
+/// The SQL deciding an ending, the `_ends` row `e`: that it is an ending (not a correction) heard
+/// by the point `known` when given, and that its valid time is on or before `day`, NULL unknown.
+pub(crate) fn ending_sql(e: &str, known: Option<&str>, day: &str) -> (String, String) {
+    let bound = known.map_or(String::new(), |known| format!(" AND {e}.point <= {known}"));
+    (
+        format!("{e}.point IS NOT NULL{bound}"),
+        format!("{} <= {day}", valid_day(&format!("{e}.valid"))),
+    )
+}
+
+/// Whether the link of `relation` from `from` to `to` had ended by the point `known` and, as of
+/// `day` when given, by then; refused as of `day` when its ending's valid time is unknown.
+fn ended(
+    conn: &Connection,
+    relation: &str,
+    (from, to): (&str, &str),
+    known: i64,
+    day: Option<&str>,
+) -> Result<bool, Error> {
+    let (heard, valid_by) = ending_sql("e", Some("?4"), "?5");
+    let sql = format!(
+        "SELECT ?5 IS NULL OR {valid_by} FROM _ends e \
+         WHERE e.entity = ?1 AND e.key = ?2 AND e.to_key = ?3 AND {heard}"
+    );
+    let ending: Option<Option<bool>> = conn
+        .prepare_cached(&sql)?
+        .query_row(
+            params![link_entity(relation), from, to, known, day],
+            |row| row.get(0),
+        )
+        .optional()?;
+    ending.map_or(Ok(false), |ended| {
+        ended.ok_or_else(|| unknown_ending(relation, (from, to), day.unwrap_or_default()))
+    })
+}
+
+/// The refusal of a read as of `day` that would follow the link of `relation` from `from` to
+/// `to`, whose ending has an unknown valid time.
+pub(crate) fn unknown_ending(relation: &str, (from, to): (&str, &str), day: &str) -> Error {
     Error::Refused(format!(
-        "the {link} ended, and its ending's valid time is unknown: \
+        "the {relation} link from {from} to {to} ended, and its ending's valid time is unknown: \
          a read as of {day} cannot say whether the link held"
     ))
 }
@@ -819,7 +830,7 @@ impl Graph {
     pub fn state_at(&self, node: &NodeRef, at: At) -> Result<Option<Version>, Error> {
         let ontology = self.current_ontology()?;
         let class = ontology.class(&node.class)?;
-        Ok(node_at(&self.conn, class, &node.key, axis(class, at)?)?.map(|(v, _)| v))
+        Ok(node_at(&self.conn, class, &node.key, axis(class, at)?)?.map(|(v, ..)| v))
     }
 
     /// The version of the link of `relation` from the node keyed `from` to the node keyed `to`
@@ -836,26 +847,15 @@ impl Graph {
         to: &str,
         at: At,
     ) -> Result<Option<Version>, Error> {
-        let At::Time(at) = at else {
-            return Err(Error::Refused(format!(
-                "a link of {relation} is read at a time, not at {at:?}"
-            )));
-        };
+        let (_, at) = known_bound(None, at)?;
         let relation = self.current_ontology()?.relation(relation)?.name.clone();
         let entity = link_entity(&relation);
-        let Some((mut version, _)) = version_row(
-            &self.conn,
-            (&entity, from, Some(to)),
-            BY_POINT,
-            &[&millis(at)],
-        )?
+        let Some((mut version, ..)) =
+            version_row(&self.conn, (&entity, from, Some(to)), &by_point(), &[&at])?
         else {
             return Ok(None);
         };
-        version.ended = matches!(
-            self.link_end(&relation, from, to)?,
-            Some(End::Ended { at: ended, .. }) if ended <= at
-        );
+        version.ended = ended(&self.conn, &relation, (from, to), at, None)?;
         Ok(Some(version))
     }
 
@@ -871,9 +871,9 @@ impl Graph {
         let entity = node_entity(&class.name);
         let of = (entity.as_str(), node.key.as_str(), None);
         let read = |tail: &str| version_row(&self.conn, of, tail, &[]);
-        let (Some((first_heard, _)), Some((last_heard, _)), Some((first_recorded, _))) = (
-            read("ORDER BY integer, point, event LIMIT 1")?,
-            read("ORDER BY integer DESC, point DESC, event DESC LIMIT 1")?,
+        let (Some((first_heard, ..)), Some((last_heard, ..)), Some((first_recorded, ..))) = (
+            read(&format!("ORDER BY {} LIMIT 1", order("ASC")))?,
+            newest(&self.conn, of)?,
             read(
                 "AND arrived = (SELECT min(arrived) FROM _hearings \
                  WHERE entity = ?1 AND key = ?2 AND to_key IS ?3)",
@@ -883,11 +883,11 @@ impl Graph {
         };
         let first_true = self
             .conn
-            .prepare_cached(
+            .prepare_cached(&format!(
                 "SELECT valid FROM _hearings WHERE entity = ?1 AND key = ?2 AND to_key IS NULL \
-                 AND valid IS NOT NULL \
-                 ORDER BY CASE WHEN length(valid) = 7 THEN valid || '-01' ELSE valid END LIMIT 1",
-            )?
+                 AND valid IS NOT NULL ORDER BY {} LIMIT 1",
+                valid_day("valid")
+            ))?
             .query_row(params![of.0, of.1], |row| row.get(0))
             .optional()?;
         Ok(Some(Seen {

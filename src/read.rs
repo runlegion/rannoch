@@ -1,7 +1,7 @@
 //! Reads: find a node or a link, describe a node, walk from a root, count exactly.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::events::EventId;
 use crate::history::{
-    At, Version, known_bound, link_as_of, link_entity, node_as_of, node_at, node_entity,
-    unknown_ending, valid_day,
+    At, Versioned, ending_sql, known_bound, link_as_of, link_entity, newest, node_as_of,
+    node_entity, order, time, unknown_ending, valid_day,
 };
 use crate::open::{
     Class, Graph, Ontology, Relation, Value, class_table, property_column, relation_table,
@@ -101,10 +101,6 @@ pub struct Walk {
     /// True when at least one more node within `hops` (and valid as of the date, for
     /// `walk_as_of`) would have been returned under a larger cap.
     pub capped: bool,
-}
-
-fn recorded(millis: i64) -> SystemTime {
-    UNIX_EPOCH + Duration::from_millis(u64::try_from(millis).unwrap_or(0))
 }
 
 /// One step of a count's path: a relation, read backwards when written `name<-`, and an
@@ -229,17 +225,18 @@ fn find_in(
     key: &str,
 ) -> Result<Option<Node>, Error> {
     let class = ontology.class(class)?;
-    node_in(conn, class, key, node_at(conn, class, key, i64::MAX)?)
+    let version = newest(conn, (&node_entity(&class.name), key, None))?;
+    node_in(conn, class, key, version)
 }
 
-/// The node keyed `key` in `class` as its `version`, recorded at `at`, holds it.
+/// The node keyed `key` in `class` as its `version` holds it.
 fn node_in(
     conn: &Connection,
     class: &Class,
     key: &str,
-    version: Option<(Version, i64)>,
+    version: Option<Versioned>,
 ) -> Result<Option<Node>, Error> {
-    let Some((version, at)) = version else {
+    let Some((version, recorded, _)) = version else {
         return Ok(None);
     };
     let events: Vec<String> = conn
@@ -252,7 +249,7 @@ fn node_in(
         properties: version.properties,
         source: version.source,
         valid: version.valid,
-        recorded: recorded(at),
+        recorded: time(recorded),
         derived_from: events
             .iter()
             .map(|event| serde_json::from_value(event.as_str().into()))
@@ -325,7 +322,7 @@ impl Graph {
                     to: NodeRef::new(&relation.to, to),
                     source: row.get(0)?,
                     valid: ValidTime::from_sql(row.get(1)?),
-                    recorded: recorded(row.get(2)?),
+                    recorded: time(row.get(2)?),
                 })
             })
             .optional()?)
@@ -572,7 +569,7 @@ impl Graph {
                                 }
                                 let class = ontology.class(there)?;
                                 match node_as_of(&tx, class, &key, day, *known)? {
-                                    Some((version, _)) => version.valid,
+                                    Some((version, ..)) => version.valid,
                                     None => continue,
                                 }
                             }
@@ -632,7 +629,9 @@ impl Graph {
         let mut last: Option<(String, i64)> = None;
         while let Some(row) = rows.next()? {
             if let Some(link) = row.get::<_, Option<String>>(4)? {
-                return Err(unknown_ending(&link, &as_of.unwrap_or_default()));
+                let (relation, from, to): (String, String, String) = serde_json::from_str(&link)?;
+                let day = as_of.unwrap_or_default();
+                return Err(unknown_ending(&relation, (&from, &to), &day));
             }
             let root: String = row.get(0)?;
             let end: i64 = row.get(1)?;
@@ -823,7 +822,7 @@ fn version_property(class: &Class, property: &str, known: Option<&str>) -> Strin
          ELSE coalesce(json_extract(v.properties, {integer}), json_extract(v.properties, {float}), \
          json_extract(v.properties, {decimal})) END FROM _hearings v WHERE v.entity = {entity} \
          AND v.key = g.key AND v.to_key IS NULL AND {valid}{bound} \
-         ORDER BY {day} DESC, v.integer DESC, v.point DESC, v.event DESC LIMIT 1)",
+         ORDER BY {day} DESC, {order} LIMIT 1)",
         at = path(""),
         integer = path(".integer"),
         float = path(".float"),
@@ -831,36 +830,31 @@ fn version_property(class: &Class, property: &str, known: Option<&str>) -> Strin
         entity = literal(&node_entity(&class.name)),
         valid = valid_by_sql("v.valid"),
         day = valid_day("v.valid"),
+        order = order("DESC"),
     )
 }
 
 /// As of a date (`?2`), the ending, aliased `e`, of the link of `relation` between the nodes
 /// `from` and `to`, if it ended (and was heard by `?3` on the column `known` names, when given):
-/// the join that reads it, the condition that an ending valid on or before the date is not
-/// followed, the condition that its valid time is unknown, and the link's name for the refusal.
-/// A correction is not an ending and joins nothing.
+/// the join that reads it, then, as [`ending_sql`] decides them, the condition that an ending
+/// valid on or before the date is not followed and that its valid time is unknown, and the
+/// link's relation and keys for the refusal. A correction is not an ending and joins nothing.
 fn ending(
     relation: &str,
     (from, to): (&String, &String),
     e: &str,
     known: Option<&str>,
 ) -> (String, String, String, String) {
-    let bound = known.map_or(String::new(), |column| format!(" AND {e}.{column} <= ?3"));
+    let (heard, valid_by) = ending_sql(e, known.map(|_| "?3"), "?2");
     (
         format!(
             "LEFT JOIN _ends {e} ON {e}.entity = {} AND {e}.key = {from}.key \
-             AND {e}.to_key = {to}.key AND {e}.point IS NOT NULL{bound}",
+             AND {e}.to_key = {to}.key AND {heard}",
             literal(&link_entity(relation))
         ),
-        format!(
-            "({e}.valid IS NULL OR NOT {})",
-            valid_by_sql(&format!("{e}.valid"))
-        ),
-        format!("{e}.event IS NOT NULL AND {e}.valid IS NULL"),
-        format!(
-            "{} || {from}.key || ' to ' || {to}.key",
-            literal(&format!("{relation} link from "))
-        ),
+        format!("NOT coalesce({valid_by}, 0)"),
+        format!("{e}.event IS NOT NULL AND {valid_by} IS NULL"),
+        format!("json_array({}, {from}.key, {to}.key)", literal(relation)),
     )
 }
 
