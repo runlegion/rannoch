@@ -20,7 +20,7 @@ use crate::open::{
     CLASS, Class, Graph, HistoryKey, Ontology, RELATION, Relation, Value, ValueType, class_table,
     concat, property_column, relation_index, relation_table, schema_version,
 };
-use crate::purge::{Purge, Target, purged, stand, standing};
+use crate::purge::{Purge, Target, concluded_by, part_of_purged, purged, stand, standing};
 use crate::read::NodeRef;
 
 /// The most changes one piece holds (a node is one change, a link is one); a unit larger than
@@ -619,6 +619,25 @@ impl<'a> Piece<'a> {
         Ok(self.standing && purged(self.tx, self.key, of, self.source)?)
     }
 
+    /// Whether `unit` arrives as part of a whole a standing purge rule purges everything about.
+    fn part_of_purged(&self, unit: &Unit) -> Result<bool, Error> {
+        if !self.standing {
+            return Ok(false);
+        }
+        let mut links = Vec::new();
+        for link in &unit.links {
+            let relation = self.ontology.relation(&link.relation)?;
+            links.push(LinkFact {
+                relation: relation.name.clone(),
+                from: NodeRef::new(&relation.from, &link.from),
+                to: NodeRef::new(&relation.to, &link.to),
+                valid: link.valid.clone(),
+            });
+        }
+        let node = NodeRef::new(&unit.node.class, &unit.node.key);
+        part_of_purged(self.tx, self.key, self.ontology, &node, &links)
+    }
+
     /// Hears `of`: the identical hearing held, or a new one, which current state takes only
     /// when it is now its node's or link's newest version.
     pub(crate) fn hear(&self, of: &Of) -> Result<Heard, Error> {
@@ -1089,8 +1108,9 @@ impl Graph {
     /// point reopens it, and a correction that arrives later masks its endings.
     ///
     /// # Errors
-    /// The relation is not declared; [`Error::Refused`] when the graph holds no hearing of the
-    /// link; the graph file cannot be written.
+    /// The relation is not declared; [`Error::Refused`] naming the rule when a standing purge
+    /// rule matches the link, and nothing is recorded; [`Error::Refused`] when the graph holds no
+    /// hearing of the link; the graph file cannot be written.
     pub fn end_link(
         &mut self,
         relation: &str,
@@ -1108,8 +1128,9 @@ impl Graph {
     /// ending. A later ending or correction of the link replaces it.
     ///
     /// # Errors
-    /// The relation is not declared; [`Error::Refused`] when the graph holds no hearing of the
-    /// link; the graph file cannot be written.
+    /// The relation is not declared; [`Error::Refused`] naming the rule when a standing purge
+    /// rule matches the link, and nothing is recorded; [`Error::Refused`] when the graph holds no
+    /// hearing of the link; the graph file cannot be written.
     pub fn correct_link(
         &mut self,
         relation: &str,
@@ -1136,16 +1157,25 @@ impl Graph {
         let ontology = Ontology::load(&tx)?;
         let declared = ontology.relation(relation)?;
         let name = declared.name.clone();
+        let ends = (
+            NodeRef::new(&declared.from, from),
+            NodeRef::new(&declared.to, to),
+        );
+        if let Some(key) = &self.key
+            && let Some(rule) = concluded_by(&tx, key, (&name, &ends.0, &ends.1), source)?
+        {
+            return Err(Error::Refused(format!(
+                "the purge rule {rule} matches the {name} link from {from} to {to}: nothing was \
+                 recorded"
+            )));
+        }
         if !link_heard(&tx, &name, from, to)? {
             return Err(Error::Refused(format!(
                 "no {name} link from {from} to {to} has been heard"
             )));
         }
         let (source, relation) = (source.to_string(), name);
-        let (from, to) = (
-            NodeRef::new(&declared.from, from),
-            NodeRef::new(&declared.to, to),
-        );
+        let (from, to) = ends;
         let change = match at {
             Some((at, valid)) => Change::Ended {
                 source,
@@ -1369,8 +1399,9 @@ fn put(
             derived_from: derived_from.to_vec(),
             ..unit.node.clone()
         };
-        // A unit a standing purge rule matches is kept as if it never came.
-        if piece.purged(&Of::Node(&node))? {
+        // A unit a standing purge rule matches, or that arrives as part of a whole one purges,
+        // is kept as if it never came.
+        if piece.purged(&Of::Node(&node))? || piece.part_of_purged(unit)? {
             continue;
         }
         let (_, new) = piece.node(&node)?;

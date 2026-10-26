@@ -142,77 +142,195 @@ pub(crate) fn standing(tx: &Connection) -> Result<bool, Error> {
         .query_row([], |row| row.get(0))?)
 }
 
+/// The standing rule (its rule and purge event) the first of `candidates`, purges whose targets
+/// are plain, matches; `None` when none does.
+fn rule_matching(
+    tx: &Connection,
+    key: &Key,
+    candidates: Vec<Purge>,
+) -> Result<Option<(String, String)>, Error> {
+    for candidate in candidates {
+        let (kind, a, b) = rule_of(&candidate.matched(key))?;
+        let found = tx
+            .prepare_cached(
+                "SELECT rule, event FROM _purge_rules WHERE kind = ?1 AND a = ?2 AND b = ?3 LIMIT 1",
+            )?
+            .query_row(params![kind, a, b], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()?;
+        if found.is_some() {
+            return Ok(found);
+        }
+    }
+    Ok(None)
+}
+
+/// The purges that match the link of `relation` from `from` to `to` from `source`: its write
+/// source, its hearing source, the link, the link from `source`, and everything about either end.
+fn link_candidates(relation: &str, from: &NodeRef, to: &NodeRef, source: &str) -> Vec<Purge> {
+    let link = Target::Link {
+        relation: relation.to_string(),
+        from: from.clone(),
+        to: to.clone(),
+    };
+    vec![
+        Purge::Stream {
+            source: source.to_string(),
+        },
+        Purge::Source {
+            source: source.to_string(),
+        },
+        Purge::Entity {
+            target: Target::Node(from.clone()),
+        },
+        Purge::Entity {
+            target: Target::Node(to.clone()),
+        },
+        Purge::EntityFromSource {
+            target: link.clone(),
+            source: source.to_string(),
+        },
+        Purge::Entity { target: link },
+    ]
+}
+
 /// Whether a standing rule matches the hearing `of`, written and heard from `source`: by its
 /// identity, its write source, its hearing source, its node or link, that from `source`, or, for
 /// a link, everything about either of its ends.
 pub(crate) fn purged(tx: &Connection, key: &Key, of: &Of, source: &str) -> Result<bool, Error> {
-    let identity = of.identity(key, source)?;
-    let source = source.to_string();
-    let mut candidates = vec![
-        Purge::Fact { identity },
-        Purge::Stream {
-            source: source.clone(),
-        },
-        Purge::Source {
-            source: source.clone(),
-        },
-    ];
-    let target = match of {
-        Of::Node(node) => Target::Node(NodeRef::new(&node.class, &node.key)),
-        Of::Link(link) => {
-            for end in [&link.from, &link.to] {
-                candidates.push(Purge::Entity {
-                    target: Target::Node(end.clone()),
-                });
-            }
-            Target::Link {
-                relation: link.relation.clone(),
-                from: link.from.clone(),
-                to: link.to.clone(),
-            }
+    let mut candidates = vec![Purge::Fact {
+        identity: of.identity(key, source)?,
+    }];
+    match of {
+        Of::Node(node) => {
+            let target = Target::Node(NodeRef::new(&node.class, &node.key));
+            candidates.extend([
+                Purge::Stream {
+                    source: source.to_string(),
+                },
+                Purge::Source {
+                    source: source.to_string(),
+                },
+                Purge::EntityFromSource {
+                    target: target.clone(),
+                    source: source.to_string(),
+                },
+                Purge::Entity { target },
+            ]);
         }
-    };
-    candidates.push(Purge::EntityFromSource {
-        target: target.clone(),
-        source,
-    });
-    candidates.push(Purge::Entity { target });
-    for candidate in candidates {
-        let (kind, a, b) = rule_of(&candidate.matched(key))?;
-        let found: bool = tx
-            .prepare_cached(
-                "SELECT EXISTS(SELECT 1 FROM _purge_rules WHERE kind = ?1 AND a = ?2 AND b = ?3)",
+        Of::Link(link) => {
+            candidates.extend(link_candidates(
+                &link.relation,
+                &link.from,
+                &link.to,
+                source,
+            ));
+        }
+    }
+    Ok(rule_matching(tx, key, candidates)?.is_some())
+}
+
+/// The rule that matches an ending or a correction of the link of `relation` from `from` to `to`
+/// from `source`, if a standing rule does.
+pub(crate) fn concluded_by(
+    tx: &Connection,
+    key: &Key,
+    (relation, from, to): (&str, &NodeRef, &NodeRef),
+    source: &str,
+) -> Result<Option<String>, Error> {
+    Ok(rule_matching(tx, key, link_candidates(relation, from, to, source))?.map(|(rule, _)| rule))
+}
+
+/// Whether `node` arrives as a part of a whole a standing rule purges everything about: one of
+/// `links` is a containment link from it to such a whole, or to a part of one that arrived
+/// before. It then stands as a part under that whole's rule, so its own parts follow it.
+pub(crate) fn part_of_purged<'l>(
+    tx: &Connection,
+    key: &Key,
+    ontology: &Ontology,
+    node: &NodeRef,
+    links: impl IntoIterator<Item = &'l LinkFact>,
+) -> Result<bool, Error> {
+    for link in links {
+        let contained = ontology
+            .relations
+            .get(&link.relation)
+            .is_some_and(|r| r.containment);
+        if !contained || link.from != *node {
+            continue;
+        }
+        let whole = Purge::Entity {
+            target: Target::Node(link.to.clone()),
+        };
+        if let Some((rule, event)) = rule_matching(tx, key, vec![whole])? {
+            let part = Purge::Entity {
+                target: Target::Node(node.clone()),
+            };
+            let (kind, a, b) = rule_of(&part.matched(key))?;
+            tx.prepare_cached(
+                "INSERT INTO _purge_rules(rule, kind, a, b, event) VALUES (?1, ?2, ?3, ?4, ?5)",
             )?
-            .query_row(params![kind, a, b], |row| row.get(0))?;
-        if found {
+            .execute(params![rule, kind, a, b, event])?;
             return Ok(true);
         }
     }
     Ok(false)
 }
 
-/// `change` as it is kept on arrival: a write without each hearing a standing rule matches, or
-/// `None` when nothing is left of it.
+/// `change` as it is kept on arrival: a write without each hearing a standing rule matches (a
+/// node arriving as part of a purged whole with it), or `None` when nothing is left of it, or
+/// when it is an ending or a correction a rule matches.
 pub(crate) fn arriving(
     tx: &Connection,
     key: &Key,
+    ontology: &Ontology,
     change: &Change,
 ) -> Result<Option<Change>, Error> {
-    let Change::Wrote {
-        source,
-        added,
-        wrong_kind,
-        check,
-    } = change
-    else {
-        return Ok(Some(change.clone()));
-    };
     if !standing(tx)? {
         return Ok(Some(change.clone()));
     }
+    let (source, added, wrong_kind, check) = match change {
+        Change::Wrote {
+            source,
+            added,
+            wrong_kind,
+            check,
+        } => (source, added, wrong_kind, check),
+        Change::Ended {
+            source,
+            relation,
+            from,
+            to,
+            ..
+        }
+        | Change::Corrected {
+            source,
+            relation,
+            from,
+            to,
+        } => {
+            let rule = concluded_by(tx, key, (relation, from, to), source)?;
+            return Ok(rule.is_none().then(|| change.clone()));
+        }
+        _ => return Ok(Some(change.clone())),
+    };
+    let links: Vec<&LinkFact> = added
+        .iter()
+        .filter_map(|fact| match fact {
+            Fact::Link(link) | Fact::Opened(link) => Some(link),
+            Fact::Node(_) => None,
+        })
+        .collect();
     let mut kept = Vec::new();
     for fact in added {
-        if !purged(tx, key, &Of::fact(fact), source)? {
+        let gone = purged(tx, key, &Of::fact(fact), source)?
+            || match fact {
+                Fact::Node(node) => {
+                    let node = NodeRef::new(&node.class, &node.key);
+                    part_of_purged(tx, key, ontology, &node, links.iter().copied())?
+                }
+                _ => false,
+            };
+        if !gone {
             kept.push(fact.clone());
         }
     }
@@ -227,6 +345,33 @@ pub(crate) fn arriving(
             check: check.clone(),
         }),
     )
+}
+
+/// Keeps a standing rule for each purge and each legacy forget in the log of a store that holds
+/// none, as one transaction: a store that purged before its rules were kept.
+pub(crate) fn stand_all(conn: &mut Connection, key: &Key) -> Result<(), Error> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if standing(&tx)? {
+        return Ok(());
+    }
+    let mut events: BTreeMap<i64, Stored> = naming_key(&tx, "purged")?.into_iter().collect();
+    events.extend(naming_key(&tx, "forgot")?);
+    for stored in events.into_values() {
+        match &stored.change {
+            Change::Purged { rule, purge, .. } => stand(&tx, rule, purge, stored.id)?,
+            Change::Forgot { rule, nodes, .. } => {
+                for node in nodes {
+                    let purge = Purge::Entity {
+                        target: Target::Node(node.clone()),
+                    };
+                    stand(&tx, rule, &purge.matched(key), stored.id)?;
+                }
+            }
+            _ => {}
+        }
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 /// A node or a link as the hearings name it: its entity, its key and, for a link, its target's.
@@ -924,7 +1069,214 @@ impl Graph {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Class, Declaration, Error, NodeRef, Purge, Target, Unit, ValidTime, Write, open};
+    use crate::{
+        Change, Class, Cursor, Declaration, Error, Event, EventId, Fact, LinkFact, NodeFact,
+        NodeRef, Purge, Relation, Target, Unit, ValidTime, Write, open, rebuild,
+    };
+
+    /// A graph of people who know people, and rooms part of houses and shelves part of rooms.
+    fn people(path: &std::path::Path) -> Result<crate::Graph, Error> {
+        let mut g = open(path, Some(&crate::TEST_KEY))?;
+        for d in [
+            Declaration::Class(Class::new("person", [] as [&str; 0])),
+            Declaration::Class(Class::new("house", [] as [&str; 0])),
+            Declaration::Class(Class::new("room", [] as [&str; 0])),
+            Declaration::Class(Class::new("shelf", [] as [&str; 0])),
+            Declaration::Relation(Relation::new("knows", "person", "person", false)),
+            Declaration::Relation(Relation::new("in_house", "room", "house", true)),
+            Declaration::Relation(Relation::new("in_room", "shelf", "room", true)),
+        ] {
+            g.declare(&d)?;
+        }
+        Ok(g)
+    }
+
+    fn bare(class: &str, key: &str) -> Unit {
+        Unit::new(class, key, [] as [(&str, &str); 0], ValidTime::Unknown)
+    }
+
+    /// `change` as the next event after `events`.
+    fn after(events: &[Event], change: Change) -> Event {
+        Event {
+            id: EventId::now(),
+            cursor: Cursor(events.last().map_or(0, |e| e.cursor.0) + 1),
+            change,
+        }
+    }
+
+    #[test]
+    fn an_ending_or_correction_a_rule_matches_is_refused_and_dropped_on_replay()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let mut g = people(&dir.path().join("graph.rannoch"))?;
+        let knows = |p: &str| bare("person", p).link("knows", p, "p2", ValidTime::Unknown);
+        g.write(&Write::new("a").unit(bare("person", "p2")).unit(knows("p1")))?;
+        g.write(&Write::new("b").unit(knows("p1")))?;
+        let link = Target::Link {
+            relation: "knows".into(),
+            from: NodeRef::new("person", "p1"),
+            to: NodeRef::new("person", "p2"),
+        };
+        g.purge(
+            Purge::EntityFromSource {
+                target: link,
+                source: "b".into(),
+            },
+            "b-forgets",
+            "app",
+        )?;
+        let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(9);
+        for refused in [
+            g.end_link("knows", "p1", "p2", at, ValidTime::Unknown, "b"),
+            g.correct_link("knows", "p1", "p2", "b"),
+        ] {
+            let Err(Error::Refused(why)) = refused else {
+                panic!("a conclusion a rule matches was recorded: {refused:?}");
+            };
+            assert!(
+                why.contains("b-forgets") && why.contains("nothing was recorded"),
+                "{why}"
+            );
+        }
+        assert_eq!(g.link_end("knows", "p1", "p2")?, None);
+        g.end_link("knows", "p1", "p2", at, ValidTime::Unknown, "a")?;
+
+        let mut events = g.events().since(Cursor::START)?;
+        let (from, to) = (NodeRef::new("person", "p1"), NodeRef::new("person", "p2"));
+        let ended = Change::Ended {
+            source: "b".into(),
+            relation: "knows".into(),
+            from: from.clone(),
+            to: to.clone(),
+            at: 10_000,
+            valid: ValidTime::Unknown,
+        };
+        events.push(after(&events, ended));
+        let corrected = Change::Corrected {
+            source: "b".into(),
+            relation: "knows".into(),
+            from,
+            to,
+        };
+        events.push(after(&events, corrected));
+        let rebuilt = rebuild(
+            &events,
+            dir.path().join("rebuilt.rannoch"),
+            Some(&crate::TEST_KEY),
+        )?;
+        assert_eq!(
+            rebuilt.events().since(Cursor::START)?.len(),
+            events.len() - 2,
+            "the matched ending and correction are not stored"
+        );
+        assert_eq!(
+            rebuilt.link_end("knows", "p1", "p2")?,
+            g.link_end("knows", "p1", "p2")?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_part_of_a_purged_whole_is_purged_on_arrival_at_any_depth()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let mut g = people(&dir.path().join("graph.rannoch"))?;
+        g.write(
+            &Write::new("app")
+                .unit(bare("house", "h1"))
+                .unit(bare("house", "h2")),
+        )?;
+        g.purge(
+            Purge::Entity {
+                target: Target::Node(NodeRef::new("house", "h1")),
+            },
+            "h1-gone",
+            "app",
+        )?;
+        let room = bare("room", "r1").link("in_house", "r1", "h1", ValidTime::Unknown);
+        let shelf = bare("shelf", "s1").link("in_room", "s1", "r1", ValidTime::Unknown);
+        assert_eq!(g.write(&Write::new("app").unit(room))?, vec![]);
+        assert_eq!(g.write(&Write::new("app").unit(shelf))?, vec![]);
+        let kept = bare("room", "r2").link("in_house", "r2", "h2", ValidTime::Unknown);
+        assert_eq!(g.write(&Write::new("app").unit(kept))?.len(), 1);
+        assert_eq!(g.find("room", "r1")?, None);
+        assert_eq!(g.find("shelf", "s1")?, None);
+        assert!(g.find("room", "r2")?.is_some());
+
+        // On replay, as on the write path.
+        let mut events = g.events().since(Cursor::START)?;
+        let unit = |class: &str, key: &str, relation: &str, whole: (&str, &str)| Change::Wrote {
+            source: "app".into(),
+            added: vec![
+                Fact::Node(NodeFact {
+                    class: class.into(),
+                    key: key.into(),
+                    properties: std::collections::BTreeMap::new(),
+                    valid: ValidTime::Unknown,
+                    time: None,
+                    integer: None,
+                    derived_from: Vec::new(),
+                }),
+                Fact::Opened(LinkFact {
+                    relation: relation.into(),
+                    from: NodeRef::new(class, key),
+                    to: NodeRef::new(whole.0, whole.1),
+                    valid: ValidTime::Unknown,
+                }),
+            ],
+            wrong_kind: Vec::new(),
+            check: None,
+        };
+        events.push(after(
+            &events,
+            unit("room", "r3", "in_house", ("house", "h1")),
+        ));
+        events.push(after(
+            &events,
+            unit("shelf", "s3", "in_room", ("room", "r3")),
+        ));
+        let rebuilt = rebuild(
+            &events,
+            dir.path().join("rebuilt.rannoch"),
+            Some(&crate::TEST_KEY),
+        )?;
+        assert_eq!(rebuilt.find("room", "r3")?, None);
+        assert_eq!(rebuilt.find("shelf", "s3")?, None);
+        assert_eq!(
+            rebuilt.events().since(Cursor::START)?.len(),
+            events.len() - 2
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_store_that_purged_before_rules_were_kept_takes_them_at_open()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("graph.rannoch");
+        {
+            let mut g = people(&path)?;
+            g.write(&Write::new("app").unit(bare("person", "p1")))?;
+            crate::events::forget_as_before(&mut g, &NodeRef::new("person", "p1"))?;
+            g.write(&Write::new("app").unit(bare("house", "h1")))?;
+            let target = Target::Node(NodeRef::new("house", "h1"));
+            g.purge(Purge::Entity { target }, "h1-gone", "app")?;
+            // As a store written before its rules were kept.
+            g.conn.execute_batch("DELETE FROM _purge_rules")?;
+        }
+        let mut g = open(&path, Some(&crate::TEST_KEY))?;
+        assert_eq!(
+            g.write(&Write::new("app").unit(bare("house", "h1")))?,
+            vec![]
+        );
+        assert_eq!(
+            g.write(&Write::new("app").unit(bare("person", "p1")))?,
+            vec![]
+        );
+        assert_eq!(g.find("house", "h1")?, None);
+        assert_eq!(g.find("person", "p1")?, None);
+        Ok(())
+    }
 
     const TOKEN: &[u8] = b"zq-reader-token";
 

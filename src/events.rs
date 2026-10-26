@@ -449,7 +449,7 @@ fn replay_into(mut graph: Graph, events: &[Event]) -> Result<Graph, Error> {
             }
         }
         // What a standing purge rule matches is kept as if it never came.
-        let Some(change) = arriving(&tx, &key, &event.change)? else {
+        let Some(change) = arriving(&tx, &key, &ontology, &event.change)? else {
             continue;
         };
         let event = Event {
