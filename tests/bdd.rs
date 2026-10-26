@@ -24,11 +24,14 @@ use rannoch::{
     Fate, Graph, GroupBy, Link, LinkFact, Node, NodeRef, OpenLink, PartOf, Relation, Snapshot,
     Step, Tally, Unit, ValidTime, Value, Write, WriteError,
 };
-use rannoch::{Failure, HistoryKey, NodeFact, Queue, Ticket, ValueType};
+use rannoch::{Failure, Hearing, HistoryKey, NodeFact, Queue, Ticket, ValueType};
 use rstest_bdd_macros::{given, scenarios, then, when};
 use tempfile::TempDir;
 
 const NONE: [(&str, &str); 0] = [];
+
+/// The content-identity key the scenarios open their graphs under.
+const KEY: [u8; 32] = *b"rannoch scenarios' identity key!";
 
 /// The piece size these fixtures are shaped to: rannoch's own.
 const PIECE_CHANGES: usize = 1_000;
@@ -545,6 +548,12 @@ struct World {
     derived: Vec<NodeRef>,
     follower: Option<std::process::Child>,
     followed: Followed,
+    graphs: Vec<Graph>,
+    restate: Option<Unit>,
+    first: Vec<Event>,
+    hearings: BTreeMap<String, Vec<Hearing>>,
+    refusals: Vec<Error>,
+    key: [u8; 32],
 }
 
 #[rstest::fixture]
@@ -593,6 +602,12 @@ fn world() -> World {
         derived: Vec::new(),
         follower: None,
         followed: Followed::default(),
+        graphs: Vec::new(),
+        restate: None,
+        first: Vec::new(),
+        hearings: BTreeMap::new(),
+        refusals: Vec::new(),
+        key: KEY,
     }
 }
 
@@ -603,7 +618,7 @@ impl World {
 
     /// Opens the graph file, keeping the handle.
     fn open(&mut self) -> &mut Graph {
-        self.graph = Some(rannoch::open(self.path()).unwrap());
+        self.graph = Some(rannoch::open(self.path(), Some(&KEY)).unwrap());
         self.g()
     }
 
@@ -1108,7 +1123,7 @@ fn listener_writing(world: &mut World) {
     let path = world.path();
     let done = Arc::clone(&world.burst_done);
     world.burst = Some(std::thread::spawn(move || {
-        let mut g = rannoch::open(path).unwrap();
+        let mut g = rannoch::open(path, Some(&KEY)).unwrap();
         g.write(&write).unwrap();
         done.store(true, Ordering::SeqCst);
     }));
@@ -1116,7 +1131,7 @@ fn listener_writing(world: &mut World) {
 
 #[when("a reader counts statements and their voices during the burst")]
 fn reader_counts(world: &mut World) {
-    let reader = rannoch::open(world.path()).unwrap();
+    let reader = rannoch::open(world.path(), Some(&KEY)).unwrap();
     let keys: Vec<String> = world
         .stream
         .as_ref()
@@ -1206,8 +1221,11 @@ fn v1_once(world: &mut World) {
 
 #[when("the app writes voice v1 again with the same properties, source and valid time")]
 fn writes_v1_same(world: &mut World) {
+    let held = world.all_events();
     world.write(&Write::new("swtor").unit(Unit::new("voice", "v1", NONE, day(2021, 3, 2))));
-    assert!(world.written.is_empty());
+    // It writes nothing, and returns the event the hearing it repeats is named by.
+    assert_eq!(world.written.len(), 1);
+    assert!(held.contains(&world.written[0]));
 }
 
 // ---------- write: replacing a node ----------
@@ -1662,7 +1680,7 @@ fn listener_writing_without_parents(world: &mut World) {
     let path = world.path();
     let done = Arc::clone(&world.burst_done);
     world.burst = Some(std::thread::spawn(move || {
-        let mut g = rannoch::open(path).unwrap();
+        let mut g = rannoch::open(path, Some(&KEY)).unwrap();
         g.write(&write).unwrap();
         done.store(true, Ordering::SeqCst);
     }));
@@ -1670,7 +1688,7 @@ fn listener_writing_without_parents(world: &mut World) {
 
 #[when("a reader walks answers links during the burst")]
 fn reader_walks_answers(world: &mut World) {
-    let reader = rannoch::open(world.path()).unwrap();
+    let reader = rannoch::open(world.path(), Some(&KEY)).unwrap();
     let stream = world.stream.as_ref().unwrap();
     // The replies whose parents never arrive, and every reply of the stream's first window.
     let replies: BTreeSet<String> = stream
@@ -2090,7 +2108,7 @@ fn rebuild_from_snapshot(world: &mut World) -> &mut Graph {
     let snapshot = world.snapshot.clone().expect("the app took a snapshot");
     let later = world.g().events().since(snapshot.cursor()).unwrap();
     let path = world.dir.path().join("rebuilt.rannoch");
-    world.rebuilt = Some(snapshot.rebuild(&later, path).unwrap());
+    world.rebuilt = Some(snapshot.rebuild(&later, path, Some(&KEY)).unwrap());
     world.rebuilt.as_mut().unwrap()
 }
 
@@ -2171,7 +2189,8 @@ fn fates_before_snapshot(world: &mut World) {
 )]
 fn fates_survive_snapshot(world: &mut World) {
     let rebuilt = world.dir.path().join("rebuilt.rannoch");
-    let mut referrer = rannoch::open(world.dir.path().join("referrer.rannoch")).unwrap();
+    let mut referrer =
+        rannoch::open(world.dir.path().join("referrer.rannoch"), Some(&KEY)).unwrap();
     referrer.mount("live", world.path()).unwrap();
     referrer.mount("rebuilt", rebuilt).unwrap();
     for (key, fate) in [
@@ -2358,7 +2377,7 @@ fn answer_names_node(world: &mut World) {
 
 #[when("the app writes a node derived from an event id the graph does not hold")]
 fn writes_from_foreign_event(world: &mut World) {
-    let mut other = rannoch::open(world.dir.path().join("other.rannoch")).unwrap();
+    let mut other = rannoch::open(world.dir.path().join("other.rannoch"), Some(&KEY)).unwrap();
     let foreign = other
         .declare(&Declaration::Class(Class::new(
             "elsewhere",
@@ -2766,8 +2785,8 @@ fn rebuilds(world: &mut World) {
     world.log = world.all_events();
     let path = world.dir.path().join("rebuilt.rannoch");
     assert!(!path.exists());
-    rannoch::rebuild(&world.log, &path).unwrap();
-    world.rebuilt = Some(rannoch::open(&path).unwrap());
+    rannoch::rebuild(&world.log, &path, Some(&KEY)).unwrap();
+    world.rebuilt = Some(rannoch::open(&path, Some(&KEY)).unwrap());
 }
 
 #[then("none of the 36 events fails to land")]
@@ -3062,7 +3081,7 @@ const REFERENCES: usize = 300;
 fn local_mounts_shared(world: &mut World) {
     let when = day(2026, 10, 13);
     let shared_path = world.dir.path().join("shared.rannoch");
-    let mut shared = rannoch::open(&shared_path).unwrap();
+    let mut shared = rannoch::open(&shared_path, Some(&KEY)).unwrap();
     shared
         .declare(&Declaration::Class(Class::new("statement", ["text"])))
         .unwrap();
@@ -3465,9 +3484,9 @@ fn declares_no_history(world: &mut World) {
     declare_class(world, Class::new("reading", ["value"]));
 }
 
-#[then("the graph's ontology names recording order as that class's history order")]
-fn history_is_recorded(world: &mut World) {
-    assert_eq!(history_after_reopen(world), HistoryKey::Recorded);
+#[then("the graph's ontology names the origin's record time as that class's history order")]
+fn history_is_origin(world: &mut World) {
+    assert_eq!(history_after_reopen(world), HistoryKey::Origin);
 }
 
 fn class_with(world: &mut World, of: ValueType) {
@@ -3565,8 +3584,20 @@ fn store_opened(world: &mut World) {
     world.open();
 }
 
+/// Asserts every node `keys` names has one hearing, named by an event the store holds, at a
+/// point after the epoch.
+fn hearings_read_back_points(world: &mut World, keys: &[(&str, &str)]) {
+    let held: BTreeSet<EventId> = world.all_events().iter().map(|e| e.id).collect();
+    for (class, key) in keys {
+        let hearings = world.g().hearings(&NodeRef::new(*class, *key)).unwrap();
+        assert_eq!(hearings.len(), 1, "{class} {key}: {hearings:?}");
+        assert!(held.contains(&hearings[0].event), "{class} {key}");
+        assert!(hearings[0].point > SystemTime::UNIX_EPOCH, "{class} {key}");
+    }
+}
+
 #[then(
-    "every event it held is still read, each of the class's properties reads as text and the class is ordered by recording order"
+    "every event it held is still read, each of the class's properties reads as text and each hearing reads back a point"
 )]
 fn store_011_whole(world: &mut World) {
     let events = world.all_events();
@@ -3584,7 +3615,7 @@ fn store_011_whole(world: &mut World) {
         .collect();
     assert_eq!(written.len(), 3);
     let book = world.g().ontology().classes["book"].clone();
-    assert_eq!(book.history, HistoryKey::Recorded);
+    assert_eq!(book.history, HistoryKey::Origin);
     assert!(book.properties.values().all(|of| *of == ValueType::Text));
     for (key, title) in [("b1", "Dune"), ("b2", "Emma"), ("b3", "Ubik")] {
         let node = world.find("book", key);
@@ -3596,6 +3627,7 @@ fn store_011_whole(world: &mut World) {
             .iter()
             .all(|n| n.properties.values().all(|v| matches!(v, Value::Text(_))))
     );
+    hearings_read_back_points(world, &[("book", "b1"), ("book", "b2"), ("book", "b3")]);
 }
 
 // ---------- write: refused when it breaks its class's declaration ----------
@@ -3893,7 +3925,7 @@ fn enqueue(world: &mut World, key: &str) {
 
 /// Whether another handle on the file reads node `item` `key`: it is committed.
 fn committed_elsewhere(world: &World, key: &str) -> bool {
-    rannoch::open(world.path())
+    rannoch::open(world.path(), Some(&KEY))
         .unwrap()
         .find("item", key)
         .unwrap()
@@ -3952,7 +3984,7 @@ fn graph_with_subscriber(world: &mut World) {
     let (path, heard) = (world.path(), Arc::clone(&world.heard));
     q(world).subscribe(move |cursor| {
         // What another handle reads up to the cursor the subscriber was given, as it is given.
-        let committed: Vec<Event> = rannoch::open(&path)
+        let committed: Vec<Event> = rannoch::open(&path, Some(&KEY))
             .unwrap()
             .events()
             .since(Cursor::START)
@@ -4074,7 +4106,7 @@ fn commits_while_reading(world: &mut World) {
     let (path, done) = (world.path(), Arc::clone(&world.burst_done));
     let last = format!("i{}", LARGE_BATCH - 1);
     let reader = std::thread::spawn(move || {
-        let reader = rannoch::open(path).unwrap();
+        let reader = rannoch::open(path, Some(&KEY)).unwrap();
         let (mut reads, mut partial, mut whole) = (0, 0, 0);
         loop {
             let finished = done.load(Ordering::SeqCst);
@@ -4131,7 +4163,7 @@ fn link_after_failing_node(world: &mut World) {
 #[then("the link is not in the graph")]
 fn link_not_in_graph(world: &mut World) {
     assert!(world.flushed >= world.tickets.last().copied());
-    let g = rannoch::open(world.path()).unwrap();
+    let g = rannoch::open(world.path(), Some(&KEY)).unwrap();
     assert!(g.find("item", "bad").unwrap().is_none());
     assert!(g.find_link("next", "bad", "i2").unwrap().is_none());
     assert!(g.open_links().unwrap().is_empty(), "the link was left open");
@@ -4248,7 +4280,7 @@ const PROCESS_KEYS: [&str; 3] = ["p1", "p2", "p3"];
 #[test]
 #[ignore = "run in its own process by the FR-RANNOCH-061 scenarios"]
 fn short_lived_process() {
-    let graph = rannoch::open(std::env::var(PROCESS_FILE).unwrap()).unwrap();
+    let graph = rannoch::open(std::env::var(PROCESS_FILE).unwrap(), Some(&KEY)).unwrap();
     let queue = Queue::open(graph, NEVER);
     for key in PROCESS_KEYS {
         let unit = Unit::new("item", key, [("v", key)], day(2026, 1, 1));
@@ -4362,7 +4394,7 @@ fn node_keys(event: &Event) -> Vec<String> {
 #[test]
 #[ignore = "run in its own process by the FR-RANNOCH-064 scenarios"]
 fn follower_process() {
-    let graph = rannoch::open(std::env::var(FOLLOW_FILE).unwrap()).unwrap();
+    let graph = rannoch::open(std::env::var(FOLLOW_FILE).unwrap(), Some(&KEY)).unwrap();
     let once = std::env::var(FOLLOW_MODE).unwrap() == "once";
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut cursor = Cursor::START;
@@ -4457,7 +4489,7 @@ fn writer_commits(world: &mut World) {
 #[then("the follower sees each committed event exactly once")]
 fn follower_sees_each_once(world: &mut World) {
     followed(world);
-    let committed: Vec<EventId> = rannoch::open(world.path())
+    let committed: Vec<EventId> = rannoch::open(world.path(), Some(&KEY))
         .unwrap()
         .events()
         .since(Cursor::START)
@@ -4492,7 +4524,7 @@ fn follower_sees_each_once(world: &mut World) {
 )]
 fn writer_with_uncommitted(world: &mut World) {
     queued(world, NEVER);
-    world.cursor = rannoch::open(world.path())
+    world.cursor = rannoch::open(world.path(), Some(&KEY))
         .unwrap()
         .events()
         .committed()
@@ -4514,6 +4546,580 @@ fn follower_sees_no_uncommitted(world: &mut World) {
     assert_eq!(world.followed.marks, vec![world.cursor]);
     let keys: Vec<&String> = world.followed.events.iter().flat_map(|(_, k)| k).collect();
     assert!(keys.is_empty(), "the follower saw {keys:?}");
+}
+
+// ---------- history: every write's point, and hearings by content (FR-RANNOCH-055, FR-RANNOCH-065) ----------
+
+/// A content-identity key other than the one the scenarios open their graphs under.
+const OTHER_KEY: [u8; 32] = *b"another app's identity key here!";
+
+/// A time a writer supplies: `minute` minutes after a fixed instant.
+fn at(minute: u64) -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000 + minute * 60)
+}
+
+/// Declares the class `kind` names, with one text property: `visit`, keyed by a time the writer
+/// supplies; `reading`, keyed by an integer the writer supplies; or `note`, with no key.
+fn declare_kind(g: &mut Graph, kind: &str) {
+    let (name, history) = match kind {
+        "time-keyed" => ("visit", HistoryKey::Time),
+        "integer-keyed" => ("reading", HistoryKey::Integer),
+        "keyless" => ("note", HistoryKey::Origin),
+        other => panic!("no class kind {other}"),
+    };
+    let mut class = Class::new(name, ["text"]);
+    class.history = history;
+    g.declare(&Declaration::Class(class)).unwrap();
+}
+
+/// The graph's one class.
+fn the_class(g: &Graph) -> Class {
+    let classes = &g.ontology().classes;
+    assert_eq!(classes.len(), 1, "{classes:?}");
+    classes.values().next().unwrap().clone()
+}
+
+/// A node of the graph's one class keyed `key` and carrying `text`, with the point or the
+/// integer key `n` where its class is keyed by one.
+fn unit_of(g: &Graph, key: &str, text: &str, n: u64) -> Unit {
+    let class = the_class(g);
+    let unit = Unit::new(class.name, key, [("text", text)], day(2026, 10, 1));
+    match class.history {
+        HistoryKey::Time => unit.at(at(n)),
+        HistoryKey::Integer => unit.integer(i64::try_from(n).unwrap()),
+        HistoryKey::Origin => unit,
+    }
+}
+
+/// Every hearing of each node of the graph's one class, by key.
+fn hearings_by_key(g: &Graph) -> BTreeMap<String, Vec<Hearing>> {
+    let class = the_class(g).name;
+    ["h0", "h1", "h2", "k1"]
+        .into_iter()
+        .map(|key| {
+            let hearings = g.hearings(&NodeRef::new(&class, key)).unwrap();
+            (key.to_string(), hearings)
+        })
+        .filter(|(_, hearings)| !hearings.is_empty())
+        .collect()
+}
+
+/// A graph of the class `kind` names, holding nodes h0, h1 and h2 each heard from two sources,
+/// a few milliseconds apart so their record times differ. Keeps every hearing as it reads now.
+fn hearings_of_kind(world: &mut World, kind: &str) {
+    declare_kind(world.open(), kind);
+    for (round, source) in [(0, "first"), (1, "second")] {
+        for (i, key) in ["h0", "h1", "h2"].into_iter().enumerate() {
+            let unit = unit_of(world.g(), key, source, round * 10 + i as u64);
+            world.g().write(&Write::new(source).unit(unit)).unwrap();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+    world.hearings = hearings_by_key(world.g());
+    assert_eq!(world.hearings.len(), 3);
+    assert!(world.hearings.values().all(|h| h.len() == 2));
+}
+
+#[given("a graph with hearings of a {kind} class")]
+fn graph_with_hearings(world: &mut World, kind: String) {
+    hearings_of_kind(world, &kind);
+}
+
+#[given("a graph with hearings of a {kind} class and a snapshot after them")]
+fn graph_with_hearings_and_snapshot(world: &mut World, kind: String) {
+    hearings_of_kind(world, &kind);
+    snapshot_at_end(world);
+}
+
+#[when("the graph is rebuilt from its events")]
+fn rebuilt_from_events(world: &mut World) {
+    let events = world.all_events();
+    let path = world.dir.path().join("rebuilt.rannoch");
+    world.rebuilt = Some(rannoch::rebuild(&events, path, Some(&KEY)).unwrap());
+}
+
+#[then("every hearing reads back the point it had before the rebuild")]
+#[then("every hearing reads back the same point in both graphs")]
+fn hearings_survive(world: &mut World) {
+    let rebuilt = world.rebuilt.as_ref().expect("the graph was rebuilt");
+    assert_eq!(hearings_by_key(rebuilt), world.hearings);
+}
+
+#[given(
+    "the events of a graph holding hearings of a class with no key, recorded at different times"
+)]
+fn keyless_events(world: &mut World) {
+    hearings_of_kind(world, "keyless");
+    let points: BTreeSet<SystemTime> = world.hearings.values().flatten().map(|h| h.point).collect();
+    assert_eq!(points.len(), 6, "each hearing was recorded at its own time");
+    world.log = world.all_events();
+}
+
+#[when("a new graph is given the same events in reverse order")]
+fn given_in_reverse(world: &mut World) {
+    let (declared, wrote): (Vec<Event>, Vec<Event>) = world
+        .log
+        .iter()
+        .cloned()
+        .partition(|e| matches!(e.change, Change::Declared(_)));
+    let events: Vec<Event> = declared
+        .into_iter()
+        .chain(wrote.into_iter().rev())
+        .collect();
+    let path = world.dir.path().join("reversed.rannoch");
+    world.rebuilt = Some(rannoch::rebuild(&events, path, Some(&KEY)).unwrap());
+}
+
+/// `tests/fixtures/store-0.2.0.rannoch` was written by rannoch at tag v0.2.0: class book (no
+/// history key) with title (text) and pages (integer), class reading keyed by an integer, class
+/// visit keyed by a time, relation of from reading to book; books b1 and b2, readings r1 and r2
+/// each linked to a book, visit v1; 7 events, none carrying a point.
+#[given("a store written by rannoch 0.2.0 with classes and hearings")]
+fn store_020(world: &mut World) {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/store-0.2.0.rannoch"
+    );
+    std::fs::copy(fixture, world.path()).unwrap();
+}
+
+#[then("every event it held is still read and each hearing reads back a point")]
+fn store_020_whole(world: &mut World) {
+    assert_eq!(world.all_events().len(), 7);
+    let nodes = [
+        ("book", "b1"),
+        ("book", "b2"),
+        ("reading", "r1"),
+        ("reading", "r2"),
+        ("visit", "v1"),
+    ];
+    hearings_read_back_points(world, &nodes);
+    for (from, to) in [("r1", "b1"), ("r2", "b2")] {
+        let hearings = world.g().link_hearings("of", from, to).unwrap();
+        assert_eq!(hearings.len(), 1, "{from} {to}: {hearings:?}");
+        assert!(hearings[0].point > SystemTime::UNIX_EPOCH);
+    }
+}
+
+#[given("a class declared with a time key the writer supplies")]
+#[given("a class whose history is ordered by a time the writer supplies")]
+fn time_keyed_class(world: &mut World) {
+    declare_kind(world.open(), "time-keyed");
+    world.mark_events();
+}
+
+#[given("a class declared with an integer key the writer supplies")]
+fn integer_keyed_class(world: &mut World) {
+    declare_kind(world.open(), "integer-keyed");
+    world.mark_events();
+}
+
+#[given("a class declared without a history key")]
+fn keyless_class(world: &mut World) {
+    declare_kind(world.open(), "keyless");
+}
+
+#[when("the app writes a node of that class without a time")]
+#[when("the app writes a node of that class without an integer key")]
+fn writes_without_its_key(world: &mut World) {
+    let class = the_class(world.g()).name;
+    write_refusing(
+        world,
+        Unit::new(class, "k1", [("text", "words")], day(2026, 10, 1)),
+    );
+}
+
+#[then("the write is refused when it is written, naming the class and the missing key")]
+fn refused_naming_key(world: &mut World) {
+    let class = the_class(world.g());
+    let missing = match class.history {
+        HistoryKey::Time => "a time",
+        HistoryKey::Integer => "an integer key",
+        HistoryKey::Origin => panic!("class {} is not keyed", class.name),
+    };
+    let error = world.write_error.as_ref().expect("the write was refused");
+    assert!(error.events.is_empty(), "{error:?}");
+    let Error::Refused(why) = &error.cause else {
+        panic!("expected a refusal, got {:?}", error.cause);
+    };
+    assert!(why.contains(&class.name) && why.contains(missing), "{why}");
+    assert_eq!(world.all_events().len(), world.events_before);
+}
+
+#[given("one hearing's content delivered twice, under event ids A and B, A the smaller")]
+fn delivered_twice(world: &mut World) {
+    let unit = unit_of(world.g(), "k1", "words", 1);
+    world.write(&Write::new("log").unit(unit));
+    let a = world.written[0].clone();
+    // B carries A's content under an id minted later, so larger, at its own place in the log.
+    let later = unit_of(world.g(), "k2", "words", 2);
+    world.write(&Write::new("log").unit(later));
+    let b = Event {
+        id: world.written[0].id,
+        cursor: world.written[0].cursor,
+        change: a.change.clone(),
+    };
+    assert!(a.id < b.id);
+    world.log = world
+        .all_events()
+        .into_iter()
+        .filter(|e| matches!(e.change, Change::Declared(_)))
+        .chain([a, b])
+        .collect();
+}
+
+#[when("a new graph is given A then B")]
+fn given_a_then_b(world: &mut World) {
+    let path = world.dir.path().join("given.rannoch");
+    world.rebuilt = Some(rannoch::rebuild(&world.log, path, Some(&KEY)).unwrap());
+}
+
+#[then("the node has one hearing, and B is held as an alias of it")]
+fn b_is_an_alias(world: &mut World) {
+    let (a, b) = (
+        world.log[world.log.len() - 2].id,
+        world.log[world.log.len() - 1].id,
+    );
+    let given = world
+        .rebuilt
+        .as_ref()
+        .expect("the new graph was given A and B");
+    let hearings = given.hearings(&NodeRef::new("visit", "k1")).unwrap();
+    assert_eq!(hearings.len(), 1, "{hearings:?}");
+    assert_eq!(hearings[0].event, a);
+    assert_eq!(hearings[0].aliases, vec![b]);
+}
+
+#[given("a node heard once from one source")]
+fn heard_once(world: &mut World) {
+    let unit = unit_of(world.g(), "k1", "words", 1);
+    world.write(&Write::new("crawler").unit(unit));
+    world.first = world.written.clone();
+    world.hearings = hearings_by_key(world.g());
+    world.mark_events();
+}
+
+#[when("the same source writes the node again later with the same valid time and properties")]
+fn writes_again_later(world: &mut World) {
+    std::thread::sleep(Duration::from_millis(5));
+    let unit = unit_of(world.g(), "k1", "words", 1);
+    world.write(&Write::new("crawler").unit(unit));
+}
+
+#[then(
+    "the number of events is unchanged, the node has one hearing at the point it had before, and the second write returns the first write's event id"
+)]
+fn rewrite_adds_nothing(world: &mut World) {
+    assert_eq!(world.all_events().len(), world.events_before);
+    assert_eq!(hearings_by_key(world.g()), world.hearings);
+    assert_eq!(world.hearings["k1"].len(), 1);
+    let ids = |events: &[Event]| events.iter().map(|e| e.id).collect::<Vec<_>>();
+    assert_eq!(ids(&world.written), ids(&world.first));
+}
+
+#[when(
+    "the app writes the node again from the same source at the same point with one property changed"
+)]
+fn writes_changed_account(world: &mut World) {
+    let unit = unit_of(world.g(), "k1", "other words", 1);
+    world.write(&Write::new("crawler").unit(unit));
+}
+
+#[then("the node has two hearings")]
+fn two_hearings(world: &mut World) {
+    let hearings = hearings_by_key(world.g()).remove("k1").unwrap();
+    assert_eq!(hearings.len(), 2, "{hearings:?}");
+}
+
+#[given("a node that has been heard from one source")]
+fn node_heard(world: &mut World) {
+    declare_kind(world.open(), "keyless");
+    let unit = unit_of(world.g(), "k1", "words", 0);
+    world.write(&Write::new("swtor").unit(unit.clone()));
+    world.restate = Some(unit);
+    world.found = Some(world.find("note", "k1"));
+}
+
+#[given("a link that has been heard from one source")]
+fn link_heard(world: &mut World) {
+    let g = world.open();
+    for d in t9b() {
+        g.declare(&d).unwrap();
+    }
+    let when = day(2021, 3, 2);
+    let statement = Unit::new("statement", "s1", [("text", "words")], when.clone()).link(
+        "said",
+        "v1",
+        "s1",
+        when.clone(),
+    );
+    let voice = Unit::new("voice", "v1", NONE, when);
+    world.write(&Write::new("swtor").unit(voice).unit(statement.clone()));
+    world.restate = Some(statement);
+}
+
+#[when("the app restates it from another source")]
+fn restates(world: &mut World) {
+    let unit = world.restate.clone().expect("a fact was heard");
+    world.write(&Write::new("reddit").unit(unit));
+}
+
+#[then("the graph holds one node for it")]
+fn one_node_for_it(world: &mut World) {
+    let tallies = world
+        .g()
+        .count(&Count {
+            class: "note".into(),
+            roots: vec!["k1".into()],
+            path: Vec::new(),
+            group_by: None,
+            as_of: None,
+        })
+        .unwrap();
+    assert_eq!(tallies.len(), 1);
+    assert_eq!(tallies[0].distinct, 1);
+    assert_eq!(hearings_by_key(world.g())["k1"].len(), 2);
+}
+
+#[then("the link has a hearing for each source it was heard from")]
+fn link_hearing_per_source(world: &mut World) {
+    let sources: BTreeSet<String> = world
+        .g()
+        .link_hearings("said", "v1", "s1")
+        .unwrap()
+        .into_iter()
+        .map(|h| h.source)
+        .collect();
+    assert_eq!(sources, BTreeSet::from(["reddit".into(), "swtor".into()]));
+}
+
+#[when("the app restates it from another source with other properties and a later valid time")]
+fn restates_otherwise(world: &mut World) {
+    let unit = Unit::new("note", "k1", [("text", "other words")], day(2026, 10, 20));
+    world.write(&Write::new("reddit").unit(unit));
+}
+
+#[then("the node's first recorded and first true are those of the first hearing")]
+fn first_recorded_and_true_kept(world: &mut World) {
+    let first = world.found.clone().expect("the node was heard");
+    let hearings = world.g().hearings(&NodeRef::new("note", "k1")).unwrap();
+    assert_eq!(hearings.len(), 2, "{hearings:?}");
+    assert_eq!(hearings[0].source, "swtor");
+    assert_eq!(hearings[0].point, first.recorded);
+    assert_eq!(hearings[0].valid, first.valid);
+    assert_eq!(world.find("note", "k1").valid, day(2026, 10, 20));
+}
+
+/// New graphs of the keyless class, one under each of `keys`.
+fn new_graphs(world: &World, keys: &[[u8; 32]]) -> Vec<Graph> {
+    keys.iter()
+        .enumerate()
+        .map(|(i, key)| {
+            let path = world.dir.path().join(format!("graph{i}.rannoch"));
+            let mut g = rannoch::open(path, Some(key)).unwrap();
+            declare_kind(&mut g, "keyless");
+            g
+        })
+        .collect()
+}
+
+#[given("two new graphs with the same ontology")]
+fn two_new_graphs(world: &mut World) {
+    world.graphs = new_graphs(world, &[KEY, KEY]);
+}
+
+#[given(
+    "three new graphs with the same ontology, two with one content-identity key and one with another key"
+)]
+fn three_new_graphs(world: &mut World) {
+    world.graphs = new_graphs(world, &[KEY, KEY, OTHER_KEY]);
+}
+
+#[when("the app writes the same hearing to each graph")]
+fn same_hearing_to_each(world: &mut World) {
+    for g in &mut world.graphs {
+        let unit = Unit::new("note", "k1", [("text", "words")], day(2026, 10, 1));
+        g.write(&Write::new("swtor").unit(unit)).unwrap();
+    }
+}
+
+/// The one hearing of note k1 in each graph.
+fn each_hearing(world: &World) -> Vec<Hearing> {
+    world
+        .graphs
+        .iter()
+        .map(|g| {
+            let mut hearings = g.hearings(&NodeRef::new("note", "k1")).unwrap();
+            assert_eq!(hearings.len(), 1, "{hearings:?}");
+            hearings.remove(0)
+        })
+        .collect()
+}
+
+#[then("each hearing's event id is a version 7 UUID and the two event ids differ")]
+fn ids_are_v7_and_differ(world: &mut World) {
+    let ids: Vec<String> = each_hearing(world)
+        .iter()
+        .map(|h| h.event.to_string())
+        .collect();
+    for id in &ids {
+        assert_eq!(id.as_bytes()[14], b'7', "{id} is not a version 7 UUID");
+    }
+    assert_ne!(ids[0], ids[1]);
+}
+
+#[then(
+    "the two graphs with the same key hold it under the same content identity and the graph with the other key holds it under a different one"
+)]
+fn identity_is_keyed(world: &mut World) {
+    let identities: Vec<[u8; 32]> = each_hearing(world).iter().map(|h| h.identity).collect();
+    assert_eq!(identities[0], identities[1]);
+    assert_ne!(identities[0], identities[2]);
+}
+
+#[given("a graph opened under a content-identity key the app supplies")]
+fn graph_under_app_key(world: &mut World) {
+    let mut rng = fastrand::Rng::new();
+    world.key = std::array::from_fn(|_| rng.u8(..));
+    let mut g = rannoch::open(world.path(), Some(&world.key)).unwrap();
+    declare_kind(&mut g, "keyless");
+    world.graph = Some(g);
+}
+
+#[when("the app writes hearings, takes a snapshot and closes the queue")]
+fn writes_snapshots_closes(world: &mut World) {
+    let graph = world.graph.take().expect("the graph is open");
+    let queue = Queue::open(graph, Duration::from_millis(5));
+    for k in 0..20 {
+        let unit = Unit::new(
+            "note",
+            format!("k{k}"),
+            [("text", "words")],
+            day(2026, 10, 1),
+        );
+        queue.write(Write::new("swtor").unit(unit)).unwrap();
+    }
+    assert!(queue.flush().1.is_empty());
+    let reader = rannoch::open(world.path(), Some(&world.key)).unwrap();
+    let cursor = reader.events().committed().unwrap();
+    reader
+        .snapshot(cursor, world.dir.path().join("snapshot.rannoch"))
+        .unwrap();
+    assert!(queue.close().is_empty());
+    // The reader stays open, so the write-ahead log is still on disk to be searched.
+    world.graph = Some(reader);
+}
+
+#[then(
+    "a byte search of the store's files, its write-ahead log and snapshots included, finds no copy of the key"
+)]
+fn key_in_no_file(world: &mut World) {
+    let hex = world.key.iter().fold(String::new(), |mut hex, b| {
+        use std::fmt::Write as _;
+        write!(hex, "{b:02x}").unwrap();
+        hex
+    });
+    let mut searched = BTreeSet::new();
+    for entry in std::fs::read_dir(world.dir.path()).unwrap() {
+        let path = entry.unwrap().path();
+        let bytes = std::fs::read(&path).unwrap();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            !bytes.windows(32).any(|w| w == world.key),
+            "{name} holds the key"
+        );
+        assert!(
+            !bytes.windows(64).any(|w| w == hex.as_bytes()),
+            "{name} holds the key as hex"
+        );
+        searched.insert(name);
+    }
+    for name in ["graph.rannoch", "graph.rannoch-wal", "snapshot.rannoch"] {
+        assert!(
+            searched.contains(name),
+            "{name} was not searched: {searched:?}"
+        );
+    }
+}
+
+#[given("a graph first opened under one content-identity key, written to and closed")]
+#[given("a graph first opened under a content-identity key, written to and closed")]
+fn written_and_closed(world: &mut World) {
+    declare_kind(world.open(), "keyless");
+    let unit = unit_of(world.g(), "k1", "words", 0);
+    world.write(&Write::new("swtor").unit(unit));
+    world.graph = None;
+}
+
+#[when("the app opens the graph under another key")]
+fn opens_under_other_key(world: &mut World) {
+    let refused = rannoch::open(world.path(), Some(&OTHER_KEY)).expect_err("the open is refused");
+    world.refusals = vec![refused];
+}
+
+#[when("the app opens the graph without a content-identity key")]
+fn opens_without_key(world: &mut World) {
+    let refused = rannoch::open(world.path(), None).expect_err("the open is refused");
+    world.refusals = vec![refused];
+}
+
+/// Asserts `n` refusals, each saying the key differs from the graph's.
+fn key_differs(world: &World, n: usize) {
+    assert_eq!(world.refusals.len(), n, "{:?}", world.refusals);
+    for refusal in &world.refusals {
+        assert!(matches!(refusal, Error::KeyDiffers), "{refusal:?}");
+        assert!(refusal.to_string().contains("differs"), "{refusal}");
+    }
+}
+
+#[then("the open is refused, and the refusal says the key differs from the graph's")]
+fn open_refused_key_differs(world: &mut World) {
+    key_differs(world, 1);
+}
+
+#[then("the open is refused, and the refusal says the key is missing")]
+fn open_refused_key_missing(world: &mut World) {
+    let [refusal] = &world.refusals[..] else {
+        panic!("expected one refusal, got {:?}", world.refusals);
+    };
+    assert!(matches!(refusal, Error::KeyMissing), "{refusal:?}");
+    assert!(refusal.to_string().contains("missing"), "{refusal}");
+}
+
+#[given("a graph written under one content-identity key, with a snapshot")]
+fn written_with_snapshot(world: &mut World) {
+    declare_kind(world.open(), "keyless");
+    let unit = unit_of(world.g(), "k1", "words", 0);
+    world.write(&Write::new("swtor").unit(unit));
+    snapshot_at_end(world);
+}
+
+#[when(
+    "the graph is rebuilt from its events under another key, and from its snapshot under another key"
+)]
+fn rebuilt_under_other_key(world: &mut World) {
+    let events = world.all_events();
+    let from_events = rannoch::rebuild(
+        &events,
+        world.dir.path().join("from-events.rannoch"),
+        Some(&OTHER_KEY),
+    )
+    .expect_err("the rebuild from events is refused");
+    let snapshot = world.snapshot.clone().expect("the app took a snapshot");
+    let later = world.g().events().since(snapshot.cursor()).unwrap();
+    let from_snapshot = snapshot
+        .rebuild(
+            &later,
+            world.dir.path().join("from-snapshot.rannoch"),
+            Some(&OTHER_KEY),
+        )
+        .expect_err("the rebuild from the snapshot is refused");
+    world.refusals = vec![from_events, from_snapshot];
+}
+
+#[then("both rebuilds are refused, and each refusal says the key differs from the graph's")]
+fn rebuilds_refused_key_differs(world: &mut World) {
+    key_differs(world, 2);
 }
 
 scenarios!("tests", fixtures = [world: World]);

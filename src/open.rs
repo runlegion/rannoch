@@ -11,6 +11,7 @@ use rusqlite::{Connection, Row, ToSql};
 use serde::{Deserialize, Serialize};
 
 use crate::events::{Events, OWN_TABLES};
+use crate::history::{HISTORY_TABLES, Key, take};
 use crate::write::Error;
 
 /// A class: a kind of node, with its natural key, its properties and each one's value type,
@@ -22,13 +23,14 @@ pub struct Class {
     /// properties by name alone; each of those reads as text.
     #[serde(deserialize_with = "properties")]
     pub properties: BTreeMap<String, ValueType>,
-    /// The key the class's history is ordered by; recording order when it declares none.
+    /// The key the class's history is ordered by; the origin's record time when it declares none.
     #[serde(default)]
     pub history: HistoryKey,
 }
 
 impl Class {
-    /// A class whose properties are all text and whose history is in recording order.
+    /// A class whose properties are all text and whose history is ordered by the origin's
+    /// record time.
     pub fn new<P: Into<String>>(
         name: impl Into<String>,
         properties: impl IntoIterator<Item = P>,
@@ -39,7 +41,7 @@ impl Class {
                 .into_iter()
                 .map(|p| (p.into(), ValueType::Text))
                 .collect(),
-            history: HistoryKey::Recorded,
+            history: HistoryKey::Origin,
         }
     }
 }
@@ -77,14 +79,16 @@ pub enum ValueType {
     FloatVector(usize),
 }
 
-/// What a class's history is ordered by. Where two events carry the same key, the order
-/// rannoch recorded them in breaks the tie.
+/// What a class's history is ordered by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HistoryKey {
-    /// The order rannoch records the class's events in.
+    /// The record time of the store that first recorded each hearing, carried in its event:
+    /// never the order this store received it in. It is stored as `recorded`, as every store
+    /// written before it holds it.
     #[default]
-    Recorded,
+    #[serde(rename = "recorded")]
+    Origin,
     /// An integer the writer supplies with each write.
     Integer,
     /// A time the writer supplies with each write: UTC, millisecond precision.
@@ -386,6 +390,8 @@ pub struct Graph {
     pub(crate) fresh: RefCell<Fresh>,
     /// Other graph files this graph's references can name, by the name each was mounted under.
     pub(crate) mounts: BTreeMap<String, Graph>,
+    /// The app's content-identity key; a mounted graph, which is only read, holds none.
+    pub(crate) key: Option<Key>,
 }
 
 /// An ontology and the schema version of the file it was loaded at.
@@ -395,12 +401,28 @@ pub(crate) struct Fresh {
     pub(crate) ontology: Arc<Ontology>,
 }
 
-/// Opens the graph the file at `path` holds, with the ontology its own stream declared. A path
-/// that holds no graph yet starts an empty graph.
+/// Opens the graph the file at `path` holds, with the ontology its own stream declared, under the
+/// app's content-identity `key`. A path that holds no graph yet starts an empty graph. The key is
+/// never written to the store's files: the store keeps a check value, and a store that holds none
+/// yet, as one written before keys does, takes the key it is first opened with.
 ///
 /// # Errors
-/// The file cannot be opened as a graph file.
-pub fn open(path: impl AsRef<Path>) -> Result<Graph, Error> {
+/// [`Error::KeyMissing`] without a key; [`Error::KeyDiffers`] when the graph was built under
+/// another key; the file cannot be opened as a graph file.
+pub fn open(path: impl AsRef<Path>, key: Option<&[u8; 32]>) -> Result<Graph, Error> {
+    open_keyed(path, &Key::new(key.ok_or(Error::KeyMissing)?))
+}
+
+/// Opens the graph at `path` under `key`.
+pub(crate) fn open_keyed(path: impl AsRef<Path>, key: &Key) -> Result<Graph, Error> {
+    let mut graph = open_file(path)?;
+    take(&mut graph.conn, key)?;
+    graph.key = Some(key.clone());
+    Ok(graph)
+}
+
+/// Opens the graph at `path` without a key, to be read only.
+pub(crate) fn open_file(path: impl AsRef<Path>) -> Result<Graph, Error> {
     let conn = Connection::open(path)?;
     conn.busy_handler(Some(retry_lock))?;
     conn.execute_batch(
@@ -408,6 +430,7 @@ pub fn open(path: impl AsRef<Path>) -> Result<Graph, Error> {
     )?;
     conn.set_prepared_statement_cache_capacity(256);
     conn.execute_batch(OWN_TABLES)?;
+    conn.execute_batch(HISTORY_TABLES)?;
     let schema_version = schema_version(&conn)?;
     let ontology = Ontology::load(&conn)?;
     let fresh = RefCell::new(Fresh {
@@ -419,6 +442,7 @@ pub fn open(path: impl AsRef<Path>) -> Result<Graph, Error> {
         ontology,
         fresh,
         mounts: BTreeMap::new(),
+        key: None,
     })
 }
 
@@ -519,9 +543,9 @@ mod tests {
     #[test]
     fn a_data_write_elsewhere_costs_a_read_no_reload() -> Result<(), Box<dyn std::error::Error>> {
         let path = temp("no-reload");
-        let mut a = open(&path)?;
+        let mut a = open(&path, Some(&crate::TEST_KEY))?;
         a.declare(&Declaration::Class(Class::new("crate", [] as [&str; 0])))?;
-        let b = open(&path)?;
+        let b = open(&path, Some(&crate::TEST_KEY))?;
         a.write(&Write::new("a").unit(unit("crate", "k")))?;
 
         let before = loads();
@@ -539,8 +563,8 @@ mod tests {
     fn a_declaration_elsewhere_reloads_once_on_the_first_read()
     -> Result<(), Box<dyn std::error::Error>> {
         let path = temp("reload-once");
-        let mut a = open(&path)?;
-        let b = open(&path)?;
+        let mut a = open(&path, Some(&crate::TEST_KEY))?;
+        let b = open(&path, Some(&crate::TEST_KEY))?;
         a.declare(&Declaration::Class(Class::new("late", [] as [&str; 0])))?;
         a.write(&Write::new("a").unit(unit("late", "k")))?;
 

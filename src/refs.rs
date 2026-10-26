@@ -6,7 +6,7 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::events::{Change, naming_key};
-use crate::open::{Graph, open};
+use crate::open::{Graph, open_file};
 use crate::read::NodeRef;
 use crate::write::Error;
 
@@ -27,7 +27,7 @@ impl Graph {
     /// # Errors
     /// The file cannot be opened as a graph file.
     pub fn mount(&mut self, name: &str, path: impl AsRef<Path>) -> Result<(), Error> {
-        let mounted = open(path)?;
+        let mounted = open_file(path)?;
         self.mounts.insert(name.to_string(), mounted);
         Ok(())
     }

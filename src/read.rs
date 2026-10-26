@@ -797,8 +797,8 @@ mod tests {
     #[test]
     fn a_handle_reads_a_class_declared_after_it_opened() -> Result<(), Box<dyn std::error::Error>> {
         let path = temp("late");
-        let mut a = open(&path)?;
-        let b = open(&path)?;
+        let mut a = open(&path, Some(&crate::TEST_KEY))?;
+        let b = open(&path, Some(&crate::TEST_KEY))?;
         a.declare(&Declaration::Class(Class::new("late", [] as [&str; 0])))?;
         a.write(&Write::new("a").unit(late("k")))?;
 
@@ -814,9 +814,9 @@ mod tests {
     fn a_handle_counts_by_a_property_added_after_it_opened()
     -> Result<(), Box<dyn std::error::Error>> {
         let path = temp("grown");
-        let mut a = open(&path)?;
+        let mut a = open(&path, Some(&crate::TEST_KEY))?;
         a.declare(&Declaration::Class(Class::new("voice", ["name"])))?;
-        let b = open(&path)?;
+        let b = open(&path, Some(&crate::TEST_KEY))?;
         a.declare(&Declaration::Property {
             class: "voice".to_string(),
             property: "region".to_string(),
@@ -850,7 +850,7 @@ mod tests {
 
     #[test]
     fn a_count_groups_by_an_integer_property() -> Result<(), Box<dyn std::error::Error>> {
-        let mut g = open(temp("integer-groups"))?;
+        let mut g = open(temp("integer-groups"), Some(&crate::TEST_KEY))?;
         let mut voice = Class::new("voice", NONE.map(|(p, _)| p));
         voice
             .properties
@@ -901,8 +901,8 @@ mod tests {
     fn a_mount_resolves_a_class_declared_after_it_mounted() -> Result<(), Box<dyn std::error::Error>>
     {
         let path = temp("mounted");
-        let mut a = open(&path)?;
-        let mut app = open(temp("app"))?;
+        let mut a = open(&path, Some(&crate::TEST_KEY))?;
+        let mut app = open(temp("app"), Some(&crate::TEST_KEY))?;
         app.mount("other", &path)?;
         a.declare(&Declaration::Class(Class::new("late", [] as [&str; 0])))?;
         a.write(&Write::new("a").unit(late("k")))?;
@@ -918,11 +918,11 @@ mod tests {
     fn a_known_class_still_reads_after_another_handle_writes()
     -> Result<(), Box<dyn std::error::Error>> {
         let path = temp("known");
-        let mut a = open(&path)?;
+        let mut a = open(&path, Some(&crate::TEST_KEY))?;
         a.declare(&Declaration::Class(Class::new("late", [] as [&str; 0])))?;
         a.declare(&Declaration::Class(Class::new("other", [] as [&str; 0])))?;
         a.write(&Write::new("a").unit(late("k")))?;
-        let b = open(&path)?;
+        let b = open(&path, Some(&crate::TEST_KEY))?;
         assert!(b.find("late", "k")?.is_some());
 
         a.write(&Write::new("a").unit(Unit::new("other", "o", NONE, ValidTime::Unknown)))?;
@@ -933,7 +933,7 @@ mod tests {
     #[test]
     fn a_class_never_declared_is_still_refused() -> Result<(), Error> {
         let path = temp("ghost");
-        let refused = open(path)?.find("ghost", "k");
+        let refused = open(path, Some(&crate::TEST_KEY))?.find("ghost", "k");
         assert!(
             matches!(&refused, Err(Error::Refused(reason)) if reason == "class ghost is not declared"),
             "expected a refusal, got {refused:?}"
@@ -944,7 +944,8 @@ mod tests {
     #[test]
     fn walk_from_an_undeclared_class_is_refused_in_ontology_terms() -> Result<(), Error> {
         let path = std::env::temp_dir().join(format!("rannoch-walk-{}.db", uuid::Uuid::now_v7()));
-        let refused = open(path)?.walk(&NodeRef::new("ghost", "k"), &[], 1, 10);
+        let refused =
+            open(path, Some(&crate::TEST_KEY))?.walk(&NodeRef::new("ghost", "k"), &[], 1, 10);
         assert!(
             matches!(&refused, Err(Error::Refused(reason)) if reason == "class ghost is not declared"),
             "expected a refusal, got {refused:?}"
@@ -956,7 +957,7 @@ mod tests {
     fn a_walk_asked_for_every_hop_ends_when_nothing_is_left()
     -> Result<(), Box<dyn std::error::Error>> {
         let path = std::env::temp_dir().join(format!("rannoch-hops-{}.db", uuid::Uuid::now_v7()));
-        let mut g = open(path)?;
+        let mut g = open(path, Some(&crate::TEST_KEY))?;
         g.declare(&Declaration::Class(Class::new("crate", ["name"])))?;
         g.declare(&Declaration::Relation(Relation::new(
             "depends_on",
@@ -987,7 +988,7 @@ mod tests {
     /// link and neighbour valid on its own date.
     fn star(neighbours: &[(&str, Date)]) -> Result<crate::Graph, Box<dyn std::error::Error>> {
         let path = std::env::temp_dir().join(format!("rannoch-cap-{}.db", uuid::Uuid::now_v7()));
-        let mut g = open(path)?;
+        let mut g = open(path, Some(&crate::TEST_KEY))?;
         g.declare(&Declaration::Class(Class::new("crate", ["name"])))?;
         g.declare(&Declaration::Relation(Relation::new(
             "depends_on",
@@ -1072,7 +1073,7 @@ mod tests {
     /// A graph of items, each `part` of another and `flags` another, holding the units given.
     fn items(units: Vec<Unit>) -> Result<Graph, Box<dyn std::error::Error>> {
         let path = std::env::temp_dir().join(format!("rannoch-asof-{}.db", uuid::Uuid::now_v7()));
-        let mut g = open(path)?;
+        let mut g = open(path, Some(&crate::TEST_KEY))?;
         g.declare(&Declaration::Class(Class::new("item", ["name"])))?;
         for relation in ["part", "flags"] {
             g.declare(&Declaration::Relation(Relation::new(
