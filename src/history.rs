@@ -38,15 +38,13 @@ pub(crate) const HISTORY_TABLES: &str = "
         source TEXT NOT NULL, point INTEGER, valid TEXT,
         PRIMARY KEY(entity, key, to_key)) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS _endings(
-        entity TEXT NOT NULL, key TEXT NOT NULL, to_key TEXT NOT NULL, point INTEGER NOT NULL,
-        event TEXT NOT NULL, source TEXT NOT NULL, valid TEXT,
-        PRIMARY KEY(entity, key, to_key, point, event)) WITHOUT ROWID;
+        id INTEGER PRIMARY KEY, entity TEXT NOT NULL, key TEXT NOT NULL, to_key TEXT NOT NULL,
+        point INTEGER NOT NULL, event TEXT NOT NULL, source TEXT NOT NULL, valid TEXT,
+        UNIQUE(entity, key, to_key, point, event));
     CREATE TABLE IF NOT EXISTS _seen(
         entity TEXT NOT NULL, key TEXT NOT NULL, to_key TEXT NOT NULL,
-        first_arrived INTEGER, first_integer INTEGER, first_point INTEGER NOT NULL,
-        first_event TEXT NOT NULL, last_arrived INTEGER, last_integer INTEGER,
-        last_point INTEGER NOT NULL, last_event TEXT NOT NULL, recorded_arrived INTEGER,
-        recorded_point INTEGER NOT NULL, recorded_event TEXT NOT NULL, first_true TEXT,
+        first_hearing INTEGER, first_ending INTEGER, last_hearing INTEGER, last_ending INTEGER,
+        recorded_hearing INTEGER, recorded_ending INTEGER, first_true TEXT,
         count INTEGER NOT NULL, PRIMARY KEY(entity, key, to_key)) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS _check(value TEXT NOT NULL);";
 
@@ -219,7 +217,8 @@ pub(crate) fn hear(
         properties
     ])?;
     let mark = Mark {
-        arrived: Some(tx.last_insert_rowid()),
+        hearing: Some(tx.last_insert_rowid()),
+        ending: None,
         integer,
         point,
         event: stamp.id.to_string(),
@@ -228,10 +227,11 @@ pub(crate) fn hear(
     Ok(None)
 }
 
-/// A fact a kept seen row names: a hearing, by when this store recorded it, or an ending, which
-/// has no `arrived`, by its point and event; with what orders it among the others.
+/// A fact a kept seen row names, by its row: a hearing by when this store recorded it, or an
+/// ending by its id; with what orders it among the others.
 struct Mark {
-    arrived: Option<i64>,
+    hearing: Option<i64>,
+    ending: Option<i64>,
     integer: Option<i64>,
     point: i64,
     event: String,
@@ -246,10 +246,11 @@ impl Mark {
 
     fn row(row: &rusqlite::Row, at: usize) -> rusqlite::Result<Mark> {
         Ok(Mark {
-            arrived: row.get(at)?,
-            integer: row.get(at + 1)?,
-            point: row.get(at + 2)?,
-            event: row.get(at + 3)?,
+            hearing: row.get(at)?,
+            ending: row.get(at + 1)?,
+            integer: row.get(at + 2)?,
+            point: row.get(at + 3)?,
+            event: row.get(at + 4)?,
         })
     }
 }
@@ -268,29 +269,22 @@ fn saw(
     let to = to.unwrap_or_default();
     let kept = tx
         .prepare_cached(
-            "SELECT first_arrived, first_integer, first_point, first_event, last_arrived, \
-             last_integer, last_point, last_event FROM _seen \
-             WHERE entity = ?1 AND key = ?2 AND to_key = ?3",
+            "SELECT s.first_hearing, s.first_ending, fh.integer, coalesce(fh.point, fe.point), \
+             coalesce(fh.event, fe.event), s.last_hearing, s.last_ending, lh.integer, \
+             coalesce(lh.point, le.point), coalesce(lh.event, le.event) FROM _seen s \
+             LEFT JOIN _hearings fh ON fh.arrived = s.first_hearing \
+             LEFT JOIN _endings fe ON fe.id = s.first_ending \
+             LEFT JOIN _hearings lh ON lh.arrived = s.last_hearing \
+             LEFT JOIN _endings le ON le.id = s.last_ending \
+             WHERE s.entity = ?1 AND s.key = ?2 AND s.to_key = ?3",
         )?
         .query_row(params![entity, key, to], |row| {
-            Ok((Mark::row(row, 0)?, Mark::row(row, 4)?))
+            Ok((Mark::row(row, 0)?, Mark::row(row, 5)?))
         })
         .optional()?;
     let Some((first, last)) = kept else {
-        tx.prepare_cached(
-            "INSERT INTO _seen VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?4, ?5, ?6, ?7, ?4, ?6, ?7, \
-             ?8, 1)",
-        )?
-        .execute(params![
-            entity,
-            key,
-            to,
-            mark.arrived,
-            mark.integer,
-            mark.point,
-            mark.event,
-            valid
-        ])?;
+        tx.prepare_cached("INSERT INTO _seen VALUES (?1, ?2, ?3, ?4, ?5, ?4, ?5, ?4, ?5, ?6, 1)")?
+            .execute(params![entity, key, to, mark.hearing, mark.ending, valid])?;
         return Ok(());
     };
     let first = if mark.rank() < first.rank() {
@@ -314,26 +308,21 @@ fn keep(
     (first, last): (&Mark, &Mark),
     (added, valid): (i64, Option<&str>),
 ) -> Result<(), Error> {
-    let earlier = format!("{} < {}", valid_day("?13"), valid_day("first_true"));
+    let earlier = format!("{} < {}", valid_day("?9"), valid_day("first_true"));
     tx.prepare_cached(&format!(
-        "UPDATE _seen SET first_arrived = ?4, first_integer = ?5, first_point = ?6, \
-         first_event = ?7, last_arrived = ?8, last_integer = ?9, last_point = ?10, \
-         last_event = ?11, count = count + ?12, first_true = CASE WHEN ?13 IS NOT NULL \
-         AND (first_true IS NULL OR {earlier}) THEN ?13 ELSE first_true END \
+        "UPDATE _seen SET first_hearing = ?4, first_ending = ?5, last_hearing = ?6, \
+         last_ending = ?7, count = count + ?8, first_true = CASE WHEN ?9 IS NOT NULL \
+         AND (first_true IS NULL OR {earlier}) THEN ?9 ELSE first_true END \
          WHERE entity = ?1 AND key = ?2 AND to_key = ?3"
     ))?
     .execute(params![
         entity,
         key,
         to,
-        first.arrived,
-        first.integer,
-        first.point,
-        first.event,
-        last.arrived,
-        last.integer,
-        last.point,
-        last.event,
+        first.hearing,
+        first.ending,
+        last.hearing,
+        last.ending,
         added,
         valid
     ])?;
@@ -351,7 +340,7 @@ fn reseen(tx: &Connection, identity: [u8; 32]) -> Result<(), Error> {
     let edge = |direction: &str| -> Result<Option<Mark>, Error> {
         let hearing = tx
             .prepare_cached(&format!(
-                "SELECT arrived, integer, point, event FROM _hearings \
+                "SELECT arrived, NULL, integer, point, event FROM _hearings \
                  WHERE entity = ?1 AND key = ?2 AND to_key IS ?3 ORDER BY {} LIMIT 1",
                 order(direction)
             ))?
@@ -359,7 +348,7 @@ fn reseen(tx: &Connection, identity: [u8; 32]) -> Result<(), Error> {
             .optional()?;
         let ending = tx
             .prepare_cached(&format!(
-                "SELECT NULL, NULL, point, event FROM _endings \
+                "SELECT NULL, id, NULL, point, event FROM _endings \
                  WHERE entity = ?1 AND key = ?2 AND to_key = ?3 \
                  ORDER BY point {direction}, event {direction} LIMIT 1"
             ))?
@@ -527,7 +516,8 @@ pub(crate) fn conclude(tx: &Connection, event: EventId, change: &Change) -> Resu
             ])?;
         if new == 1 {
             let mark = Mark {
-                arrived: None,
+                hearing: None,
+                ending: Some(tx.last_insert_rowid()),
                 integer: None,
                 point: at,
                 event: event.to_string(),
@@ -555,8 +545,9 @@ pub(crate) fn take(conn: &mut Connection, key: &Key) -> Result<(), Error> {
         return Ok(());
     }
     tx.execute(
-        "INSERT OR IGNORE INTO _endings SELECT entity, key, to_key, point, event, source, valid \
-         FROM _ends WHERE point IS NOT NULL",
+        "INSERT OR IGNORE INTO _endings(entity, key, to_key, point, event, source, valid) \
+         SELECT entity, key, to_key, point, event, source, valid FROM _ends \
+         WHERE point IS NOT NULL",
         [],
     )?;
     let read = |row: &rusqlite::Row| -> rusqlite::Result<Seeing> {
@@ -565,14 +556,14 @@ pub(crate) fn take(conn: &mut Connection, key: &Key) -> Result<(), Error> {
             row.get(1)?,
             row.get(2)?,
             Mark::row(row, 3)?,
-            row.get(7)?,
+            row.get(8)?,
         ))
     };
     let facts: Vec<Seeing> = tx
         .prepare(
-            "SELECT * FROM (SELECT entity, key, to_key, arrived, integer, point, event, valid \
-             FROM _hearings UNION ALL SELECT entity, key, to_key, NULL, NULL, point, event, valid \
-             FROM _endings) ORDER BY arrived IS NULL, arrived",
+            "SELECT * FROM (SELECT entity, key, to_key, arrived, NULL AS id, integer, point, \
+             event, valid FROM _hearings UNION ALL SELECT entity, key, to_key, NULL, id, NULL, \
+             point, event, valid FROM _endings) ORDER BY arrived IS NULL, arrived, id",
         )?
         .query_map([], read)?
         .collect::<Result<_, _>>()?;
@@ -1061,12 +1052,11 @@ pub(crate) fn ending_sql(
     let after = live("point", &i64::MIN.to_string());
     (
         format!(
-            "{link_e} AND ({e}.point, {e}.event) = (SELECT x.point, x.event FROM _endings x \
+            "{e}.id = (SELECT x.id FROM _endings x \
              WHERE {link_x}{by_x} AND x.point >= {after} AND (x.point, x.event) > ({after}, {}) \
              ORDER BY x.point, x.event LIMIT 1) \
              AND NOT EXISTS (SELECT 1 FROM _ends c WHERE {link_c} AND c.point IS NULL)",
             live("event", "''"),
-            link_e = link(e),
             link_x = link("x"),
             by_x = by("x"),
             link_c = link("c"),
@@ -1076,7 +1066,7 @@ pub(crate) fn ending_sql(
 }
 
 /// The one read of a kept seen row of `?1`, `?2`, `?3` (its target key `''` for a node), with
-/// the facts it names, each a hearing joined by when it arrived or an ending by its key, and
+/// the facts it names, each a hearing joined by when it arrived or an ending by its id, and
 /// when a link ended: count, first true, when it ended, then first heard, last heard and first
 /// recorded as event, source, valid time, point, integer key, properties and whether an ending.
 fn seen_sql() -> String {
@@ -1090,10 +1080,8 @@ fn seen_sql() -> String {
     };
     let join = |p: &str, column: &str| {
         format!(
-            "LEFT JOIN _hearings {p}h ON {p}h.arrived = s.{column}_arrived \
-             LEFT JOIN _endings {p}e ON s.{column}_arrived IS NULL AND {p}e.entity = s.entity \
-             AND {p}e.key = s.key AND {p}e.to_key = s.to_key \
-             AND {p}e.point = s.{column}_point AND {p}e.event = s.{column}_event"
+            "LEFT JOIN _hearings {p}h ON {p}h.arrived = s.{column}_hearing \
+             LEFT JOIN _endings {p}e ON {p}e.id = s.{column}_ending"
         )
     };
     let (ending, _) = ending_sql("n", ("s.entity", "s.key", "s.to_key"), None, "NULL");
