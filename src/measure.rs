@@ -1,4 +1,6 @@
-//! The measurement of NFR-RANNOCH-016, run as the NFR writes it and reported against its target.
+//! The measurements of NFR-RANNOCH-016 and NFR-RANNOCH-025, each run as its NFR writes it and
+//! reported against its target. NFR-RANNOCH-025's times the crate's own check that a named event
+//! exists, which the public interface reaches only inside a whole write.
 //!
 //! It runs inside the crate because whether a count read blocked on the writer is observed on
 //! the reader connection's busy handler, which rannoch's public interface does not expose. It
@@ -10,6 +12,7 @@
 //!
 //! ```text
 //! cargo test --release --lib nfr_016 -- --ignored --nocapture --test-threads=1
+//! cargo test --release --lib named_event_check -- --ignored --nocapture
 //! ```
 
 #![allow(
@@ -300,5 +303,104 @@ fn nfr_016() {
         missed.is_empty(),
         "NFR-RANNOCH-016 missed its target: {}",
         missed.join(", ")
+    );
+}
+
+/// A store at `path` whose log holds `events` events past its one declaration: one node write
+/// per event in one keyless class.
+fn store_of(path: &Path, events: usize) -> Graph {
+    let mut g = crate::open(path, Some(&crate::TEST_KEY)).unwrap();
+    g.declare(&Declaration::Class(Class::new("note", [] as [&str; 0])))
+        .unwrap();
+    let writes: Vec<Write> = (0..events)
+        .map(|i| Write::new("app").unit(Unit::new("note", format!("n{i}"), NONE, when())))
+        .collect();
+    for batch in writes.chunks(10_000) {
+        for result in g.write_batch(batch).unwrap() {
+            result.unwrap();
+        }
+    }
+    g
+}
+
+/// The p99, in microseconds, of checking that `g` holds each of 10,000 ids chosen with a seeded
+/// RNG from its log.
+fn named_p99(g: &Graph) -> f64 {
+    let last = g.events().committed().unwrap().0;
+    let mut rng = fastrand::Rng::with_seed(25);
+    let ids: Vec<crate::EventId> = (0..10_000)
+        .map(|_| {
+            crate::events::event_at(&g.conn, crate::Cursor(rng.i64(1..=last)))
+                .unwrap()
+                .unwrap()
+                .id
+        })
+        .collect();
+    let mut times: Vec<f64> = ids
+        .into_iter()
+        .map(|id| {
+            let start = Instant::now();
+            assert!(crate::events::holds(&g.conn, id).unwrap());
+            start.elapsed().as_secs_f64() * 1e6
+        })
+        .collect();
+    times.sort_by(f64::total_cmp);
+    times[times.len() * 99 / 100]
+}
+
+/// The query plan of the named-event check, one line per step.
+fn named_plan(g: &Graph) -> Vec<String> {
+    let mut statement = g
+        .conn
+        .prepare(&format!("EXPLAIN QUERY PLAN {}", crate::events::HOLDS))
+        .unwrap();
+    statement
+        .query_map(["0"], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+#[test]
+#[ignore = "a measurement: run at verify time on a machine running nothing else (see the module docs)"]
+fn named_event_check() {
+    let dir = TempDir::new().unwrap();
+    let mut plan = Vec::new();
+    let p99s: Vec<(usize, f64)> = [1_000, 1_000_000]
+        .into_iter()
+        .map(|events| {
+            let g = store_of(&dir.path().join(format!("{events}.rannoch")), events);
+            plan = named_plan(&g);
+            (events, named_p99(&g))
+        })
+        .collect();
+    for step in &plan {
+        println!("NFR-RANNOCH-025: plan: {step}");
+    }
+    for (events, p99) in &p99s {
+        println!("NFR-RANNOCH-025: {events} events, p99 of the named-event check {p99:.2} us");
+    }
+    let ratio = p99s[1].1 / p99s[0].1;
+    println!("NFR-RANNOCH-025: ratio {ratio:.2} x, for reference");
+    let searched = plan
+        .iter()
+        .any(|step| step.starts_with("SEARCH _events USING"))
+        && !plan.iter().any(|step| step.starts_with("SCAN _events"));
+    let p99 = p99s[1].1;
+    let verdict = if searched && p99 <= 1_000.0 {
+        "met"
+    } else {
+        "NOT met"
+    };
+    println!(
+        "NFR-RANNOCH-025: index search with no scan of the log and p99 <= 1 ms at 1,000,000 events; {verdict}"
+    );
+    assert!(
+        searched,
+        "NFR-RANNOCH-025: the check scans the log: {plan:?}"
+    );
+    assert!(
+        p99 <= 1_000.0,
+        "NFR-RANNOCH-025 missed its target: p99 {p99:.2} us"
     );
 }

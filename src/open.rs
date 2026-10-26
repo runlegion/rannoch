@@ -10,7 +10,7 @@ use rusqlite::types::ToSqlOutput;
 use rusqlite::{Connection, ToSql};
 use serde::{Deserialize, Serialize};
 
-use crate::events::{Events, OWN_TABLES};
+use crate::events::{Events, OWN_TABLES, upgrade};
 use crate::history::{HISTORY_TABLES, Key, point_aliases, see_all, take};
 use crate::purge::{PURGE_TABLES, stand_all};
 use crate::write::{Error, date_fates};
@@ -400,12 +400,16 @@ pub(crate) fn table(conn: &Connection, name: &str) -> Result<bool, Error> {
 pub(crate) fn open_file(path: impl AsRef<Path>) -> Result<Graph, Error> {
     let mut conn = Connection::open(path)?;
     conn.busy_handler(Some(retry_lock))?;
+    // Freed space is zeroed on every deletion and page split, so no copy of a purged body is
+    // left in free space by a split made before the purge.
     conn.execute_batch(
-        "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;",
+        "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; \
+         PRAGMA secure_delete=ON;",
     )?;
     conn.set_prepared_statement_cache_capacity(256);
     conn.execute_batch(OWN_TABLES)?;
     conn.execute_batch(PURGE_TABLES)?;
+    upgrade(&mut conn)?;
     date_fates(&mut conn)?;
     point_aliases(&mut conn)?;
     // A store whose hearings were written before what is seen of them was kept.

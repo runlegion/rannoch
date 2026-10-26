@@ -22,8 +22,8 @@ use std::time::{Duration, Instant, SystemTime};
 use rannoch::{At, End, Failure, Hearing, HistoryKey, NodeFact, Queue, Ticket, ValueType, Version};
 use rannoch::{
     Change, Class, Count, Cursor, Date, Declaration, Description, Error, Event, EventId, Fact,
-    Fate, Graph, GroupBy, Link, LinkFact, Node, NodeRef, OpenLink, PartOf, Purge, Relation,
-    Snapshot, Step, Tally, Target, Unit, ValidTime, Value, Write, WriteError,
+    FactRef, Fate, Graph, GroupBy, Link, LinkFact, Node, NodeRef, OpenLink, PartOf, Purge,
+    Relation, Snapshot, Step, Tally, Target, Unit, ValidTime, Value, Write, WriteError,
 };
 use rstest_bdd_macros::{given, scenarios, then, when};
 use tempfile::TempDir;
@@ -581,7 +581,7 @@ struct World {
     snapshot: Option<Snapshot>,
     stored_cursor: String,
     bound: Cursor,
-    derived: Vec<NodeRef>,
+    derived: Vec<FactRef>,
     follower: Option<std::process::Child>,
     followed: Followed,
     graphs: Vec<Graph>,
@@ -596,6 +596,8 @@ struct World {
     seen: Option<rannoch::Seen>,
     reads_link: bool,
     links: Vec<LinkAt>,
+    /// The node whose history a scenario walks.
+    walking: Option<NodeRef>,
 }
 
 #[rstest::fixture]
@@ -654,6 +656,7 @@ fn world() -> World {
         seen: None,
         reads_link: false,
         links: Vec::new(),
+        walking: None,
     }
 }
 
@@ -1749,6 +1752,7 @@ fn reports_wrong_kind(world: &mut World) {
                 from: NodeRef::new("statement", "s2"),
                 to: NodeRef::new("statement", "s1"),
                 valid: day(2021, 3, 2),
+                derived_from: Vec::new(),
             }
         )]
     );
@@ -2259,8 +2263,15 @@ fn rebuilt_and_writes(world: &mut World) {
 #[then("the write is accepted")]
 fn write_accepted(world: &mut World) {
     assert_eq!(world.written.len(), 1);
+    let Change::Wrote { added, .. } = &world.written[0].change else {
+        panic!("expected a write, got {:?}", world.written[0].change);
+    };
     let (_, rebuilt) = world.both();
-    assert!(rebuilt.find("voice", "v1").unwrap().is_some());
+    for fact in added {
+        if let Fact::Node(node) = fact {
+            assert!(rebuilt.find(&node.class, &node.key).unwrap().is_some());
+        }
+    }
 }
 
 #[given("a graph whose class was declared with its history axis before a snapshot's cursor")]
@@ -2584,7 +2595,10 @@ fn asks_derived(world: &mut World) {
 
 #[then("the answer names that node")]
 fn answer_names_node(world: &mut World) {
-    assert_eq!(world.derived, [NodeRef::new("finding", "f1")]);
+    assert_eq!(
+        world.derived,
+        [FactRef::Node(NodeRef::new("finding", "f1"))]
+    );
     let other = world.log[1].id;
     assert!(world.g().derived(other).unwrap().is_empty());
 }
@@ -2606,6 +2620,7 @@ fn writes_from_foreign_event(world: &mut World) {
 }
 
 #[given("a graph with a node derived from an event and a snapshot after it")]
+#[given("a graph with a node derived from an event, and a snapshot after that event")]
 fn derived_before_snapshot(world: &mut World) {
     node_from_an_event(world);
     snapshot_at_end(world);
@@ -2621,6 +2636,241 @@ fn same_source_after_rebuild(world: &mut World) {
         back.derived_from,
         live.find("finding", "f1").unwrap().unwrap().derived_from
     );
+}
+
+/// Statements s1 and s2 written as their own events, and relation answers between statements.
+fn two_statements_and_answers(world: &mut World) {
+    two_statements(world);
+    world
+        .g()
+        .declare(&Declaration::Relation(Relation::new(
+            "answers",
+            "statement",
+            "statement",
+            false,
+        )))
+        .unwrap();
+}
+
+/// Statement s1 restated with a link answering s2, derived from `events`.
+fn answer_from(events: &[Event]) -> Write {
+    Write::new("eavesdrop")
+        .unit(
+            Unit::new("statement", "s1", [("text", "words")], day(2026, 10, 21)).link(
+                "answers",
+                "s1",
+                "s2",
+                day(2026, 10, 21),
+            ),
+        )
+        .derived_from(events.iter().map(|e| e.id))
+}
+
+fn the_answer() -> FactRef {
+    FactRef::Link {
+        relation: "answers".into(),
+        from: NodeRef::new("statement", "s1"),
+        to: NodeRef::new("statement", "s2"),
+    }
+}
+
+/// The events the link s1 answers s2 names as its source, as `g`'s log holds it.
+fn answer_sources(g: &Graph) -> HashSet<EventId> {
+    g.events()
+        .since(Cursor::START)
+        .unwrap()
+        .into_iter()
+        .flat_map(|e| match e.change {
+            Change::Wrote { added, .. } => added,
+            _ => Vec::new(),
+        })
+        .filter_map(|fact| match fact {
+            Fact::Link(link) if link.relation == "answers" => Some(link.derived_from),
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
+
+#[given("a graph with two nodes and two events")]
+fn two_nodes_two_events(world: &mut World) {
+    two_statements_and_answers(world);
+}
+
+#[when("the app writes a link between the nodes derived from both events")]
+fn writes_link_from_both(world: &mut World) {
+    let write = answer_from(&world.log);
+    world.write(&write);
+}
+
+#[then("the link reads back naming both events as its source")]
+fn link_names_both(world: &mut World) {
+    assert_eq!(answer_sources(world.g()), ids(&world.log));
+}
+
+#[given("a graph with a link derived from two events")]
+fn link_from_two(world: &mut World) {
+    two_statements_and_answers(world);
+    writes_link_from_both(world);
+}
+
+#[when("the app asks what was derived from each of those events")]
+fn asks_derived_each(world: &mut World) {
+    let events: Vec<EventId> = world.log.iter().map(|e| e.id).collect();
+    world.derived = events
+        .into_iter()
+        .flat_map(|e| world.g().derived(e).unwrap())
+        .collect();
+}
+
+#[then("each answer names that link")]
+fn each_names_link(world: &mut World) {
+    for event in world.log.clone() {
+        assert!(
+            world.g().derived(event.id).unwrap().contains(&the_answer()),
+            "{event:?}"
+        );
+    }
+    assert_eq!(
+        world.derived.iter().filter(|f| **f == the_answer()).count(),
+        world.log.len()
+    );
+}
+
+#[when(
+    "the graph is rebuilt from the snapshot and the app writes another node derived from the same event"
+)]
+fn rebuilt_and_writes_derived(world: &mut World) {
+    let source = world.log[0].id;
+    let write = Write::new("analyst")
+        .unit(Unit::new(
+            "finding",
+            "f2",
+            [("text", "more knowledge")],
+            day(2026, 10, 21),
+        ))
+        .derived_from([source]);
+    world.written = rebuild_from_snapshot(world).write(&write).unwrap();
+}
+
+#[given("a graph with a link derived from an event and a snapshot after it")]
+fn link_before_snapshot(world: &mut World) {
+    two_statements_and_answers(world);
+    let write = answer_from(&world.log[..1]);
+    world.write(&write);
+    snapshot_at_end(world);
+}
+
+#[when(
+    "the graph is rebuilt once from its events and once from the snapshot and the events after its cursor"
+)]
+fn rebuilt_both_ways(world: &mut World) {
+    let events = world.all_events();
+    let path = world.dir.path().join("from-events.rannoch");
+    let from_events = rannoch::rebuild(&events, path, Some(&KEY)).unwrap();
+    rebuild_from_snapshot(world);
+    let from_snapshot = world.rebuilt.take().unwrap();
+    world.graphs = vec![from_events, from_snapshot];
+}
+
+#[then("in both rebuilt graphs the link reads back naming the same event as its source")]
+fn link_source_in_both(world: &mut World) {
+    let source = world.log[0].id;
+    assert_eq!(answer_sources(world.g()), HashSet::from([source]));
+    for g in &world.graphs {
+        assert_eq!(answer_sources(g), HashSet::from([source]));
+        assert!(g.derived(source).unwrap().contains(&the_answer()));
+    }
+}
+
+#[given("a graph with a node derived from an event, and a purge that removed that event")]
+fn derived_then_purged(world: &mut World) {
+    node_from_an_event(world);
+    let target = Target::Node(NodeRef::new("statement", "s1"));
+    world
+        .g()
+        .purge(Purge::Entity { target }, "retention", "eavesdrop")
+        .unwrap();
+    let purged = world.log[0].id;
+    assert!(world.all_events().iter().all(|e| e.id != purged));
+}
+
+#[when(
+    "the app writes a node derived from the purged event's id, and another derived from an id the graph never held"
+)]
+fn writes_from_purged_and_never_held(world: &mut World) {
+    let mut other = rannoch::open(world.dir.path().join("other.rannoch"), Some(&KEY)).unwrap();
+    let never = other
+        .declare(&Declaration::Class(Class::new(
+            "elsewhere",
+            [] as [&str; 0],
+        )))
+        .unwrap()
+        .expect("a new declaration is an event");
+    for (key, source) in [("f2", world.log[0].id), ("f3", never.id)] {
+        let write = Write::new("analyst")
+            .unit(Unit::new(
+                "finding",
+                key,
+                [("text", "knowledge")],
+                day(2026, 10, 21),
+            ))
+            .derived_from([source]);
+        let refused = world.g().write(&write).expect_err("the write is refused");
+        assert!(refused.events.is_empty(), "{:?}", refused.events);
+        world.refusals.push(refused.cause);
+    }
+}
+
+#[then("both writes are refused with the same refusal")]
+fn same_refusal(world: &mut World) {
+    let ids = [world.log[0].id.to_string()];
+    let shapes: Vec<String> = world
+        .refusals
+        .iter()
+        .map(|error| {
+            let Error::Refused(why) = error else {
+                panic!("not refused: {error}");
+            };
+            // Each refusal names its own id; the rest is the same.
+            let at = why.find("event ").unwrap() + "event ".len();
+            format!("{}<id>{}", &why[..at], &why[at + 36..])
+        })
+        .collect();
+    assert_eq!(shapes.len(), 2);
+    assert_eq!(shapes[0], shapes[1]);
+    assert!(world.refusals[0].to_string().contains(&ids[0]));
+}
+
+#[given("one new graph given A then B and another given B then A")]
+fn source_delivered_in_both_orders(world: &mut World) {
+    given_both_orders(world);
+}
+
+#[when("the app writes to each graph a node derived from B")]
+fn writes_from_b(world: &mut World) {
+    let b = world.log[world.log.len() - 1].id;
+    for g in &mut world.graphs {
+        let write = Write::new("log")
+            .unit(unit_of(g, "k3", "derived", 3))
+            .derived_from([b]);
+        if let Err(refused) = g.write(&write) {
+            world.refusals.push(refused.cause);
+        }
+    }
+}
+
+#[then("both writes are accepted")]
+fn both_accepted(world: &mut World) {
+    assert!(world.refusals.is_empty(), "{:?}", world.refusals);
+    let b = world.log[world.log.len() - 1].id;
+    for g in &world.graphs {
+        let class = the_class(g).name;
+        assert_eq!(
+            g.derived(b).unwrap(),
+            [FactRef::Node(NodeRef::new(class, "k3"))]
+        );
+    }
 }
 
 // ---------- read: walks ----------
@@ -5163,6 +5413,128 @@ fn given_in_reverse(world: &mut World) {
     world.rebuilt = Some(rannoch::rebuild(&events, path, Some(&KEY)).unwrap());
 }
 
+// ---------- history: the walk back to first heard (FR-RANNOCH-069) ----------
+
+/// Writes `unit` from `source`, then waits a few milliseconds so the next hearing's record
+/// time differs.
+fn hear(world: &mut World, source: &str, unit: Unit) {
+    world.write(&Write::new(source).unit(unit));
+    std::thread::sleep(Duration::from_millis(2));
+}
+
+#[given("a node heard more than once, not in axis order")]
+fn heard_out_of_axis_order(world: &mut World) {
+    declare_kind(world.open(), "integer-keyed");
+    for n in [30, 10, 40, 5, 20] {
+        let unit = unit_of(world.g(), "r1", &format!("at {n}"), n);
+        hear(world, "meter", unit);
+    }
+    world.walking = Some(NodeRef::new("reading", "r1"));
+}
+
+#[given("a node heard under one key and then replaced by a new key")]
+fn heard_then_replaced(world: &mut World) {
+    open_graph(world);
+    let unit = Unit::new("statement", "s8", [("text", "first")], day(2021, 3, 2));
+    hear(world, "swtor", unit);
+    let hearings = world
+        .g()
+        .hearings(&NodeRef::new("statement", "s8"))
+        .unwrap();
+    assert_eq!(hearings.len(), 1, "{hearings:?}");
+    world.hearings.insert("s8".into(), hearings);
+    s9(world);
+    replaces_s8_by_s9(world);
+    world.walking = Some(NodeRef::new("statement", "s9"));
+}
+
+#[given("a node first heard before a snapshot and heard again from another source after it")]
+fn heard_across_snapshot(world: &mut World) {
+    declare_kind(world.open(), "time-keyed");
+    let unit = unit_of(world.g(), "a", "before", 10);
+    hear(world, "crawler", unit);
+    let node = NodeRef::new("visit", "a");
+    let hearings = world.g().hearings(&node).unwrap();
+    world.hearings.insert("before".into(), hearings);
+    snapshot_at_end(world);
+    let unit = unit_of(world.g(), "a", "after", 20);
+    hear(world, "reddit", unit);
+    rebuild_from_snapshot(world);
+    world.walking = Some(node);
+}
+
+#[given("a node that has been heard from more than one source, with no snapshot taken")]
+fn heard_from_sources(world: &mut World) {
+    declare_kind(world.open(), "time-keyed");
+    for (source, n, month) in [("crawler", 30, 4), ("reddit", 10, 9), ("swtor", 20, 1)] {
+        let unit = Unit::new("visit", "a", [("text", source)], day(2025, month, 1)).at(at(n));
+        hear(world, source, unit);
+    }
+    world.walking = Some(NodeRef::new("visit", "a"));
+}
+
+#[when("the app walks its history")]
+#[when("the app walks the new key's history")]
+fn walks_history(world: &mut World) {
+    let node = world.walking.clone().expect("a scenario names the node");
+    let g = world.rebuilt.as_ref().or(world.graph.as_ref()).unwrap();
+    let hearings = g.hearings(&node).unwrap();
+    world.hearings.insert("walked".into(), hearings);
+}
+
+#[then("the walk returns every hearing in order on the class's declared axis")]
+fn walk_in_axis_order(world: &mut World) {
+    let integers: Vec<Option<i64>> = world.hearings["walked"].iter().map(|h| h.integer).collect();
+    assert_eq!(integers, [5, 10, 20, 30, 40].map(Some));
+}
+
+#[then("the walk reaches first heard under the old key")]
+fn walk_reaches_old_key(world: &mut World) {
+    let walked = &world.hearings["walked"];
+    assert_eq!(walked.len(), 2, "{walked:?}");
+    assert_eq!(walked[0], world.hearings["s8"][0]);
+}
+
+#[then("the walk reaches the first hearing recorded before the snapshot")]
+fn walk_reaches_before_snapshot(world: &mut World) {
+    let walked = &world.hearings["walked"];
+    assert_eq!(walked.len(), 2, "{walked:?}");
+    assert_eq!(walked[0], world.hearings["before"][0]);
+    assert_eq!(walked[1].source, "reddit");
+}
+
+#[then("each hearing returned matches the event that recorded it")]
+fn hearings_match_events(world: &mut World) {
+    let node = world.walking.clone().unwrap();
+    let walked = world.hearings["walked"].clone();
+    assert_eq!(walked.len(), 3, "{walked:?}");
+    let events = world.all_events();
+    let g = world.g();
+    for hearing in &walked {
+        let event = events.iter().find(|e| e.id == hearing.event).unwrap();
+        let Change::Wrote { source, added, .. } = &event.change else {
+            panic!("{event:?} is not a write");
+        };
+        let fact = added
+            .iter()
+            .find_map(|fact| match fact {
+                Fact::Node(n) if n.class == node.class && n.key == node.key => Some(n),
+                _ => None,
+            })
+            .unwrap();
+        let millis = hearing
+            .point
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap();
+        assert_eq!(source, &hearing.source);
+        assert_eq!(fact.valid, hearing.valid);
+        assert_eq!(fact.time, Some(i64::try_from(millis.as_millis()).unwrap()));
+        let version = g.state_at(&node, At::Time(hearing.point)).unwrap().unwrap();
+        assert_eq!(version.event, hearing.event);
+        assert_eq!(fact.properties, version.properties);
+    }
+}
+
 /// `tests/fixtures/store-0.2.0.rannoch` was written by rannoch at tag v0.2.0: class book (no
 /// history key) with title (text) and pages (integer), class reading keyed by an integer, class
 /// visit keyed by a time, relation of from reading to book; books b1 and b2, readings r1 and r2
@@ -5243,6 +5615,9 @@ fn refused_naming_key(world: &mut World) {
 
 #[given("one hearing's content delivered twice, under event ids A and B, A the smaller")]
 fn delivered_twice(world: &mut World) {
+    if world.graph.is_none() {
+        keyless_class(world);
+    }
     let unit = unit_of(world.g(), "k1", "words", 1);
     world.write(&Write::new("log").unit(unit));
     let a = world.written[0].clone();
@@ -6437,6 +6812,7 @@ fn graph_of(world: &mut World, facts: &[LinkAt]) -> Graph {
                     from,
                     to,
                     valid,
+                    derived_from: Vec::new(),
                 };
                 let added = vec![Fact::Link(fact)];
                 let source = source.into();
@@ -7292,7 +7668,7 @@ fn pair_id_accepted(world: &mut World) {
     .unwrap();
     assert_eq!(
         g.derived(pair).unwrap(),
-        [NodeRef::new("person", "p-derived")]
+        [FactRef::Node(NodeRef::new("person", "p-derived"))]
     );
     assert_eq!(
         g.hearings(&NodeRef::new("person", "p-two")).unwrap()[0].event,
