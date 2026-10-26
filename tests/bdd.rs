@@ -1328,6 +1328,101 @@ fn s8_replaced_by_s9(world: &mut World) {
     assert_eq!(s8.replaced_by, Some(NodeRef::new("statement", "s9")));
 }
 
+// ---------- FR-RANNOCH-067: replacing a node carries its hearings and links ----------
+
+/// Statement `s9`, the node `s8` is replaced by in FR-RANNOCH-067's scenarios.
+fn s9(world: &mut World) {
+    let when = day(2021, 3, 2);
+    world.write(&Write::new("eavesdrop").unit(Unit::new(
+        "statement",
+        "s9",
+        [("text", "merged")],
+        when,
+    )));
+}
+
+#[given("a node with links")]
+fn node_with_links(world: &mut World) {
+    open_graph(world);
+    let when = day(2021, 3, 2);
+    world.write(
+        &Write::new("swtor")
+            .unit(Unit::new("voice", "v1", NONE, when.clone()))
+            .unit(Unit::new("finding", "f1", NONE, when.clone()))
+            .unit(
+                Unit::new("statement", "s8", [("text", "first")], when.clone())
+                    .link("said", "v1", "s8", when.clone())
+                    .link("supports", "s8", "f1", when),
+            ),
+    );
+    s9(world);
+}
+
+#[given("a node that has been heard more than once")]
+fn node_heard_twice(world: &mut World) {
+    open_graph(world);
+    for (source, text) in [("swtor", "first"), ("reddit", "again")] {
+        world.write(&Write::new(source).unit(Unit::new(
+            "statement",
+            "s8",
+            [("text", text)],
+            day(2021, 3, 2),
+        )));
+    }
+    let hearings = world
+        .g()
+        .hearings(&NodeRef::new("statement", "s8"))
+        .unwrap();
+    assert_eq!(hearings.len(), 2, "{hearings:?}");
+    world.hearings.insert("s8".into(), hearings);
+    s9(world);
+}
+
+#[when("the app replaces it by a node under a new key")]
+fn replaces_it_by_new_key(world: &mut World) {
+    replaces_s8_by_s9(world);
+}
+
+#[then("its links are on the new key")]
+fn links_on_new_key(world: &mut World) {
+    let g = world.g();
+    for (relation, from, to) in [("said", "v1", "s9"), ("supports", "s9", "f1")] {
+        assert!(
+            g.find_link(relation, from, to).unwrap().is_some(),
+            "{relation}"
+        );
+        assert_eq!(g.link_hearings(relation, from, to).unwrap().len(), 1);
+    }
+    for (relation, from, to) in [("said", "v1", "s8"), ("supports", "s8", "f1")] {
+        assert!(
+            g.find_link(relation, from, to).unwrap().is_none(),
+            "{relation}"
+        );
+        assert!(g.link_hearings(relation, from, to).unwrap().is_empty());
+    }
+    let s8 = g.describe(&NodeRef::new("statement", "s8")).unwrap();
+    assert!(
+        s8.relations_in.is_empty() && s8.relations_out.is_empty(),
+        "{s8:?}"
+    );
+}
+
+#[then("the new key holds every hearing the old key had")]
+fn new_key_holds_hearings(world: &mut World) {
+    let had = world.hearings["s8"].clone();
+    let g = world.g();
+    let now = g.hearings(&NodeRef::new("statement", "s9")).unwrap();
+    for hearing in &had {
+        assert!(now.contains(hearing), "{hearing:?} not in {now:?}");
+    }
+    assert_eq!(now.len(), had.len() + 1);
+    assert!(
+        g.hearings(&NodeRef::new("statement", "s8"))
+            .unwrap()
+            .is_empty()
+    );
+}
+
 // ---------- write: source, valid time, recorded time ----------
 
 #[given("an open graph")]
@@ -4034,6 +4129,156 @@ fn mark_is_remaining(world: &mut World) {
     assert_eq!(mark(world), Some(fifth));
 }
 
+// ---------- events: the committed watermark across a rebuild and a purge ----------
+
+fn rebuilt_committed(world: &World) -> Cursor {
+    let rebuilt = world.rebuilt.as_ref().expect("the graph was rebuilt");
+    rebuilt.events().committed().unwrap()
+}
+
+#[given("a graph with committed events and a snapshot at the cursor of its last event")]
+fn snapshot_at_last_event(world: &mut World) {
+    events_around_cursor(world);
+    snapshot_at_end(world);
+}
+
+#[then("the rebuilt graph's committed watermark equals the snapshot's cursor")]
+fn rebuilt_watermark_is_snapshot(world: &mut World) {
+    let cursor = world.snapshot.as_ref().unwrap().cursor();
+    assert_eq!(rebuilt_committed(world), cursor);
+}
+
+#[given("a graph with a snapshot at a cursor and three committed events after it")]
+fn snapshot_then_three(world: &mut World) {
+    events_around_cursor(world);
+    snapshot_at_end(world);
+    for v in 10..13 {
+        world
+            .g()
+            .write(&Write::new("eavesdrop").unit(Unit::new(
+                "voice",
+                format!("v{v}"),
+                NONE,
+                day(2026, 10, 14),
+            )))
+            .unwrap();
+    }
+    world.log = world.all_events();
+}
+
+#[then("the rebuilt graph's committed watermark is the cursor of the third event")]
+fn rebuilt_watermark_is_third(world: &mut World) {
+    let after = logged_after(world, world.cursor);
+    assert_eq!(after.len(), 3);
+    assert_eq!(rebuilt_committed(world), after[2].cursor);
+}
+
+/// A graph whose last event, at `World::cursor`, holds the one hearing of p-gone, the fact to
+/// purge.
+#[given("a graph whose last committed event is a hearing a purge rule matches, at cursor c")]
+fn last_event_purgeable(world: &mut World) {
+    let g = purge_graph(world);
+    g.write(&Write::new("app").unit(person("p-other", "before")))
+        .unwrap();
+    g.write(&Write::new("app").unit(person("p-gone", TOKEN)))
+        .unwrap();
+    let hearing = &g.hearings(&NodeRef::new("person", "p-gone")).unwrap()[0];
+    world.purge.targets.push(Purge::Fact {
+        identity: hearing.identity,
+    });
+    world.cursor = world.all_events().last().unwrap().cursor;
+    assert_eq!(world.g().events().committed().unwrap(), world.cursor);
+}
+
+#[when("the purge runs")]
+fn purge_runs(world: &mut World) {
+    purge_targets(world);
+}
+
+#[then("the committed watermark is the purge event's cursor, which is greater than c")]
+fn watermark_is_purge_event(world: &mut World) {
+    let purged = world.all_events().last().unwrap().clone();
+    assert!(matches!(purged.change, Change::Purged { .. }), "{purged:?}");
+    assert_eq!(world.g().events().committed().unwrap(), purged.cursor);
+    assert!(purged.cursor > world.cursor);
+}
+
+#[given("a graph whose last event before cursor c was purged, so no event is at c")]
+fn purged_at_cursor(world: &mut World) {
+    last_event_purgeable(world);
+    purge_targets(world);
+    let c = world.cursor;
+    assert!(world.all_events().iter().all(|e| e.cursor != c));
+}
+
+#[when("a snapshot is taken at c and a graph is rebuilt from it with no later events")]
+fn snapshot_at_c_rebuilt(world: &mut World) {
+    take_snapshot(world);
+    rebuilt_from_snapshot_alone(world);
+}
+
+#[then("the rebuilt graph's committed watermark is at least c")]
+fn rebuilt_watermark_at_least_c(world: &mut World) {
+    assert!(rebuilt_committed(world) >= world.cursor);
+}
+
+const READER: &str = "reader";
+
+#[given(
+    "a graph with a registered follower whose stored cursor is after the second event, and a \
+     snapshot at the cursor of the fifth event"
+)]
+fn follower_second_snapshot_fifth(world: &mut World) {
+    events_around_cursor(world);
+    let second = after_event(world, 2);
+    let events = world.g().events();
+    events.register(READER).unwrap();
+    events.advance(READER, second).unwrap();
+    world.cursor = after_event(world, 5);
+    take_snapshot(world);
+}
+
+#[then("the follower's stored cursor in the rebuilt graph is the cursor after the second event")]
+fn rebuilt_follower_at_second(world: &mut World) {
+    let rebuilt = world.rebuilt.as_ref().expect("the graph was rebuilt");
+    assert_eq!(
+        rebuilt.events().followers().unwrap(),
+        vec![(READER.to_string(), after_event(world, 2))]
+    );
+}
+
+#[given(
+    "a graph rebuilt from a snapshot, with a registered follower whose stored cursor is before \
+     the snapshot's cursor"
+)]
+fn rebuilt_with_follower_behind(world: &mut World) {
+    events_around_cursor(world);
+    let second = after_event(world, 2);
+    let events = world.g().events();
+    events.register(READER).unwrap();
+    events.advance(READER, second).unwrap();
+    take_snapshot(world);
+    rebuild_from_snapshot(world);
+}
+
+#[when("the app advances the follower to the snapshot's cursor")]
+fn advances_to_snapshot(world: &mut World) {
+    let rebuilt = world.rebuilt.as_ref().expect("the graph was rebuilt");
+    if let Err(error) = rebuilt.events().advance(READER, world.cursor) {
+        world.refusals.push(error);
+    }
+}
+
+#[then("the advance is accepted and the follower's stored cursor is the snapshot's cursor")]
+fn advance_accepted(world: &mut World) {
+    assert!(world.refusals.is_empty(), "{:?}", world.refusals);
+    let rebuilt = world.rebuilt.as_ref().expect("the graph was rebuilt");
+    assert_eq!(
+        rebuilt.events().followers().unwrap(),
+        vec![(READER.to_string(), world.cursor)]
+    );
+}
+
 // ---------- queue: a heartbeat commits the in-memory write queue ----------
 
 /// A heartbeat long enough that no scenario races it: those scenarios commit by flushing.
@@ -6384,6 +6629,76 @@ fn both_ended_at_40(world: &mut World) {
     }
 }
 
+#[given(
+    "a node written by one source with content v1, then v2, then v1 again, each in its own commit"
+)]
+fn returns_to_v1(world: &mut World) {
+    for text in ["v1", "v2", "v1"] {
+        let unit = unit_of(world.g(), "k1", text, 0);
+        world.write(&Write::new("crawler").unit(unit));
+        assert_eq!(world.written.len(), 1, "{text} wrote its event");
+        std::thread::sleep(Duration::from_millis(3));
+    }
+}
+
+#[when("the node is read")]
+fn the_node_is_read(world: &mut World) {
+    let class = the_class(world.g()).name;
+    world.found = Some(world.find(&class, "k1"));
+}
+
+#[then("its current state is v1")]
+fn current_state_v1(world: &mut World) {
+    let node = world.found.as_ref().expect("the node was read");
+    assert_eq!(node.properties.get("text"), Some(&Value::Text("v1".into())));
+}
+
+#[then("it has one hearing of v1 with two occurrences and one hearing of v2")]
+fn v1_twice_v2_once(world: &mut World) {
+    let class = the_class(world.g()).name;
+    let hearings = world.g().hearings(&NodeRef::new(&class, "k1")).unwrap();
+    // A hearing occurs under its own event and under each alias.
+    let mut occurrences: Vec<usize> = hearings.iter().map(|h| 1 + h.aliases.len()).collect();
+    occurrences.sort_unstable();
+    assert_eq!(occurrences, [1, 2], "{hearings:?}");
+}
+
+/// `tests/fixtures/store-0.2.0-return.rannoch` was written by rannoch at tag v0.2.0: class book
+/// (no history key) with title (text), and book b1 written by source shelf with title v1, then
+/// v2, then v1 again, each in its own commit; 4 events, none carrying a point.
+#[given(
+    "a log written by rannoch 0.2.0 in which one source wrote a node with content v1, then v2, then v1 again"
+)]
+fn log_020_return(world: &mut World) {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/store-0.2.0-return.rannoch"
+    );
+    std::fs::copy(fixture, world.path()).unwrap();
+    world.open();
+    world.log = world.all_events();
+    assert_eq!(world.log.len(), 4);
+}
+
+#[when("a graph is rebuilt from that log")]
+fn rebuilt_from_log(world: &mut World) {
+    let path = world.dir.path().join("rebuilt.rannoch");
+    world.rebuilt = Some(rannoch::rebuild(&world.log, path, Some(&KEY)).unwrap());
+}
+
+#[then("the node's current state is v1")]
+fn rebuilt_reads_v1(world: &mut World) {
+    let rebuilt = world.rebuilt.as_ref().expect("the graph was rebuilt");
+    let node = rebuilt
+        .find("book", "b1")
+        .unwrap()
+        .expect("b1 is in the graph");
+    assert_eq!(
+        node.properties.get("title"),
+        Some(&Value::Text("v1".into()))
+    );
+}
+
 // ---------- purge ----------
 
 /// The token the purged fact's property carries: found nowhere else in a scenario's files.
@@ -7309,13 +7624,415 @@ fn nothing_of_node_hearing(world: &mut World) {
     assert!(g.find("person", "p-stays").unwrap().is_some());
 }
 
-// FR-RANNOCH-084's other scenarios belong to #89, which brings their steps and drops this filter.
-scenarios!(
-    "tests",
-    fixtures = [world: World],
-    tags = "not (@criterion-01a1752f-2126-7ef3-8e7a-1fc5f265519a \
-            or @criterion-01a17540-2219-7e60-ad01-4420aefe6364 \
-            or @criterion-01a17540-2219-7e60-ad01-4434d39dc772 \
-            or @criterion-01a17759-c275-706d-ae91-072c9950dc21 \
-            or @criterion-01a17771-f692-7a92-8518-e5e663c774ae)"
-);
+// FR-RANNOCH-066: an ending is a version of the link, held whether or not a live hearing of
+// the link arrived before it.
+
+#[given(
+    "a graph rebuilt from events in which a link's ending arrives before any live hearing of that link"
+)]
+fn ending_before_hearing(world: &mut World) {
+    declare_kind(world.open(), "time-keyed");
+    follows_between_visits(world);
+    let facts = [LinkAt::Ended("b", 20), LinkAt::Heard("b", "crawler", 10)];
+    world.graph = Some(graph_of(world, &facts));
+}
+
+#[when("the link's state is read at a point after the ending")]
+fn state_after_ending(world: &mut World) {
+    let state = world
+        .g()
+        .link_state_at("follows", "b", "a", At::Time(at(25)));
+    world.states = vec![state.unwrap()];
+}
+
+#[then("the link reads as ended at the ending's point")]
+fn ended_at_endings_point(world: &mut World) {
+    let state = world.states[0]
+        .as_ref()
+        .expect("the link has a version by then");
+    assert!(state.ended, "{state:?}");
+    assert_eq!(state.point, at(20));
+}
+
+#[given("a link ended at point 10 and first heard alive at point 20")]
+fn ended_then_first_heard(world: &mut World) {
+    declare_kind(world.open(), "time-keyed");
+    follows_between_visits(world);
+    let facts = [LinkAt::Ended("b", 10), LinkAt::Heard("b", "crawler", 20)];
+    world.graph = Some(graph_of(world, &facts));
+}
+
+#[when("its state is read at point 15 and at point 25")]
+fn state_at_15_and_25(world: &mut World) {
+    world.states = [15, 25]
+        .map(|n| {
+            let state = world
+                .g()
+                .link_state_at("follows", "b", "a", At::Time(at(n)));
+            state.unwrap()
+        })
+        .to_vec();
+}
+
+#[then("it reads as ended at point 15 and live at point 25")]
+fn ended_at_15_live_at_25(world: &mut World) {
+    let [Some(early), Some(late)] = &world.states[..] else {
+        panic!("the link has a version at both points: {:?}", world.states);
+    };
+    assert!(early.ended && early.point == at(10), "{early:?}");
+    assert!(!late.ended && late.point == at(20), "{late:?}");
+}
+
+// FR-RANNOCH-084: the same events in any arrival order, declarations first, give the same
+// answers to every read except first recorded.
+
+/// Every node of the arrival-order graph, by class and key.
+const ARRIVAL_NODES: [(&str, &str); 6] = [
+    ("visit", "a"),
+    ("visit", "b"),
+    ("visit", "c"),
+    ("visit", "z"),
+    ("note", "n1"),
+    ("note", "n2"),
+];
+
+/// Every link of the arrival-order graph: relation, from and to.
+const ARRIVAL_LINKS: [(&str, &str, &str); 5] = [
+    ("follows", "b", "a"),
+    ("follows", "c", "z"),
+    ("follows", "a", "b"),
+    ("about", "n1", "a"),
+    ("about", "n2", "z"),
+];
+
+/// What a graph answers about `seen`, but for first recorded, which is per store.
+fn seen_but_first_recorded(seen: Option<rannoch::Seen>) -> String {
+    format!(
+        "{:?}",
+        seen.map(|s| (s.first_heard, s.last_heard, s.first_true, s.count, s.ended))
+    )
+}
+
+/// The answers `g` gives to find, state at a point, reads as of a valid time, first and last
+/// heard and counts, for every node and link of the arrival-order graph, and its open links.
+fn arrival_answers(g: &Graph) -> Vec<String> {
+    let points = [5, 15, 25, 35, 45, 100_000].map(|n| At::Time(at(n)));
+    let dates = ["2025-01-01", "2026-06-01"].map(date);
+    let mut answers = Vec::new();
+    for (class, key) in ARRIVAL_NODES {
+        let node = NodeRef::new(class, key);
+        answers.push(format!("{:?}", g.find(class, key).unwrap().map(node_facts)));
+        for at in &points {
+            answers.push(format!("{:?}", g.state_at(&node, *at).unwrap()));
+        }
+        for as_of in &dates {
+            let found = g.find_as_of(class, key, as_of, None).unwrap();
+            answers.push(format!("{:?}", found.map(node_facts)));
+        }
+        answers.push(seen_but_first_recorded(g.seen(&node).unwrap()));
+    }
+    for (relation, from, to) in ARRIVAL_LINKS {
+        let link = g.find_link(relation, from, to).unwrap();
+        answers.push(format!("{:?}", link.map(link_facts)));
+        for at in &points {
+            answers.push(format!(
+                "{:?}",
+                g.link_state_at(relation, from, to, *at).unwrap()
+            ));
+        }
+        answers.push(seen_but_first_recorded(
+            g.link_seen(relation, from, to).unwrap(),
+        ));
+    }
+    answers.push(format!("{:?}", g.open_links().unwrap()));
+    answers
+}
+
+#[given(
+    "a graph holding nodes and links of a time-keyed class and of a class with no key, some of whose versions arrived after newer ones"
+)]
+fn arrival_graph(world: &mut World) {
+    let g = world.open();
+    declare_kind(g, "time-keyed");
+    declare_kind(g, "keyless");
+    for (name, from) in [("follows", "visit"), ("about", "note")] {
+        let relation = Relation::new(name, from, "visit", false);
+        g.declare(&Declaration::Relation(relation)).unwrap();
+    }
+    let visit = |key: &str, text: &str, valid: ValidTime, n: u64| {
+        Unit::new("visit", key, [("text", text)], valid).at(at(n))
+    };
+    let note = |key: &str, text: &str| Unit::new("note", key, [("text", text)], day(2026, 2, 1));
+    let writes = [
+        Write::new("crawler").unit(visit("a", "a at 10", day(2026, 1, 1), 10)),
+        Write::new("crawler").unit(visit("b", "b at 30", day(2026, 3, 1), 30).link(
+            "follows",
+            "b",
+            "a",
+            day(2026, 3, 1),
+        )),
+        // Older on the axis than the version held, arriving after it.
+        Write::new("mirror").unit(visit("b", "b at 20", day(2025, 6, 1), 20)),
+        // z has not been heard: the link waits open until it is.
+        Write::new("crawler").unit(visit("c", "c at 15", day(2026, 1, 1), 15).link(
+            "follows",
+            "c",
+            "z",
+            day(2026, 1, 1),
+        )),
+        Write::new("notes").unit(note("n1", "n1").link("about", "n1", "a", day(2026, 2, 1))),
+        Write::new("notes").unit(note("n2", "n2").link("about", "n2", "z", day(2026, 2, 1))),
+        Write::new("mirror").unit(visit("a", "a at 5", day(2024, 1, 1), 5)),
+        Write::new("crawler").unit(visit("z", "z at 40", day(2026, 4, 1), 40)),
+        Write::new("archive").unit(note("n1", "n1 again")),
+        Write::new("crawler").unit(visit("a", "a at 50", day(2026, 5, 1), 50).link(
+            "follows",
+            "a",
+            "b",
+            day(2026, 5, 1),
+        )),
+    ];
+    for write in &writes {
+        world.g().write(write).unwrap();
+        // Each keyless version takes its own record time as its point.
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let closed = world.all_events();
+    assert!(closed.iter().any(|e| matches!(e.change, Change::Closed(_))));
+}
+
+#[when(
+    "its declarations and then its other events are given to 20 new graphs, the other events in a different random order in each, some links arriving before their ends"
+)]
+#[when(
+    "its declarations and then its other events are given to 20 new graphs, the other events in a different random order in each"
+)]
+fn given_in_20_orders(world: &mut World) {
+    let (declared, others): (Vec<Event>, Vec<Event>) = world
+        .all_events()
+        .into_iter()
+        .partition(|e| matches!(e.change, Change::Declared(_)));
+    // A fixed seed, so each run gives the graphs the same orders.
+    let mut rng = fastrand::Rng::with_seed(84);
+    for i in 0..20 {
+        let mut order = others.clone();
+        rng.shuffle(&mut order);
+        let events: Vec<Event> = declared.iter().cloned().chain(order).collect();
+        let path = world.dir.path().join(format!("order-{i}.rannoch"));
+        world
+            .graphs
+            .push(rannoch::rebuild(&events, path, Some(&KEY)).unwrap());
+    }
+}
+
+#[then(
+    "every graph returns the same answers as the original to find, state at a point, reads as of a valid time, first and last heard, and counts, for every node and link"
+)]
+fn same_answers_in_every_order(world: &mut World) {
+    let original = arrival_answers(world.g());
+    for (i, g) in world.graphs.iter().enumerate() {
+        assert_eq!(arrival_answers(g), original, "graph {i}");
+    }
+}
+
+/// Builds a new graph from the world graph's events and `events`, in that order.
+fn given_events(world: &mut World, events: &[Event], name: &str) -> Graph {
+    let declared = world
+        .log
+        .iter()
+        .take_while(|e| matches!(e.change, Change::Declared(_)));
+    let events: Vec<Event> = declared.chain(events).cloned().collect();
+    let path = world.dir.path().join(format!("{name}.rannoch"));
+    rannoch::rebuild(&events, path, Some(&KEY)).unwrap()
+}
+
+/// A and B, the two deliveries of one hearing, as the world's log ends with them.
+fn deliveries(world: &World) -> (Event, Event) {
+    let n = world.log.len();
+    (world.log[n - 2].clone(), world.log[n - 1].clone())
+}
+
+#[when("one new graph is given A then B and another new graph is given B then A")]
+fn given_both_orders(world: &mut World) {
+    let (a, b) = deliveries(world);
+    let forward = given_events(world, &[a.clone(), b.clone()], "a-then-b");
+    let backward = given_events(world, &[b, a], "b-then-a");
+    world.graphs.extend([forward, backward]);
+}
+
+#[then("both graphs name the hearing by A")]
+fn both_name_a(world: &mut World) {
+    let (a, b) = deliveries(world);
+    for g in &world.graphs {
+        let hearings = g.hearings(&NodeRef::new("visit", "k1")).unwrap();
+        assert_eq!(hearings.len(), 1, "{hearings:?}");
+        assert_eq!(
+            (hearings[0].event, &hearings[0].aliases),
+            (a.id, &vec![b.id])
+        );
+    }
+}
+
+#[given(
+    "another version of the same node at the same point, with other properties, under an event id between A and B"
+)]
+fn other_version_between(world: &mut World) {
+    let (a, b) = deliveries(world);
+    let Change::Wrote {
+        source, mut added, ..
+    } = a.change.clone()
+    else {
+        panic!("A is a write: {a:?}");
+    };
+    let Some(Fact::Node(node)) = added.first_mut() else {
+        panic!("A writes a node: {added:?}");
+    };
+    node.properties.insert("text".into(), Value::from("other"));
+    // A's id plus one: minted in the same millisecond as A, before B.
+    let id = serde_json::to_value(a.id).unwrap();
+    let id = uuid::Uuid::parse_str(id.as_str().unwrap())
+        .unwrap()
+        .as_u128()
+        + 1;
+    let id: EventId = serde_json::from_value(uuid::Uuid::from_u128(id).to_string().into()).unwrap();
+    assert!(a.id < id && id < b.id);
+    let last: i64 =
+        serde_json::from_value(serde_json::to_value(a.cursor.max(b.cursor)).unwrap()).unwrap();
+    let other = Event {
+        id,
+        cursor: serde_json::from_value(serde_json::json!(last + 1)).unwrap(),
+        change: Change::Wrote {
+            source,
+            added,
+            wrong_kind: Vec::new(),
+            check: None,
+        },
+    };
+    world.log.insert(world.log.len() - 1, other);
+}
+
+#[when(
+    "one new graph is given A, the other version, then B, and another new graph is given B, the other version, then A"
+)]
+fn given_around_the_other(world: &mut World) {
+    let n = world.log.len();
+    let (a, other, b) = (
+        world.log[n - 3].clone(),
+        world.log[n - 2].clone(),
+        world.log[n - 1].clone(),
+    );
+    let forward = given_events(world, &[a.clone(), other.clone(), b.clone()], "a-other-b");
+    let backward = given_events(world, &[b, other, a], "b-other-a");
+    world.graphs.extend([forward, backward]);
+}
+
+/// The hearing delivered under A and B wins the tie: its occurrence under B has the larger
+/// (point, event id).
+#[then("find returns the hearing delivered under A and B as the node's state in both graphs")]
+fn delivered_hearing_in_both(world: &mut World) {
+    for g in &world.graphs {
+        let found = g.find("visit", "k1").unwrap().expect("the node is held");
+        assert_eq!(text_of(&found), "words");
+    }
+}
+
+#[given(
+    "a graph of a time-keyed class holding links that have ended, one of them ended twice at the same point under different event ids, and nodes heard with different valid times, some versions arriving after newer ones"
+)]
+fn ended_links_graph(world: &mut World) {
+    declare_kind(world.open(), "time-keyed");
+    follows_between_visits(world);
+    for (key, n, valid) in [
+        ("a", 30, day(2025, 3, 1)),
+        // Older on the axis than the version held, arriving after it.
+        ("a", 20, day(2024, 1, 1)),
+        ("b", 25, day(2023, 5, 1)),
+    ] {
+        let unit = Unit::new("visit", key, [("text", key)], valid).at(at(n));
+        world.g().write(&Write::new("mirror").unit(unit)).unwrap();
+    }
+    let facts = [
+        LinkAt::Heard("b", "crawler", 10),
+        LinkAt::Ended("b", 20),
+        LinkAt::Ended("b", 20),
+        LinkAt::Heard("c", "crawler", 10),
+        LinkAt::Ended("c", 30),
+    ];
+    world.graph = Some(graph_of(world, &facts));
+}
+
+/// When each link of `g` ended and each node's and link's first true.
+fn ended_and_first_true(g: &Graph) -> Vec<String> {
+    let mut answers = Vec::new();
+    for from in ["b", "c"] {
+        answers.push(format!("{:?}", g.link_end("follows", from, "a").unwrap()));
+        let seen = g.link_seen("follows", from, "a").unwrap().unwrap();
+        answers.push(format!("{:?}", (seen.ended, seen.first_true)));
+    }
+    for key in ["a", "b", "c"] {
+        let seen = g.seen(&NodeRef::new("visit", key)).unwrap().unwrap();
+        answers.push(format!("{:?}", seen.first_true));
+    }
+    answers
+}
+
+#[then(
+    "every graph returns the same answer as the original to when each link ended and to each node's and link's first true"
+)]
+fn same_endings_and_first_true(world: &mut World) {
+    let original = ended_and_first_true(world.g());
+    for (i, g) in world.graphs.iter().enumerate() {
+        assert_eq!(ended_and_first_true(g), original, "graph {i}");
+    }
+}
+
+#[given(
+    "a graph of a time-keyed class holding one node replaced twice at the same point under different event ids, and another node replaced twice at different points"
+)]
+fn replaced_twice_graph(world: &mut World) {
+    declare_kind(world.open(), "time-keyed");
+    let mut write = Write::new("crawler");
+    for key in ["a", "b", "c", "d", "e"] {
+        write = write.unit(Unit::new("visit", key, [("text", key)], day(2026, 1, 1)).at(at(1)));
+    }
+    world.g().write(&write).unwrap();
+    let mut events = world.all_events();
+    // The later replacement of d arrives first.
+    for (old, new, n) in [
+        ("a", "b", 10),
+        ("a", "c", 10),
+        ("d", "b", 20),
+        ("d", "e", 10),
+    ] {
+        let cursor = serde_json::from_value(serde_json::json!(events.len() + 1)).unwrap();
+        events.push(Event {
+            id: id_at(at(n)),
+            cursor,
+            change: Change::Replaced {
+                class: "visit".into(),
+                old: old.into(),
+                new: new.into(),
+            },
+        });
+    }
+    let path = world.dir.path().join("replaced.rannoch");
+    world.graph = Some(rannoch::rebuild(&events, path, Some(&KEY)).unwrap());
+}
+
+/// The fate `g` gives each replaced node.
+fn fates_of(g: &Graph) -> Vec<Option<NodeRef>> {
+    ["a", "d"]
+        .map(|key| g.describe(&NodeRef::new("visit", key)).unwrap().replaced_by)
+        .to_vec()
+}
+
+#[then("every graph returns the same fate as the original for each node")]
+fn same_fates(world: &mut World) {
+    let original = fates_of(world.g());
+    assert!(original.iter().all(Option::is_some), "{original:?}");
+    for (i, g) in world.graphs.iter().enumerate() {
+        assert_eq!(fates_of(g), original, "graph {i}");
+    }
+}
+
+scenarios!("tests", fixtures = [world: World]);

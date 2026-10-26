@@ -11,9 +11,9 @@ use rusqlite::{Connection, ToSql};
 use serde::{Deserialize, Serialize};
 
 use crate::events::{Events, OWN_TABLES};
-use crate::history::{HISTORY_TABLES, Key, see_all, take};
+use crate::history::{HISTORY_TABLES, Key, point_aliases, see_all, take};
 use crate::purge::{PURGE_TABLES, stand_all};
-use crate::write::Error;
+use crate::write::{Error, date_fates};
 
 /// A class: a kind of node, with its natural key, its properties and each one's value type,
 /// and the key its history is ordered by.
@@ -406,6 +406,8 @@ pub(crate) fn open_file(path: impl AsRef<Path>) -> Result<Graph, Error> {
     conn.set_prepared_statement_cache_capacity(256);
     conn.execute_batch(OWN_TABLES)?;
     conn.execute_batch(PURGE_TABLES)?;
+    date_fates(&mut conn)?;
+    point_aliases(&mut conn)?;
     // A store whose hearings were written before what is seen of them was kept.
     if table(&conn, "_hearings")? && !table(&conn, "_seen")? {
         see_all(&mut conn)?;

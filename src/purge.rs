@@ -665,7 +665,7 @@ fn choose(tx: &Connection, ontology: &Ontology, key: &Key, purge: &Purge) -> Res
 
 /// Removes the link of `relation` from `from` to `to` from live state: from its relation, or
 /// from the open links.
-fn drop_link(
+pub(crate) fn drop_link(
     tx: &Connection,
     ontology: &Ontology,
     (relation, from, to): (&str, &str, &str),
@@ -686,7 +686,7 @@ fn drop_link(
 
 /// What is left of a touched node or link once its purged hearings are gone.
 #[derive(Default)]
-struct Left {
+pub(crate) struct Left {
     /// Nodes with no hearing left, which left live state; their links wait open.
     nodes: BTreeSet<NodeRef>,
     /// Links with no hearing left, which left live state.
@@ -696,7 +696,7 @@ struct Left {
 /// Puts the current state of `of` back from its newest version left, as every write chooses it;
 /// a node or link with no version left leaves live state, and a node's links that still have
 /// hearings wait open for it.
-fn current(
+pub(crate) fn current(
     tx: &Connection,
     ontology: &Ontology,
     key: &Key,
