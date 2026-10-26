@@ -278,9 +278,9 @@ pub struct Events<'g> {
 impl Events<'_> {
     /// The committed watermark: the highest place the log has given a committed event, or
     /// [`Cursor::START`] when it has given none. It never moves back, not even when a purge
-    /// removes the last event. Another process on the same file learns of a commit by reading it, then
-    /// reads [`Events::since_until`] its own cursor up to it; an event not yet committed is
-    /// never under it.
+    /// removes the last event. Another process on the same file learns of a commit by reading
+    /// it, then reads [`Events::since_until`] its own cursor up to it; an event not yet
+    /// committed is never under it.
     ///
     /// # Errors
     /// The graph file cannot be read.
