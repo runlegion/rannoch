@@ -66,9 +66,7 @@ impl Key {
             check: blake3::keyed_hash(bytes, CHECK_LABEL).to_hex().to_string(),
         }
     }
-}
 
-impl Key {
     /// `text`'s keyed match value: its keyed hash under the key, so a purge names what it
     /// matched without holding it.
     pub(crate) fn matched(&self, text: &[u8]) -> blake3::Hash {
@@ -88,7 +86,15 @@ pub(crate) enum Of<'a> {
     Link(&'a LinkFact),
 }
 
-impl Of<'_> {
+impl<'a> Of<'a> {
+    /// What `fact` is a hearing of: a node, or a link, open or not.
+    pub(crate) fn fact(fact: &'a Fact) -> Of<'a> {
+        match fact {
+            Fact::Node(node) => Of::Node(node),
+            Fact::Link(link) | Fact::Opened(link) => Of::Link(link),
+        }
+    }
+
     /// Its entity (a class or a relation), its key and, for a link, its target's key.
     pub(crate) fn entity(&self) -> (String, &str, Option<&str>) {
         match self {
@@ -635,10 +641,7 @@ pub(crate) fn take(conn: &mut Connection, key: &Key) -> Result<(), Error> {
         // Into the versions only, as a replay hears them: current state stays as it is.
         let mut piece = Piece::new(&tx, &ontology, key, source, stamp);
         for fact in added {
-            let of = match fact {
-                Fact::Node(node) => Of::Node(node),
-                Fact::Link(link) | Fact::Opened(link) => Of::Link(link),
-            };
+            let of = Of::fact(fact);
             if let Heard::Held(held) = piece.hear(&of)? {
                 piece.held(&held, false)?;
             }

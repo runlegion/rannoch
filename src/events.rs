@@ -18,8 +18,8 @@ use crate::write::{Declaration, Error, ValidTime, now_millis, replay};
 
 /// rannoch's own tables: the event log, the ontology, links waiting for an end, the fates of
 /// nodes that were replaced, the events each node was derived from, the registered followers
-/// with their stored cursors, and every snapshot the store made, so a purge reaches it. An event's place is never reused, so a cursor stays a place in the
-/// log.
+/// with their stored cursors, and every snapshot the store made, so a purge reaches it. An
+/// event's place is never reused, so a cursor stays a place in the log.
 pub(crate) const OWN_TABLES: &str = "
     CREATE TABLE IF NOT EXISTS _events(seq INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS _ontology(

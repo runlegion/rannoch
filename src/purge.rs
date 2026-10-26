@@ -11,7 +11,8 @@ use rusqlite::{Connection, OptionalExtension, ToSql, TransactionBehavior, params
 use serde::{Deserialize, Serialize};
 
 use crate::events::{
-    Change, Cursor, Event, Fact, LinkFact, Stored, append, drop_derived, naming_key, remove, unlink,
+    Change, Cursor, Event, EventId, Fact, LinkFact, Stored, append, drop_derived, naming_key,
+    remove, unlink,
 };
 use crate::history::{Key, Of, link_entity, newest, node_entity, see};
 use crate::open::{CLASS, Graph, Ontology, RELATION, class_table, open_keyed, relation_table};
@@ -154,10 +155,7 @@ impl Chosen {
                     source: s, added, ..
                 } if s == source => {
                     for fact in added {
-                        let of = match fact {
-                            Fact::Node(node) => Of::Node(node),
-                            Fact::Link(link) | Fact::Opened(link) => Of::Link(link),
-                        };
+                        let of = Of::fact(fact);
                         let identity = of.identity(key, s)?;
                         self.hear(tx, "identity = ?1", params![identity])?;
                     }
@@ -389,7 +387,7 @@ fn current(
 ) -> Result<(), Error> {
     let version = newest(tx, (entity, at, to.as_deref()))?;
     let stamp = |recorded| Stamp {
-        id: crate::events::EventId::now(),
+        id: EventId::now(),
         cursor: Cursor::START,
         recorded,
         arrived: true,
@@ -481,10 +479,7 @@ fn without(
         } => {
             let mut kept = Vec::new();
             for fact in added {
-                let of = match fact {
-                    Fact::Node(node) => Of::Node(node),
-                    Fact::Link(link) | Fact::Opened(link) => Of::Link(link),
-                };
+                let of = Of::fact(fact);
                 let gone = match stripped {
                     Some(stripped) => stripped.contains(&of.identity(key, source)?),
                     None => false,
