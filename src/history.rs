@@ -214,7 +214,10 @@ pub(crate) fn hear(
     } else {
         None
     };
-    let point = of.time().unwrap_or(stamp.id.millis());
+    let point = match of.time() {
+        Some(point) => point,
+        None => stamp.id.recorded()?,
+    };
     tx.prepare_cached(
         "INSERT INTO _hearings(identity, entity, key, to_key, event, seq, source, valid, point, \
          integer, recorded, properties) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
@@ -457,7 +460,7 @@ pub(crate) fn alias(
             held.identity,
             event.to_string(),
             cursor.0,
-            held.time.unwrap_or(event.millis())
+            point(held, event)?
         ])?;
     }
     let alias = if renamed { held.event } else { event };
@@ -468,12 +471,18 @@ pub(crate) fn alias(
         .execute(params![
             held.identity,
             alias.to_string(),
-            held.time.unwrap_or(alias.millis())
+            point(held, alias)?
         ])?;
     if renamed || new == 1 {
         reseen(tx, held.identity)?;
     }
     Ok(renamed)
+}
+
+/// The point an occurrence of `held` as `event` is at: the hearing's own time, or else the
+/// record time of `event`.
+fn point(held: &Held, event: EventId) -> Result<i64, Error> {
+    held.time.map_or_else(|| event.recorded(), Ok)
 }
 
 /// An alias as a store holds it: the identity of the hearing it is an alias of, its event id
@@ -657,7 +666,7 @@ pub(crate) fn take(conn: &mut Connection, key: &Key) -> Result<(), Error> {
         let stamp = Stamp {
             id: event.id,
             cursor: event.cursor,
-            recorded: event.id.millis(),
+            recorded: event.id.recorded()?,
             arrived: true,
         };
         // Into the versions only, as a replay hears them: current state stays as it is.
@@ -722,7 +731,7 @@ pub(crate) fn point_aliases(conn: &mut Connection) -> Result<(), Error> {
         for (identity, alias, _) in aliases(&tx)? {
             let id: EventId = serde_json::from_value(alias.clone().into())?;
             tx.prepare_cached("UPDATE _aliases SET point = ?3 WHERE identity = ?1 AND alias = ?2")?
-                .execute(params![identity, alias, id.millis()])?;
+                .execute(params![identity, alias, id.recorded()?])?;
         }
     }
     tx.commit()?;
@@ -1897,19 +1906,20 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let (g, written) = returned(&dir.path().join("return.rannoch"))?;
         let k1 = NodeRef::new("note", "k1");
-        let point =
-            |i: usize| UNIX_EPOCH + Duration::from_millis(written[i].id.millis().cast_unsigned());
-        let between = super::At::Time(point(2) - Duration::from_millis(1));
-        assert!(point(1) <= point(2) - Duration::from_millis(1));
+        let point = |i: usize| -> Result<_, crate::Error> {
+            Ok(UNIX_EPOCH + Duration::from_millis(written[i].id.recorded()?.cast_unsigned()))
+        };
+        let between = super::At::Time(point(2)? - Duration::from_millis(1));
+        assert!(point(1)? <= point(2)? - Duration::from_millis(1));
         assert_eq!(text(g.state_at(&k1, between)?), Some("v2".into()));
         assert_eq!(
-            text(g.state_at(&k1, super::At::Time(point(2)))?),
+            text(g.state_at(&k1, super::At::Time(point(2)?))?),
             Some("v1".into())
         );
         let seen = g.seen(&k1)?.ok_or("k1 was seen")?;
         assert_eq!(
             (seen.count, seen.first_heard.point, seen.last_heard.point),
-            (2, point(0), point(2))
+            (2, point(0)?, point(2)?)
         );
         assert_eq!(
             seen.last_heard.event, written[0].id,
@@ -1960,7 +1970,7 @@ mod tests {
             .collect::<Result<_, _>>()?;
         assert_eq!(
             points,
-            [(written[2].id.to_string(), Some(written[2].id.millis()))]
+            [(written[2].id.to_string(), written[2].id.millis())]
         );
         let indexed: bool = g.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_index_info('_aliases_at'))",
@@ -2037,6 +2047,44 @@ mod tests {
         let before = g.link_state_at("knows", "v2", "v1", super::At::Time(ended))?;
         assert!(before.is_some_and(|v| v.ended));
         assert_eq!(g.link_hearings("knows", "v2", "v1")?.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn a_store_whose_log_holds_an_event_whose_id_is_not_a_uuidv7_refuses_to_take_its_key()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("prekey.db");
+        let foreign = uuid::Builder::from_random_bytes([7; 16]).into_uuid();
+        {
+            let mut g = open(&path, Some(&crate::TEST_KEY))?;
+            g.declare(&Declaration::Class(Class::new("person", ["name"])))?;
+            let written = g.write(&Write::new("tree").unit(Unit::new(
+                "person",
+                "p01",
+                [("name", "Ana")],
+                ValidTime::Unknown,
+            )))?;
+            // As a store written before keys, whose log holds an event from another store.
+            g.conn.execute(
+                "UPDATE _events SET body = replace(body, ?1, ?2)",
+                rusqlite::params![written[0].id.to_string(), foreign.to_string()],
+            )?;
+            g.conn.execute_batch(
+                "DELETE FROM _check; DELETE FROM _hearings; DELETE FROM _aliases;",
+            )?;
+        }
+
+        let Err(crate::Error::Refused(message)) = open(&path, Some(&crate::TEST_KEY)) else {
+            panic!("the store took its key over an event with a version-4 id");
+        };
+        assert!(message.contains(&foreign.to_string()), "{message}");
+        let hearings: i64 = rusqlite::Connection::open(&path)?.query_row(
+            "SELECT count(*) FROM _hearings",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(hearings, 0);
         Ok(())
     }
 

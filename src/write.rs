@@ -936,6 +936,7 @@ pub(crate) fn replay(
     recorded: i64,
     event: &Event,
 ) -> Result<bool, Error> {
+    event.id.recorded()?;
     let stamp = Stamp {
         id: event.id,
         cursor: event.cursor,
@@ -1350,10 +1351,14 @@ fn put(
 ) -> Result<Put, Error> {
     let id = EventId::now();
     let cursor = next_cursor(tx)?;
+    #[allow(clippy::expect_used)]
+    let recorded = id
+        .millis()
+        .expect("an id minted by EventId::now is a UUIDv7, which carries its time");
     let stamp = Stamp {
         id,
         cursor,
-        recorded: id.millis(),
+        recorded,
         arrived: false,
     };
     let mut piece = Piece::new(tx, ontology, key, source, stamp);

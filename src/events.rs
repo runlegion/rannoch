@@ -68,13 +68,24 @@ impl EventId {
     }
 
     /// The millisecond the id was minted at: when the store that minted it recorded its event.
-    pub(crate) fn millis(self) -> i64 {
-        self.0.get_timestamp().map_or(0, |at| {
+    /// None when the id carries no timestamp, as an id that is not a `UUIDv7` may not.
+    pub(crate) fn millis(self) -> Option<i64> {
+        self.0.get_timestamp().map(|at| {
             let (seconds, nanos) = at.to_unix();
             i64::try_from(seconds)
                 .unwrap_or(i64::MAX)
                 .saturating_mul(1_000)
                 .saturating_add(i64::from(nanos / 1_000_000))
+        })
+    }
+
+    /// The millisecond the id was minted at, for an event that came from outside this store's
+    /// own write path: refused when the id carries none, since no other time stands in for it.
+    pub(crate) fn recorded(self) -> Result<i64, Error> {
+        self.millis().ok_or_else(|| {
+            Error::Refused(format!(
+                "event {self} has no record time: its id is not a UUIDv7"
+            ))
         })
     }
 }
@@ -932,6 +943,39 @@ mod tests {
             message.contains(&events[last].id.to_string()) && message.contains("age"),
             "{message}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_rebuild_refuses_an_event_whose_id_is_not_a_uuidv7_and_names_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let mut g = open(dir.path().join("live.db"), Some(&crate::TEST_KEY))?;
+        g.declare(&Declaration::Class(Class::new("person", ["name"])))?;
+        g.write(&Write::new("tree").unit(Unit::new(
+            "person",
+            "p01",
+            [("name", "Ana")],
+            ValidTime::Unknown,
+        )))?;
+        let mut events = g.events().since(crate::Cursor::START)?;
+        let last = events.len() - 1;
+        let foreign = super::EventId(uuid::Builder::from_random_bytes([7; 16]).into_uuid());
+        events[last].id = foreign;
+
+        let rebuilt = dir.path().join("rebuilt.db");
+        let Err(crate::Error::Refused(message)) =
+            crate::rebuild(&events, &rebuilt, Some(&crate::TEST_KEY))
+        else {
+            panic!("a rebuild placed an event with a version-4 id");
+        };
+        assert!(message.contains(&foreign.to_string()), "{message}");
+        let hearings: i64 = rusqlite::Connection::open(&rebuilt)?.query_row(
+            "SELECT count(*) FROM _hearings",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(hearings, 0);
         Ok(())
     }
 
