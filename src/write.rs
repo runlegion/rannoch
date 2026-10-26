@@ -14,7 +14,7 @@ use crate::events::{
     event_at, holds, keep_derived, next_cursor, store,
 };
 use crate::history::{
-    Held, Key, Of, alias, conclude, hear, link_heard, millis, newest, node_entity,
+    Held, Key, Of, alias, carry, conclude, hear, link_heard, millis, newest, node_entity,
 };
 use crate::open::{
     CLASS, Class, Graph, HistoryKey, Ontology, RELATION, Relation, Value, ValueType, class_table,
@@ -584,8 +584,6 @@ pub(crate) struct Piece<'a> {
     closed: Vec<LinkFact>,
     /// The places of the events naming hearings identical to what a write heard again.
     held: BTreeSet<Cursor>,
-    /// Whether an arriving event renamed a hearing it was identical to.
-    renamed: bool,
 }
 
 impl<'a> Piece<'a> {
@@ -606,7 +604,6 @@ impl<'a> Piece<'a> {
             wrong_kind: Vec::new(),
             closed: Vec::new(),
             held: BTreeSet::new(),
-            renamed: false,
         }
     }
 
@@ -645,9 +642,7 @@ impl<'a> Piece<'a> {
     /// id, and with it maybe another point, so current state is read again from the versions.
     pub(crate) fn held(&mut self, held: &Held, written: bool) -> Result<bool, Error> {
         if self.stamp.arrived || written {
-            let renamed = alias(self.tx, held, self.stamp.id, self.stamp.cursor)?;
-            self.renamed |= renamed;
-            return Ok(renamed);
+            return alias(self.tx, held, self.stamp.id, self.stamp.cursor);
         }
         self.held.insert(held.cursor);
         Ok(false)
@@ -876,15 +871,10 @@ impl<'a> Piece<'a> {
         Ok(())
     }
 
-    /// The ids of a link's two ends, both present.
-    fn ends(&self, link: &LinkFact) -> Result<(i64, i64), Error> {
-        let id = |end: &NodeRef| {
-            node_id(self.tx, &end.class, &end.key)?.ok_or_else(|| Error::NotFound {
-                class: end.class.clone(),
-                key: end.key.clone(),
-            })
-        };
-        Ok((id(&link.from)?, id(&link.to)?))
+    /// The ids of a link's two ends, when both are held.
+    fn ends(&self, link: &LinkFact) -> Result<Option<(i64, i64)>, Error> {
+        let from = node_id(self.tx, &link.from.class, &link.from.key)?;
+        Ok(from.zip(node_id(self.tx, &link.to.class, &link.to.key)?))
     }
 
     /// Closes every open link that was waiting for the node `key` of `class`, now present, and
@@ -944,16 +934,16 @@ impl<'a> Piece<'a> {
 /// Applies one event's change to the state in `tx`, as it was applied when the event was
 /// written: a declaration builds what it needs, a write puts what it added, a closing moves its
 /// open link into its relation, a forget removes the node and its links, a replacement records
-/// the node's fate, and a purge changes nothing. Facts are stamped as recorded at `recorded`. Returns false when the event is
-/// a write whose every fact is identical to a hearing held, so it adds nothing and its id is
-/// held only as an alias.
+/// the node's fate, and a purge changes nothing. Facts are stamped as recorded at `recorded`. A
+/// write whose every fact is identical to a hearing held adds nothing but its id, held as an
+/// alias.
 pub(crate) fn replay(
     tx: &Connection,
     ontology: &Ontology,
     key: &Key,
     recorded: i64,
     event: &Event,
-) -> Result<bool, Error> {
+) -> Result<(), Error> {
     let stamp = Stamp {
         id: event.id,
         cursor: event.cursor,
@@ -969,28 +959,35 @@ pub(crate) fn replay(
             for fact in added {
                 match fact {
                     Fact::Node(node) => {
-                        piece.node(node)?;
+                        if piece.node(node)?.1 {
+                            piece.arrived(&node.class, &node.key)?;
+                        }
                     }
-                    Fact::Link(link) => {
+                    // A link whose ends are not held yet waits open, and closes when they arrive.
+                    Fact::Link(link) | Fact::Opened(link) => {
                         let ends = piece.ends(link)?;
-                        piece.heard_link(link.clone(), Some(ends))?;
+                        piece.heard_link(link.clone(), ends)?;
                     }
-                    Fact::Opened(link) => piece.heard_link(link.clone(), None)?,
                 }
             }
-            return Ok(added.is_empty() || !piece.added.is_empty() || piece.renamed);
         }
+        // A closing that arrives before the open row it closes changes nothing: the link is
+        // applied by its own event once its ends are held.
         Change::Closed(link) => {
-            let source: String = tx
+            let source: Option<String> = tx
                 .prepare_cached(
                     "SELECT source FROM _open WHERE rel = ?1 AND from_key = ?2 AND to_key = ?3",
                 )?
                 .query_row(params![link.relation, link.from.key, link.to.key], |row| {
                     row.get(0)
-                })?;
-            let piece = Piece::new(tx, ontology, key, &source, stamp);
-            let (from, to) = piece.ends(link)?;
-            piece.close(link, from, to, &source)?;
+                })
+                .optional()?;
+            if let Some(source) = source {
+                let piece = Piece::new(tx, ontology, key, &source, stamp);
+                if let Some((from, to)) = piece.ends(link)? {
+                    piece.close(link, from, to, &source)?;
+                }
+            }
         }
         Change::Forgot { nodes, .. } => {
             for node in nodes {
@@ -998,23 +995,76 @@ pub(crate) fn replay(
             }
         }
         Change::Replaced { class, old, new } => {
-            record_fate(tx, class, old, new)?;
+            record_fate(tx, class, old, new, event.id)?;
+            carry(tx, ontology, key, (class, old, new))?;
         }
         // What a purge removed has already left every event before it.
         Change::Purged { .. } => {}
         Change::Ended { .. } | Change::Corrected { .. } => conclude(tx, event.id, &event.change)?,
     }
-    Ok(true)
+    Ok(())
 }
 
-/// Records that the node `old` of `class` was replaced by the node `new`. Replacing and
-/// replaying a replacement both record through here.
-fn record_fate(tx: &Connection, class: &str, old: &str, new: &str) -> Result<(), Error> {
+/// Records that the node `old` of `class` was replaced by the node `new` in the event `id`,
+/// unless the fate held is from a replacement later by point and then event id, as versions are
+/// ordered. Replacing and replaying a replacement both record through here.
+fn record_fate(
+    tx: &Connection,
+    class: &str,
+    old: &str,
+    new: &str,
+    id: EventId,
+) -> Result<(), Error> {
     tx.prepare_cached(
-        "INSERT INTO _fates(class, key, replaced_by) VALUES (?1, ?2, ?3) \
-         ON CONFLICT(class, key) DO UPDATE SET replaced_by = excluded.replaced_by",
+        "INSERT INTO _fates(class, key, replaced_by, point, event) VALUES (?1, ?2, ?3, ?4, ?5) \
+         ON CONFLICT(class, key) DO UPDATE SET replaced_by = excluded.replaced_by, \
+         point = excluded.point, event = excluded.event \
+         WHERE _fates.event IS NULL \
+         OR (excluded.point, excluded.event) > (_fates.point, _fates.event)",
     )?
-    .execute(params![class, old, new])?;
+    .execute(params![class, old, new, id.millis(), id.to_string()])?;
+    Ok(())
+}
+
+/// Gives each fate of a store written before fates kept their replacement's point and event id
+/// the point and id of the replacement event that recorded it.
+pub(crate) fn date_fates(conn: &mut Connection) -> Result<(), Error> {
+    let dated = |conn: &Connection| -> Result<bool, Error> {
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('_fates') WHERE name = 'point')",
+            [],
+            |row| row.get(0),
+        )?)
+    };
+    if dated(conn)? {
+        return Ok(());
+    }
+    let conn = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // Another handle may have dated them while this one waited.
+    if dated(&conn)? {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "ALTER TABLE _fates ADD COLUMN point INTEGER; ALTER TABLE _fates ADD COLUMN event TEXT;",
+    )?;
+    let fates: Vec<(String, String, String, Option<String>)> = conn
+        .prepare(
+            "SELECT class, key, replaced_by, (SELECT max(json_extract(body, '$.id')) FROM _events \
+             WHERE json_extract(body, '$.change.replaced.class') = _fates.class \
+             AND json_extract(body, '$.change.replaced.old') = _fates.key \
+             AND json_extract(body, '$.change.replaced.new') = _fates.replaced_by) FROM _fates",
+        )?
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect::<Result<_, _>>()?;
+    for (class, key, new, id) in fates {
+        if let Some(id) = id {
+            let id: EventId = serde_json::from_value(id.into())?;
+            record_fate(&conn, &class, &key, &new, id)?;
+        }
+    }
+    conn.commit()?;
     Ok(())
 }
 
@@ -1048,14 +1098,15 @@ impl Graph {
 
     /// Replaces the node `old` of `class` by the node `new` of the same class, under a different
     /// key, as one event naming the class, the old key and the new key. The old node stays in
-    /// the graph and describes as replaced by the new one. The event and the replacement land
-    /// together or not at all.
+    /// the graph and describes as replaced by the new one; its hearings and links move to the
+    /// new key. The event and the replacement land together or not at all.
     ///
     /// # Errors
-    /// `class` is not declared; [`Error::Refused`] when `old` and `new` are the same key;
-    /// [`Error::NotFound`] when no node of `class` has key `old`, or key `new`; the graph file
-    /// cannot be written.
+    /// [`Error::KeyMissing`] when the graph holds no key; `class` is not declared;
+    /// [`Error::Refused`] when `old` and `new` are the same key; [`Error::NotFound`] when no node
+    /// of `class` has key `old`, or key `new`; the graph file cannot be written.
     pub fn replace(&mut self, class: &str, old: &str, new: &str) -> Result<Event, Error> {
+        let key = self.key.as_ref().ok_or(Error::KeyMissing)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1076,15 +1127,16 @@ impl Graph {
                 });
             }
         }
-        record_fate(&tx, &class, old, new)?;
+        carry(&tx, &ontology, key, (&class, old, new))?;
         let event = append(
             &tx,
             Change::Replaced {
-                class,
+                class: class.clone(),
                 old: old.to_string(),
                 new: new.to_string(),
             },
         )?;
+        record_fate(&tx, &class, old, new, event.id)?;
         tx.commit()?;
         self.loaded(version, ontology);
         Ok(event)
@@ -1501,6 +1553,34 @@ mod tests {
             g.describe(&NodeRef::new("item", "x"))?.replaced_by,
             Some(NodeRef::new("item", "y"))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_fate_kept_before_fates_had_points_takes_its_replacement_point_at_open()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = std::env::temp_dir().join(format!("rannoch-fates-{}.db", uuid::Uuid::now_v7()));
+        let mut g = open(&path, Some(&crate::TEST_KEY))?;
+        g.declare(&Declaration::Class(Class::new("item", ["name"])))?;
+        let when = ValidTime::On(Date::day(2026, 1, 1));
+        let unit = |key: &str| Unit::new("item", key, [("name", key)], when.clone());
+        g.write(&Write::new("toy").unit(unit("x")).unit(unit("y")))?;
+        let event = g.replace("item", "x", "y")?;
+        // The fates table as a store written before it kept points holds it.
+        g.conn.execute_batch(
+            "CREATE TABLE old(class TEXT NOT NULL, key TEXT NOT NULL, replaced_by TEXT NOT NULL,
+                 PRIMARY KEY(class, key)) WITHOUT ROWID;
+             INSERT INTO old SELECT class, key, replaced_by FROM _fates;
+             DROP TABLE _fates; ALTER TABLE old RENAME TO _fates;",
+        )?;
+        drop(g);
+        let g = open(&path, Some(&crate::TEST_KEY))?;
+        let dated: (i64, String) = g.conn.query_row(
+            "SELECT point, event FROM _fates WHERE class = 'item' AND key = 'x'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(dated, (event.id.millis(), event.id.to_string()));
         Ok(())
     }
 

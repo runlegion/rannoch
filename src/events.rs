@@ -33,7 +33,7 @@ pub(crate) const OWN_TABLES: &str = "
     CREATE INDEX IF NOT EXISTS _open_to ON _open(rel, to_key);
     CREATE TABLE IF NOT EXISTS _fates(
         class TEXT NOT NULL, key TEXT NOT NULL, replaced_by TEXT NOT NULL,
-        PRIMARY KEY(class, key)) WITHOUT ROWID;
+        point INTEGER, event TEXT, PRIMARY KEY(class, key)) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS _followers(name TEXT PRIMARY KEY, cursor INTEGER NOT NULL)
         WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS _snapshots(path TEXT PRIMARY KEY, cursor INTEGER);";
@@ -263,9 +263,16 @@ pub(crate) fn append(tx: &Connection, change: Change) -> Result<Event, Error> {
 
 /// The place the next event appended to the log takes.
 pub(crate) fn next_cursor(tx: &Connection) -> Result<Cursor, Error> {
+    Ok(Cursor(high_water(tx)?.0 + 1))
+}
+
+/// The highest place the log has ever given an event, or [`Cursor::START`] when it has given
+/// none: `_events` is `AUTOINCREMENT`, so SQLite keeps it and never lowers it when an event is
+/// deleted.
+fn high_water(conn: &Connection) -> Result<Cursor, Error> {
     Ok(Cursor(
-        tx.prepare_cached(
-            "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = '_events'), 0) + 1",
+        conn.prepare_cached(
+            "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = '_events'), 0)",
         )?
         .query_row([], |row| row.get(0))?,
     ))
@@ -317,19 +324,16 @@ pub struct Events<'g> {
 }
 
 impl Events<'_> {
-    /// The committed watermark: the cursor of the last committed event, or [`Cursor::START`]
-    /// when none is. Another process on the same file learns of a commit by reading it, then
-    /// reads [`Events::since_until`] its own cursor up to it; an event not yet committed is
-    /// never under it.
+    /// The committed watermark: the highest place the log has given a committed event, or
+    /// [`Cursor::START`] when it has given none. It never moves back, not even when a purge
+    /// removes the last event. Another process on the same file learns of a commit by reading
+    /// it, then reads [`Events::since_until`] its own cursor up to it; an event not yet
+    /// committed is never under it.
     ///
     /// # Errors
     /// The graph file cannot be read.
     pub fn committed(&self) -> Result<Cursor, Error> {
-        Ok(Cursor(
-            self.conn
-                .prepare_cached("SELECT COALESCE(MAX(seq), 0) FROM _events")?
-                .query_row([], |row| row.get(0))?,
-        ))
+        high_water(self.conn)
     }
 
     /// Every event after `cursor`, in the order they were written.
@@ -448,7 +452,7 @@ impl Events<'_> {
 /// Rebuilds a graph file at `empty_path` from `events` alone, under the graph's content-identity
 /// `key`, replaying them in order: its ontology from the declaration events, and its nodes, links,
 /// open links and hearings from the rest. Each event lands in the new file under its own id and
-/// at its own place in the log, except one whose every fact is identical to a hearing already
+/// at its own place in the log, also one whose every fact is identical to a hearing already
 /// replayed, whose id is held as an alias of it. The events land together or not at all.
 ///
 /// # Errors
@@ -496,13 +500,11 @@ fn replay_into(mut graph: Graph, events: &[Event]) -> Result<Graph, Error> {
                 }
             }
         }
-        let added = replay(&tx, &ontology, &key, recorded, event)?;
+        replay(&tx, &ontology, &key, recorded, event)?;
         if matches!(event.change, Change::Declared(_)) {
             ontology = Ontology::load(&tx)?;
         }
-        if added {
-            store(&tx, event.id, Some(event.cursor), event.change.clone())?;
-        }
+        store(&tx, event.id, Some(event.cursor), event.change.clone())?;
     }
     tx.commit()?;
     graph.ontology = ontology;
@@ -704,6 +706,18 @@ impl Graph {
                 .conn
                 .prepare_cached("INSERT INTO _followers(name, cursor) VALUES (?1, ?2)")?
                 .execute(params![name, at.0])?;
+        }
+        // The snapshot's watermark is at least its cursor, even when no event is at that place
+        // (a purge removed it), so a rebuild from it never reports less than it holds.
+        let raised = snapshot.conn.execute(
+            "UPDATE sqlite_sequence SET seq = ?1 WHERE name = '_events' AND seq < ?1",
+            params![cursor.0],
+        )?;
+        if raised == 0 && high_water(&snapshot.conn)? < cursor {
+            snapshot.conn.execute(
+                "INSERT INTO sqlite_sequence(name, seq) VALUES ('_events', ?1)",
+                params![cursor.0],
+            )?;
         }
         snapshot
             .conn
