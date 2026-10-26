@@ -227,7 +227,8 @@ pub(crate) fn unhear(tx: &Connection, node: &NodeRef, links: &[LinkFact]) -> Res
 }
 
 /// Takes `key` as the graph's. A store holding another key's check value refuses it; a store
-/// holding none takes it and hears every write already in its log, in order.
+/// holding none takes it and hears every write already in its log, in order, dropping what each
+/// forget in it removed.
 pub(crate) fn take(conn: &mut Connection, key: &Key) -> Result<(), Error> {
     let check = |conn: &Connection| -> Result<Option<String>, Error> {
         Ok(conn
@@ -251,8 +252,15 @@ pub(crate) fn take(conn: &mut Connection, key: &Key) -> Result<(), Error> {
     }
     tx.execute("INSERT INTO _check(value) VALUES (?1)", params![key.check])?;
     for event in (Events { conn: &tx }).since(Cursor::START)? {
-        let Change::Wrote { source, added, .. } = &event.change else {
-            continue;
+        let (source, added) = match &event.change {
+            Change::Wrote { source, added, .. } => (source, added),
+            Change::Forgot { nodes, links, .. } => {
+                for node in nodes {
+                    unhear(&tx, node, links)?;
+                }
+                continue;
+            }
+            _ => continue,
         };
         for fact in added {
             let of = match fact {
@@ -370,5 +378,61 @@ impl Graph {
             });
         }
         Ok(hearings)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Class, Date, Declaration, NodeRef, Relation, Unit, ValidTime, Write, open};
+
+    #[test]
+    fn a_pre_key_store_takes_its_key_without_the_hearings_a_forget_removed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = std::env::temp_dir().join(format!("rannoch-prekey-{}.db", uuid::Uuid::now_v7()));
+        let when = ValidTime::On(Date::day(1975, 2, 10));
+        let bare =
+            |class: &str, key: &str| Unit::new(class, key, [] as [(&str, &str); 0], when.clone());
+        let ana = || Unit::new("person", "p01", [("name", "Ana")], when.clone());
+        {
+            let mut g = open(&path, Some(&crate::TEST_KEY))?;
+            g.declare(&Declaration::Class(Class::new("person", ["name"])))?;
+            g.declare(&Declaration::Class(Class::new("visitor", [] as [&str; 0])))?;
+            g.declare(&Declaration::Class(Class::new("place", [] as [&str; 0])))?;
+            g.declare(&Declaration::Relation(Relation::new(
+                "visited", "visitor", "place", false,
+            )))?;
+            g.write(&Write::new("tree").unit(bare("place", "pl1")))?;
+            g.write(&Write::new("tree").unit(ana()))?;
+            g.write(&Write::new("tree").unit(bare("visitor", "p05").link(
+                "visited",
+                "p05",
+                "pl1",
+                when.clone(),
+            )))?;
+            g.forget(&NodeRef::new("visitor", "p05"), "living", "tree")?;
+            // As a store written before keys: no check value and no hearings.
+            g.conn.execute_batch(
+                "DELETE FROM _check; DELETE FROM _hearings; DELETE FROM _aliases;",
+            )?;
+        }
+
+        let mut g = open(&path, Some(&crate::TEST_KEY))?;
+        let forgotten = NodeRef::new("visitor", "p05");
+        assert_eq!(
+            g.hearings(&forgotten)?,
+            vec![],
+            "the forgotten node keeps no hearing"
+        );
+        assert_eq!(
+            g.link_hearings("visited", "p05", "pl1")?,
+            vec![],
+            "the links the forget took keep no hearing"
+        );
+        assert_eq!(g.hearings(&NodeRef::new("person", "p01"))?.len(), 1);
+        g.write(&Write::new("tree").unit(ana()))?;
+        assert_eq!(g.hearings(&NodeRef::new("person", "p01"))?.len(), 1);
+        g.write(&Write::new("tree").unit(bare("visitor", "p05")))?;
+        assert_eq!(g.hearings(&forgotten)?.len(), 1);
+        Ok(())
     }
 }
