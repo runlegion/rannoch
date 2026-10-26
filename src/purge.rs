@@ -84,12 +84,13 @@ impl Purge {
 
 /// Each purge's standing rule: its rule, its kind, its targets as keyed match values
 /// (`match_b` empty for a kind with one), and the purge event. A hearing that arrives is looked
-/// up by (`kind`, `match_a`, `match_b`).
+/// up by (`kind`, `match_a`, `match_b`), which holds one rule: the first kept for it.
 pub(crate) const PURGE_TABLES: &str = "
     CREATE TABLE IF NOT EXISTS _purge_rules(
         rule TEXT NOT NULL, kind TEXT NOT NULL, match_a BLOB NOT NULL, match_b BLOB NOT NULL,
         event TEXT NOT NULL);
-    CREATE INDEX IF NOT EXISTS _purge_rules_match ON _purge_rules(kind, match_a, match_b);";
+    CREATE UNIQUE INDEX IF NOT EXISTS _purge_rules_one
+        ON _purge_rules(kind, match_a, match_b);";
 
 /// The kind and the values `match_a` and `match_b` a standing rule is kept and looked up under,
 /// from a purge whose targets are keyed match values: a node is its class's and its key's, a link
@@ -135,7 +136,8 @@ pub(crate) fn stand(
 fn keep_rule(tx: &Connection, rule: &str, matched: &Purge, event: &str) -> Result<(), Error> {
     let (kind, a, b) = rule_of(matched)?;
     tx.prepare_cached(
-        "INSERT INTO _purge_rules(rule, kind, match_a, match_b, event) VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT OR IGNORE INTO _purge_rules(rule, kind, match_a, match_b, event) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
     )?
     .execute(params![rule, kind, a, b, event])?;
     Ok(())
@@ -1048,12 +1050,20 @@ fn truncate_log(conn: &Connection) -> Result<(), Error> {
     Ok(())
 }
 
-/// Purges the snapshot file at `path` as the store was purged, and truncates its log.
-fn purge_snapshot(path: &Path, key: &Key, target: &Purge) -> Result<(), Error> {
+/// Purges the snapshot file at `path` as the store was purged by the purge event `purged`, keeps
+/// that event's rules in it in the same transaction, so a rebuild from the snapshot alone keeps
+/// purging, and truncates its log.
+fn purge_snapshot(path: &Path, key: &Key, target: &Purge, purged: &Event) -> Result<(), Error> {
     let mut snapshot = open_keyed(path, key)?;
     secure(&mut snapshot.conn, |conn| {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         purge_in(&tx, &Ontology::load(&tx)?, key, target)?;
+        if let Change::Purged {
+            rule, purge, parts, ..
+        } = &purged.change
+        {
+            stand_purged(&tx, rule, (purge, parts), purged.id)?;
+        }
         tx.commit()?;
         Ok(())
     })?;
@@ -1112,7 +1122,7 @@ impl Graph {
             .map(PathBuf::from)
             .filter(|p| p.exists())
         {
-            if let Err(error) = purge_snapshot(&path, &key, &target) {
+            if let Err(error) = purge_snapshot(&path, &key, &target, &event) {
                 failed.get_or_insert_with(|| {
                     Error::Refused(format!(
                         "the snapshot {} was not purged: {error}",
@@ -1362,6 +1372,72 @@ mod tests {
             Some(&crate::TEST_KEY),
         )?;
         back(&mut rebuilt)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_snapshot_taken_before_a_purge_and_rebuilt_alone_keeps_purging()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const LATE: &str = "zq-late-copy-88";
+        let dir = tempfile::tempdir()?;
+        let mut g = people(&dir.path().join("graph.rannoch"))?;
+        let copy = || bare("house", LATE);
+        g.write(&Write::new("app").unit(copy()).unit(bare("house", "h2")))?;
+        let snapshot = g.snapshot(g.events().committed()?, dir.path().join("snapshot.rannoch"))?;
+        g.purge(
+            Purge::Entity {
+                target: Target::Node(NodeRef::new("house", LATE)),
+            },
+            "late-gone",
+            "app",
+        )?;
+        let mut rebuilt = snapshot.rebuild(
+            &[],
+            dir.path().join("rebuilt.rannoch"),
+            Some(&crate::TEST_KEY),
+        )?;
+        assert_eq!(rebuilt.write(&Write::new("app").unit(copy()))?, vec![]);
+        assert_eq!(rebuilt.find("house", LATE)?, None);
+        assert!(rebuilt.hearings(&NodeRef::new("house", LATE))?.is_empty());
+        for event in rebuilt.events().since(Cursor::START)? {
+            let body = serde_json::to_string(&event.change)?;
+            assert!(!body.contains(LATE), "{body}");
+        }
+        assert!(rebuilt.find("house", "h2")?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn a_purged_snapshot_rebuilt_with_the_purge_event_keeps_one_row_per_rule()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let mut g = people(&dir.path().join("graph.rannoch"))?;
+        g.write(&Write::new("app").unit(bare("house", "h1")))?;
+        let room = bare("room", "r1").link("in_house", "r1", "h1", ValidTime::Unknown);
+        g.write(&Write::new("app").unit(room))?;
+        let at = g.events().committed()?;
+        let snapshot = g.snapshot(at, dir.path().join("snapshot.rannoch"))?;
+        let target = Target::Node(NodeRef::new("house", "h1"));
+        g.purge(Purge::Entity { target }, "h1-gone", "app")?;
+        // The purged snapshot holds the purge's rules, and the purge event replays them again.
+        let later: Vec<Event> = g
+            .events()
+            .since(at)?
+            .into_iter()
+            .filter(|e| e.cursor > at)
+            .collect();
+        assert_eq!(later.len(), 1);
+        let rebuilt = snapshot.rebuild(
+            &later,
+            dir.path().join("rebuilt.rannoch"),
+            Some(&crate::TEST_KEY),
+        )?;
+        let rows = |g: &crate::Graph| -> rusqlite::Result<i64> {
+            g.conn
+                .query_row("SELECT count(*) FROM _purge_rules", [], |row| row.get(0))
+        };
+        assert_eq!(rows(&g)?, 2, "the house's rule and the room's as a part");
+        assert_eq!(rows(&rebuilt)?, 2);
         Ok(())
     }
 
