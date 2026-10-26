@@ -10,7 +10,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::history::{Key, unhear};
+use crate::history::{Key, aliases, hold_aliases, unhear};
 use crate::open::{
     Graph, Ontology, Value, class_table, open_keyed, relation_table, schema_version,
 };
@@ -403,16 +403,12 @@ pub fn rebuild(
     key: Option<&[u8; 32]>,
 ) -> Result<Graph, Error> {
     let key = Key::new(key.ok_or(Error::KeyMissing)?);
-    replay_into(open_keyed(empty_path, &key)?, events, |_| true)
+    replay_into(open_keyed(empty_path, &key)?, events)
 }
 
-/// Replays `events` into `graph` in one transaction, storing each one `keep` holds for under its
-/// own place in the log, so a cursor names the same event in the new file as in the source.
-fn replay_into(
-    mut graph: Graph,
-    events: &[Event],
-    keep: impl Fn(&Change) -> bool,
-) -> Result<Graph, Error> {
+/// Replays `events` into `graph` in one transaction, storing each one under its own place in the
+/// log, so a cursor names the same event in the new file as in the source.
+fn replay_into(mut graph: Graph, events: &[Event]) -> Result<Graph, Error> {
     let key = graph.key.clone().ok_or(Error::KeyMissing)?;
     let tx = graph
         .conn
@@ -445,7 +441,7 @@ fn replay_into(
         if matches!(event.change, Change::Declared(_)) {
             ontology = Ontology::load(&tx)?;
         }
-        if added && keep(&event.change) {
+        if added {
             store(&tx, event.id, Some(event.cursor), event.change.clone())?;
         }
     }
@@ -455,9 +451,9 @@ fn replay_into(
 }
 
 /// A graph's state at a cursor, in a file of its own: its ontology, nodes, links, open links,
-/// each node's fate and the registered followers. Of the events, it holds only the forget events,
-/// which carry no content and are what a forgotten node's fate is read from. A new reader or a
-/// rebuild starts from it and takes only the events after its cursor.
+/// every version row and hearing, each node's fate, the registered followers and every event up
+/// to the cursor under its own id. A new reader or a rebuild starts from it and takes only the
+/// events after its cursor, late ones included.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
     cursor: Cursor,
@@ -493,7 +489,7 @@ impl Snapshot {
             Error::Refused(format!("the path {} is not UTF-8", empty_path.display()))
         })?;
         Connection::open(&self.path)?.execute("VACUUM INTO ?1", params![target])?;
-        let graph = replay_into(open_keyed(empty_path, &key)?, later, |_| true)?;
+        let graph = replay_into(open_keyed(empty_path, &key)?, later)?;
         // A carried follower cursor past what the rebuilt graph holds is lowered to its
         // watermark, so the mark never claims an event the rebuilt graph has not read.
         let committed = graph.events().committed()?;
@@ -565,8 +561,11 @@ impl Graph {
     }
 
     /// Takes a snapshot of the graph's state at `cursor`, a place the app picks, into a new file
-    /// at `empty_path`. It deletes nothing: every event stays in the store. It reads this graph's
-    /// log and writes only the new file, so it never takes this graph's write lock.
+    /// at `empty_path`: every event up to the cursor replayed into it and kept in its log under
+    /// its own id and place, so it holds every version row, each node's and link's hearings and
+    /// every event id up to the cursor. It deletes nothing: every event stays in the store. It
+    /// reads this graph in one read transaction and writes only the new file through its own
+    /// connection, so it never takes this graph's write lock.
     ///
     /// # Errors
     /// The graph file cannot be read, the new file cannot be opened as a graph file, or an
@@ -576,22 +575,38 @@ impl Graph {
         cursor: Cursor,
         empty_path: impl AsRef<Path>,
     ) -> Result<Snapshot, Error> {
-        let mut events = self.events().since(Cursor::START)?;
-        events.retain(|event| event.cursor <= cursor);
         let key = self.key.as_ref().ok_or(Error::KeyMissing)?;
-        // A forget event holds no content and is where a forgotten node's fate is read from.
-        let snapshot = replay_into(open_keyed(&empty_path, key)?, &events, |change| {
-            matches!(change, Change::Forgot { .. })
-        })?;
-        // Registrations are state about readers, not events: the snapshot carries them. Their
-        // cursors name places in this graph's log, which the snapshot's own log does not hold,
-        // so they are copied as they are rather than advanced against its watermark.
-        for (name, at) in self.events().followers()? {
+        let read = self.conn.unchecked_transaction()?;
+        let events = Events { conn: &read }.since_until(Cursor::START, cursor, |_| true)?;
+        let followers = Events { conn: &read }.followers()?;
+        // An alias is not an event in the log, so replaying the log does not bring it back. It
+        // holds no place in the log either: every alias of a hearing the snapshot holds is
+        // carried, one that arrived after the cursor included.
+        let aliases = aliases(&read)?;
+        drop(read);
+        // Nothing reads the new file until this returns, so it is filled under a rollback
+        // journal, which writes each page once, and goes back to WAL at the end: filled in WAL,
+        // every page was written twice on the disk the graph's own commits share.
+        let fresh = open_keyed(&empty_path, key)?;
+        fresh
+            .conn
+            .pragma_update_and_check(None, "journal_mode", "DELETE", |row| {
+                row.get::<_, String>(0)
+            })?;
+        let snapshot = replay_into(fresh, &events)?;
+        hold_aliases(&snapshot.conn, &aliases)?;
+        // Registrations are state about readers, not events: the snapshot carries them. A
+        // cursor past the snapshot's names a place in this graph's log the snapshot does not
+        // hold, so they are copied as they are rather than lowered to its watermark.
+        for (name, at) in followers {
             snapshot
                 .conn
                 .prepare_cached("INSERT INTO _followers(name, cursor) VALUES (?1, ?2)")?
                 .execute(params![name, at.0])?;
         }
+        snapshot
+            .conn
+            .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get::<_, String>(0))?;
         Ok(Snapshot {
             cursor,
             path: empty_path.as_ref().to_path_buf(),
@@ -907,6 +922,45 @@ mod tests {
             message.contains(&events[last].id.to_string()) && message.contains("age"),
             "{message}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_snapshot_keeps_the_aliases_its_hearings_hold() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let (g, _) = two_notes()?;
+        // The same write arriving again from another store under a larger id: an alias.
+        let mut events = g.events().since(crate::Cursor::START)?;
+        let mut again = events[events.len() - 1].clone();
+        again.id = super::EventId::now();
+        again.cursor = crate::Cursor(again.cursor.0 + 1);
+        events.push(again.clone());
+        let live = crate::rebuild(&events, dir.path().join("live.db"), Some(&crate::TEST_KEY))?;
+        let n2 = NodeRef::new("note", "n2");
+        assert_eq!(live.hearings(&n2)?[0].aliases, [again.id]);
+
+        let at = live.events().committed()?;
+        let snapshot = live.snapshot(at, dir.path().join("snapshot.db"))?;
+        let back = snapshot.rebuild(&[], dir.path().join("back.db"), Some(&crate::TEST_KEY))?;
+        assert_eq!(back.hearings(&n2)?, live.hearings(&n2)?);
+        Ok(())
+    }
+
+    #[test]
+    fn a_snapshot_is_taken_while_another_connection_holds_the_write_lock()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("live.db");
+        let mut g = open(&path, Some(&crate::TEST_KEY))?;
+        g.declare(&Declaration::Class(Class::new("note", ["text"])))?;
+        g.write(&Write::new("app").unit(note("n1")))?;
+        let writer = rusqlite::Connection::open(&path)?;
+        writer.execute_batch("BEGIN IMMEDIATE")?;
+        let at = g.events().committed()?;
+        let snapshot = g.snapshot(at, dir.path().join("snapshot.db"))?;
+        writer.execute_batch("ROLLBACK")?;
+        let back = snapshot.rebuild(&[], dir.path().join("back.db"), Some(&crate::TEST_KEY))?;
+        assert!(back.find("note", "n1")?.is_some());
         Ok(())
     }
 

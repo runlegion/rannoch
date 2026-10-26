@@ -448,6 +448,28 @@ pub(crate) fn alias(
     Ok(renamed)
 }
 
+/// Every alias `conn` holds, with the identity of the hearing it is an alias of.
+pub(crate) fn aliases(conn: &Connection) -> Result<Vec<(Vec<u8>, String)>, Error> {
+    Ok(conn
+        .prepare_cached("SELECT identity, alias FROM _aliases")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<_, _>>()?)
+}
+
+/// Holds each of `aliases` whose hearing the graph holds, in one transaction.
+pub(crate) fn hold_aliases(conn: &Connection, aliases: &[(Vec<u8>, String)]) -> Result<(), Error> {
+    let tx = conn.unchecked_transaction()?;
+    for (identity, alias) in aliases {
+        tx.prepare_cached(
+            "INSERT OR IGNORE INTO _aliases(identity, alias) SELECT ?1, ?2 \
+             WHERE EXISTS (SELECT 1 FROM _hearings WHERE identity = ?1)",
+        )?
+        .execute(params![identity, alias])?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 /// Drops the hearings of `node`, which left live state, and of `links`, which left with it, with
 /// the links' endings and what was seen of each.
 pub(crate) fn unhear(tx: &Connection, node: &NodeRef, links: &[LinkFact]) -> Result<(), Error> {
