@@ -127,12 +127,33 @@ pub(crate) fn stand(
     matched: &Purge,
     event: EventId,
 ) -> Result<(), Error> {
+    keep_rule(tx, rule, matched, &event.to_string())
+}
+
+/// Keeps `matched`, a purge whose targets are keyed match values, under `rule`, named by the
+/// purge event whose id is `event`.
+fn keep_rule(tx: &Connection, rule: &str, matched: &Purge, event: &str) -> Result<(), Error> {
     let (kind, a, b) = rule_of(matched)?;
     tx.prepare_cached(
         "INSERT INTO _purge_rules(rule, kind, a, b, event) VALUES (?1, ?2, ?3, ?4, ?5)",
     )?
-    .execute(params![rule, kind, a, b, event.to_string()])?;
+    .execute(params![rule, kind, a, b, event])?;
     Ok(())
+}
+
+/// Keeps a legacy forget of `node` under `rule`, named by the forget event `event`, as that
+/// node's purge rule.
+pub(crate) fn stand_forgot(
+    tx: &Connection,
+    key: &Key,
+    rule: &str,
+    node: &NodeRef,
+    event: EventId,
+) -> Result<(), Error> {
+    let purge = Purge::Entity {
+        target: Target::Node(node.clone()),
+    };
+    stand(tx, rule, &purge.matched(key), event)
 }
 
 /// Keeps a purge event's rules: `matched`, and each of the `parts` it removed with the whole,
@@ -283,11 +304,7 @@ pub(crate) fn part_of_purged<'l>(
             let part = Purge::Entity {
                 target: Target::Node(node.clone()),
             };
-            let (kind, a, b) = rule_of(&part.matched(key))?;
-            tx.prepare_cached(
-                "INSERT INTO _purge_rules(rule, kind, a, b, event) VALUES (?1, ?2, ?3, ?4, ?5)",
-            )?
-            .execute(params![rule, kind, a, b, event])?;
+            keep_rule(tx, &rule, &part.matched(key), &event)?;
             return Ok(true);
         }
     }
@@ -381,10 +398,7 @@ pub(crate) fn stand_all(conn: &mut Connection, key: &Key) -> Result<(), Error> {
             } => stand_purged(&tx, rule, (purge, parts), stored.id)?,
             Change::Forgot { rule, nodes, .. } => {
                 for node in nodes {
-                    let purge = Purge::Entity {
-                        target: Target::Node(node.clone()),
-                    };
-                    stand(&tx, rule, &purge.matched(key), stored.id)?;
+                    stand_forgot(&tx, key, rule, node, stored.id)?;
                 }
             }
             _ => {}

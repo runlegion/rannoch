@@ -14,7 +14,7 @@ use rusqlite::{Connection, OptionalExtension, ToSql, TransactionBehavior, params
 
 use crate::events::{Change, Cursor, EventId, Events, Fact, LinkFact, NodeFact};
 use crate::open::{CLASS, Graph, HistoryKey, Ontology, RELATION, Value, table};
-use crate::purge::{Purge, Target, stand};
+use crate::purge::stand_forgot;
 use crate::read::NodeRef;
 use crate::write::{Error, Heard, Piece, Stamp, ValidTime};
 
@@ -648,10 +648,7 @@ pub(crate) fn take(conn: &mut Connection, key: &Key) -> Result<(), Error> {
             } => {
                 for node in nodes {
                     unhear(&tx, node, links)?;
-                    let purge = Purge::Entity {
-                        target: Target::Node(node.clone()),
-                    };
-                    stand(&tx, rule, &purge.matched(key), event.id)?;
+                    stand_forgot(&tx, key, rule, node, event.id)?;
                 }
                 continue;
             }
