@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, ToSql, TransactionBehavior, params};
 
 use crate::events::{Change, Cursor, EventId, Events, Fact, LinkFact, NodeFact};
 use crate::open::{CLASS, Graph, HistoryKey, Ontology, RELATION, Value};
@@ -133,7 +133,7 @@ fn by_integer(ontology: &Ontology, of: &Of) -> Result<bool, Error> {
     })
 }
 
-fn node_entity(class: &str) -> String {
+pub(crate) fn node_entity(class: &str) -> String {
     format!("{CLASS}:{class}")
 }
 
@@ -576,6 +576,16 @@ pub enum At {
     Key(i64),
 }
 
+impl At {
+    /// The point or key as the axis column holds it: a time as milliseconds since the epoch.
+    pub(crate) fn bound(self) -> i64 {
+        match self {
+            At::Time(time) => millis(time),
+            At::Key(key) => key,
+        }
+    }
+}
+
 /// One version of a node or a link: the hearing that held at a point, by its class's order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Version {
@@ -610,12 +620,12 @@ const BY_POINT: &str =
     "AND integer IS NULL AND point <= ?4 ORDER BY point DESC, event DESC LIMIT 1";
 
 /// Reads one version row of `entity` keyed `key` (and `to`, for a link), as `tail` picks it,
-/// with `at` bound as `?4` when the tail names it: the version and when this store recorded it.
+/// with `bound` bound from `?4` on: the version and when this store recorded it.
 fn version_row(
     conn: &Connection,
     (entity, key, to): (&str, &str, Option<&str>),
     tail: &str,
-    at: Option<i64>,
+    bound: &[&dyn ToSql],
 ) -> Result<Option<(Version, i64)>, Error> {
     /// A version row: event, source, valid time, point, integer key, properties, record time.
     type Row = (
@@ -643,11 +653,9 @@ fn version_row(
             row.get(6)?,
         ))
     };
-    let row = match at {
-        Some(at) => statement.query_row(params![entity, key, to, at], read),
-        None => statement.query_row(params![entity, key, to], read),
-    }
-    .optional()?;
+    let mut all: Vec<&dyn ToSql> = vec![&entity, &key, &to];
+    all.extend_from_slice(bound);
+    let row = statement.query_row(all.as_slice(), read).optional()?;
     let Some((event, source, valid, point, integer, properties, recorded)) = row else {
         return Ok(None);
     };
@@ -677,7 +685,114 @@ pub(crate) fn node_at(
     } else {
         BY_POINT
     };
-    version_row(conn, (&node_entity(&class.name), key, None), tail, Some(at))
+    version_row(conn, (&node_entity(&class.name), key, None), tail, &[&at])
+}
+
+/// A valid time in `column` as `YYYY-MM-DD`: a month (7 characters) stands for its first day,
+/// and an unknown valid time is NULL, which no comparison holds for.
+pub(crate) fn valid_day(column: &str) -> String {
+    format!("(CASE WHEN length({column}) = 7 THEN {column} || '-01' ELSE {column} END)")
+}
+
+/// What a read known at `at` bounds the versions of `class` by, or of a link when `class` is
+/// `None`: the column on its axis and the bound. A link is read at a time only.
+pub(crate) fn known_bound(
+    class: Option<&crate::Class>,
+    at: At,
+) -> Result<(&'static str, i64), Error> {
+    match (class, at) {
+        (Some(class), at) if class.history == HistoryKey::Integer => {
+            Ok(("integer", axis(class, at)?))
+        }
+        (Some(class), at) => Ok(("point", axis(class, at)?)),
+        (None, At::Time(time)) => Ok(("point", millis(time))),
+        (None, At::Key(_)) => Err(Error::Refused(format!(
+            "a link is read at a time, not at {at:?}"
+        ))),
+    }
+}
+
+/// The version of `of` true at the valid time `day` (`YYYY-MM-DD`), as known at `known` (its
+/// axis column and bound) when given: among its versions valid on or before `day`, the greatest
+/// by valid time, then by its class's order. A version of unknown valid time is never one.
+fn version_as_of(
+    conn: &Connection,
+    of: (&str, &str, Option<&str>),
+    day: &str,
+    known: Option<(&str, i64)>,
+) -> Result<Option<(Version, i64)>, Error> {
+    let valid = valid_day("valid");
+    let order = format!("ORDER BY {valid} DESC, integer DESC, point DESC, event DESC LIMIT 1");
+    match known {
+        None => version_row(conn, of, &format!("AND {valid} <= ?4 {order}"), &[&day]),
+        Some((column, at)) => version_row(
+            conn,
+            of,
+            &format!("AND {valid} <= ?4 AND {column} <= ?5 {order}"),
+            &[&day, &at],
+        ),
+    }
+}
+
+/// The version of the node keyed `key` in `class` true at the valid time `day`, as known at
+/// `known` when given; see [`version_as_of`].
+pub(crate) fn node_as_of(
+    conn: &Connection,
+    class: &crate::Class,
+    key: &str,
+    day: &str,
+    known: Option<At>,
+) -> Result<Option<(Version, i64)>, Error> {
+    let known = known.map(|at| known_bound(Some(class), at)).transpose()?;
+    version_as_of(conn, (&node_entity(&class.name), key, None), day, known)
+}
+
+/// The version of the link of `relation` from `from` to `to` true at the valid time `day`, as
+/// known at `known` when given, and whether it had ended by then: an ending heard by `known`
+/// whose valid time is on or before `day`.
+///
+/// # Errors
+/// [`Error::Refused`] when the link held then and its ending, heard by `known`, has an unknown
+/// valid time, or `known` is an integer key.
+pub(crate) fn link_as_of(
+    conn: &Connection,
+    relation: &str,
+    (from, to): (&str, &str),
+    day: &str,
+    known: Option<At>,
+) -> Result<Option<Version>, Error> {
+    let known = known.map(|at| known_bound(None, at)).transpose()?;
+    let entity = link_entity(relation);
+    let Some((mut version, _)) = version_as_of(conn, (&entity, from, Some(to)), day, known)? else {
+        return Ok(None);
+    };
+    let sql = format!(
+        "SELECT point, {} <= ?4 FROM _ends \
+         WHERE entity = ?1 AND key = ?2 AND to_key = ?3 AND point IS NOT NULL",
+        valid_day("valid")
+    );
+    let ending: Option<(i64, Option<bool>)> = conn
+        .prepare_cached(&sql)?
+        .query_row(params![entity, from, to, day], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .optional()?;
+    if let Some((point, ended)) = ending
+        && known.is_none_or(|(_, at)| point <= at)
+    {
+        version.ended = ended
+            .ok_or_else(|| unknown_ending(&format!("{relation} link from {from} to {to}"), day))?;
+    }
+    Ok(Some(version))
+}
+
+/// The refusal of a read as of `day` that would follow `link`, whose ending has an unknown
+/// valid time.
+pub(crate) fn unknown_ending(link: &str, day: &str) -> Error {
+    Error::Refused(format!(
+        "the {link} ended, and its ending's valid time is unknown: \
+         a read as of {day} cannot say whether the link held"
+    ))
 }
 
 /// Refuses an integer key for a class not ordered by one, and a time for one that is.
@@ -732,7 +847,7 @@ impl Graph {
             &self.conn,
             (&entity, from, Some(to)),
             BY_POINT,
-            Some(millis(at)),
+            &[&millis(at)],
         )?
         else {
             return Ok(None);
@@ -755,7 +870,7 @@ impl Graph {
         let class = ontology.class(&node.class)?;
         let entity = node_entity(&class.name);
         let of = (entity.as_str(), node.key.as_str(), None);
-        let read = |tail: &str| version_row(&self.conn, of, tail, None);
+        let read = |tail: &str| version_row(&self.conn, of, tail, &[]);
         let (Some((first_heard, _)), Some((last_heard, _)), Some((first_recorded, _))) = (
             read("ORDER BY integer, point, event LIMIT 1")?,
             read("ORDER BY integer DESC, point DESC, event DESC LIMIT 1")?,

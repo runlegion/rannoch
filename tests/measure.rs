@@ -471,6 +471,7 @@ fn count_one(largest: &str) -> Count {
             property: "place".into(),
         }),
         as_of: None,
+        known_at: None,
     }
 }
 
@@ -482,6 +483,7 @@ fn count_all() -> Count {
         path: vec![Step::new("supports<-"), Step::new("said<-")],
         group_by: None,
         as_of: None,
+        known_at: None,
     }
 }
 

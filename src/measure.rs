@@ -170,6 +170,7 @@ fn largest_count(shape: &Shape, largest: &str) -> Count {
             property: shape.property.clone(),
         }),
         as_of: None,
+        known_at: None,
     }
 }
 
