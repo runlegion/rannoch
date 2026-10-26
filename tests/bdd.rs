@@ -24,7 +24,7 @@ use rannoch::{
     Fate, Graph, GroupBy, Link, LinkFact, Node, NodeRef, OpenLink, PartOf, Relation, Snapshot,
     Step, Tally, Unit, ValidTime, Value, Write, WriteError,
 };
-use rannoch::{Failure, Hearing, HistoryKey, NodeFact, Queue, Ticket, ValueType};
+use rannoch::{End, Failure, Hearing, HistoryKey, NodeFact, Queue, Ticket, ValueType};
 use rstest_bdd_macros::{given, scenarios, then, when};
 use tempfile::TempDir;
 
@@ -1865,7 +1865,10 @@ fn folds_from_events(world: &mut World) {
                 Vec::new(),
             ),
             Change::Closed(l) => (vec![l], Vec::new()),
-            Change::Declared(_) | Change::Replaced { .. } => (Vec::new(), Vec::new()),
+            Change::Declared(_)
+            | Change::Replaced { .. }
+            | Change::Ended { .. }
+            | Change::Corrected { .. } => (Vec::new(), Vec::new()),
             Change::Forgot { links, .. } => (Vec::new(), links),
         };
         for link in added {
@@ -4856,6 +4859,90 @@ fn link_heard(world: &mut World) {
     let voice = Unit::new("voice", "v1", NONE, when);
     world.write(&Write::new("swtor").unit(voice).unit(statement.clone()));
     world.restate = Some(statement);
+}
+
+// ---------- FR-RANNOCH-066: a link that ends, and a link found wrong ----------
+
+/// The point the scenarios end a link at, whole milliseconds as the graph keeps points.
+fn ended_at() -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_millis(1_760_000_000_123)
+}
+
+#[given("a link that has been heard")]
+fn a_link_heard(world: &mut World) {
+    link_heard(world);
+}
+
+#[given("a link that has been heard more than once")]
+fn a_link_heard_twice(world: &mut World) {
+    link_heard(world);
+    restates(world);
+    let hearings = world.g().link_hearings("said", "v1", "s1").unwrap();
+    assert_eq!(hearings.len(), 2, "{hearings:?}");
+    world.hearings.insert("said".into(), hearings);
+}
+
+#[when("the app ends the link at a time")]
+fn ends_the_link_at(world: &mut World) {
+    ends_the_link(world);
+}
+
+#[when("the app ends the link")]
+fn ends_the_link(world: &mut World) {
+    let event = world
+        .g()
+        .end_link("said", "v1", "s1", ended_at(), "moderator")
+        .unwrap();
+    world.written.push(event);
+}
+
+#[when("the app finds the link wrong")]
+fn finds_the_link_wrong(world: &mut World) {
+    let event = world
+        .g()
+        .correct_link("said", "v1", "s1", "moderator")
+        .unwrap();
+    world.written.push(event);
+}
+
+#[then("the link's history holds an ending at that time")]
+fn history_holds_the_ending(world: &mut World) {
+    let event = world.written.last().unwrap().id;
+    assert_eq!(
+        world.g().link_end("said", "v1", "s1").unwrap(),
+        Some(End::Ended {
+            at: ended_at(),
+            source: "moderator".into(),
+            event,
+        })
+    );
+    assert!(
+        matches!(world.written.last().unwrap().change, Change::Ended { .. }),
+        "the ending is an event of its own"
+    );
+}
+
+#[then("the link's history still holds every hearing")]
+fn history_keeps_every_hearing(world: &mut World) {
+    let hearings = world.g().link_hearings("said", "v1", "s1").unwrap();
+    assert_eq!(hearings, world.hearings["said"]);
+    assert!(matches!(
+        world.g().link_end("said", "v1", "s1").unwrap(),
+        Some(End::Ended { .. })
+    ));
+}
+
+#[then("the link does not read as ended")]
+fn link_not_ended(world: &mut World) {
+    let event = world.written.last().unwrap().id;
+    assert_eq!(
+        world.g().link_end("said", "v1", "s1").unwrap(),
+        Some(End::Corrected {
+            source: "moderator".into(),
+            event,
+        }),
+        "a link found wrong reads as corrected"
+    );
 }
 
 #[when("the app restates it from another source")]

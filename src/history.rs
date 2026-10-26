@@ -2,6 +2,8 @@
 //! hearing's identity is its content, hashed under the app's key: identical content is one
 //! hearing, and an identical event that arrives from another store under its own id is held as an
 //! alias of it. The key never reaches the store's files; the store keeps only a check value.
+//! A link that ends records its ending, at its own point, beside its hearings; a link found
+//! wrong records a correction, which is not an ending.
 
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -13,7 +15,9 @@ use crate::open::{CLASS, Graph, RELATION};
 use crate::read::NodeRef;
 use crate::write::{Error, ValidTime};
 
-/// The hearings, the other ids each arrived under, and the check value of the graph's key.
+/// The hearings, the other ids each arrived under, how each link that ended or was found wrong
+/// came to that (`point` is the ending's, and null for a correction), and the check value of
+/// the graph's key.
 pub(crate) const HISTORY_TABLES: &str = "
     CREATE TABLE IF NOT EXISTS _hearings(
         identity BLOB PRIMARY KEY, entity TEXT NOT NULL, key TEXT NOT NULL, to_key TEXT,
@@ -22,6 +26,9 @@ pub(crate) const HISTORY_TABLES: &str = "
     CREATE INDEX IF NOT EXISTS _hearings_of ON _hearings(entity, key, to_key);
     CREATE TABLE IF NOT EXISTS _aliases(
         identity BLOB NOT NULL, alias TEXT NOT NULL, PRIMARY KEY(identity, alias)) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS _ends(
+        entity TEXT NOT NULL, key TEXT NOT NULL, to_key TEXT NOT NULL, event TEXT NOT NULL,
+        source TEXT NOT NULL, point INTEGER, PRIMARY KEY(entity, key, to_key)) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS _check(value TEXT NOT NULL);";
 
 /// The fixed label whose keyed hash is the check value.
@@ -217,12 +224,63 @@ pub(crate) fn unhear(tx: &Connection, node: &NodeRef, links: &[LinkFact]) -> Res
     };
     drop(node_entity(&node.class), &node.key, None)?;
     for link in links {
-        drop(
-            link_entity(&link.relation),
-            &link.from.key,
-            Some(&link.to.key),
-        )?;
+        let entity = link_entity(&link.relation);
+        tx.prepare_cached("DELETE FROM _ends WHERE entity = ?1 AND key = ?2 AND to_key = ?3")?
+            .execute(params![entity, link.from.key, link.to.key])?;
+        drop(entity, &link.from.key, Some(&link.to.key))?;
     }
+    Ok(())
+}
+
+/// Whether the graph holds a hearing of the link of `relation` from `from` to `to`.
+pub(crate) fn link_heard(
+    tx: &Connection,
+    relation: &str,
+    from: &str,
+    to: &str,
+) -> Result<bool, Error> {
+    Ok(tx
+        .prepare_cached(
+            "SELECT 1 FROM _hearings WHERE entity = ?1 AND key = ?2 AND to_key = ?3 LIMIT 1",
+        )?
+        .query_row(params![link_entity(relation), from, to], |_| Ok(()))
+        .optional()?
+        .is_some())
+}
+
+/// Records how a link came to an end, when `change` is an ending (at its point) or a correction
+/// (with none), as the event `event`; any other change records nothing. The latest replaces any
+/// before it. Ending, correcting and replaying either record through here.
+pub(crate) fn conclude(tx: &Connection, event: EventId, change: &Change) -> Result<(), Error> {
+    let (source, relation, from, to, at) = match change {
+        Change::Ended {
+            source,
+            relation,
+            from,
+            to,
+            at,
+        } => (source, relation, from, to, Some(*at)),
+        Change::Corrected {
+            source,
+            relation,
+            from,
+            to,
+        } => (source, relation, from, to, None),
+        _ => return Ok(()),
+    };
+    tx.prepare_cached(
+        "INSERT INTO _ends(entity, key, to_key, event, source, point) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(entity, key, to_key) DO UPDATE SET \
+         event = excluded.event, source = excluded.source, point = excluded.point",
+    )?
+    .execute(params![
+        link_entity(relation),
+        from.key,
+        to.key,
+        event.to_string(),
+        source,
+        at
+    ])?;
     Ok(())
 }
 
@@ -312,7 +370,54 @@ pub struct Hearing {
     pub aliases: Vec<EventId>,
 }
 
+/// How a link came to an end: it ended, a new fact with its own point, or it was found wrong,
+/// which is a correction and not an ending.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum End {
+    Ended {
+        /// The ending's point on the time axis.
+        at: SystemTime,
+        source: String,
+        event: EventId,
+    },
+    Corrected {
+        source: String,
+        event: EventId,
+    },
+}
+
 impl Graph {
+    /// How the link of `relation` from the node keyed `from` to the node keyed `to` came to an
+    /// end, or `None` while it has neither ended nor been found wrong. Its hearings stay in
+    /// [`Graph::link_hearings`] either way.
+    ///
+    /// # Errors
+    /// The relation is not declared, or the graph file cannot be read.
+    pub fn link_end(&self, relation: &str, from: &str, to: &str) -> Result<Option<End>, Error> {
+        let relation = self.current_ontology()?.relation(relation)?.name.clone();
+        let row: Option<(String, String, Option<i64>)> = self
+            .conn
+            .prepare_cached(
+                "SELECT event, source, point FROM _ends WHERE entity = ?1 AND key = ?2 AND to_key = ?3",
+            )?
+            .query_row(params![link_entity(&relation), from, to], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .optional()?;
+        let Some((event, source, at)) = row else {
+            return Ok(None);
+        };
+        let event = serde_json::from_value(event.into())?;
+        Ok(Some(match at {
+            Some(at) => End::Ended {
+                at: time(at),
+                source,
+                event,
+            },
+            None => End::Corrected { source, event },
+        }))
+    }
+
     /// Every hearing of `node`, by point and then by event id.
     ///
     /// # Errors
@@ -383,7 +488,53 @@ impl Graph {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Class, Date, Declaration, NodeRef, Relation, Unit, ValidTime, Write, open};
+    use std::time::{Duration, UNIX_EPOCH};
+
+    use crate::{
+        Class, Cursor, Date, Declaration, End, NodeRef, Relation, Unit, ValidTime, Write, open,
+        rebuild,
+    };
+
+    #[test]
+    fn an_ending_and_a_correction_rebuild_from_the_events() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let dir = tempfile::tempdir()?;
+        let mut g = open(dir.path().join("live.rannoch"), Some(&crate::TEST_KEY))?;
+        let when = ValidTime::On(Date::day(2021, 3, 2));
+        g.declare(&Declaration::Class(Class::new("voice", [] as [&str; 0])))?;
+        g.declare(&Declaration::Relation(Relation::new(
+            "knows", "voice", "voice", false,
+        )))?;
+        let voice = |key: &str| Unit::new("voice", key, [] as [(&str, &str); 0], when.clone());
+        g.write(
+            &Write::new("swtor")
+                .unit(voice("v1"))
+                .unit(voice("v2").link("knows", "v2", "v1", when.clone()))
+                .unit(voice("v3").link("knows", "v3", "v1", when.clone())),
+        )?;
+        let at = UNIX_EPOCH + Duration::from_millis(1_760_000_000_123);
+        g.end_link("knows", "v2", "v1", at, "moderator")?;
+        g.correct_link("knows", "v3", "v1", "moderator")?;
+        assert!(g.end_link("knows", "v1", "v3", at, "moderator").is_err());
+
+        let events = g.events().since(Cursor::START)?;
+        let back = rebuild(
+            &events,
+            dir.path().join("back.rannoch"),
+            Some(&crate::TEST_KEY),
+        )?;
+        for (from, to) in [("v2", "v1"), ("v3", "v1")] {
+            assert_eq!(
+                back.link_end("knows", from, to)?,
+                g.link_end("knows", from, to)?
+            );
+        }
+        assert!(matches!(
+            back.link_end("knows", "v3", "v1")?,
+            Some(End::Corrected { .. })
+        ));
+        Ok(())
+    }
 
     #[test]
     fn a_pre_key_store_takes_its_key_without_the_hearings_a_forget_removed()

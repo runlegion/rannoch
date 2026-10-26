@@ -13,7 +13,7 @@ use crate::events::{
     Change, Cursor, Event, EventId, Fact, LinkFact, NodeFact, WrongKind, add_derived, append,
     event_at, holds, keep_derived, next_cursor, store,
 };
-use crate::history::{Held, Key, Of, alias, hear, millis};
+use crate::history::{Held, Key, Of, alias, conclude, hear, link_heard, millis};
 use crate::open::{
     CLASS, Class, Graph, HistoryKey, Ontology, RELATION, Relation, Value, ValueType, class_table,
     concat, property_column, relation_index, relation_table, schema_version,
@@ -893,6 +893,7 @@ pub(crate) fn replay(
         Change::Replaced { class, old, new } => {
             record_fate(tx, class, old, new)?;
         }
+        Change::Ended { .. } | Change::Corrected { .. } => conclude(tx, event.id, &event.change)?,
     }
     Ok(true)
 }
@@ -975,6 +976,89 @@ impl Graph {
                 new: new.to_string(),
             },
         )?;
+        tx.commit()?;
+        self.loaded(version, ontology);
+        Ok(event)
+    }
+
+    /// Ends the link of `relation` from the node keyed `from` to the node keyed `to` at the
+    /// point `at`, from `source`, as one event: the ending is a new fact with its own point, and
+    /// the link keeps every hearing. A later ending or correction of the link replaces it.
+    ///
+    /// # Errors
+    /// The relation is not declared; [`Error::Refused`] when the graph holds no hearing of the
+    /// link; the graph file cannot be written.
+    pub fn end_link(
+        &mut self,
+        relation: &str,
+        from: &str,
+        to: &str,
+        at: SystemTime,
+        source: &str,
+    ) -> Result<Event, Error> {
+        self.conclude_link(relation, from, to, source, Some(millis(at)))
+    }
+
+    /// Records that the link of `relation` from the node keyed `from` to the node keyed `to`
+    /// was found wrong, from `source`, as one event: a correction, which does not read as an
+    /// ending. A later ending or correction of the link replaces it.
+    ///
+    /// # Errors
+    /// The relation is not declared; [`Error::Refused`] when the graph holds no hearing of the
+    /// link; the graph file cannot be written.
+    pub fn correct_link(
+        &mut self,
+        relation: &str,
+        from: &str,
+        to: &str,
+        source: &str,
+    ) -> Result<Event, Error> {
+        self.conclude_link(relation, from, to, source, None)
+    }
+
+    /// Ends the link at `at`, or with no point records it as found wrong.
+    fn conclude_link(
+        &mut self,
+        relation: &str,
+        from: &str,
+        to: &str,
+        source: &str,
+        at: Option<i64>,
+    ) -> Result<Event, Error> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let version = schema_version(&tx)?;
+        let ontology = Ontology::load(&tx)?;
+        let declared = ontology.relation(relation)?;
+        let name = declared.name.clone();
+        if !link_heard(&tx, &name, from, to)? {
+            return Err(Error::Refused(format!(
+                "no {name} link from {from} to {to} has been heard"
+            )));
+        }
+        let (source, relation) = (source.to_string(), name);
+        let (from, to) = (
+            NodeRef::new(&declared.from, from),
+            NodeRef::new(&declared.to, to),
+        );
+        let change = match at {
+            Some(at) => Change::Ended {
+                source,
+                relation,
+                from,
+                to,
+                at,
+            },
+            None => Change::Corrected {
+                source,
+                relation,
+                from,
+                to,
+            },
+        };
+        let event = append(&tx, change)?;
+        conclude(&tx, event.id, &event.change)?;
         tx.commit()?;
         self.loaded(version, ontology);
         Ok(event)
