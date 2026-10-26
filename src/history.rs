@@ -19,8 +19,8 @@ use crate::write::{Error, Stamp, ValidTime};
 /// The hearings, one version row each, with no valid-to: `arrived` counts up as this store
 /// records them, `integer` is set only in an integer-keyed class, and `properties` holds a
 /// node's. Then the other ids each arrived under, how each link that ended or was found wrong
-/// came to that (`point` is the ending's, and null for a correction), and the check value of
-/// the graph's key.
+/// came to that (`point` and `valid` are the ending's, `point` null for a correction and
+/// `valid` null when unknown), and the check value of the graph's key.
 pub(crate) const HISTORY_TABLES: &str = "
     CREATE TABLE IF NOT EXISTS _hearings(
         arrived INTEGER PRIMARY KEY, identity BLOB NOT NULL UNIQUE, entity TEXT NOT NULL,
@@ -33,7 +33,8 @@ pub(crate) const HISTORY_TABLES: &str = "
         identity BLOB NOT NULL, alias TEXT NOT NULL, PRIMARY KEY(identity, alias)) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS _ends(
         entity TEXT NOT NULL, key TEXT NOT NULL, to_key TEXT NOT NULL, event TEXT NOT NULL,
-        source TEXT NOT NULL, point INTEGER, PRIMARY KEY(entity, key, to_key)) WITHOUT ROWID;
+        source TEXT NOT NULL, point INTEGER, valid TEXT,
+        PRIMARY KEY(entity, key, to_key)) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS _check(value TEXT NOT NULL);";
 
 /// The fixed label whose keyed hash is the check value.
@@ -136,7 +137,7 @@ fn node_entity(class: &str) -> String {
     format!("{CLASS}:{class}")
 }
 
-fn link_entity(relation: &str) -> String {
+pub(crate) fn link_entity(relation: &str) -> String {
     format!("{RELATION}:{relation}")
 }
 
@@ -313,30 +314,33 @@ pub(crate) fn link_heard(
         .is_some())
 }
 
-/// Records how a link came to an end, when `change` is an ending (at its point) or a correction
-/// (with none), as the event `event`; any other change records nothing. The latest replaces any
-/// before it. Ending, correcting and replaying either record through here.
+/// Records how a link came to an end, when `change` is an ending (at its point, with its valid
+/// time) or a correction (with neither), as the event `event`; any other change records
+/// nothing. The latest replaces any before it. Ending, correcting and replaying either record
+/// through here.
 pub(crate) fn conclude(tx: &Connection, event: EventId, change: &Change) -> Result<(), Error> {
-    let (source, relation, from, to, at) = match change {
+    let (source, relation, from, to, at, valid) = match change {
         Change::Ended {
             source,
             relation,
             from,
             to,
             at,
-        } => (source, relation, from, to, Some(*at)),
+            valid,
+        } => (source, relation, from, to, Some(*at), valid.to_sql()),
         Change::Corrected {
             source,
             relation,
             from,
             to,
-        } => (source, relation, from, to, None),
+        } => (source, relation, from, to, None, None),
         _ => return Ok(()),
     };
     tx.prepare_cached(
-        "INSERT INTO _ends(entity, key, to_key, event, source, point) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(entity, key, to_key) DO UPDATE SET \
-         event = excluded.event, source = excluded.source, point = excluded.point",
+        "INSERT INTO _ends(entity, key, to_key, event, source, point, valid) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT(entity, key, to_key) DO UPDATE SET \
+         event = excluded.event, source = excluded.source, point = excluded.point, \
+         valid = excluded.valid",
     )?
     .execute(params![
         link_entity(relation),
@@ -344,7 +348,8 @@ pub(crate) fn conclude(tx: &Connection, event: EventId, change: &Change) -> Resu
         to.key,
         event.to_string(),
         source,
-        at
+        at,
+        valid
     ])?;
     Ok(())
 }
@@ -450,6 +455,8 @@ pub enum End {
     Ended {
         /// The ending's point on the time axis.
         at: SystemTime,
+        /// When the link stopped holding in the world, which may be unknown.
+        valid: ValidTime,
         source: String,
         event: EventId,
     },
@@ -468,22 +475,24 @@ impl Graph {
     /// The relation is not declared, or the graph file cannot be read.
     pub fn link_end(&self, relation: &str, from: &str, to: &str) -> Result<Option<End>, Error> {
         let relation = self.current_ontology()?.relation(relation)?.name.clone();
-        let row: Option<(String, String, Option<i64>)> = self
+        let row: Option<(String, String, Option<i64>, Option<String>)> = self
             .conn
             .prepare_cached(
-                "SELECT event, source, point FROM _ends WHERE entity = ?1 AND key = ?2 AND to_key = ?3",
+                "SELECT event, source, point, valid FROM _ends \
+                 WHERE entity = ?1 AND key = ?2 AND to_key = ?3",
             )?
             .query_row(params![link_entity(&relation), from, to], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
             })
             .optional()?;
-        let Some((event, source, at)) = row else {
+        let Some((event, source, at, valid)) = row else {
             return Ok(None);
         };
         let event = serde_json::from_value(event.into())?;
         Ok(Some(match at {
             Some(at) => End::Ended {
                 at: time(at),
+                valid: ValidTime::from_sql(valid),
                 source,
                 event,
             },
@@ -802,9 +811,13 @@ mod tests {
                 .unit(voice("v3").link("knows", "v3", "v1", when.clone())),
         )?;
         let at = UNIX_EPOCH + Duration::from_millis(1_760_000_000_123);
-        g.end_link("knows", "v2", "v1", at, "moderator")?;
+        let ended = ValidTime::On(Date::day(2025, 6, 1));
+        g.end_link("knows", "v2", "v1", at, ended, "moderator")?;
         g.correct_link("knows", "v3", "v1", "moderator")?;
-        assert!(g.end_link("knows", "v1", "v3", at, "moderator").is_err());
+        assert!(
+            g.end_link("knows", "v1", "v3", at, ValidTime::Unknown, "moderator")
+                .is_err()
+        );
 
         let events = g.events().since(Cursor::START)?;
         let back = rebuild(
