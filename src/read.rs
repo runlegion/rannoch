@@ -845,13 +845,14 @@ fn ending(
     e: &str,
     known: Option<&str>,
 ) -> (String, String, String, String) {
-    let (heard, valid_by) = ending_sql(e, known.map(|_| "?3"), "?2");
+    let link = (
+        literal(&link_entity(relation)),
+        format!("{from}.key"),
+        format!("{to}.key"),
+    );
+    let (ending, valid_by) = ending_sql(e, (&link.0, &link.1, &link.2), known.map(|_| "?3"), "?2");
     (
-        format!(
-            "LEFT JOIN _ends {e} ON {e}.entity = {} AND {e}.key = {from}.key \
-             AND {e}.to_key = {to}.key AND {heard}",
-            literal(&link_entity(relation))
-        ),
+        format!("LEFT JOIN _endings {e} ON {ending}"),
         format!("NOT coalesce({valid_by}, 0)"),
         format!("{e}.event IS NOT NULL AND {valid_by} IS NULL"),
         format!("json_array({}, {from}.key, {to}.key)", literal(relation)),
