@@ -150,9 +150,8 @@ pub(crate) struct Held {
 }
 
 /// Records what `of` heard from `source`, whose content identity is `identity`, as a new version
-/// row named by `stamp`'s event and
-/// returns `None`; or, when the graph holds a hearing identical to it, records nothing and
-/// returns that one. Its integer key is kept only when its class is ordered by one, so every
+/// row named by `stamp`'s event and returns `None`; or, when the graph holds a hearing identical
+/// to it, records nothing and returns that one. Its integer key is kept only when its class is ordered by one, so every
 /// other class's rows order by point alone.
 pub(crate) fn hear(
     tx: &Connection,
@@ -239,10 +238,13 @@ pub(crate) struct Newest {
 
 impl Newest {
     pub(crate) fn properties(&self) -> Result<BTreeMap<String, Value>, Error> {
-        Ok(serde_json::from_str(
-            self.properties.as_deref().unwrap_or("{}"),
-        )?)
+        decode(self.properties.as_deref())
     }
+}
+
+/// A version row's properties: a node's, or none for a link, whose row holds null.
+fn decode(json: Option<&str>) -> Result<BTreeMap<String, Value>, Error> {
+    Ok(serde_json::from_str(json.unwrap_or("{}"))?)
 }
 
 /// Holds `event`, at `cursor`, as an alias of `held`, whose content it arrived with. When
@@ -646,7 +648,7 @@ fn version_row(
         valid: ValidTime::from_sql(valid),
         point: time(point),
         integer,
-        properties: serde_json::from_str(properties.as_deref().unwrap_or("{}"))?,
+        properties: decode(properties.as_deref())?,
         ended: false,
     };
     Ok(Some((version, recorded)))
