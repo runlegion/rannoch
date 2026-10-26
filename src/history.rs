@@ -283,9 +283,31 @@ fn saw(
         })
         .optional()?;
     let Some((first, last)) = kept else {
+        // One fact keeps no row, since it is its own first, last and first recorded; the second
+        // starts the row from the one before it.
+        let other = tx
+            .prepare_cached(
+                "SELECT * FROM (SELECT arrived, NULL, integer, point, event, valid FROM _hearings \
+                 WHERE entity = ?1 AND key = ?2 AND to_key IS nullif(?3, '') \
+                 AND arrived IS NOT ?4 UNION ALL SELECT NULL, id, NULL, point, event, valid \
+                 FROM _endings WHERE entity = ?1 AND key = ?2 AND to_key = ?3 AND id IS NOT ?5) \
+                 LIMIT 1",
+            )?
+            .query_row(params![entity, key, to, mark.hearing, mark.ending], |row| {
+                Ok((Mark::row(row, 0)?, row.get::<_, Option<String>>(5)?))
+            })
+            .optional()?;
+        let Some((other, was)) = other else {
+            return Ok(());
+        };
         tx.prepare_cached("INSERT INTO _seen VALUES (?1, ?2, ?3, ?4, ?5, ?4, ?5, ?4, ?5, ?6, 1)")?
-            .execute(params![entity, key, to, mark.hearing, mark.ending, valid])?;
-        return Ok(());
+            .execute(params![entity, key, to, other.hearing, other.ending, was])?;
+        let (first, last) = if mark.rank() < other.rank() {
+            (mark, &other)
+        } else {
+            (&other, mark)
+        };
+        return keep(tx, (entity, key, to), (first, last), (1, valid));
     };
     let first = if mark.rank() < first.rank() {
         mark
@@ -337,6 +359,23 @@ fn reseen(tx: &Connection, identity: [u8; 32]) -> Result<(), Error> {
         .query_row(params![identity], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?;
+    if let Some((first, last)) = edges(tx, (&entity, &key, to.as_deref()))? {
+        let of = (
+            entity.as_str(),
+            key.as_str(),
+            to.as_deref().unwrap_or_default(),
+        );
+        keep(tx, of, (&first, &last), (0, None))?;
+    }
+    Ok(())
+}
+
+/// The first and last facts of `of` (entity, key, target key), hearings and endings, by index
+/// seeks; `None` when it has none.
+fn edges(
+    tx: &Connection,
+    (entity, key, to): (&str, &str, Option<&str>),
+) -> Result<Option<(Mark, Mark)>, Error> {
     let edge = |direction: &str| -> Result<Option<Mark>, Error> {
         let hearing = tx
             .prepare_cached(&format!(
@@ -361,15 +400,7 @@ fn reseen(tx: &Connection, identity: [u8; 32]) -> Result<(), Error> {
             (None, e) => e,
         })
     };
-    if let (Some(first), Some(last)) = (edge("ASC")?, edge("DESC")?) {
-        let of = (
-            entity.as_str(),
-            key.as_str(),
-            to.as_deref().unwrap_or_default(),
-        );
-        keep(tx, of, (&first, &last), (0, None))?;
-    }
-    Ok(())
+    Ok(edge("ASC")?.zip(edge("DESC")?))
 }
 
 /// The current version of the node or link `of` (entity, key, target key): the newest by its
@@ -530,51 +561,8 @@ pub(crate) fn conclude(tx: &Connection, event: EventId, change: &Change) -> Resu
 
 /// Takes `key` as the graph's. A store holding another key's check value refuses it; a store
 /// holding none takes it and hears every write already in its log, in order, dropping what each
-/// forget in it removed. A store that holds hearings written before endings and what is seen
-/// were kept gets them, from its hearings and its latest endings.
+/// forget in it removed.
 pub(crate) fn take(conn: &mut Connection, key: &Key) -> Result<(), Error> {
-    /// A fact to see again: its entity, key and target key, its mark and its valid time.
-    type Seeing = (String, String, Option<String>, Mark, Option<String>);
-    take_key(conn, key)?;
-    let unseen = "SELECT EXISTS(SELECT 1 FROM _hearings) AND NOT EXISTS(SELECT 1 FROM _seen)";
-    if !conn.query_row(unseen, [], |row| row.get::<_, bool>(0))? {
-        return Ok(());
-    }
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    if !tx.query_row(unseen, [], |row| row.get::<_, bool>(0))? {
-        return Ok(());
-    }
-    tx.execute(
-        "INSERT OR IGNORE INTO _endings(entity, key, to_key, point, event, source, valid) \
-         SELECT entity, key, to_key, point, event, source, valid FROM _ends \
-         WHERE point IS NOT NULL",
-        [],
-    )?;
-    let read = |row: &rusqlite::Row| -> rusqlite::Result<Seeing> {
-        Ok((
-            row.get(0)?,
-            row.get(1)?,
-            row.get(2)?,
-            Mark::row(row, 3)?,
-            row.get(8)?,
-        ))
-    };
-    let facts: Vec<Seeing> = tx
-        .prepare(
-            "SELECT * FROM (SELECT entity, key, to_key, arrived, NULL AS id, integer, point, \
-             event, valid FROM _hearings UNION ALL SELECT entity, key, to_key, NULL, id, NULL, \
-             point, event, valid FROM _endings) ORDER BY arrived IS NULL, arrived, id",
-        )?
-        .query_map([], read)?
-        .collect::<Result<_, _>>()?;
-    for (entity, key, to, mark, valid) in facts {
-        saw(&tx, (&entity, &key, to.as_deref()), &mark, valid.as_deref())?;
-    }
-    tx.commit()?;
-    Ok(())
-}
-
-fn take_key(conn: &mut Connection, key: &Key) -> Result<(), Error> {
     let check = |conn: &Connection| -> Result<Option<String>, Error> {
         Ok(conn
             .prepare_cached("SELECT value FROM _check")?
@@ -625,6 +613,58 @@ fn take_key(conn: &mut Connection, key: &Key) -> Result<(), Error> {
                 piece.held(&held, false)?;
             }
         }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Keeps every ending and what is seen of each node and link of a store whose hearings were
+/// written before they were kept: its endings from each link's latest one, and a seen row for
+/// each node and link with more than one fact.
+pub(crate) fn see_all(conn: &mut Connection) -> Result<(), Error> {
+    /// A node or link to see: its entity, key and target key.
+    type Of = (String, String, Option<String>);
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    tx.execute(
+        "INSERT OR IGNORE INTO _endings(entity, key, to_key, point, event, source, valid) \
+         SELECT entity, key, to_key, point, event, source, valid FROM _ends \
+         WHERE point IS NOT NULL",
+        [],
+    )?;
+    let many: Vec<Of> = tx
+        .prepare(
+            "SELECT entity, key, to_key FROM (SELECT entity, key, to_key FROM _hearings \
+             UNION ALL SELECT entity, key, to_key FROM _endings) \
+             GROUP BY entity, key, to_key HAVING count(*) > 1",
+        )?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<Result<_, _>>()?;
+    let day = valid_day("valid");
+    for (entity, key, to) in many {
+        let Some((first, last)) = edges(&tx, (&entity, &key, to.as_deref()))? else {
+            continue;
+        };
+        tx.prepare_cached(&format!(
+            "INSERT INTO _seen SELECT ?1, ?2, coalesce(?3, ''), ?4, ?5, ?6, ?7, \
+             (SELECT min(arrived) FROM _hearings WHERE entity = ?1 AND key = ?2 AND to_key IS ?3), \
+             (SELECT min(id) FROM _endings WHERE entity = ?1 AND key = ?2 AND to_key = ?3 \
+             AND NOT EXISTS (SELECT 1 FROM _hearings WHERE entity = ?1 AND key = ?2 \
+             AND to_key IS ?3)), (SELECT valid FROM (SELECT valid FROM _hearings \
+             WHERE entity = ?1 AND key = ?2 AND to_key IS ?3 UNION ALL SELECT valid \
+             FROM _endings WHERE entity = ?1 AND key = ?2 AND to_key = ?3) \
+             WHERE valid IS NOT NULL ORDER BY {day} LIMIT 1), \
+             (SELECT count(*) FROM _hearings WHERE entity = ?1 AND key = ?2 AND to_key IS ?3) \
+             + (SELECT count(*) FROM _endings WHERE entity = ?1 AND key = ?2 AND to_key = ?3)"
+        ))?
+        .execute(params![
+            entity,
+            key,
+            to,
+            first.hearing,
+            first.ending,
+            last.hearing,
+            last.ending
+        ])?;
     }
     tx.commit()?;
     Ok(())
@@ -1065,10 +1105,11 @@ pub(crate) fn ending_sql(
     )
 }
 
-/// The one read of a kept seen row of `?1`, `?2`, `?3` (its target key `''` for a node), with
-/// the facts it names, each a hearing joined by when it arrived or an ending by its id, and
-/// when a link ended: count, first true, when it ended, then first heard, last heard and first
-/// recorded as event, source, valid time, point, integer key, properties and whether an ending.
+/// The one read of what is seen of `?1`, `?2`, `?3` (its target key `''` for a node): its kept
+/// row, with the facts it names, each a hearing joined by when it arrived or an ending by its
+/// id; or, for a node or link with one fact, which keeps no row, that fact. Then when a link
+/// ended: count, first true, when it ended, then first heard, last heard and first recorded as
+/// event, source, valid time, point, integer key, properties and whether an ending.
 fn seen_sql() -> String {
     let fact = |p: &str| {
         format!(
@@ -1084,16 +1125,35 @@ fn seen_sql() -> String {
              LEFT JOIN _endings {p}e ON {p}e.id = s.{column}_ending"
         )
     };
-    let (ending, _) = ending_sql("n", ("s.entity", "s.key", "s.to_key"), None, "NULL");
+    let (ending, _) = ending_sql("n", ("?1", "?2", "?3"), None, "NULL");
+    // A node or link with one fact, a hearing or an ending, keeps no row: that fact is read.
+    let one = |fact: &str, from: &str, to: &str| {
+        format!(
+            "UNION ALL SELECT 1, valid, (SELECT n.point FROM _endings n WHERE {ending}), \
+             {fact}, {fact}, {fact} FROM {from} WHERE entity = ?1 AND key = ?2 AND {to} \
+             AND NOT EXISTS (SELECT 1 FROM _seen WHERE entity = ?1 AND key = ?2 AND to_key = ?3)"
+        )
+    };
     format!(
         "SELECT s.count, s.first_true, (SELECT n.point FROM _endings n WHERE {ending}), \
-         {}, {}, {} FROM _seen s {} {} {} WHERE s.entity = ?1 AND s.key = ?2 AND s.to_key = ?3",
+         {}, {}, {} FROM _seen s {} {} {} WHERE s.entity = ?1 AND s.key = ?2 AND s.to_key = ?3 \
+         {} {} LIMIT 1",
         fact("f"),
         fact("l"),
         fact("r"),
         join("f", "first"),
         join("l", "last"),
         join("r", "recorded"),
+        one(
+            "event, source, valid, point, integer, properties, 0",
+            "_hearings",
+            "to_key IS nullif(?3, '')"
+        ),
+        one(
+            "event, source, valid, point, NULL, NULL, 1",
+            "_endings",
+            "to_key = ?3"
+        ),
     )
 }
 
