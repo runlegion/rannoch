@@ -1404,9 +1404,9 @@ impl Put {
     }
 }
 
-/// Writes whole `units` from `source`, each node and link derived from `derived_from`, inside `tx` and
-/// appends their events: one for what they added and one per open link they closed. The caller
-/// commits.
+/// Writes whole `units` from `source`, each node and link derived from `derived_from`, inside
+/// `tx` and appends their events: one for what they added and one per open link they closed. The
+/// caller commits.
 fn put(
     tx: &Connection,
     ontology: &Ontology,
