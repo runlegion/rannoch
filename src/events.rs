@@ -584,7 +584,16 @@ impl Graph {
         // carried, one that arrived after the cursor included.
         let aliases = aliases(&read)?;
         drop(read);
-        let snapshot = replay_into(open_keyed(&empty_path, key)?, &events)?;
+        // Nothing reads the new file until this returns, so it is filled under a rollback
+        // journal, which writes each page once, and goes back to WAL at the end: filled in WAL,
+        // every page was written twice on the disk the graph's own commits share.
+        let fresh = open_keyed(&empty_path, key)?;
+        fresh
+            .conn
+            .pragma_update_and_check(None, "journal_mode", "DELETE", |row| {
+                row.get::<_, String>(0)
+            })?;
+        let snapshot = replay_into(fresh, &events)?;
         hold_aliases(&snapshot.conn, &aliases)?;
         // Registrations are state about readers, not events: the snapshot carries them. A
         // cursor past the snapshot's names a place in this graph's log the snapshot does not
@@ -595,6 +604,9 @@ impl Graph {
                 .prepare_cached("INSERT INTO _followers(name, cursor) VALUES (?1, ?2)")?
                 .execute(params![name, at.0])?;
         }
+        snapshot
+            .conn
+            .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get::<_, String>(0))?;
         Ok(Snapshot {
             cursor,
             path: empty_path.as_ref().to_path_buf(),
@@ -931,6 +943,24 @@ mod tests {
         let snapshot = live.snapshot(at, dir.path().join("snapshot.db"))?;
         let back = snapshot.rebuild(&[], dir.path().join("back.db"), Some(&crate::TEST_KEY))?;
         assert_eq!(back.hearings(&n2)?, live.hearings(&n2)?);
+        Ok(())
+    }
+
+    #[test]
+    fn a_snapshot_is_taken_while_another_connection_holds_the_write_lock()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("live.db");
+        let mut g = open(&path, Some(&crate::TEST_KEY))?;
+        g.declare(&Declaration::Class(Class::new("note", ["text"])))?;
+        g.write(&Write::new("app").unit(note("n1")))?;
+        let writer = rusqlite::Connection::open(&path)?;
+        writer.execute_batch("BEGIN IMMEDIATE")?;
+        let at = g.events().committed()?;
+        let snapshot = g.snapshot(at, dir.path().join("snapshot.db"))?;
+        writer.execute_batch("ROLLBACK")?;
+        let back = snapshot.rebuild(&[], dir.path().join("back.db"), Some(&crate::TEST_KEY))?;
+        assert!(back.find("note", "n1")?.is_some());
         Ok(())
     }
 
