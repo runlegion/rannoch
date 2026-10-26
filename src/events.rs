@@ -11,16 +11,15 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::history::{Key, aliases, hold_aliases, unhear};
-use crate::open::{
-    Graph, Ontology, Value, class_table, open_keyed, relation_table, schema_version,
-};
+use crate::open::{Graph, Ontology, Value, class_table, open_keyed, relation_table};
+use crate::purge::Purge;
 use crate::read::NodeRef;
 use crate::write::{Declaration, Error, ValidTime, now_millis, replay};
 
 /// rannoch's own tables: the event log, the ontology, links waiting for an end, the fates of
-/// nodes that were replaced, the events each node was derived from, and the registered followers
-/// with their stored cursors. An event's place is never reused, so a cursor stays a place in the
-/// log.
+/// nodes that were replaced, the events each node was derived from, the registered followers
+/// with their stored cursors, and every snapshot the store made, so a purge reaches it. An
+/// event's place is never reused, so a cursor stays a place in the log.
 pub(crate) const OWN_TABLES: &str = "
     CREATE TABLE IF NOT EXISTS _events(seq INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS _ontology(
@@ -39,7 +38,8 @@ pub(crate) const OWN_TABLES: &str = "
         PRIMARY KEY(class, key, event)) WITHOUT ROWID;
     CREATE INDEX IF NOT EXISTS _derived_event ON _derived(event);
     CREATE TABLE IF NOT EXISTS _followers(name TEXT PRIMARY KEY, cursor INTEGER NOT NULL)
-        WITHOUT ROWID;";
+        WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS _snapshots(path TEXT PRIMARY KEY, cursor INTEGER);";
 
 /// A place in a graph's event log. Reading since a cursor returns the events after it. An app
 /// stores a cursor by serializing it, and a graph rebuilt from the log keeps each event's place,
@@ -113,13 +113,21 @@ pub enum Change {
     },
     /// An open link whose missing end arrived: it now holds in its relation.
     Closed(LinkFact),
-    /// A node the app forgot under its own rule, and the links that left with it. It names
-    /// what it removed by id and kind and holds none of the node's content.
+    /// A node the app forgot under its own rule, and the links that left with it, as logs
+    /// written before purges hold it: it is read and replayed as that node's purge, and no longer
+    /// written.
     Forgot {
         source: String,
         rule: String,
         nodes: Vec<NodeRef>,
         links: Vec<LinkFact>,
+    },
+    /// A purge under the app's own `rule`, from `source`: its kind, with each target as its
+    /// keyed match value under the graph's key, never as content.
+    Purged {
+        source: String,
+        rule: String,
+        purge: Purge,
     },
     /// The node `old` of `class` was replaced by the node `new` of the same class.
     Replaced {
@@ -197,7 +205,7 @@ pub struct LinkFact {
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Stored {
-    id: EventId,
+    pub(crate) id: EventId,
     pub(crate) change: Change,
 }
 
@@ -487,10 +495,7 @@ impl Snapshot {
         key: Option<&[u8; 32]>,
     ) -> Result<Graph, Error> {
         let key = Key::new(key.ok_or(Error::KeyMissing)?);
-        let empty_path = empty_path.as_ref();
-        let target = empty_path.to_str().ok_or_else(|| {
-            Error::Refused(format!("the path {} is not UTF-8", empty_path.display()))
-        })?;
+        let target = path_text(empty_path.as_ref())?;
         Connection::open(&self.path)?.execute("VACUUM INTO ?1", params![target])?;
         let graph = replay_into(open_keyed(empty_path, &key)?, later)?;
         // A carried follower cursor past what the rebuilt graph holds is lowered to its
@@ -502,6 +507,12 @@ impl Snapshot {
             .execute(params![committed.0])?;
         Ok(graph)
     }
+}
+
+/// `path` as text, refused when it is not UTF-8.
+fn path_text(path: &Path) -> Result<&str, Error> {
+    path.to_str()
+        .ok_or_else(|| Error::Refused(format!("the path {} is not UTF-8", path.display())))
 }
 
 /// Whether the log holds the event `id`.
@@ -534,7 +545,7 @@ pub(crate) fn add_derived(tx: &Connection, node: &NodeFact) -> Result<bool, Erro
 }
 
 /// Removes every derived-from event the node `key` of `class` names.
-fn drop_derived(tx: &Connection, class: &str, key: &str) -> Result<(), Error> {
+pub(crate) fn drop_derived(tx: &Connection, class: &str, key: &str) -> Result<(), Error> {
     tx.prepare_cached("DELETE FROM _derived WHERE class = ?1 AND key = ?2")?
         .execute(params![class, key])?;
     Ok(())
@@ -567,8 +578,9 @@ impl Graph {
     /// at `empty_path`: every event up to the cursor replayed into it and kept in its log under
     /// its own id and place, so it holds every version row, each node's and link's hearings and
     /// every event id up to the cursor. It deletes nothing: every event stays in the store. It
-    /// reads this graph in one read transaction and writes only the new file through its own
-    /// connection, so it never takes this graph's write lock.
+    /// reads this graph in one read transaction and fills the new file through its own
+    /// connection; the one write it makes on this graph, once the new file is whole, records the
+    /// snapshot so a purge reaches it.
     ///
     /// # Errors
     /// The graph file cannot be read, the new file cannot be opened as a graph file, or an
@@ -610,50 +622,23 @@ impl Graph {
         snapshot
             .conn
             .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get::<_, String>(0))?;
+        // Recorded so a purge reaches it, by its full path: the one write this takes on this
+        // graph, once the new file is whole.
+        let recorded = std::fs::canonicalize(&empty_path)
+            .unwrap_or_else(|_| empty_path.as_ref().to_path_buf());
+        self.conn
+            .prepare_cached("INSERT OR REPLACE INTO _snapshots(path, cursor) VALUES (?1, ?2)")?
+            .execute(params![path_text(&recorded)?, cursor.0])?;
         Ok(Snapshot {
             cursor,
             path: empty_path.as_ref().to_path_buf(),
         })
     }
-
-    /// Forgets `target` under the app's own `rule`, from `source`. The node and its links leave
-    /// live state; the earlier events that named it keep its id, its kind and its links'
-    /// endpoints and lose its content. Returns the forget event, which names what it removed by
-    /// id and kind and holds none of the node's content. All of it lands in one transaction or
-    /// none of it does.
-    ///
-    /// # Errors
-    /// [`Error::NotFound`] when no node of the class has the key; [`Error::Refused`] when the
-    /// class is not declared; the graph file cannot be read or written.
-    pub fn forget(&mut self, target: &NodeRef, rule: &str, source: &str) -> Result<Event, Error> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let version = schema_version(&tx)?;
-        let ontology = Ontology::load(&tx)?;
-        let links = remove(&tx, &ontology, target)?.ok_or_else(|| Error::NotFound {
-            class: target.class.clone(),
-            key: target.key.clone(),
-        })?;
-        strip(&tx, target)?;
-        let event = append(
-            &tx,
-            Change::Forgot {
-                source: source.to_string(),
-                rule: rule.to_string(),
-                nodes: vec![target.clone()],
-                links,
-            },
-        )?;
-        tx.commit()?;
-        self.loaded(version, ontology);
-        Ok(event)
-    }
 }
 
 /// Removes `target`, its links and the events it was derived from from live state and returns
-/// the links, or `None` when no node of its class has its key. Forgetting and replaying a forget
-/// both remove through here.
+/// the links, or `None` when no node of its class has its key. Purging a node and replaying a
+/// forget both remove through here.
 pub(crate) fn remove(
     tx: &Connection,
     ontology: &Ontology,
@@ -677,7 +662,7 @@ pub(crate) fn remove(
 
 /// Removes every link of the node `id`, which is `target`, from live state, open links waiting
 /// on its other end included, and returns them.
-fn unlink(
+pub(crate) fn unlink(
     tx: &Connection,
     ontology: &Ontology,
     target: &NodeRef,
@@ -738,31 +723,6 @@ fn unlink(
     Ok(links)
 }
 
-/// Strips `target`'s content from every earlier event that wrote it, keeping its id and kind.
-fn strip(tx: &Connection, target: &NodeRef) -> Result<(), Error> {
-    for (seq, mut stored) in naming_key(tx, &target.key)? {
-        let Change::Wrote { added, .. } = &mut stored.change else {
-            continue;
-        };
-        let mut stripped = false;
-        for fact in added {
-            if let Fact::Node(node) = fact
-                && node.class == target.class
-                && node.key == target.key
-                && !node.properties.is_empty()
-            {
-                node.properties.clear();
-                stripped = true;
-            }
-        }
-        if stripped {
-            tx.prepare_cached("UPDATE _events SET body = ?1 WHERE seq = ?2")?
-                .execute(params![serde_json::to_string(&stored)?, seq])?;
-        }
-    }
-    Ok(())
-}
-
 /// Every event whose encoding holds `key`, in log order, with its place in the log. A coarse
 /// filter on the key as the events encode it: the caller matches each candidate exactly.
 pub(crate) fn naming_key(conn: &Connection, key: &str) -> Result<Vec<(i64, Stored)>, Error> {
@@ -776,10 +736,31 @@ pub(crate) fn naming_key(conn: &Connection, key: &str) -> Result<Vec<(i64, Store
         .collect()
 }
 
+/// Forgets `target` as stores did before purges: it leaves live state and a forget event
+/// names it, while earlier events keep its writes. Tests reach the old logs' replay through here.
+#[cfg(test)]
+pub(crate) fn forget_as_before(graph: &mut Graph, target: &NodeRef) -> Result<Event, Error> {
+    let tx = graph.conn.transaction()?;
+    let ontology = Ontology::load(&tx)?;
+    let links = remove(&tx, &ontology, target)?.unwrap_or_default();
+    let event = append(
+        &tx,
+        Change::Forgot {
+            source: "tree".into(),
+            rule: "living".into(),
+            nodes: vec![target.clone()],
+            links,
+        },
+    )?;
+    tx.commit()?;
+    Ok(event)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{
-        Change, Class, Date, Declaration, NodeRef, Relation, Unit, ValidTime, Write, open,
+        Change, Class, Date, Declaration, NodeRef, Purge, Relation, Target, Unit, ValidTime, Write,
+        open,
     };
 
     #[test]
@@ -868,7 +849,7 @@ mod tests {
     }
 
     #[test]
-    fn a_forget_takes_the_nodes_open_links_with_it() -> Result<(), Box<dyn std::error::Error>> {
+    fn a_purge_takes_the_nodes_open_links_with_it() -> Result<(), Box<dyn std::error::Error>> {
         let path = std::env::temp_dir().join(format!("rannoch-forget-{}.db", uuid::Uuid::now_v7()));
         let mut g = open(path, Some(&crate::TEST_KEY))?;
         g.declare(&Declaration::Class(Class::new("person", ["name"])))?;
@@ -880,14 +861,11 @@ mod tests {
         let fiona = || Unit::new("person", "p05", [("name", "Fiona")], when.clone());
         g.write(&Write::new("tree").unit(fiona().link("born_in", "p05", "pl-late", when.clone())))?;
 
-        let forgot = g.forget(&NodeRef::new("person", "p05"), "living", "tree")?;
-        let Change::Forgot { links, .. } = forgot.change else {
-            panic!("expected a forget event, got {:?}", forgot.change);
-        };
-        assert_eq!(links.len(), 1, "the forget names the open born_in link");
+        let target = Target::Node(NodeRef::new("person", "p05"));
+        g.purge(Purge::Entity { target }, "living", "tree")?;
         assert!(
             g.open_links()?.is_empty(),
-            "no open link names the forgotten person"
+            "no open link names the purged person"
         );
 
         g.write(&Write::new("tree").unit(Unit::new(
@@ -899,7 +877,7 @@ mod tests {
         let back = g.write(&Write::new("tree").unit(fiona()))?;
         assert!(
             back.iter().all(|e| !matches!(e.change, Change::Closed(_))),
-            "a link the forget removed never closes onto the returning key: {back:?}"
+            "a link the purge removed never closes onto the returning key: {back:?}"
         );
         Ok(())
     }
@@ -993,9 +971,14 @@ mod tests {
         g.write(&Write::new("app").unit(note("n1")))?;
         let writer = rusqlite::Connection::open(&path)?;
         writer.execute_batch("BEGIN IMMEDIATE")?;
+        // The snapshot reads and fills its file under the lock; recording it waits for the lock.
+        let held = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            writer.execute_batch("ROLLBACK")
+        });
         let at = g.events().committed()?;
         let snapshot = g.snapshot(at, dir.path().join("snapshot.db"))?;
-        writer.execute_batch("ROLLBACK")?;
+        held.join().map_err(|_| "the writer panicked")??;
         let back = snapshot.rebuild(&[], dir.path().join("back.db"), Some(&crate::TEST_KEY))?;
         assert!(back.find("note", "n1")?.is_some());
         Ok(())
@@ -1041,11 +1024,12 @@ mod tests {
     }
 
     #[test]
-    fn a_forget_leaves_no_derived_from_behind() -> Result<(), Box<dyn std::error::Error>> {
+    fn a_purge_leaves_no_derived_from_behind() -> Result<(), Box<dyn std::error::Error>> {
         let (mut g, sources) = two_notes()?;
         let source = sources[0].id;
         g.write(&Write::new("app").unit(note("n3")).derived_from([source]))?;
-        g.forget(&NodeRef::new("note", "n3"), "retention", "app")?;
+        let target = Target::Node(NodeRef::new("note", "n3"));
+        g.purge(Purge::Entity { target }, "retention", "app")?;
         assert!(g.derived(source)?.is_empty());
         let rebuilt = crate::rebuild(
             &g.events().since(crate::Cursor::START)?,

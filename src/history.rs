@@ -69,6 +69,12 @@ impl Key {
             check: blake3::keyed_hash(bytes, CHECK_LABEL).to_hex().to_string(),
         }
     }
+
+    /// `text`'s keyed match value: its keyed hash under the key, so a purge names what it
+    /// matched without holding it.
+    pub(crate) fn matched(&self, text: &[u8]) -> blake3::Hash {
+        blake3::keyed_hash(&self.bytes, text)
+    }
 }
 
 impl fmt::Debug for Key {
@@ -83,7 +89,15 @@ pub(crate) enum Of<'a> {
     Link(&'a LinkFact),
 }
 
-impl Of<'_> {
+impl<'a> Of<'a> {
+    /// What `fact` is a hearing of: a node, or a link, open or not.
+    pub(crate) fn fact(fact: &'a Fact) -> Of<'a> {
+        match fact {
+            Fact::Node(node) => Of::Node(node),
+            Fact::Link(link) | Fact::Opened(link) => Of::Link(link),
+        }
+    }
+
     /// Its entity (a class or a relation), its key and, for a link, its target's key.
     pub(crate) fn entity(&self) -> (String, &str, Option<&str>) {
         match self {
@@ -103,7 +117,7 @@ impl Of<'_> {
         }
     }
 
-    fn time(&self) -> Option<i64> {
+    pub(crate) fn time(&self) -> Option<i64> {
         match self {
             Of::Node(node) => node.time,
             Of::Link(_) => None,
@@ -645,10 +659,7 @@ pub(crate) fn take(conn: &mut Connection, key: &Key) -> Result<(), Error> {
         // Into the versions only, as a replay hears them: current state stays as it is.
         let mut piece = Piece::new(&tx, &ontology, key, source, stamp);
         for fact in added {
-            let of = match fact {
-                Fact::Node(node) => Of::Node(node),
-                Fact::Link(link) | Fact::Opened(link) => Of::Link(link),
-            };
+            let of = Of::fact(fact);
             if let Heard::Held(held) = piece.hear(&of)? {
                 piece.held(&held, false)?;
             }
@@ -685,32 +696,8 @@ pub(crate) fn see_all(conn: &mut Connection) -> Result<(), Error> {
         )?
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
         .collect::<Result<_, _>>()?;
-    let day = valid_day("valid");
     for (entity, key, to) in many {
-        let Some((first, last)) = edges(&tx, (&entity, &key, to.as_deref()))? else {
-            continue;
-        };
-        tx.prepare_cached(&format!(
-            "INSERT INTO _seen SELECT ?1, ?2, coalesce(?3, ''), ?4, ?5, ?6, ?7, \
-             (SELECT min(arrived) FROM _hearings WHERE entity = ?1 AND key = ?2 AND to_key IS ?3), \
-             (SELECT min(id) FROM _endings WHERE entity = ?1 AND key = ?2 AND to_key = ?3 \
-             AND NOT EXISTS (SELECT 1 FROM _hearings WHERE entity = ?1 AND key = ?2 \
-             AND to_key IS ?3)), (SELECT valid FROM (SELECT valid FROM _hearings \
-             WHERE entity = ?1 AND key = ?2 AND to_key IS ?3 UNION ALL SELECT valid \
-             FROM _endings WHERE entity = ?1 AND key = ?2 AND to_key = ?3) \
-             WHERE valid IS NOT NULL ORDER BY {day} LIMIT 1), \
-             (SELECT count(*) FROM _hearings WHERE entity = ?1 AND key = ?2 AND to_key IS ?3) \
-             + (SELECT count(*) FROM _endings WHERE entity = ?1 AND key = ?2 AND to_key = ?3)"
-        ))?
-        .execute(params![
-            entity,
-            key,
-            to,
-            first.hearing,
-            first.ending,
-            last.hearing,
-            last.ending
-        ])?;
+        see(&tx, (&entity, &key, to.as_deref()))?;
     }
     tx.commit()?;
     Ok(())
@@ -735,6 +722,53 @@ pub(crate) fn point_aliases(conn: &mut Connection) -> Result<(), Error> {
         }
     }
     tx.commit()?;
+    Ok(())
+}
+
+/// Keeps what is seen of `of` (entity, key, target key) from its hearings and endings as they are
+/// now, when it has more than one fact; a node or link with one fact keeps no row. Its old row,
+/// if any, is dropped first.
+pub(crate) fn see(
+    tx: &Connection,
+    (entity, key, to): (&str, &str, Option<&str>),
+) -> Result<(), Error> {
+    tx.prepare_cached("DELETE FROM _seen WHERE entity = ?1 AND key = ?2 AND to_key = ?3")?
+        .execute(params![entity, key, to.unwrap_or_default()])?;
+    let facts: i64 = tx
+        .prepare_cached(
+            "SELECT (SELECT count(*) FROM _hearings WHERE entity = ?1 AND key = ?2 \
+             AND to_key IS ?3) + (SELECT count(*) FROM _endings WHERE entity = ?1 AND key = ?2 \
+             AND to_key = coalesce(?3, ''))",
+        )?
+        .query_row(params![entity, key, to], |row| row.get(0))?;
+    if facts < 2 {
+        return Ok(());
+    }
+    let Some((first, last)) = edges(tx, (entity, key, to))? else {
+        return Ok(());
+    };
+    let day = valid_day("valid");
+    tx.prepare_cached(&format!(
+        "INSERT INTO _seen SELECT ?1, ?2, coalesce(?3, ''), ?4, ?5, ?6, ?7, \
+         (SELECT min(arrived) FROM _hearings WHERE entity = ?1 AND key = ?2 AND to_key IS ?3), \
+         (SELECT min(id) FROM _endings WHERE entity = ?1 AND key = ?2 AND to_key = ?3 \
+         AND NOT EXISTS (SELECT 1 FROM _hearings WHERE entity = ?1 AND key = ?2 \
+         AND to_key IS ?3)), (SELECT valid FROM (SELECT valid FROM _hearings \
+         WHERE entity = ?1 AND key = ?2 AND to_key IS ?3 UNION ALL SELECT valid \
+         FROM _endings WHERE entity = ?1 AND key = ?2 AND to_key = ?3) \
+         WHERE valid IS NOT NULL ORDER BY {day} LIMIT 1), \
+         (SELECT count(*) FROM _hearings WHERE entity = ?1 AND key = ?2 AND to_key IS ?3) \
+         + (SELECT count(*) FROM _endings WHERE entity = ?1 AND key = ?2 AND to_key = ?3)"
+    ))?
+    .execute(params![
+        entity,
+        key,
+        to,
+        first.hearing,
+        first.ending,
+        last.hearing,
+        last.ending
+    ])?;
     Ok(())
 }
 
@@ -1196,13 +1230,14 @@ pub(crate) fn ending_sql(
     let link =
         |t: &str| format!("{t}.entity = {entity} AND {t}.key = {from} AND {t}.to_key = {to}");
     let by = |t: &str| known.map_or(String::new(), |known| format!(" AND {t}.point <= {known}"));
-    // The last live hearing's point and event, or below every ending when there is none.
+    // The last live hearing's point and event, by its occurrences, or below every ending when
+    // there is none.
     let live = |column: &str, none: &str| {
         format!(
-            "coalesce((SELECT h.{column} FROM _hearings h WHERE {} AND h.integer IS NULL{} \
-             ORDER BY h.point DESC, h.event DESC LIMIT 1), {none})",
-            link("h"),
-            by("h")
+            "coalesce((SELECT {column} FROM {} WHERE true{} ORDER BY {} LIMIT 1), {none})",
+            occurrences(&format!("{} AND h.integer IS NULL", link("h"))),
+            known.map_or(String::new(), |known| format!(" AND point <= {known}")),
+            order("DESC")
         )
     };
     let after = live("point", &i64::MIN.to_string());
@@ -1732,6 +1767,73 @@ mod tests {
     }
 
     #[test]
+    fn resending_a_time_keyed_version_after_a_newer_one_writes_no_event()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let mut g = open(dir.path().join("timed.rannoch"), Some(&crate::TEST_KEY))?;
+        let mut class = Class::new("visit", ["text"]);
+        class.history = crate::HistoryKey::Time;
+        g.declare(&Declaration::Class(class))?;
+        let at = |minute: u64| UNIX_EPOCH + Duration::from_secs(1_790_000_000 + minute * 60);
+        let visit = |text: &str, minute: u64| {
+            let when = ValidTime::On(Date::day(2026, 10, 1));
+            Write::new("crawler")
+                .unit(Unit::new("visit", "k1", [("text", text)], when).at(at(minute)))
+        };
+        let first = g.write(&visit("v1", 1))?;
+        g.write(&visit("v2", 2))?;
+        let before = g.events().since(Cursor::START)?.len();
+        let again = g.write(&visit("v1", 1))?;
+        assert_eq!(g.events().since(Cursor::START)?.len(), before);
+        let ids: Vec<_> = again.iter().map(|e| e.id).collect();
+        assert_eq!(ids, [first[0].id], "the held hearing's event is returned");
+        let k1 = g.find("visit", "k1")?.ok_or("k1 is in the graph")?;
+        assert_eq!(k1.properties.get("text"), Some(&"v2".into()));
+        Ok(())
+    }
+
+    #[test]
+    fn a_link_ended_then_heard_again_as_before_reads_live_after_that_occurrence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let mut g = open(dir.path().join("link.rannoch"), Some(&crate::TEST_KEY))?;
+        g.declare(&Declaration::Class(Class::new("voice", [] as [&str; 0])))?;
+        g.declare(&Declaration::Relation(Relation::new(
+            "knows", "voice", "voice", false,
+        )))?;
+        let first = ValidTime::On(Date::day(2021, 3, 2));
+        let knows = |valid: &ValidTime| {
+            let voice = |key: &str| Unit::new("voice", key, [] as [(&str, &str); 0], valid.clone());
+            Write::new("swtor").unit(voice("v1")).unit(voice("v2").link(
+                "knows",
+                "v2",
+                "v1",
+                valid.clone(),
+            ))
+        };
+        let pause = || std::thread::sleep(Duration::from_millis(3));
+        g.write(&knows(&first))?;
+        pause();
+        g.write(&knows(&ValidTime::On(Date::day(2022, 4, 5))))?;
+        pause();
+        let ended = std::time::SystemTime::now();
+        g.end_link("knows", "v2", "v1", ended, ValidTime::Unknown, "moderator")?;
+        assert!(g.link_end("knows", "v2", "v1")?.is_some());
+        pause();
+        g.write(&knows(&first))?;
+        assert_eq!(g.link_end("knows", "v2", "v1")?, None);
+        let now = super::At::Time(std::time::SystemTime::now());
+        let state = g
+            .link_state_at("knows", "v2", "v1", now)?
+            .ok_or("the link held")?;
+        assert!(!state.ended, "{state:?}");
+        let before = g.link_state_at("knows", "v2", "v1", super::At::Time(ended))?;
+        assert!(before.is_some_and(|v| v.ended));
+        assert_eq!(g.link_hearings("knows", "v2", "v1")?.len(), 2);
+        Ok(())
+    }
+
+    #[test]
     fn a_pre_key_store_takes_its_key_without_the_hearings_a_forget_removed()
     -> Result<(), Box<dyn std::error::Error>> {
         let path = std::env::temp_dir().join(format!("rannoch-prekey-{}.db", uuid::Uuid::now_v7()));
@@ -1755,7 +1857,7 @@ mod tests {
                 "pl1",
                 when.clone(),
             )))?;
-            g.forget(&NodeRef::new("visitor", "p05"), "living", "tree")?;
+            crate::events::forget_as_before(&mut g, &NodeRef::new("visitor", "p05"))?;
             // As a store written before keys: no check value and no hearings.
             g.conn.execute_batch(
                 "DELETE FROM _check; DELETE FROM _hearings; DELETE FROM _aliases;",

@@ -34,6 +34,7 @@ mod history;
 #[cfg(test)]
 mod measure;
 mod open;
+mod purge;
 mod queue;
 mod read;
 mod refs;
@@ -48,6 +49,7 @@ pub(crate) const TEST_KEY: [u8; 32] = *b"rannoch unit tests' identity key";
 
 pub use history::{At, End, Hearing, Seen, Version};
 pub use open::{Class, Graph, HistoryKey, Ontology, Relation, Value, ValueType, open};
+pub use purge::{Purge, Target};
 pub use queue::{Failure, Queue, Ticket};
 pub use read::{
     Count, Description, Filter, GroupBy, Link, Node, NodeRef, OpenLink, PartOf, Step, Tally, Walk,

@@ -610,9 +610,10 @@ impl<'a> Piece<'a> {
         }
     }
 
-    /// Hears `of`: the identical hearing held when it is its node's or link's current version;
-    /// else a new hearing, or a return to an older one, which this event is a new occurrence of.
-    /// Current state takes either only when it is now the newest version.
+    /// Hears `of`: the identical hearing held when it is its node's or link's current version,
+    /// or when its writer supplied its point, which is then part of its identity; else a new
+    /// hearing, or a return to an older one, which this event is a new occurrence of. Current
+    /// state takes either only when it is now the newest version.
     pub(crate) fn hear(&self, of: &Of) -> Result<Heard, Error> {
         let identity = of.identity(self.key, self.source)?;
         let (entity, key, to) = of.entity();
@@ -624,7 +625,10 @@ impl<'a> Piece<'a> {
             of,
             self.ontology,
         )? {
-            if newest(self.tx, (&entity, key, to))?.is_some_and(|(.., newest)| newest == identity) {
+            if of.time().is_some()
+                || newest(self.tx, (&entity, key, to))?
+                    .is_some_and(|(.., newest)| newest == identity)
+            {
                 return Ok(Heard::Held(held));
             }
             alias(self.tx, &held, self.stamp.id, self.stamp.cursor)?;
@@ -703,7 +707,7 @@ impl<'a> Piece<'a> {
 
     /// Puts a version of the node keyed `key` into its class's table as its current state.
     /// Returns the node's id and whether it is new.
-    fn put(
+    pub(crate) fn put(
         &self,
         class: &Class,
         key: &str,
@@ -809,7 +813,7 @@ impl<'a> Piece<'a> {
     }
 
     /// Puts a link's current state: into its relation when `ends` are both present, else open.
-    fn current_link(
+    pub(crate) fn current_link(
         &self,
         fact: &LinkFact,
         ends: Option<(i64, i64)>,
@@ -922,7 +926,7 @@ impl<'a> Piece<'a> {
 /// Applies one event's change to the state in `tx`, as it was applied when the event was
 /// written: a declaration builds what it needs, a write puts what it added, a closing moves its
 /// open link into its relation, a forget removes the node and its links, a replacement records
-/// the node's fate. Facts are stamped as recorded at `recorded`. Returns false when the event is
+/// the node's fate, and a purge changes nothing. Facts are stamped as recorded at `recorded`. Returns false when the event is
 /// a write whose every fact is identical to a hearing held, so it adds nothing and its id is
 /// held only as an alias.
 pub(crate) fn replay(
@@ -978,6 +982,8 @@ pub(crate) fn replay(
         Change::Replaced { class, old, new } => {
             record_fate(tx, class, old, new)?;
         }
+        // What a purge removed has already left every event before it.
+        Change::Purged { .. } => {}
         Change::Ended { .. } | Change::Corrected { .. } => conclude(tx, event.id, &event.change)?,
     }
     Ok(true)
