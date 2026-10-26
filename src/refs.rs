@@ -6,7 +6,9 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::events::{Change, naming_key};
+use crate::history::Key;
 use crate::open::{Graph, open_file};
+use crate::purge::{Purge, Target};
 use crate::read::NodeRef;
 use crate::write::Error;
 
@@ -15,7 +17,7 @@ use crate::write::Error;
 pub enum Fate {
     /// The target is in its file, and nothing replaced it.
     Live,
-    /// The target was forgotten under the app's `rule`.
+    /// The target was purged, or forgotten, under the app's `rule`.
     Forgotten { rule: String },
     /// The target was replaced by the node `by`.
     Replaced { by: NodeRef },
@@ -33,8 +35,9 @@ impl Graph {
     }
 
     /// Resolves a reference to `target` in the graph file mounted as `mount`, from that file's
-    /// own facts: replaced (and by what), forgotten (and by which rule), or live. Resolving
-    /// changes neither file.
+    /// own facts: replaced (and by what), forgotten (and by which rule), or live. A purge names
+    /// its target by its keyed match value, so a purged target resolves as forgotten when the
+    /// mounted file was purged under this graph's key. Resolving changes neither file.
     ///
     /// # Errors
     /// [`Error::Refused`] when no graph file is mounted as `mount`; [`Error::NotFound`] when the
@@ -60,7 +63,7 @@ impl Graph {
         if mounted.find(&target.class, &target.key)?.is_some() {
             return Ok(Fate::Live);
         }
-        match forgotten_by(&mounted.conn, target)? {
+        match forgotten_by(&mounted.conn, target, self.key.as_ref())? {
             Some(rule) => Ok(Fate::Forgotten { rule }),
             None => Err(Error::NotFound {
                 class: target.class.clone(),
@@ -70,8 +73,26 @@ impl Graph {
     }
 }
 
-/// The rule of the latest forget event that named `target`, if one did.
-fn forgotten_by(conn: &Connection, target: &NodeRef) -> Result<Option<String>, Error> {
+/// The rule of the latest purge of `target` as a whole, matched under `key`, or of the latest
+/// forget event that named it, if one did.
+fn forgotten_by(
+    conn: &Connection,
+    target: &NodeRef,
+    key: Option<&Key>,
+) -> Result<Option<String>, Error> {
+    let purged = key.map(|key| {
+        Purge::Entity {
+            target: Target::Node(target.clone()),
+        }
+        .matched(key)
+    });
+    for (_, stored) in naming_key(conn, "purged")?.into_iter().rev() {
+        if let Change::Purged { rule, purge, .. } = stored.change
+            && Some(&purge) == purged.as_ref()
+        {
+            return Ok(Some(rule));
+        }
+    }
     for (_, stored) in naming_key(conn, &target.key)?.into_iter().rev() {
         if let Change::Forgot { rule, nodes, .. } = stored.change
             && nodes.contains(target)
