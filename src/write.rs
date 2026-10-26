@@ -13,7 +13,9 @@ use crate::events::{
     Change, Cursor, Event, EventId, Fact, LinkFact, NodeFact, WrongKind, add_derived, append,
     event_at, holds, keep_derived, next_cursor, store,
 };
-use crate::history::{Held, Key, Of, alias, conclude, hear, link_heard, millis, newest};
+use crate::history::{
+    Held, Key, Of, alias, conclude, hear, link_heard, millis, newest, node_entity,
+};
 use crate::open::{
     CLASS, Class, Graph, HistoryKey, Ontology, RELATION, Relation, Value, ValueType, class_table,
     concat, property_column, relation_index, relation_table, schema_version,
@@ -559,14 +561,14 @@ pub(crate) struct Stamp {
 
 /// What hearing a fact did: one identical to a hearing held, a new newest version, or a new
 /// version older on its class's axis than one held.
-enum Heard {
+pub(crate) enum Heard {
     Held(Held),
     Newest,
     Older,
 }
 
 /// What a piece is writing: its transaction, source, event and what it added so far.
-struct Piece<'a> {
+pub(crate) struct Piece<'a> {
     tx: &'a Connection,
     ontology: &'a Ontology,
     key: &'a Key,
@@ -582,7 +584,7 @@ struct Piece<'a> {
 }
 
 impl<'a> Piece<'a> {
-    fn new(
+    pub(crate) fn new(
         tx: &'a Connection,
         ontology: &'a Ontology,
         key: &'a Key,
@@ -603,10 +605,9 @@ impl<'a> Piece<'a> {
         }
     }
 
-    /// Hears `of`: `None` when it is a new hearing, else the identical hearing held.
     /// Hears `of`: the identical hearing held, or a new one, which current state takes only
     /// when it is now its node's or link's newest version.
-    fn hear(&self, of: &Of) -> Result<Heard, Error> {
+    pub(crate) fn hear(&self, of: &Of) -> Result<Heard, Error> {
         let identity = of.identity(self.key, self.source)?;
         if let Some(held) = hear(
             self.tx,
@@ -618,8 +619,9 @@ impl<'a> Piece<'a> {
         )? {
             return Ok(Heard::Held(held));
         }
-        Ok(match newest(self.tx, of)? {
-            Some(newest) if newest.identity != identity => Heard::Older,
+        let (entity, key, to) = of.entity();
+        Ok(match newest(self.tx, (&entity, key, to))? {
+            Some((.., newest)) if newest != identity => Heard::Older,
             _ => Heard::Newest,
         })
     }
@@ -628,7 +630,7 @@ impl<'a> Piece<'a> {
     /// id, or one `written` for what else it adds, is held as an alias of it; otherwise the write
     /// returns the event the hearing is named by. Returns whether the hearing took this event's
     /// id, and with it maybe another point, so current state is read again from the versions.
-    fn held(&mut self, held: &Held, written: bool) -> Result<bool, Error> {
+    pub(crate) fn held(&mut self, held: &Held, written: bool) -> Result<bool, Error> {
         if self.stamp.arrived || written {
             let renamed = alias(self.tx, held, self.stamp.id, self.stamp.cursor)?;
             self.renamed |= renamed;
@@ -657,15 +659,16 @@ impl<'a> Piece<'a> {
                     self.added.push(Fact::Node(node.clone()));
                 }
                 if self.held(&held, derived)?
-                    && let Some(n) = newest(self.tx, &Of::Node(node))?
+                    && let Some((v, recorded, _)) =
+                        newest(self.tx, (&node_entity(&class.name), &node.key, None))?
                 {
                     self.put(
                         class,
                         &node.key,
-                        &n.source,
-                        &n.valid,
-                        n.recorded,
-                        &n.properties()?,
+                        &v.source,
+                        &v.valid,
+                        recorded,
+                        &v.properties,
                     )?;
                 }
                 return Ok((have()?, false));
@@ -777,10 +780,11 @@ impl<'a> Piece<'a> {
         let of = Of::Link(&fact);
         match self.hear(&of)? {
             Heard::Held(held) => {
+                let (entity, from, to) = of.entity();
                 if self.held(&held, false)?
-                    && let Some(n) = newest(self.tx, &of)?
+                    && let Some((v, ..)) = newest(self.tx, (&entity, from, to))?
                 {
-                    self.current_link(&fact, ends, &n.source, &n.valid)?;
+                    self.current_link(&fact, ends, &v.source, &v.valid)?;
                 }
                 return Ok(());
             }
@@ -1160,18 +1164,19 @@ impl Graph {
     /// [`WriteError`] when a piece fails: the pieces before it are kept, and the error holds
     /// their events.
     pub fn write(&mut self, write: &Write) -> Result<Vec<Event>, WriteError> {
-        let events = Vec::new();
         // The version is read before the load: a declaration landing between them leaves the
         // cached version behind the ontology, which costs the next read a reload and nothing more.
-        match schema_version(&self.conn).and_then(|v| Ok((v, Ontology::load(&self.conn)?))) {
-            Ok((version, ontology)) => self.loaded(version, ontology),
-            Err(cause) => return Err(WriteError { events, cause }),
-        }
-        if let Err(cause) = check(&self.conn, &self.ontology, write) {
-            return Err(WriteError { events, cause });
-        }
+        let refused = |cause| WriteError {
+            events: Vec::new(),
+            cause,
+        };
+        let (version, ontology) = schema_version(&self.conn)
+            .and_then(|v| Ok((v, Ontology::load(&self.conn)?)))
+            .map_err(refused)?;
+        self.loaded(version, ontology);
+        check(&self.conn, &self.ontology, write).map_err(refused)?;
         let mut put = Put {
-            wrote: events,
+            wrote: Vec::new(),
             held: Vec::new(),
         };
         for (i, piece) in pieces(&write.units).into_iter().enumerate() {
