@@ -963,6 +963,27 @@ mod tests {
     }
 
     #[test]
+    fn an_identical_rewrite_on_a_graph_rebuilt_from_a_snapshot_returns_the_hearing_held()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let mut g = open(dir.path().join("live.db"), Some(&crate::TEST_KEY))?;
+        g.declare(&Declaration::Class(Class::new("note", ["text"])))?;
+        let first = g.write(&Write::new("app").unit(note("n1")))?;
+        let at = g.events().committed()?;
+        let snapshot = g.snapshot(at, dir.path().join("snapshot.db"))?;
+        // Nothing is replayed: the hearing's event reaches the rebuilt graph by the snapshot alone.
+        let mut back = snapshot.rebuild(&[], dir.path().join("back.db"), Some(&crate::TEST_KEY))?;
+
+        let on_source = g.write(&Write::new("app").unit(note("n1")))?;
+        assert_eq!(on_source, first);
+        let before = back.events().committed()?;
+        let on_back = back.write(&Write::new("app").unit(note("n1")))?;
+        assert_eq!(on_back, on_source);
+        assert_eq!(back.events().committed()?, before);
+        Ok(())
+    }
+
+    #[test]
     fn a_snapshot_is_taken_while_another_connection_holds_the_write_lock()
     -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
