@@ -615,7 +615,7 @@ pub(crate) fn conclude(tx: &Connection, event: EventId, change: &Change) -> Resu
 
 /// Takes `key` as the graph's. A store holding another key's check value refuses it; a store
 /// holding none takes it and hears every write already in its log, in order, dropping what each
-/// forget in it removed.
+/// forget in it removed and moving what each replacement in it moved.
 pub(crate) fn take(conn: &mut Connection, key: &Key) -> Result<(), Error> {
     let check = |conn: &Connection| -> Result<Option<String>, Error> {
         Ok(conn
@@ -646,6 +646,10 @@ pub(crate) fn take(conn: &mut Connection, key: &Key) -> Result<(), Error> {
                 for node in nodes {
                     unhear(&tx, node, links)?;
                 }
+                continue;
+            }
+            Change::Replaced { class, old, new } => {
+                carry(&tx, &ontology, key, (class, old, new))?;
                 continue;
             }
             _ => continue,
@@ -769,6 +773,91 @@ pub(crate) fn see(
         last.hearing,
         last.ending
     ])?;
+    Ok(())
+}
+
+/// Moves the history and links of the node `old` of `class` to the node `new`, which replaced
+/// it: its hearings and derivations, and every link it is an end of, with the link's hearings,
+/// conclusion, endings and place in live state, are the new key's. A moved link that lands on a
+/// link already held becomes that link, holding both sets of hearings; of two conclusions the
+/// one later by point and then event id is kept. What is seen of each, and its current state,
+/// are read again from its hearings. The old node keeps its row and nothing else. Replacing,
+/// replaying a replacement and taking a first key all move through here.
+pub(crate) fn carry(
+    tx: &Connection,
+    ontology: &Ontology,
+    key: &Key,
+    (class, old, new): (&str, &str, &str),
+) -> Result<(), Error> {
+    let mut moved = Vec::new();
+    for relation in ontology.relations.values() {
+        let entity = link_entity(&relation.name);
+        let links: Vec<(String, String)> = tx
+            .prepare_cached(
+                "SELECT DISTINCT key, to_key FROM _hearings WHERE entity = ?1 \
+                 AND ((?2 AND key = ?4) OR (?3 AND to_key = ?4))",
+            )?
+            .query_map(
+                params![entity, relation.from == class, relation.to == class, old],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?
+            .collect::<Result<_, _>>()?;
+        for (from, to) in links {
+            let end = |at: &str, of: &str| {
+                if of == class && at == old {
+                    new.to_string()
+                } else {
+                    at.to_string()
+                }
+            };
+            let (f, t) = (end(&from, &relation.from), end(&to, &relation.to));
+            crate::purge::drop_link(tx, ontology, (&relation.name, &from, &to))?;
+            let keys = params![entity, from, to, f, t];
+            tx.prepare_cached(
+                "UPDATE _hearings SET key = ?4, to_key = ?5 \
+                 WHERE entity = ?1 AND key = ?2 AND to_key = ?3",
+            )?
+            .execute(keys)?;
+            tx.prepare_cached(&format!(
+                "INSERT INTO _ends SELECT entity, ?4, ?5, event, source, point, valid FROM \
+                 (SELECT NULL AS integer, * FROM _ends WHERE entity = ?1 \
+                 AND ((key = ?2 AND to_key = ?3) OR (key = ?4 AND to_key = ?5)) \
+                 ORDER BY {} LIMIT 1) WHERE true \
+                 ON CONFLICT(entity, key, to_key) DO UPDATE SET event = excluded.event, \
+                 source = excluded.source, point = excluded.point, valid = excluded.valid",
+                order("DESC")
+            ))?
+            .execute(keys)?;
+            tx.prepare_cached(
+                "UPDATE OR IGNORE _endings SET key = ?4, to_key = ?5 \
+                 WHERE entity = ?1 AND key = ?2 AND to_key = ?3",
+            )?
+            .execute(keys)?;
+            for table in ["_ends", "_endings", "_seen"] {
+                tx.prepare_cached(&format!(
+                    "DELETE FROM {table} WHERE entity = ?1 AND key = ?2 AND to_key = ?3"
+                ))?
+                .execute(params![entity, from, to])?;
+            }
+            moved.push((entity.clone(), f, Some(t)));
+        }
+    }
+    let node = node_entity(class);
+    tx.prepare_cached(
+        "UPDATE _hearings SET key = ?3 WHERE entity = ?1 AND key = ?2 AND to_key IS NULL",
+    )?
+    .execute(params![node, old, new])?;
+    tx.prepare_cached("UPDATE OR IGNORE _derived SET key = ?3 WHERE class = ?1 AND key = ?2")?
+        .execute(params![class, old, new])?;
+    tx.prepare_cached("DELETE FROM _derived WHERE class = ?1 AND key = ?2")?
+        .execute(params![class, old])?;
+    tx.prepare_cached("DELETE FROM _seen WHERE entity = ?1 AND key = ?2 AND to_key = ''")?
+        .execute(params![node, old])?;
+    moved.insert(0, (node, new.to_string(), None));
+    for of in &moved {
+        see(tx, (&of.0, &of.1, of.2.as_deref()))?;
+        crate::purge::current(tx, ontology, key, of, &mut crate::purge::Left::default())?;
+    }
     Ok(())
 }
 
@@ -1473,6 +1562,124 @@ mod tests {
         Class, Cursor, Date, Declaration, End, NodeRef, Relation, Unit, ValidTime, Write, open,
         rebuild,
     };
+
+    /// A graph where `v2` and `v3` each know `v1`, from different sources, and `v3` was
+    /// replaced by `v2`.
+    fn replaced(dir: &tempfile::TempDir) -> Result<crate::Graph, Box<dyn std::error::Error>> {
+        let mut g = open(dir.path().join("live.rannoch"), Some(&crate::TEST_KEY))?;
+        let when = ValidTime::On(Date::day(2021, 3, 2));
+        g.declare(&Declaration::Class(Class::new("voice", [] as [&str; 0])))?;
+        g.declare(&Declaration::Relation(Relation::new(
+            "knows", "voice", "voice", false,
+        )))?;
+        let voice = |key: &str| Unit::new("voice", key, [] as [(&str, &str); 0], when.clone());
+        g.write(
+            &Write::new("swtor").unit(voice("v1")).unit(voice("v2").link(
+                "knows",
+                "v2",
+                "v1",
+                when.clone(),
+            )),
+        )?;
+        g.write(&Write::new("reddit").unit(voice("v3").link("knows", "v3", "v1", when.clone())))?;
+        g.replace("voice", "v3", "v2")?;
+        Ok(g)
+    }
+
+    #[test]
+    fn a_moved_link_landing_on_a_link_held_merges_into_one_with_both_hearings()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let g = replaced(&dir)?;
+        let sources: Vec<String> = g
+            .link_hearings("knows", "v2", "v1")?
+            .into_iter()
+            .map(|h| h.source)
+            .collect();
+        assert_eq!(sources.len(), 2, "{sources:?}");
+        assert!(sources.contains(&"swtor".into()) && sources.contains(&"reddit".into()));
+        assert!(g.link_hearings("knows", "v3", "v1")?.is_empty());
+        assert!(g.find_link("knows", "v3", "v1")?.is_none());
+        let rows: i64 = g.conn.query_row(
+            &format!(
+                "SELECT count(*) FROM {}",
+                crate::open::relation_table("knows")
+            ),
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(rows, 1);
+        assert_eq!(g.link_seen("knows", "v2", "v1")?.map(|s| s.count), Some(2));
+        assert!(g.hearings(&NodeRef::new("voice", "v3"))?.is_empty());
+        assert_eq!(g.hearings(&NodeRef::new("voice", "v2"))?.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn a_rebuild_after_a_replace_reads_the_hearings_and_links_of_the_live_graph()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let g = replaced(&dir)?;
+        let events = g.events().since(Cursor::START)?;
+        let back = rebuild(
+            &events,
+            dir.path().join("back.rannoch"),
+            Some(&crate::TEST_KEY),
+        )?;
+        for key in ["v1", "v2", "v3"] {
+            let node = NodeRef::new("voice", key);
+            assert_eq!(back.hearings(&node)?, g.hearings(&node)?);
+            let found = |g: &crate::Graph| -> Result<_, crate::Error> {
+                Ok(g.find("voice", key)?
+                    .map(|n| (n.source, n.valid, n.properties)))
+            };
+            assert_eq!(found(&back)?, found(&g)?);
+            assert_eq!(back.seen(&node)?, g.seen(&node)?);
+        }
+        for from in ["v2", "v3"] {
+            assert_eq!(
+                back.link_hearings("knows", from, "v1")?,
+                g.link_hearings("knows", from, "v1")?
+            );
+            let link = |g: &crate::Graph| -> Result<_, crate::Error> {
+                Ok(g.find_link("knows", from, "v1")?
+                    .map(|l| (l.source, l.valid)))
+            };
+            assert_eq!(link(&back)?, link(&g)?);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_pre_key_store_with_a_replacement_takes_its_key_with_what_the_replacement_moved()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let g = replaced(&dir)?;
+        let nodes = ["v1", "v2", "v3"].map(|key| NodeRef::new("voice", key));
+        let heard = |g: &crate::Graph| -> Result<_, crate::Error> {
+            let mut all = Vec::new();
+            for node in &nodes {
+                all.push((g.hearings(node)?, g.seen(node)?));
+            }
+            for from in ["v2", "v3"] {
+                all.push((
+                    g.link_hearings("knows", from, "v1")?,
+                    g.link_seen("knows", from, "v1")?,
+                ));
+            }
+            Ok(all)
+        };
+        let keyed = heard(&g)?;
+        // As a store written before keys: no check value, no hearings and nothing seen.
+        g.conn.execute_batch(
+            "DELETE FROM _check; DELETE FROM _hearings; DELETE FROM _aliases; DELETE FROM _seen;",
+        )?;
+        drop(g);
+        let g = open(dir.path().join("live.rannoch"), Some(&crate::TEST_KEY))?;
+        assert_eq!(heard(&g)?, keyed);
+        assert_eq!(g.link_hearings("knows", "v2", "v1")?.len(), 2);
+        Ok(())
+    }
 
     #[test]
     fn an_ending_and_a_correction_rebuild_from_the_events() -> Result<(), Box<dyn std::error::Error>>
