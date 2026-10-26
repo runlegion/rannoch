@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::events::{Events, OWN_TABLES};
 use crate::history::{HISTORY_TABLES, Key, see_all, take};
-use crate::write::Error;
+use crate::write::{Error, date_fates};
 
 /// A class: a kind of node, with its natural key, its properties and each one's value type,
 /// and the key its history is ordered by.
@@ -394,6 +394,7 @@ pub(crate) fn open_file(path: impl AsRef<Path>) -> Result<Graph, Error> {
     )?;
     conn.set_prepared_statement_cache_capacity(256);
     conn.execute_batch(OWN_TABLES)?;
+    date_fates(&mut conn)?;
     let table = |name: &str| -> Result<bool, Error> {
         Ok(conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
