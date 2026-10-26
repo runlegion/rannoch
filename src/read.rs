@@ -7,9 +7,14 @@ use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
-use crate::events::{Change, EventId, Fact, naming_key};
-use crate::history::{link_entity, node_at};
-use crate::open::{Graph, Ontology, Relation, Value, class_table, property_column, relation_table};
+use crate::events::EventId;
+use crate::history::{
+    At, Version, known_bound, link_as_of, link_entity, node_as_of, node_at, node_entity,
+    unknown_ending, valid_day,
+};
+use crate::open::{
+    Class, Graph, Ontology, Relation, Value, class_table, property_column, relation_table,
+};
 use crate::write::{Date, Error, ValidTime, node_id};
 
 /// A node named by its class and natural key.
@@ -146,10 +151,12 @@ pub struct GroupBy {
 }
 
 /// An exact count from many roots of one class, along a path of relations. It counts the
-/// nodes the path ends on. With `as_of`, every node and link the count reads must be valid on
-/// or before that date; one whose valid time is unknown is never counted. A link whose ending
-/// is valid on or before that date is not followed, and a count that would follow a link whose
-/// ending's valid time is unknown is refused.
+/// nodes the path ends on. With `as_of`, a valid time, it reads every node and link on the
+/// path, and the grouped property, as the version true then (see [`Graph::find_as_of`]): one
+/// with no version valid by then is never counted. A link whose ending is valid on or before
+/// that date is not followed, and a count that would follow a link whose ending's valid time is
+/// unknown is refused. With `known_at` as well, it reads them as the store knew them at that
+/// point, each on its class's axis; a link is read at a time only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Count {
     pub class: String,
@@ -157,6 +164,7 @@ pub struct Count {
     pub path: Vec<Step>,
     pub group_by: Option<GroupBy>,
     pub as_of: Option<Date>,
+    pub known_at: Option<At>,
 }
 
 /// One root's count: the distinct nodes the path ends on, the total of paths that reach them,
@@ -174,27 +182,31 @@ fn day_text((year, month, day): (u16, u8, u8)) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
-/// Whether `valid` is on or before `as_of`, a month standing for its first day. A stored date
-/// that is not a real date (written before writes checked the range) is compared as count's SQL
-/// compares it, so find, walk and count agree on it.
-fn on_or_before(valid: &Date, as_of: (u16, u8, u8)) -> bool {
-    if let Ok(parts) = valid.parts() {
-        return parts <= as_of;
-    }
-    let text = valid.as_str();
-    let text = if text.len() == 7 {
-        format!("{text}-01")
-    } else {
-        text.to_string()
-    };
-    text <= day_text(as_of)
+/// The SQL condition that `column`, a valid time, is on or before the count's `?2`, bound as
+/// `YYYY-MM-DD`; see [`valid_day`]. The condition on an unknown valid time is never true.
+fn valid_by_sql(column: &str) -> String {
+    format!("{} <= ?2", valid_day(column))
 }
 
-/// The SQL condition that `column`, a valid time, is on or before the count's `?2`, bound as
-/// `YYYY-MM-DD`: a month (7 characters) compares as its first day. An unknown valid time is
-/// NULL, and the condition on NULL is never true.
-fn valid_by_sql(column: &str) -> String {
-    format!("(CASE WHEN length({column}) = 7 THEN {column} || '-01' ELSE {column} END) <= ?2")
+/// The SQL condition that the node or link of `entity` keyed `key` (and `to`, `NULL` for a
+/// node) has a version true at the count's `?2`, heard by its `?3` on the axis `known` names.
+fn held_sql(entity: &str, (key, to): (&str, &str), known: Option<&str>) -> String {
+    let bound = known.map_or(String::new(), |column| format!(" AND h.{column} <= ?3"));
+    format!(
+        "EXISTS (SELECT 1 FROM _hearings h WHERE h.entity = {} AND h.key = {key} \
+         AND h.to_key IS {to} AND {}{bound})",
+        literal(entity),
+        valid_by_sql("h.valid")
+    )
+}
+
+/// [`held_sql`] for the node `n` (a table alias) of `class`.
+fn node_held_sql(class: &Class, n: &str, known: Option<&str>) -> String {
+    held_sql(
+        &node_entity(&class.name),
+        (&format!("{n}.key"), "NULL"),
+        known,
+    )
 }
 
 /// `text` as an SQL string literal.
@@ -217,7 +229,17 @@ fn find_in(
     key: &str,
 ) -> Result<Option<Node>, Error> {
     let class = ontology.class(class)?;
-    let Some((version, at)) = node_at(conn, class, key, i64::MAX)? else {
+    node_in(conn, class, key, node_at(conn, class, key, i64::MAX)?)
+}
+
+/// The node keyed `key` in `class` as its `version`, recorded at `at`, holds it.
+fn node_in(
+    conn: &Connection,
+    class: &Class,
+    key: &str,
+    version: Option<(Version, i64)>,
+) -> Result<Option<Node>, Error> {
+    let Some((version, at)) = version else {
         return Ok(None);
     };
     let events: Vec<String> = conn
@@ -250,49 +272,32 @@ impl Graph {
         find_in(&self.conn, &ontology, class, key)
     }
 
-    /// The node of `class` with natural key `key` as of `as_of`, read from its current
-    /// version only: past versions are not readable yet.
-    ///
-    /// It answers with the current version when that version was valid on or before `as_of`,
-    /// and with none when the node had no version by then: it was never written, or its only
-    /// version is valid after `as_of` or has an unknown valid time. When the current version is
-    /// valid after `as_of` or has an unknown valid time and the node had an earlier version, the
-    /// version that held then may be a past one, so the read is refused rather than answered
-    /// wrong. A month stands for its first day.
+    /// The node of `class` with natural key `key` as of the valid time `as_of`: the version
+    /// true then, as the store knows it now or, given `known_at`, as it knew it at that point on
+    /// the class's axis (a time, or in an integer-keyed class an integer key). Among the
+    /// versions valid on or before `as_of` (and heard at or before `known_at`), the greatest by
+    /// valid time wins, then by the class's order. A version whose valid time is unknown is never
+    /// returned; `None` when no version was valid by then. A month stands for its first day.
     ///
     /// # Errors
-    /// [`Error::Refused`] when `as_of` is not a real date, or when the version that held on
-    /// `as_of` may be a past one; the class is not declared, or the graph file cannot be read.
-    pub fn find_as_of(&self, class: &str, key: &str, as_of: &Date) -> Result<Option<Node>, Error> {
-        let parts = as_of.parts()?;
-        let Some(node) = self.find(class, key)? else {
-            return Ok(None);
-        };
-        match &node.valid {
-            ValidTime::On(date) if on_or_before(date, parts) => Ok(Some(node)),
-            _ if self.had_earlier_version(&node)? => Err(Error::Refused(format!(
-                "{class} {key} as of {}: past versions are not readable yet",
-                as_of.as_str()
-            ))),
-            _ => Ok(None),
-        }
-    }
-
-    /// Whether the log holds a version of `node` other than its current one.
-    fn had_earlier_version(&self, node: &Node) -> Result<bool, Error> {
-        for (_, stored) in naming_key(&self.conn, &node.key)? {
-            let Change::Wrote { source, added, .. } = stored.change else {
-                continue;
-            };
-            if added.iter().any(|fact| {
-                matches!(fact, Fact::Node(n) if n.class == node.class && n.key == node.key
-                    && (source != node.source || n.valid != node.valid
-                        || n.properties != node.properties))
-            }) {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+    /// [`Error::Refused`] when `as_of` is not a real date, or `known_at` is not on the class's
+    /// axis; the class is not declared, or the graph file cannot be read.
+    pub fn find_as_of(
+        &self,
+        class: &str,
+        key: &str,
+        as_of: &Date,
+        known_at: Option<At>,
+    ) -> Result<Option<Node>, Error> {
+        let day = day_text(as_of.parts()?);
+        let ontology = self.current_ontology()?;
+        let class = ontology.class(class)?;
+        node_in(
+            &self.conn,
+            class,
+            key,
+            node_as_of(&self.conn, class, key, &day, known_at)?,
+        )
     }
 
     /// The link of `relation` from the node keyed `from` to the node keyed `to`.
@@ -466,12 +471,17 @@ impl Graph {
         self.walk_in(root, via, hops, cap, None)
     }
 
-    /// [`Graph::walk`] as of `as_of`: it follows only links and reaches only nodes valid on or
-    /// before that date, from a root valid by then. A node or link whose valid time is unknown
-    /// is never followed as of a date. A month stands for its first day.
+    /// [`Graph::walk`] as of the valid time `as_of`, as the store knows it now or, given
+    /// `known_at`, as it knew it at that time: from a root with a version true then, it follows
+    /// each link with a version true then and not ended by then, and reaches each node with a
+    /// version true then, returned with that version's valid time (see [`Graph::find_as_of`]).
+    /// A node or link with no version valid by then is never followed. A month stands for its
+    /// first day.
     ///
     /// # Errors
-    /// [`Error::Refused`] when `as_of` is not a real date; otherwise as [`Graph::walk`].
+    /// [`Error::Refused`] when `as_of` is not a real date, `known_at` is not on a class's axis or
+    /// is an integer key and the walk reads a link, or the walk would follow a link whose
+    /// ending's valid time is unknown; otherwise as [`Graph::walk`].
     pub fn walk_as_of(
         &self,
         root: &NodeRef,
@@ -479,8 +489,9 @@ impl Graph {
         hops: usize,
         cap: usize,
         as_of: &Date,
+        known_at: Option<At>,
     ) -> Result<Walk, Error> {
-        self.walk_in(root, via, hops, cap, Some(as_of))
+        self.walk_in(root, via, hops, cap, Some((as_of, known_at)))
     }
 
     fn walk_in(
@@ -489,41 +500,38 @@ impl Graph {
         via: &[&str],
         hops: usize,
         cap: usize,
-        as_of: Option<&Date>,
+        as_of: Option<(&Date, Option<At>)>,
     ) -> Result<Walk, Error> {
         let tx = self.conn.unchecked_transaction()?;
         let ontology = self.current_ontology()?;
-        ontology.class(&root.class)?;
-        let as_of: Option<(u16, u8, u8)> = as_of.map(Date::parts).transpose()?;
+        let root_class = ontology.class(&root.class)?;
+        let as_of = as_of
+            .map(|(date, known)| date.parts().map(|parts| (day_text(parts), known)))
+            .transpose()?;
         let steps = via
             .iter()
             .map(|v| parse(&ontology, v))
             .collect::<Result<Vec<_>, _>>()?;
-        let sql = format!(
-            "SELECT id, valid FROM {} WHERE key = ?1",
-            class_table(&root.class)
-        );
-        let (root_id, root_valid): (i64, Option<String>) = tx
+        let sql = format!("SELECT id FROM {} WHERE key = ?1", class_table(&root.class));
+        let root_id: i64 = tx
             .prepare_cached(&sql)?
-            .query_row(params![root.key], |row| Ok((row.get(0)?, row.get(1)?)))
+            .query_row(params![root.key], |row| row.get(0))
             .optional()?
             .ok_or_else(|| Error::NotFound {
                 class: root.class.clone(),
                 key: root.key.clone(),
             })?;
-        let valid_by = |valid: Option<String>| {
-            as_of.is_none_or(|as_of| {
-                matches!(ValidTime::from_sql(valid), ValidTime::On(date) if on_or_before(&date, as_of))
-            })
-        };
-        if !valid_by(root_valid) {
+        if let Some((day, known)) = &as_of
+            && node_as_of(&tx, root_class, &root.key, day, *known)?.is_none()
+        {
             return Ok(Walk {
                 nodes: Vec::new(),
                 capped: false,
             });
         }
         let mut seen: HashSet<(&str, i64)> = HashSet::from([(root.class.as_str(), root_id)]);
-        let mut frontier: Vec<(&str, i64)> = vec![(root.class.as_str(), root_id)];
+        let mut frontier: Vec<(&str, i64, String)> =
+            vec![(root.class.as_str(), root_id, root.key.clone())];
         let mut found: Vec<(NodeRef, ValidTime)> = Vec::new();
         let mut capped = false;
         'hops: for _ in 0..hops {
@@ -531,7 +539,7 @@ impl Graph {
                 break;
             }
             let mut next = Vec::new();
-            for &(class, id) in &frontier {
+            for (class, id, here_key) in &frontier {
                 for &(relation, backwards) in &steps {
                     let (here, there, near, far) = if backwards {
                         (&relation.to, &relation.from, "dst", "src")
@@ -542,17 +550,33 @@ impl Graph {
                         continue;
                     }
                     let sql = format!(
-                        "SELECT n.id, n.key, r.valid, n.valid FROM {} r JOIN {} n ON n.id = r.{far} WHERE r.{near} = ?1",
+                        "SELECT n.id, n.key, n.valid FROM {} r JOIN {} n ON n.id = r.{far} WHERE r.{near} = ?1",
                         relation_table(&relation.name),
                         class_table(there)
                     );
                     let mut statement = tx.prepare_cached(&sql)?;
                     let mut rows = statement.query(params![id])?;
                     while let Some(row) = rows.next()? {
-                        let node_valid: Option<String> = row.get(3)?;
-                        if !(valid_by(row.get(2)?) && valid_by(node_valid.clone())) {
-                            continue;
-                        }
+                        let key: String = row.get(1)?;
+                        let valid = match &as_of {
+                            None => ValidTime::from_sql(row.get(2)?),
+                            Some((day, known)) => {
+                                let ends = if backwards {
+                                    (key.as_str(), here_key.as_str())
+                                } else {
+                                    (here_key.as_str(), key.as_str())
+                                };
+                                let link = link_as_of(&tx, &relation.name, ends, day, *known)?;
+                                if link.is_none_or(|link| link.ended) {
+                                    continue;
+                                }
+                                let class = ontology.class(there)?;
+                                match node_as_of(&tx, class, &key, day, *known)? {
+                                    Some((version, _)) => version.valid,
+                                    None => continue,
+                                }
+                            }
+                        };
                         let node: (&str, i64) = (there.as_str(), row.get(0)?);
                         if seen.insert(node) {
                             // Past the cap, one more node is all it takes to know the walk
@@ -561,11 +585,8 @@ impl Graph {
                                 capped = true;
                                 break 'hops;
                             }
-                            found.push((
-                                NodeRef::new(there, row.get::<_, String>(1)?),
-                                ValidTime::from_sql(node_valid),
-                            ));
-                            next.push(node);
+                            found.push((NodeRef::new(there, key.clone()), valid));
+                            next.push((node.0, node.1, key));
                         }
                     }
                 }
@@ -592,24 +613,26 @@ impl Graph {
             .as_ref()
             .map(|date| date.parts().map(day_text))
             .transpose()?;
+        if as_of.is_none() && count.known_at.is_some() {
+            return Err(Error::Refused(
+                "a count known at a point is a count as of a valid time: it needs as_of".into(),
+            ));
+        }
         let tx = self.conn.unchecked_transaction()?;
         let ontology = self.current_ontology()?;
         let query = count_query(&ontology, count)?;
         let roots = serde_json::to_string(&count.roots)?;
         let mut statement = tx.prepare(&query)?;
-        let mut rows = match &as_of {
-            None => statement.query(params![roots])?,
-            Some(date) => statement.query(params![roots, date])?,
+        let mut rows = match (&as_of, count.known_at) {
+            (Some(date), Some(at)) => statement.query(params![roots, date, at.bound()])?,
+            (Some(date), None) => statement.query(params![roots, date])?,
+            (None, _) => statement.query(params![roots])?,
         };
         let mut tallies: HashMap<String, Tally> = HashMap::new();
         let mut last: Option<(String, i64)> = None;
         while let Some(row) = rows.next()? {
             if let Some(link) = row.get::<_, Option<String>>(4)? {
-                return Err(Error::Refused(format!(
-                    "the {link} ended, and its ending's valid time is unknown: \
-                     the count as of {} cannot say whether the link held",
-                    as_of.unwrap_or_default()
-                )));
+                return Err(unknown_ending(&link, &as_of.unwrap_or_default()));
             }
             let root: String = row.get(0)?;
             let end: i64 = row.get(1)?;
@@ -654,11 +677,18 @@ fn count_query(ontology: &Ontology, count: &Count) -> Result<String, Error> {
     let root_class = ontology.class(&count.class)?;
     let mut joins = vec![format!("FROM {} n0", class_table(&root_class.name))];
     let mut conditions = vec!["n0.key IN (SELECT value FROM json_each(?1))".to_string()];
-    // As of a date, every node and link the count reads is valid by then (`?2`, `YYYY-MM-DD`);
-    // see `valid_by_sql`.
+    // As of a date, every node and link the count reads has a version true then (`?2`,
+    // `YYYY-MM-DD`), heard by `?3` when known at a point; see `held_sql`.
     let as_of = count.as_of.is_some();
+    let known = |class: Option<&Class>| -> Result<Option<&'static str>, Error> {
+        count
+            .known_at
+            .map(|at| known_bound(class, at).map(|(column, _)| column))
+            .transpose()
+    };
+    let link_known = if as_of { known(None)? } else { None };
     if as_of {
-        conditions.push(valid_by_sql("n0.valid"));
+        conditions.push(node_held_sql(root_class, "n0", known(Some(root_class))?));
     }
     let mut at: Vec<(&str, String)> = vec![(root_class.name.as_str(), "n0.id".to_string())];
     // As of a date, each step's ending, if its link ended: one valid on or before the date is
@@ -690,53 +720,46 @@ fn count_query(ontology: &Ontology, count: &Count) -> Result<String, Error> {
                 "JOIN {} {n} ON {n}.id = {reached}",
                 class_table(there)
             ));
-            conditions.push(format!(
-                "{} AND {}",
-                valid_by_sql(&format!("{r}.valid")),
-                valid_by_sql(&format!("{n}.valid"))
-            ));
             let near = format!("n{i}");
             let ends = if backwards { (&n, &near) } else { (&near, &n) };
-            let (join, condition, unknown) = ending(&relation.name, ends, i + 1);
+            let link = held_sql(
+                &link_entity(&relation.name),
+                (&format!("{}.key", ends.0), &format!("{}.key", ends.1)),
+                link_known,
+            );
+            let there = ontology.class(there)?;
+            let node = node_held_sql(there, &n, known(Some(there))?);
+            conditions.push(format!("{link} AND {node}"));
+            let (join, condition, unknown, name) =
+                ending(&relation.name, ends, &format!("e{}", i + 1), link_known);
             joins.push(join);
             conditions.push(condition);
-            unknown_endings.push(unknown);
+            unknown_endings.push(format!("WHEN {unknown} THEN {name}"));
         }
         if let Some(filter) = &step.filter {
-            conditions.push(filter_condition(
+            let (condition, ended) = filter_condition(
                 ontology,
                 filter,
-                there,
-                &root_class.name,
+                (there, &root_class.name),
                 &reached,
                 i + 1,
                 as_of,
-            )?);
+                link_known,
+            )?;
+            conditions.push(condition);
+            if let Some((join, unknown)) = ended {
+                joins.push(join);
+                unknown_endings.push(unknown);
+            }
         }
         at.push((there.as_str(), reached));
     }
     let group = match &count.group_by {
         None => "NULL".to_string(),
         Some(group) => {
-            let class = ontology.class(&group.class)?;
-            if !class.properties.contains_key(&group.property) {
-                return Err(Error::Refused(format!(
-                    "class {} has no property {}",
-                    class.name, group.property
-                )));
-            }
-            let Some(position) = at.iter().position(|(c, _)| *c == class.name) else {
-                return Err(Error::Refused(format!(
-                    "class {} is not on the path",
-                    class.name
-                )));
-            };
-            joins.push(format!(
-                "JOIN {} g ON g.id = {}",
-                class_table(&class.name),
-                at[position].1
-            ));
-            format!("g.{}", property_column(&group.property))
+            let (join, column) = group_column(ontology, group, &at, as_of, known)?;
+            joins.push(join);
+            column
         }
     };
     let end = &at[at.len() - 1].1;
@@ -753,40 +776,108 @@ fn count_query(ontology: &Ontology, count: &Count) -> Result<String, Error> {
     ))
 }
 
-/// As of a date (`?2`), the ending of step `step`'s link of `relation` between the nodes
-/// `from` and `to`, if it ended: the join that reads it, the condition that an ending valid on
-/// or before the date is not followed, and the case naming the link when its ending's valid
-/// time is unknown. A correction is not an ending and joins nothing.
-fn ending(relation: &str, (from, to): (&String, &String), step: usize) -> (String, String, String) {
-    let e = format!("e{step}");
+/// The join that reads the grouped node, `g` (the first node of its class on the path, each
+/// path node's id in `at`), and the column its property is read from: as of a date, its
+/// version true then.
+fn group_column(
+    ontology: &Ontology,
+    group: &GroupBy,
+    at: &[(&str, String)],
+    as_of: bool,
+    known: impl Fn(Option<&Class>) -> Result<Option<&'static str>, Error>,
+) -> Result<(String, String), Error> {
+    let class = ontology.class(&group.class)?;
+    if !class.properties.contains_key(&group.property) {
+        return Err(Error::Refused(format!(
+            "class {} has no property {}",
+            class.name, group.property
+        )));
+    }
+    let Some(position) = at.iter().position(|(c, _)| *c == class.name) else {
+        return Err(Error::Refused(format!(
+            "class {} is not on the path",
+            class.name
+        )));
+    };
+    let join = format!(
+        "JOIN {} g ON g.id = {}",
+        class_table(&class.name),
+        at[position].1
+    );
+    let column = if as_of {
+        version_property(class, &group.property, known(Some(class))?)
+    } else {
+        format!("g.{}", property_column(&group.property))
+    };
+    Ok((join, column))
+}
+
+/// As of a date, the grouped node `g`'s `property` as its version true then holds it (see
+/// `held_sql`), read as the column a node's current row holds it in would give it: text and a
+/// decimal's digits as text, an integer as an integer, a float as a real.
+fn version_property(class: &Class, property: &str, known: Option<&str>) -> String {
+    let bound = known.map_or(String::new(), |column| format!(" AND v.{column} <= ?3"));
+    let path = |tail: &str| literal(&format!("$.\"{}\"{tail}", property.replace('"', "\"\"")));
+    format!(
+        "(SELECT CASE json_type(v.properties, {at}) WHEN 'text' THEN json_extract(v.properties, {at}) \
+         ELSE coalesce(json_extract(v.properties, {integer}), json_extract(v.properties, {float}), \
+         json_extract(v.properties, {decimal})) END FROM _hearings v WHERE v.entity = {entity} \
+         AND v.key = g.key AND v.to_key IS NULL AND {valid}{bound} \
+         ORDER BY {day} DESC, v.integer DESC, v.point DESC, v.event DESC LIMIT 1)",
+        at = path(""),
+        integer = path(".integer"),
+        float = path(".float"),
+        decimal = path(".decimal"),
+        entity = literal(&node_entity(&class.name)),
+        valid = valid_by_sql("v.valid"),
+        day = valid_day("v.valid"),
+    )
+}
+
+/// As of a date (`?2`), the ending, aliased `e`, of the link of `relation` between the nodes
+/// `from` and `to`, if it ended (and was heard by `?3` on the column `known` names, when given):
+/// the join that reads it, the condition that an ending valid on or before the date is not
+/// followed, the condition that its valid time is unknown, and the link's name for the refusal.
+/// A correction is not an ending and joins nothing.
+fn ending(
+    relation: &str,
+    (from, to): (&String, &String),
+    e: &str,
+    known: Option<&str>,
+) -> (String, String, String, String) {
+    let bound = known.map_or(String::new(), |column| format!(" AND {e}.{column} <= ?3"));
     (
         format!(
             "LEFT JOIN _ends {e} ON {e}.entity = {} AND {e}.key = {from}.key \
-             AND {e}.to_key = {to}.key AND {e}.point IS NOT NULL",
+             AND {e}.to_key = {to}.key AND {e}.point IS NOT NULL{bound}",
             literal(&link_entity(relation))
         ),
         format!(
             "({e}.valid IS NULL OR NOT {})",
             valid_by_sql(&format!("{e}.valid"))
         ),
+        format!("{e}.event IS NOT NULL AND {e}.valid IS NULL"),
         format!(
-            "WHEN {e}.event IS NOT NULL AND {e}.valid IS NULL \
-             THEN {} || {from}.key || ' to ' || {to}.key",
+            "{} || {from}.key || ' to ' || {to}.key",
             literal(&format!("{relation} link from "))
         ),
     )
 }
 
-/// The condition a step's filter puts on the node it reached, `reached`, against the root.
+/// The condition a step's filter puts on the node it reached, `reached`, of `class`, against
+/// the root, of `root_class`. As of a date (bounded on the column `known` when known at a
+/// point), the filter's link must have a version true then and not have ended by then, and the
+/// condition comes with its ending's join and the case naming the link when that ending's valid
+/// time is unknown, which a count refuses.
 fn filter_condition(
     ontology: &Ontology,
     filter: &Filter,
-    class: &str,
-    root_class: &str,
+    (class, root_class): (&str, &str),
     reached: &str,
     step: usize,
     as_of: bool,
-) -> Result<String, Error> {
+    known: Option<&str>,
+) -> Result<(String, Option<(String, String)>), Error> {
     let (by, backwards) = parse(ontology, &filter.via)?;
     let (node_end, root_end, node_col, root_col) = if backwards {
         (&by.to, &by.from, "dst", "src")
@@ -799,16 +890,35 @@ fn filter_condition(
             by.name, filter.via
         )));
     }
-    let f = format!("f{step}");
-    Ok(format!(
-        "{}EXISTS (SELECT 1 FROM {} {f} WHERE {f}.{node_col} = {reached} AND {f}.{root_col} = n0.id{})",
-        if filter.keep { "" } else { "NOT " },
-        relation_table(&by.name),
-        if as_of {
-            format!(" AND {}", valid_by_sql(&format!("{f}.valid")))
-        } else {
-            String::new()
-        }
+    let not = if filter.keep { "" } else { "NOT " };
+    if !as_of {
+        let f = format!("f{step}");
+        return Ok((
+            format!(
+                "{not}EXISTS (SELECT 1 FROM {} {f} WHERE {f}.{node_col} = {reached} AND {f}.{root_col} = n0.id)",
+                relation_table(&by.name),
+            ),
+            None,
+        ));
+    }
+    let (node, root) = (format!("n{step}"), "n0".to_string());
+    let ends = if backwards {
+        (&root, &node)
+    } else {
+        (&node, &root)
+    };
+    let held = held_sql(
+        &link_entity(&by.name),
+        (&format!("{}.key", ends.0), &format!("{}.key", ends.1)),
+        known,
+    );
+    let (join, not_ended, unknown, name) = ending(&by.name, ends, &format!("fe{step}"), known);
+    // A link that held and whose ending's valid time is unknown keeps the row either way, so
+    // the count sees it and refuses.
+    let unknown = format!("{held} AND {unknown}");
+    Ok((
+        format!("({not}({held} AND {not_ended}) OR ({unknown}))"),
+        Some((join, format!("WHEN {unknown} THEN {name}"))),
     ))
 }
 
@@ -876,6 +986,7 @@ mod tests {
                 property: "region".to_string(),
             }),
             as_of: None,
+            known_at: None,
         })?;
         assert_eq!(tallies.len(), 1);
         assert_eq!(
@@ -923,6 +1034,7 @@ mod tests {
                 property: "age".to_string(),
             }),
             as_of: None,
+            known_at: None,
         })?;
         assert_eq!(
             tallies[0].groups,
@@ -1101,6 +1213,7 @@ mod tests {
             1,
             3,
             &Date::day(2026, 3, 1),
+            None,
         )?;
         assert_eq!(walk.nodes.len(), 3);
         assert!(!walk.capped);
@@ -1136,9 +1249,9 @@ mod tests {
         let jan = Date::day(2020, 1, 1);
         let g = items(vec![item("r", &jan)])?;
         let bad = Date::month(2020, 13);
-        let found = g.find_as_of("item", "r", &bad);
+        let found = g.find_as_of("item", "r", &bad, None);
         assert!(refused(&found), "find_as_of: {found:?}");
-        let walked = g.walk_as_of(&NodeRef::new("item", "r"), &["part<-"], 1, 10, &bad);
+        let walked = g.walk_as_of(&NodeRef::new("item", "r"), &["part<-"], 1, 10, &bad, None);
         assert!(refused(&walked), "walk_as_of: {walked:?}");
         let counted = g.count(&Count {
             class: "item".to_string(),
@@ -1146,6 +1259,7 @@ mod tests {
             path: vec![Step::new("part<-")],
             group_by: None,
             as_of: Some(bad),
+            known_at: None,
         });
         assert!(refused(&counted), "count: {counted:?}");
         Ok(())
@@ -1163,8 +1277,8 @@ mod tests {
                 .link("flags", "n", "r", when),
         ])?;
         let month = Date::month(2020, 1);
-        assert!(g.find_as_of("item", "n", &month)?.is_some());
-        let walked = g.walk_as_of(&NodeRef::new("item", "r"), &["part<-"], 1, 10, &month)?;
+        assert!(g.find_as_of("item", "n", &month, None)?.is_some());
+        let walked = g.walk_as_of(&NodeRef::new("item", "r"), &["part<-"], 1, 10, &month, None)?;
         assert_eq!(
             walked.nodes,
             vec![(NodeRef::new("item", "n"), ValidTime::On(first))]
@@ -1175,28 +1289,34 @@ mod tests {
             path: vec![Step::new("part<-").filter("flags", true)],
             group_by: None,
             as_of: Some(month),
+            known_at: None,
         })?;
         assert_eq!(tallies[0].distinct, 1);
         Ok(())
     }
 
+    fn valid_of(found: Option<crate::Node>) -> Option<ValidTime> {
+        found.map(|node| node.valid)
+    }
+
+    fn on(year: u16, month: u8, day: u8) -> ValidTime {
+        ValidTime::On(Date::day(year, month, day))
+    }
+
     #[test]
-    fn an_as_of_read_refuses_when_the_version_that_held_is_a_past_one()
+    fn an_as_of_read_answers_with_the_past_version_that_held()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut g = items(vec![item("v", &Date::day(2020, 1, 1))])?;
         g.write(&Write::new("src").unit(item("v", &Date::day(2022, 1, 1))))?;
-        let found = g.find_as_of("item", "v", &Date::day(2021, 1, 1));
-        assert!(
-            matches!(&found, Err(Error::Refused(why))
-                if why == "item v as of 2021-01-01: past versions are not readable yet"),
-            "find_as_of: {found:?}"
-        );
-        assert!(g.find_as_of("item", "v", &Date::day(2022, 1, 1))?.is_some());
+        let as_of = |date: Date| g.find_as_of("item", "v", &date, None).map(valid_of);
+        assert_eq!(as_of(Date::day(2021, 1, 1))?, Some(on(2020, 1, 1)));
+        assert_eq!(as_of(Date::day(2022, 1, 1))?, Some(on(2022, 1, 1)));
+        assert_eq!(as_of(Date::day(2019, 12, 31))?, None);
         Ok(())
     }
 
     #[test]
-    fn an_as_of_read_refuses_when_the_current_version_has_no_date_and_an_earlier_one_held()
+    fn an_as_of_read_passes_over_a_current_version_of_unknown_valid_time()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut g = items(vec![item("u", &Date::day(2020, 1, 1))])?;
         g.write(&Write::new("src").unit(Unit::new(
@@ -1205,12 +1325,8 @@ mod tests {
             [("name", "u")],
             ValidTime::Unknown,
         )))?;
-        let found = g.find_as_of("item", "u", &Date::day(2021, 1, 1));
-        assert!(
-            matches!(&found, Err(Error::Refused(why))
-                if why == "item u as of 2021-01-01: past versions are not readable yet"),
-            "find_as_of: {found:?}"
-        );
+        let found = g.find_as_of("item", "u", &Date::day(2100, 1, 1), None)?;
+        assert_eq!(valid_of(found), Some(on(2020, 1, 1)));
         let only = items(vec![Unit::new(
             "item",
             "w",
@@ -1218,9 +1334,181 @@ mod tests {
             ValidTime::Unknown,
         )])?;
         assert!(
-            only.find_as_of("item", "w", &Date::day(2021, 1, 1))?
+            only.find_as_of("item", "w", &Date::day(2100, 1, 1), None)?
                 .is_none()
         );
+        Ok(())
+    }
+
+    /// Items `r` and `n`, valid from 2020-01-01, with `n` part of `r` and flagging `r` by links
+    /// valid from 2020-01-01; the `part` link ends with the valid time `part`, the `flags` link
+    /// with `flags`, when given.
+    fn ended(
+        part: Option<ValidTime>,
+        flags: Option<ValidTime>,
+    ) -> Result<Graph, Box<dyn std::error::Error>> {
+        let jan = Date::day(2020, 1, 1);
+        let when = ValidTime::On(jan.clone());
+        let mut g = items(vec![
+            item("r", &jan),
+            item("n", &jan)
+                .link("part", "n", "r", when.clone())
+                .link("flags", "n", "r", when),
+        ])?;
+        let at = std::time::SystemTime::now();
+        for (relation, valid) in [("part", part), ("flags", flags)] {
+            if let Some(valid) = valid {
+                g.end_link(relation, "n", "r", at, valid, "moderator")?;
+            }
+        }
+        Ok(g)
+    }
+
+    fn walked(g: &Graph, as_of: &Date) -> Result<usize, Error> {
+        let walk = g.walk_as_of(&NodeRef::new("item", "r"), &["part<-"], 1, 10, as_of, None)?;
+        Ok(walk.nodes.len())
+    }
+
+    fn unknown_ending(result: &Result<impl std::fmt::Debug, Error>, link: &str) -> bool {
+        matches!(result, Err(Error::Refused(why))
+            if why.contains(&format!("the {link} ended, and its ending's valid time is unknown")))
+    }
+
+    #[test]
+    fn a_walk_as_of_a_date_does_not_follow_a_link_ended_by_then()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let g = ended(Some(ValidTime::On(Date::day(2021, 1, 1))), None)?;
+        assert_eq!(walked(&g, &Date::day(2020, 6, 1))?, 1);
+        assert_eq!(walked(&g, &Date::day(2021, 1, 1))?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn a_walk_as_of_a_date_refuses_a_link_whose_ending_has_no_valid_time()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let g = ended(Some(ValidTime::Unknown), None)?;
+        let refused = walked(&g, &Date::day(2020, 6, 1));
+        assert!(
+            unknown_ending(&refused, "part link from n to r"),
+            "{refused:?}"
+        );
+        assert_eq!(walked(&g, &Date::day(2019, 6, 1))?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn a_walk_as_of_a_date_returns_the_valid_time_of_the_version_then()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = ended(None, None)?;
+        g.write(&Write::new("src").unit(item("n", &Date::day(2022, 1, 1))))?;
+        let walk = g.walk_as_of(
+            &NodeRef::new("item", "r"),
+            &["part<-"],
+            1,
+            10,
+            &Date::day(2021, 1, 1),
+            None,
+        )?;
+        assert_eq!(
+            walk.nodes,
+            vec![(
+                NodeRef::new("item", "n"),
+                ValidTime::On(Date::day(2020, 1, 1))
+            )]
+        );
+        Ok(())
+    }
+
+    fn filtered(g: &Graph, keep: bool, as_of: &Date) -> Result<u64, Error> {
+        let tallies = g.count(&Count {
+            class: "item".to_string(),
+            roots: vec!["r".to_string()],
+            path: vec![Step::new("part<-").filter("flags", keep)],
+            group_by: None,
+            as_of: Some(as_of.clone()),
+            known_at: None,
+        })?;
+        Ok(tallies[0].distinct)
+    }
+
+    #[test]
+    fn a_count_filter_as_of_a_date_reads_its_link_ended_by_then()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let g = ended(None, Some(ValidTime::On(Date::day(2021, 1, 1))))?;
+        let (before, after) = (Date::day(2020, 6, 1), Date::day(2021, 6, 1));
+        assert_eq!(filtered(&g, true, &before)?, 1);
+        assert_eq!(filtered(&g, true, &after)?, 0);
+        assert_eq!(filtered(&g, false, &before)?, 0);
+        assert_eq!(filtered(&g, false, &after)?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_count_filter_as_of_a_date_refuses_a_link_whose_ending_has_no_valid_time()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let g = ended(None, Some(ValidTime::Unknown))?;
+        for keep in [true, false] {
+            let refused = filtered(&g, keep, &Date::day(2020, 6, 1));
+            assert!(
+                unknown_ending(&refused, "flags link from n to r"),
+                "{refused:?}"
+            );
+        }
+        assert_eq!(filtered(&g, true, &Date::day(2019, 6, 1))?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn a_count_as_of_a_date_groups_by_the_property_of_the_version_then()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = ended(None, None)?;
+        g.write(&Write::new("src").unit(Unit::new(
+            "item",
+            "r",
+            [("name", "renamed")],
+            ValidTime::On(Date::day(2022, 1, 1)),
+        )))?;
+        let groups = |as_of: Date| -> Result<_, Error> {
+            Ok(g.count(&Count {
+                class: "item".to_string(),
+                roots: vec!["r".to_string()],
+                path: vec![Step::new("part<-")],
+                group_by: Some(GroupBy {
+                    class: "item".to_string(),
+                    property: "name".to_string(),
+                }),
+                as_of: Some(as_of),
+                known_at: None,
+            })?[0]
+                .groups
+                .clone())
+        };
+        let one = |name: &str| BTreeMap::from([(Some(name.to_string()), (1, 1))]);
+        assert_eq!(groups(Date::day(2021, 1, 1))?, one("r"));
+        assert_eq!(groups(Date::day(2022, 1, 1))?, one("renamed"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_read_known_at_a_point_off_its_axis_is_refused() -> Result<(), Box<dyn std::error::Error>> {
+        let g = ended(None, None)?;
+        let jan = Date::day(2021, 1, 1);
+        let key = Some(crate::At::Key(3));
+        assert!(matches!(
+            g.find_as_of("item", "n", &jan, key),
+            Err(Error::Refused(_))
+        ));
+        let walk = g.walk_as_of(&NodeRef::new("item", "r"), &["part<-"], 1, 10, &jan, key);
+        assert!(matches!(walk, Err(Error::Refused(_))), "{walk:?}");
+        let count = Count {
+            class: "item".to_string(),
+            roots: vec!["r".to_string()],
+            path: Vec::new(),
+            group_by: None,
+            as_of: None,
+            known_at: Some(crate::At::Time(std::time::SystemTime::now())),
+        };
+        assert!(matches!(g.count(&count), Err(Error::Refused(_))));
         Ok(())
     }
 
@@ -1228,17 +1516,17 @@ mod tests {
     fn an_as_of_read_of_a_node_with_one_version_answers_it_or_none()
     -> Result<(), Box<dyn std::error::Error>> {
         let g = items(vec![item("o", &Date::day(2020, 6, 1))])?;
-        let found = g.find_as_of("item", "o", &Date::day(2020, 6, 1))?;
+        let found = g.find_as_of("item", "o", &Date::day(2020, 6, 1), None)?;
         assert_eq!(
             found.map(|n| n.valid),
             Some(ValidTime::On(Date::day(2020, 6, 1)))
         );
         assert!(
-            g.find_as_of("item", "o", &Date::day(2020, 5, 31))?
+            g.find_as_of("item", "o", &Date::day(2020, 5, 31), None)?
                 .is_none()
         );
         assert!(
-            g.find_as_of("item", "absent", &Date::day(2020, 6, 1))?
+            g.find_as_of("item", "absent", &Date::day(2020, 6, 1), None)?
                 .is_none()
         );
         Ok(())
@@ -1250,8 +1538,14 @@ mod tests {
             item("m", &Date::month(2020, 1)),
             item("d", &Date::day(2020, 1, 15)),
         ])?;
-        assert!(g.find_as_of("item", "m", &Date::day(2020, 1, 1))?.is_some());
-        assert!(g.find_as_of("item", "d", &Date::month(2020, 1))?.is_none());
+        assert!(
+            g.find_as_of("item", "m", &Date::day(2020, 1, 1), None)?
+                .is_some()
+        );
+        assert!(
+            g.find_as_of("item", "d", &Date::month(2020, 1), None)?
+                .is_none()
+        );
         Ok(())
     }
 }
