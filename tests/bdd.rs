@@ -5037,7 +5037,12 @@ fn supports_ended_unknown(world: &mut World) {
     "the app counts statements supporting f1 as of valid time {a}, as of valid time {b} and as of valid time {c}"
 )]
 fn counts_f1_as_of_three(world: &mut World, a: String, b: String, c: String) {
-    for when in [a, b, c] {
+    count_f1_as_of_each(world, [a, b, c]);
+}
+
+/// Counts f1's supporting statements as of each date, keeping each answer or refusal.
+fn count_f1_as_of_each(world: &mut World, dates: impl IntoIterator<Item = String>) {
+    for when in dates {
         let as_of = date(&when);
         let counted = world.g().count(&Count {
             class: "finding".into(),
@@ -5053,18 +5058,7 @@ fn counts_f1_as_of_three(world: &mut World, a: String, b: String, c: String) {
 
 #[when("the app counts statements supporting f1 as of valid time {a} and as of valid time {b}")]
 fn counts_f1_as_of_two(world: &mut World, a: String, b: String) {
-    for when in [a, b] {
-        let as_of = date(&when);
-        let counted = world.g().count(&Count {
-            class: "finding".into(),
-            roots: vec!["f1".into()],
-            path: vec![Step::new("supports<-")],
-            group_by: None,
-            as_of: Some(as_of.clone()),
-            known_at: None,
-        });
-        world.as_of_counts.push((as_of, counted));
-    }
+    count_f1_as_of_each(world, [a, b]);
 }
 
 #[then("the statement is counted as of 2024-12-01 and not as of 2025-12-01")]
