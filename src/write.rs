@@ -944,6 +944,7 @@ pub(crate) fn replay(
     recorded: i64,
     event: &Event,
 ) -> Result<(), Error> {
+    event.id.recorded()?;
     let stamp = Stamp {
         id: event.id,
         cursor: event.cursor,
@@ -1022,7 +1023,7 @@ fn record_fate(
          WHERE _fates.event IS NULL \
          OR (excluded.point, excluded.event) > (_fates.point, _fates.event)",
     )?
-    .execute(params![class, old, new, id.millis(), id.to_string()])?;
+    .execute(params![class, old, new, id.recorded()?, id.to_string()])?;
     Ok(())
 }
 
@@ -1417,10 +1418,14 @@ fn put(
 ) -> Result<Put, Error> {
     let id = EventId::now();
     let cursor = next_cursor(tx)?;
+    #[allow(clippy::expect_used)]
+    let recorded = id
+        .millis()
+        .expect("an id minted by EventId::now is a UUIDv7, which carries its time");
     let stamp = Stamp {
         id,
         cursor,
-        recorded: id.millis(),
+        recorded,
         arrived: false,
     };
     let mut piece = Piece::new(tx, ontology, key, source, stamp);
@@ -1580,7 +1585,7 @@ mod tests {
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        assert_eq!(dated, (event.id.millis(), event.id.to_string()));
+        assert_eq!(dated, (event.id.recorded()?, event.id.to_string()));
         Ok(())
     }
 
