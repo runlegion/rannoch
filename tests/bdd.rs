@@ -6496,6 +6496,65 @@ fn both_ended_at_40(world: &mut World) {
     }
 }
 
+// FR-RANNOCH-066: an ending is a version of the link, held whether or not a live hearing of
+// the link arrived before it.
+
+#[given(
+    "a graph rebuilt from events in which a link's ending arrives before any live hearing of that link"
+)]
+fn ending_before_hearing(world: &mut World) {
+    declare_kind(world.open(), "time-keyed");
+    follows_between_visits(world);
+    let facts = [LinkAt::Ended("b", 20), LinkAt::Heard("b", "crawler", 10)];
+    world.graph = Some(graph_of(world, &facts));
+}
+
+#[when("the link's state is read at a point after the ending")]
+fn state_after_ending(world: &mut World) {
+    let state = world
+        .g()
+        .link_state_at("follows", "b", "a", At::Time(at(25)));
+    world.states = vec![state.unwrap()];
+}
+
+#[then("the link reads as ended at the ending's point")]
+fn ended_at_endings_point(world: &mut World) {
+    let state = world.states[0]
+        .as_ref()
+        .expect("the link has a version by then");
+    assert!(state.ended, "{state:?}");
+    assert_eq!(state.point, at(20));
+}
+
+#[given("a link ended at point 10 and first heard alive at point 20")]
+fn ended_then_first_heard(world: &mut World) {
+    declare_kind(world.open(), "time-keyed");
+    follows_between_visits(world);
+    let facts = [LinkAt::Ended("b", 10), LinkAt::Heard("b", "crawler", 20)];
+    world.graph = Some(graph_of(world, &facts));
+}
+
+#[when("its state is read at point 15 and at point 25")]
+fn state_at_15_and_25(world: &mut World) {
+    world.states = [15, 25]
+        .map(|n| {
+            let state = world
+                .g()
+                .link_state_at("follows", "b", "a", At::Time(at(n)));
+            state.unwrap()
+        })
+        .to_vec();
+}
+
+#[then("it reads as ended at point 15 and live at point 25")]
+fn ended_at_15_live_at_25(world: &mut World) {
+    let [Some(early), Some(late)] = &world.states[..] else {
+        panic!("the link has a version at both points: {:?}", world.states);
+    };
+    assert!(early.ended && early.point == at(10), "{early:?}");
+    assert!(!late.ended && late.point == at(20), "{late:?}");
+}
+
 // FR-RANNOCH-084: the same events in any arrival order, declarations first, give the same
 // answers to every read except first recorded.
 
