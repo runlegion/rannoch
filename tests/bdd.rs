@@ -2348,6 +2348,200 @@ fn reader_gets_later_events(world: &mut World) {
     assert_eq!(world.read, after);
 }
 
+/// Hearings of visits a, b and c up to the snapshot's cursor, in arrival order: (key, point).
+/// Each node is heard at points that arrive out of order, so some arrive after newer ones; the
+/// newest point is 50.
+const BEFORE_SNAPSHOT: [(&str, u64); 10] = [
+    ("a", 30),
+    ("b", 20),
+    ("c", 40),
+    ("a", 10),
+    ("b", 50),
+    ("c", 15),
+    ("a", 45),
+    ("b", 5),
+    ("c", 35),
+    ("a", 25),
+];
+
+/// Hearings after the snapshot's cursor: four of them at points before its newest, 50.
+const AFTER_SNAPSHOT: [(&str, u64); 6] = [
+    ("b", 35),
+    ("a", 5),
+    ("c", 55),
+    ("a", 60),
+    ("c", 25),
+    ("b", 12),
+];
+
+/// Writes each hearing as its own write: the visit heard at its point, with a valid time that
+/// does not follow the point, and for b and c a link to a carrying the same valid time.
+fn hear_visits(world: &mut World, hearings: &[(&str, u64)]) {
+    for (key, n) in hearings {
+        let month = u8::try_from(n * 7 % 12 + 1).unwrap();
+        let valid = ValidTime::On(Date::day(2025, month, 1));
+        let text = format!("{key} at {n}");
+        let mut unit =
+            Unit::new("visit", *key, [("text", text.as_str())], valid.clone()).at(at(*n));
+        if *key != "a" {
+            unit = unit.link("follows", *key, "a", valid);
+        }
+        world.write(&Write::new("crawler").unit(unit));
+    }
+}
+
+/// A time-keyed class `visit` with relation `follows`, and the hearings before the snapshot.
+fn visits_before_snapshot(world: &mut World) {
+    declare_kind(world.open(), "time-keyed");
+    let follows = Relation::new("follows", "visit", "visit", false);
+    world.g().declare(&Declaration::Relation(follows)).unwrap();
+    hear_visits(world, &BEFORE_SNAPSHOT);
+}
+
+/// Asserts each node's and link's state at every point from 0 to `last` is the same in the
+/// live graph and the rebuilt one, and that some of those reads return a version.
+fn same_states(world: &World, last: u64) {
+    let (live, rebuilt) = world.both();
+    let mut versions = 0;
+    for n in 0..=last {
+        let point = At::Time(at(n));
+        for key in ["a", "b", "c"] {
+            let node = NodeRef::new("visit", key);
+            let have = live.state_at(&node, point).unwrap();
+            assert_eq!(
+                rebuilt.state_at(&node, point).unwrap(),
+                have,
+                "{key} at {n}"
+            );
+            versions += usize::from(have.is_some());
+        }
+        for from in ["b", "c"] {
+            let have = live.link_state_at("follows", from, "a", point).unwrap();
+            let back = rebuilt.link_state_at("follows", from, "a", point).unwrap();
+            assert_eq!(back, have, "follows {from} a at {n}");
+            versions += usize::from(have.is_some());
+        }
+    }
+    assert!(versions > 0, "no read returned a version");
+}
+
+#[given(
+    "a graph of a time-keyed class whose nodes and links have several versions each, some arriving after newer ones, and a snapshot at a cursor"
+)]
+fn late_versions_and_snapshot(world: &mut World) {
+    visits_before_snapshot(world);
+    snapshot_at_end(world);
+}
+
+#[when("the graph is rebuilt from the snapshot alone")]
+fn rebuilt_from_snapshot_alone(world: &mut World) {
+    let snapshot = world.snapshot.clone().expect("the app took a snapshot");
+    let path = world.dir.path().join("rebuilt.rannoch");
+    world.rebuilt = Some(snapshot.rebuild(&[], path, Some(&KEY)).unwrap());
+}
+
+#[then(
+    "for every node and link, a read of its state at each point before the snapshot's newest point returns the same answer in both graphs"
+)]
+fn snapshot_answers_the_past(world: &mut World) {
+    same_states(world, 49);
+}
+
+#[given("a graph of a time-keyed class with a snapshot at a cursor")]
+fn visits_and_snapshot(world: &mut World) {
+    visits_before_snapshot(world);
+    snapshot_at_end(world);
+}
+
+#[given("events after the cursor, some at points before the snapshot's newest point")]
+fn late_events_after_snapshot(world: &mut World) {
+    hear_visits(world, &AFTER_SNAPSHOT);
+}
+
+#[then(
+    "every read of state at a point, of first and last heard, and as of a valid time returns the same answer in both graphs"
+)]
+fn late_events_replayed(world: &mut World) {
+    same_states(world, 61);
+    let (live, rebuilt) = world.both();
+    for key in ["a", "b", "c"] {
+        let node = NodeRef::new("visit", key);
+        // First recorded is per store, so only what the axis and the valid times decide.
+        let seen = |g: &Graph| {
+            let seen = g.seen(&node).unwrap().expect("the node was heard");
+            (seen.first_heard, seen.last_heard, seen.first_true)
+        };
+        assert_eq!(seen(rebuilt), seen(live), "{key} seen");
+    }
+    let mut found = 0;
+    for month in 1..=12 {
+        let as_of = Date::day(2025, month, 15);
+        for known in [None, Some(At::Time(at(20))), Some(At::Time(at(40)))] {
+            for key in ["a", "b", "c"] {
+                let read = |g: &Graph| {
+                    let node = g.find_as_of("visit", key, &as_of, known).unwrap();
+                    node.map(|node| (node.derived_from.clone(), node_facts(node)))
+                };
+                let have = read(live);
+                assert_eq!(read(rebuilt), have, "{key} as of {as_of} known {known:?}");
+                found += usize::from(have.is_some());
+            }
+            let walk = |g: &Graph| {
+                let a = NodeRef::new("visit", "a");
+                g.walk_as_of(&a, &["follows<-"], 1, 10, &as_of, known)
+                    .unwrap()
+                    .nodes
+            };
+            assert_eq!(
+                walk(rebuilt),
+                walk(live),
+                "walk as of {as_of} known {known:?}"
+            );
+        }
+    }
+    assert!(found > 0, "no read as of a valid time returned a version");
+}
+
+#[given("a graph with events, none of them purged, and a snapshot after them")]
+fn events_and_snapshot_after(world: &mut World) {
+    events_around_cursor(world);
+    snapshot_at_end(world);
+}
+
+#[when(
+    "the graph is rebuilt from the snapshot and the app writes, for each event before the cursor, a node derived from it"
+)]
+fn writes_derived_from_each(world: &mut World) {
+    let cursor = world.cursor;
+    let before: Vec<EventId> = world
+        .log
+        .iter()
+        .filter(|e| e.cursor <= cursor)
+        .map(|e| e.id)
+        .collect();
+    assert_eq!(before.len(), world.log.len());
+    let rebuilt = rebuild_from_snapshot(world);
+    let mut refusals = Vec::new();
+    for (n, id) in before.iter().enumerate() {
+        let unit = Unit::new("finding", format!("f{n}"), NONE, day(2026, 10, 21));
+        if let Err(error) = rebuilt.write(&Write::new("analyst").unit(unit).derived_from([*id])) {
+            refusals.push(error.to_string());
+        }
+    }
+    world.answers = refusals;
+    world.events_before = before.len();
+}
+
+#[then("every write is accepted")]
+fn every_write_accepted(world: &mut World) {
+    assert!(world.answers.is_empty(), "{:?}", world.answers);
+    let (_, rebuilt) = world.both();
+    for n in 0..world.events_before {
+        let found = rebuilt.find("finding", &format!("f{n}")).unwrap();
+        assert_eq!(found.map(|f| f.derived_from.len()), Some(1), "f{n}");
+    }
+}
+
 // ---------- events: derived from ----------
 
 /// Classes statement and finding; statements s1 and s2, each written as its own event, which

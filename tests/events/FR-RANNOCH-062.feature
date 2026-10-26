@@ -1,7 +1,7 @@
-# Generated from legion requirement FR-RANNOCH-062, revision 2026-10-21T21:03:35.987989+00:00.
+# Generated from legion requirement FR-RANNOCH-062, revision 2026-10-26T08:42:09.319737+00:00.
 # Do not edit: regenerate with scripts/features.mjs.
 
-Feature: The store keeps every event; compaction is a snapshot that deletes nothing
+Feature: The store keeps every event; a snapshot keeps every version row and every event id, and deletes nothing
 
   @criterion-01a1472c-e715-76f3-a46a-32e6f6e4f98d @module-events
   Scenario: a snapshot deletes nothing
@@ -44,3 +44,22 @@ Feature: The store keeps every event; compaction is a snapshot that deletes noth
     Given a graph with one node forgotten and one node replaced before a snapshot's cursor
     When the graph is rebuilt from the snapshot and the events after its cursor
     Then the forgotten node resolves as forgotten and the replaced node resolves to its replacement, as in the live graph
+
+  @criterion-01a1752f-2144-7adb-aa82-a0ed9e00ec8f @module-events
+  Scenario: a snapshot answers the past
+    Given a graph of a time-keyed class whose nodes and links have several versions each, some arriving after newer ones, and a snapshot at a cursor
+    When the graph is rebuilt from the snapshot alone
+    Then for every node and link, a read of its state at each point before the snapshot's newest point returns the same answer in both graphs
+
+  @criterion-01a1752f-2145-773b-8018-cfc32fab5f05 @module-events
+  Scenario: late events after a snapshot are replayed
+    Given a graph of a time-keyed class with a snapshot at a cursor
+    And events after the cursor, some at points before the snapshot's newest point
+    When the graph is rebuilt from the snapshot and the events after its cursor
+    Then every read of state at a point, of first and last heard, and as of a valid time returns the same answer in both graphs
+
+  @criterion-01a1752f-2146-7050-ad82-f5e341a3321e @module-events
+  Scenario: a snapshot keeps every event id that was not purged
+    Given a graph with events, none of them purged, and a snapshot after them
+    When the graph is rebuilt from the snapshot and the app writes, for each event before the cursor, a node derived from it
+    Then every write is accepted
