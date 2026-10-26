@@ -16,7 +16,7 @@ use crate::read::NodeRef;
 use crate::write::{Error, ValidTime};
 
 /// The hearings, the other ids each arrived under, how each link that ended or was found wrong
-/// came to that (`at` is the ending's point, and null for a correction), and the check value of
+/// came to that (`point` is the ending's, and null for a correction), and the check value of
 /// the graph's key.
 pub(crate) const HISTORY_TABLES: &str = "
     CREATE TABLE IF NOT EXISTS _hearings(
@@ -28,7 +28,7 @@ pub(crate) const HISTORY_TABLES: &str = "
         identity BLOB NOT NULL, alias TEXT NOT NULL, PRIMARY KEY(identity, alias)) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS _ends(
         entity TEXT NOT NULL, key TEXT NOT NULL, to_key TEXT NOT NULL, event TEXT NOT NULL,
-        source TEXT NOT NULL, at INTEGER, PRIMARY KEY(entity, key, to_key)) WITHOUT ROWID;
+        source TEXT NOT NULL, point INTEGER, PRIMARY KEY(entity, key, to_key)) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS _check(value TEXT NOT NULL);";
 
 /// The fixed label whose keyed hash is the check value.
@@ -269,9 +269,9 @@ pub(crate) fn conclude(tx: &Connection, event: EventId, change: &Change) -> Resu
         _ => return Ok(()),
     };
     tx.prepare_cached(
-        "INSERT INTO _ends(entity, key, to_key, event, source, at) \
+        "INSERT INTO _ends(entity, key, to_key, event, source, point) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(entity, key, to_key) DO UPDATE SET \
-         event = excluded.event, source = excluded.source, at = excluded.at",
+         event = excluded.event, source = excluded.source, point = excluded.point",
     )?
     .execute(params![
         link_entity(relation),
@@ -398,7 +398,7 @@ impl Graph {
         let row: Option<(String, String, Option<i64>)> = self
             .conn
             .prepare_cached(
-                "SELECT event, source, at FROM _ends WHERE entity = ?1 AND key = ?2 AND to_key = ?3",
+                "SELECT event, source, point FROM _ends WHERE entity = ?1 AND key = ?2 AND to_key = ?3",
             )?
             .query_row(params![link_entity(&relation), from, to], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
