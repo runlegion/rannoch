@@ -356,7 +356,8 @@ impl Unit {
     }
 
     /// A link of `relation` from the node keyed `from` to the node keyed `to`, true from
-    /// `valid`. An end not yet present leaves the link open until it arrives.
+    /// `valid`. The source must be heard, in this write or before it; a target not yet present
+    /// leaves the link open until it arrives.
     #[must_use]
     pub fn link(
         mut self,
@@ -503,8 +504,8 @@ pub(crate) fn check_declared(ontology: &Ontology, write: &Write) -> Result<(), E
 /// exactly the properties its class declares, each a value of its declared type, when a unit's
 /// or a link's valid time is not a real date, when it names as its source an event the graph does
 /// not hold, or when one of its links has a source that is not of its relation's declared
-/// source class. A target is named by kind and key, so a target key not yet a node of the
-/// declared target class leaves the link open.
+/// source class or was never heard, in this write or before it. A target is named by kind and
+/// key, so a target key not yet a node of the declared target class leaves the link open.
 fn check(conn: &Connection, ontology: &Ontology, write: &Write) -> Result<(), Error> {
     check_declared(ontology, write)?;
     for event in &write.derived_from {
@@ -546,6 +547,10 @@ fn check(conn: &Connection, ontology: &Ontology, write: &Write) -> Result<(), Er
                 )));
             }
         }
+        return Err(Error::Refused(format!(
+            "relation {} links from {class} {key}, which has never been heard",
+            relation.name
+        )));
     }
     Ok(())
 }
@@ -1161,7 +1166,7 @@ impl Graph {
     /// another type than declared, or a float that is NaN or an infinity; when a unit's or a
     /// link's valid time is not a real date (a month outside 1 to 12, or a day past its month's
     /// end); when it names as its source an event the graph does not hold; or when a link's
-    /// source is not of its relation's declared source class: the write is
+    /// source is not of its relation's declared source class, or was never heard: the write is
     /// checked before any piece commits, so it lands nothing.
     /// [`WriteError`] when a piece fails: the pieces before it are kept, and the error holds
     /// their events.
