@@ -1051,18 +1051,23 @@ pub(crate) fn ending_sql(
     let link =
         |t: &str| format!("{t}.entity = {entity} AND {t}.key = {from} AND {t}.to_key = {to}");
     let by = |t: &str| known.map_or(String::new(), |known| format!(" AND {t}.point <= {known}"));
-    let live = format!(
-        "SELECT h.point, h.event FROM _hearings h WHERE {} AND h.integer IS NULL{} \
-         ORDER BY h.point DESC, h.event DESC LIMIT 1",
-        link("h"),
-        by("h")
-    );
+    // The last live hearing's point and event, or below every ending when there is none.
+    let live = |column: &str, none: &str| {
+        format!(
+            "coalesce((SELECT h.{column} FROM _hearings h WHERE {} AND h.integer IS NULL{} \
+             ORDER BY h.point DESC, h.event DESC LIMIT 1), {none})",
+            link("h"),
+            by("h")
+        )
+    };
+    let after = live("point", &i64::MIN.to_string());
     (
         format!(
             "{link_e} AND ({e}.point, {e}.event) = (SELECT x.point, x.event FROM _endings x \
-             WHERE {link_x}{by_x} AND (NOT EXISTS ({live}) OR (x.point, x.event) > ({live})) \
+             WHERE {link_x}{by_x} AND x.point >= {after} AND (x.point, x.event) > ({after}, {}) \
              ORDER BY x.point, x.event LIMIT 1) \
              AND NOT EXISTS (SELECT 1 FROM _ends c WHERE {link_c} AND c.point IS NULL)",
+            live("event", "''"),
             link_e = link(e),
             link_x = link("x"),
             by_x = by("x"),
@@ -1070,6 +1075,47 @@ pub(crate) fn ending_sql(
         ),
         format!("{} <= {day}", valid_day(&format!("{e}.valid"))),
     )
+}
+
+/// The one read of a kept seen row of `?1`, `?2`, `?3` (its target key `''` for a node), with
+/// the facts it names, each a hearing joined by when it arrived or an ending by its key, and
+/// when a link ended: count, first true, when it ended, then first heard, last heard and first
+/// recorded as event, source, valid time, point, integer key, properties and whether an ending.
+fn seen_sql() -> String {
+    let fact = |p: &str| {
+        format!(
+            "coalesce({p}h.event, {p}e.event), coalesce({p}h.source, {p}e.source), \
+             CASE WHEN {p}h.arrived IS NULL THEN {p}e.valid ELSE {p}h.valid END, \
+             coalesce({p}h.point, {p}e.point), {p}h.integer, {p}h.properties, \
+             {p}h.arrived IS NULL"
+        )
+    };
+    let join = |p: &str, column: &str| {
+        format!(
+            "LEFT JOIN _hearings {p}h ON {p}h.arrived = s.{column}_arrived \
+             LEFT JOIN _endings {p}e ON s.{column}_arrived IS NULL AND {p}e.entity = s.entity \
+             AND {p}e.key = s.key AND {p}e.to_key = s.to_key \
+             AND {p}e.point = s.{column}_point AND {p}e.event = s.{column}_event"
+        )
+    };
+    let (ending, _) = ending_sql("n", ("s.entity", "s.key", "s.to_key"), None, "NULL");
+    format!(
+        "SELECT s.count, s.first_true, (SELECT n.point FROM _endings n WHERE {ending}), \
+         {}, {}, {} FROM _seen s {} {} {} WHERE s.entity = ?1 AND s.key = ?2 AND s.to_key = ?3",
+        fact("f"),
+        fact("l"),
+        fact("r"),
+        join("f", "first"),
+        join("l", "last"),
+        join("r", "recorded"),
+    )
+}
+
+/// Whether the link `?1`, `?2`, `?3` had ended by the point `?4`, and as of the valid time `?5`
+/// when given (NULL when its ending's valid time is unknown); no row when it had not ended.
+fn ended_sql() -> String {
+    let (ending, valid_by) = ending_sql("e", ("?1", "?2", "?3"), Some("?4"), "?5");
+    format!("SELECT ?5 IS NULL OR {valid_by} FROM _endings e WHERE {ending}")
 }
 
 /// Whether the link of `relation` from `from` to `to` had ended by the point `known` and, as of
@@ -1081,10 +1127,8 @@ fn ended(
     known: i64,
     day: Option<&str>,
 ) -> Result<bool, Error> {
-    let (ending, valid_by) = ending_sql("e", ("?1", "?2", "?3"), Some("?4"), "?5");
-    let sql = format!("SELECT ?5 IS NULL OR {valid_by} FROM _endings e WHERE {ending}");
     let ending: Option<Option<bool>> = conn
-        .prepare_cached(&sql)?
+        .prepare_cached(&ended_sql())?
         .query_row(
             params![link_entity(relation), from, to, known, day],
             |row| row.get(0),
@@ -1183,33 +1227,7 @@ impl Graph {
     /// The kept seen row of `of` (its target key `''` for a node), with the facts it names: each
     /// a hearing joined by when it arrived, or an ending by its key.
     fn seen_of(&self, of: (&str, &str, &str)) -> Result<Option<Seen>, Error> {
-        let fact = |p: &str| {
-            format!(
-                "coalesce({p}h.event, {p}e.event), coalesce({p}h.source, {p}e.source), \
-                 CASE WHEN {p}h.arrived IS NULL THEN {p}e.valid ELSE {p}h.valid END, \
-                 coalesce({p}h.point, {p}e.point), {p}h.integer, {p}h.properties, \
-                 {p}h.arrived IS NULL"
-            )
-        };
-        let join = |p: &str, column: &str| {
-            format!(
-                "LEFT JOIN _hearings {p}h ON {p}h.arrived = s.{column}_arrived \
-                 LEFT JOIN _endings {p}e ON s.{column}_arrived IS NULL AND {p}e.entity = s.entity \
-                 AND {p}e.key = s.key AND {p}e.to_key = s.to_key \
-                 AND {p}e.point = s.{column}_point AND {p}e.event = s.{column}_event"
-            )
-        };
-        let (ending, _) = ending_sql("n", ("s.entity", "s.key", "s.to_key"), None, "NULL");
-        let sql = format!(
-            "SELECT s.count, s.first_true, (SELECT n.point FROM _endings n WHERE {ending}), \
-             {}, {}, {} FROM _seen s {} {} {} WHERE s.entity = ?1 AND s.key = ?2 AND s.to_key = ?3",
-            fact("f"),
-            fact("l"),
-            fact("r"),
-            join("f", "first"),
-            join("l", "last"),
-            join("r", "recorded"),
-        );
+        let sql = seen_sql();
         let version = |row: &rusqlite::Row, at: usize| -> rusqlite::Result<_> {
             Ok((
                 row.get::<_, String>(at)?,
@@ -1369,6 +1387,32 @@ mod tests {
             let g = open(&copy, Some(&crate::TEST_KEY))?;
             let seen = g.seen(&NodeRef::new("book", "b1"))?;
             assert_eq!(seen.map(|s| s.count), Some(1), "{fixture}");
+        }
+        Ok(())
+    }
+
+    /// The read of what is seen and the read of an ending each seek by key: neither scans the
+    /// hearings nor the endings, the endings are sought from after the last live hearing, and
+    /// neither reads the log.
+    #[test]
+    fn the_seen_read_and_the_ending_read_seek_and_never_scan()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let g = open(
+            tempfile::tempdir()?.path().join("plans.rannoch"),
+            Some(&crate::TEST_KEY),
+        )?;
+        for sql in [super::seen_sql(), super::ended_sql()] {
+            let mut explain = g.conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+            let unbound = vec![rusqlite::types::Null; explain.parameter_count()];
+            let plan: Vec<String> = explain
+                .query_map(rusqlite::params_from_iter(unbound), |row| row.get(3))?
+                .collect::<Result<_, _>>()?;
+            println!("{}", plan.join("\n"));
+            assert!(plan.iter().all(|step| !step.contains("SCAN")), "{plan:#?}");
+            // The endings are read from after the last live hearing: the trailing run only.
+            let mut endings = plan.iter().filter(|step| step.starts_with("SEARCH x "));
+            assert!(endings.all(|step| step.contains("point>?")), "{plan:#?}");
+            assert!(!sql.contains("_events"), "{sql}");
         }
         Ok(())
     }
