@@ -32,7 +32,7 @@ pub(crate) const OWN_TABLES: &str = "
     CREATE INDEX IF NOT EXISTS _open_to ON _open(rel, to_key);
     CREATE TABLE IF NOT EXISTS _fates(
         class TEXT NOT NULL, key TEXT NOT NULL, replaced_by TEXT NOT NULL,
-        PRIMARY KEY(class, key)) WITHOUT ROWID;
+        point INTEGER, event TEXT, PRIMARY KEY(class, key)) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS _derived(
         class TEXT NOT NULL, key TEXT NOT NULL, event TEXT NOT NULL,
         PRIMARY KEY(class, key, event)) WITHOUT ROWID;

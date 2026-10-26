@@ -1,4 +1,4 @@
-# Generated from legion requirement FR-RANNOCH-066, revision 2026-10-26T11:06:00.742202+00:00.
+# Generated from legion requirement FR-RANNOCH-066, revision 2026-10-26T19:16:25.991989+00:00.
 # Do not edit: regenerate with scripts/features.mjs.
 
 Feature: A link's ending is a new fact with its own point and, when known, its own valid time; a link found wrong is a correction
@@ -10,3 +10,15 @@ Feature: A link's ending is a new fact with its own point and, when known, its o
     When the app writes the first link again at point 30 and the second link again at point 20
     Then the first link reads as ended at point 25 and as live at point 35
     And the second link reads as ended at point 35
+
+  @criterion-01a179a4-7de1-7621-9e06-f635113ad05a @module-history
+  Scenario: an ending that arrives before the link is held
+    Given a graph rebuilt from events in which a link's ending arrives before any live hearing of that link
+    When the link's state is read at a point after the ending
+    Then the link reads as ended at the ending's point
+
+  @criterion-01a179a4-7de1-7621-9e06-f64f6b003fe5 @module-history
+  Scenario: an earlier ending and a later live hearing
+    Given a link ended at point 10 and first heard alive at point 20
+    When its state is read at point 15 and at point 25
+    Then it reads as ended at point 15 and live at point 25

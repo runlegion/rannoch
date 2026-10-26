@@ -1463,8 +1463,9 @@ impl Graph {
     }
 
     /// The version of the link of `relation` from the node keyed `from` to the node keyed `to`
-    /// that held at the time `at`, by point and then event id, and whether the link had ended
-    /// by then. `None` before its first version.
+    /// that held at the time `at`: the newest of its live hearings and endings at or before it,
+    /// by point and then event id, and whether the link had ended by then. `None` before its
+    /// first version.
     ///
     /// # Errors
     /// [`Error::Refused`] when `at` is an integer key; the relation is not declared, or the
@@ -1478,12 +1479,34 @@ impl Graph {
     ) -> Result<Option<Version>, Error> {
         let (_, at) = known_bound(None, at)?;
         let relation = self.current_ontology()?.relation(relation)?.name.clone();
-        let entity = link_entity(&relation);
-        let Some((mut version, ..)) =
-            version_row(&self.conn, (&entity, from, Some(to)), &by_point(), &[&at])?
-        else {
+        let sql = format!(
+            "SELECT event, source, valid, point, integer, properties, ending FROM ( \
+             SELECT event, source, valid, point, integer, properties, 0 AS ending FROM _hearings \
+             WHERE entity = ?1 AND key = ?2 AND to_key = ?3 AND integer IS NULL AND point <= ?4 \
+             UNION ALL SELECT event, source, valid, point, NULL, NULL, 1 FROM _endings \
+             WHERE entity = ?1 AND key = ?2 AND to_key = ?3 AND point <= ?4) \
+             ORDER BY {} LIMIT 1",
+            order("DESC")
+        );
+        let newest = self
+            .conn
+            .prepare_cached(&sql)?
+            .query_row(params![link_entity(&relation), from, to, at], |row| {
+                let columns: VersionColumns = (
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                );
+                Ok((columns, row.get::<_, bool>(6)?))
+            })
+            .optional()?;
+        let Some((columns, ending)) = newest else {
             return Ok(None);
         };
+        let mut version = version_of(columns, ending)?;
         version.ended = ended(&self.conn, &relation, (from, to), at, None)?;
         Ok(Some(version))
     }
