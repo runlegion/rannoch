@@ -647,6 +647,17 @@ pub(crate) fn see_all(conn: &mut Connection) -> Result<(), Error> {
     /// A node or link to see: its entity, key and target key.
     type Of = (String, String, Option<String>);
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // The tables are made in the same transaction as their rows, so a backfill that fails or is
+    // cut off leaves no `_seen` behind and runs again; one another open finished first is done.
+    let done: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_seen')",
+        [],
+        |row| row.get(0),
+    )?;
+    if done {
+        return Ok(());
+    }
+    tx.execute_batch(HISTORY_TABLES)?;
     tx.execute(
         "INSERT OR IGNORE INTO _endings(entity, key, to_key, point, event, source, valid) \
          SELECT entity, key, to_key, point, event, source, valid FROM _ends \
@@ -1468,6 +1479,51 @@ mod tests {
             let seen = g.seen(&NodeRef::new("book", "b1"))?;
             assert_eq!(seen.map(|s| s.count), Some(1), "{fixture}");
         }
+        Ok(())
+    }
+
+    /// A backfill that fails leaves the store as it was, so the next open runs it again.
+    #[test]
+    fn a_backfill_that_fails_runs_again_on_the_next_open() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("before-seen.rannoch");
+        let when = ValidTime::On(Date::day(2024, 3, 1));
+        let read = |g: &crate::Graph| -> Result<_, crate::Error> {
+            Ok((
+                g.seen(&NodeRef::new("voice", "v2"))?,
+                g.link_seen("knows", "v2", "v1")?,
+            ))
+        };
+        let kept = {
+            let mut g = open(&path, Some(&crate::TEST_KEY))?;
+            g.declare(&Declaration::Class(Class::new("voice", ["name"])))?;
+            g.declare(&Declaration::Relation(Relation::new(
+                "knows", "voice", "voice", false,
+            )))?;
+            let voice =
+                |key: &str, name: &str| Unit::new("voice", key, [("name", name)], when.clone());
+            g.write(
+                &Write::new("swtor")
+                    .unit(voice("v1", "Ana"))
+                    .unit(voice("v2", "Bo").link("knows", "v2", "v1", when.clone())),
+            )?;
+            g.write(&Write::new("reddit").unit(voice("v2", "Bob")))?;
+            let at = UNIX_EPOCH + Duration::from_millis(4_102_444_800_123);
+            g.end_link("knows", "v2", "v1", at, ValidTime::Unknown, "moderator")?;
+            let kept = read(&g)?;
+            assert_eq!(kept.0.as_ref().map(|s| s.count), Some(2));
+            // As a store written before what is seen was kept, whose backfill is cut off.
+            g.conn.execute_batch(
+                "DROP TABLE _seen; CREATE TRIGGER cut BEFORE INSERT ON _endings \
+                 BEGIN SELECT RAISE(ABORT, 'cut off'); END;",
+            )?;
+            kept
+        };
+        assert!(open(&path, Some(&crate::TEST_KEY)).is_err());
+        rusqlite::Connection::open(&path)?.execute_batch("DROP TRIGGER cut;")?;
+        let g = open(&path, Some(&crate::TEST_KEY))?;
+        assert_eq!(read(&g)?, kept);
         Ok(())
     }
 

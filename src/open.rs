@@ -402,11 +402,10 @@ pub(crate) fn open_file(path: impl AsRef<Path>) -> Result<Graph, Error> {
         )?)
     };
     // A store whose hearings were written before what is seen of them was kept.
-    let unseen = table("_hearings")? && !table("_seen")?;
-    conn.execute_batch(HISTORY_TABLES)?;
-    if unseen {
+    if table("_hearings")? && !table("_seen")? {
         see_all(&mut conn)?;
     }
+    conn.execute_batch(HISTORY_TABLES)?;
     let schema_version = schema_version(&conn)?;
     let ontology = Ontology::load(&conn)?;
     let fresh = RefCell::new(Fresh {
