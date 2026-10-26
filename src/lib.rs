@@ -41,7 +41,8 @@ mod refs;
 mod write;
 
 pub use events::{
-    Change, Cursor, Event, EventId, Events, Fact, LinkFact, NodeFact, Snapshot, WrongKind, rebuild,
+    Change, Cursor, Event, EventId, Events, Fact, FactRef, LinkFact, NodeFact, Snapshot, WrongKind,
+    rebuild,
 };
 /// The content-identity key the unit tests open their graphs under.
 #[cfg(test)]

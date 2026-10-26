@@ -363,6 +363,7 @@ fn drop_link(
     .execute(params![from, to])?;
     tx.prepare_cached("DELETE FROM _open WHERE rel = ?1 AND from_key = ?2 AND to_key = ?3")?
         .execute(params![relation.name, from, to])?;
+    drop_derived(tx, (&relation.name, from, to))?;
     Ok(())
 }
 
@@ -430,7 +431,7 @@ fn current(
             class_table(&class.name)
         ))?
         .execute(params![id])?;
-        drop_derived(tx, &class.name, at)?;
+        drop_derived(tx, (&class.name, at, ""))?;
         left.nodes.insert(node);
     } else if kind == RELATION {
         let relation = ontology.relation(name)?;
@@ -445,6 +446,7 @@ fn current(
             from: NodeRef::new(&relation.from, at.as_str()),
             to: NodeRef::new(&relation.to, to.as_str()),
             valid: v.valid.clone(),
+            derived_from: Vec::new(),
         };
         let ends = node_id(tx, &relation.from, at)?.zip(node_id(tx, &relation.to, &to)?);
         let piece = Piece::new(tx, ontology, key, &v.source, stamp(recorded));

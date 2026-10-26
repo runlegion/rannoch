@@ -712,7 +712,7 @@ mod tests {
         assert_eq!(found, Some(vec![source.id]));
         assert_eq!(
             reader.derived(source.id)?,
-            [crate::NodeRef::new("item", "i2")]
+            [crate::FactRef::Node(crate::NodeRef::new("item", "i2"))]
         );
         Ok(())
     }

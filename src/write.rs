@@ -380,7 +380,7 @@ impl Unit {
     }
 }
 
-/// A write: whole units from one source, and the events its nodes were derived from.
+/// A write: whole units from one source, and the events its nodes and links were derived from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Write {
     source: String,
@@ -403,7 +403,7 @@ impl Write {
         self
     }
 
-    /// Names the events the write's nodes were derived from: each node keeps them.
+    /// Names the events the write's nodes and links were derived from: each keeps them.
     #[must_use]
     pub fn derived_from(mut self, events: impl IntoIterator<Item = EventId>) -> Self {
         self.derived_from.extend(events);
@@ -667,7 +667,8 @@ impl<'a> Piece<'a> {
         match self.hear(&Of::Node(node))? {
             Heard::Held(held) => {
                 // Naming sources it did not name yet records them.
-                let derived = add_derived(self.tx, node)?;
+                let derived =
+                    add_derived(self.tx, (&node.class, &node.key, ""), &node.derived_from)?;
                 if derived {
                     self.added.push(Fact::Node(node.clone()));
                 }
@@ -700,7 +701,7 @@ impl<'a> Piece<'a> {
             self.stamp.recorded,
             &node.properties,
         )?;
-        keep_derived(self.tx, node)?;
+        keep_derived(self.tx, (&node.class, &node.key, ""), &node.derived_from)?;
         self.added.push(Fact::Node(node.clone()));
         Ok(put)
     }
@@ -773,14 +774,16 @@ impl<'a> Piece<'a> {
         Ok(changed > 0)
     }
 
-    /// Writes one link of a unit: into its relation when both ends are present, else open.
-    fn link(&mut self, link: &LinkSpec) -> Result<(), Error> {
+    /// Writes one link of a unit, derived from `derived_from`: into its relation when both ends
+    /// are present, else open.
+    fn link(&mut self, link: &LinkSpec, derived_from: &[EventId]) -> Result<(), Error> {
         let relation = self.ontology.relation(&link.relation)?;
         let fact = LinkFact {
             relation: relation.name.clone(),
             from: NodeRef::new(&relation.from, &link.from),
             to: NodeRef::new(&relation.to, &link.to),
             valid: link.valid.clone(),
+            derived_from: derived_from.to_vec(),
         };
         let from = node_id(self.tx, &relation.from, &link.from)?;
         let to = node_id(self.tx, &relation.to, &link.to)?;
@@ -788,20 +791,33 @@ impl<'a> Piece<'a> {
     }
 
     /// Hears a link. A new hearing goes into its relation when `ends` are both present, and
-    /// otherwise waits open; a link identical to a hearing held is that hearing.
+    /// otherwise waits open; a link identical to a hearing held is that hearing, and changes
+    /// nothing but the sources it names.
     fn heard_link(&mut self, fact: LinkFact, ends: Option<(i64, i64)>) -> Result<(), Error> {
         let of = Of::Link(&fact);
+        let derived = (
+            fact.relation.as_str(),
+            fact.from.key.as_str(),
+            fact.to.key.as_str(),
+        );
         match self.hear(&of)? {
             Heard::Held(held) => {
+                // Naming sources it did not name yet records them.
+                let added = add_derived(self.tx, derived, &fact.derived_from)?;
                 let (entity, from, to) = of.entity();
-                if self.held(&held, false)?
+                if self.held(&held, added)?
                     && let Some((v, ..)) = newest(self.tx, (&entity, from, to))?
                 {
                     self.current_link(&fact, ends, &v.source, &v.valid)?;
                 }
-                return Ok(());
+                if !added {
+                    return Ok(());
+                }
             }
-            Heard::Newest => self.current_link(&fact, ends, self.source, &fact.valid)?,
+            Heard::Newest => {
+                self.current_link(&fact, ends, self.source, &fact.valid)?;
+                keep_derived(self.tx, derived, &fact.derived_from)?;
+            }
             Heard::Older => {}
         }
         self.added.push(if ends.is_some() {
@@ -899,6 +915,7 @@ impl<'a> Piece<'a> {
                                 from: NodeRef::new(&relation.from, from_key),
                                 to: NodeRef::new(&relation.to, to_key),
                                 valid: ValidTime::from_sql(valid),
+                                derived_from: Vec::new(),
                             },
                         });
                         continue;
@@ -913,6 +930,7 @@ impl<'a> Piece<'a> {
                         from: NodeRef::new(&relation.from, from_key),
                         to: NodeRef::new(&relation.to, to_key),
                         valid: ValidTime::from_sql(valid),
+                        derived_from: Vec::new(),
                     };
                     self.close(&link, from, to, &source)?;
                     self.closed.push(link);
@@ -1334,7 +1352,7 @@ impl Put {
     }
 }
 
-/// Writes whole `units` from `source`, each node derived from `derived_from`, inside `tx` and
+/// Writes whole `units` from `source`, each node and link derived from `derived_from`, inside `tx` and
 /// appends their events: one for what they added and one per open link they closed. The caller
 /// commits.
 fn put(
@@ -1364,7 +1382,7 @@ fn put(
             piece.arrived(&unit.node.class, &unit.node.key)?;
         }
         for link in &unit.links {
-            piece.link(link)?;
+            piece.link(link, derived_from)?;
         }
     }
     let Piece {
