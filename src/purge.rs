@@ -82,6 +82,153 @@ impl Purge {
     }
 }
 
+/// Each purge's standing rule: its rule, its kind, its targets as keyed match values (`b` empty
+/// for a kind with one), and the purge event. A hearing that arrives is looked up by
+/// (kind, a, b).
+pub(crate) const PURGE_TABLES: &str = "
+    CREATE TABLE IF NOT EXISTS _purge_rules(
+        rule TEXT NOT NULL, kind TEXT NOT NULL, a BLOB NOT NULL, b BLOB NOT NULL,
+        event TEXT NOT NULL);
+    CREATE INDEX IF NOT EXISTS _purge_rules_match ON _purge_rules(kind, a, b);";
+
+/// The kind and the values `a` and `b` a standing rule is kept and looked up under, from a purge
+/// whose targets are keyed match values: a node is its class's and its key's, a link its
+/// relation's and its two keys', end to end.
+fn rule_of(matched: &Purge) -> Result<(&'static str, Vec<u8>, Vec<u8>), Error> {
+    let value = |hex: &str| {
+        blake3::Hash::from_hex(hex)
+            .map(|hash| hash.as_bytes().to_vec())
+            .map_err(|_| Error::Refused(format!("the purge's match value {hex} is not a hash")))
+    };
+    let target = |target: &Target| {
+        Ok::<_, Error>(match target {
+            Target::Node(node) => [value(&node.class)?, value(&node.key)?].concat(),
+            Target::Link { relation, from, to } => {
+                [value(relation)?, value(&from.key)?, value(&to.key)?].concat()
+            }
+        })
+    };
+    Ok(match matched {
+        Purge::Fact { identity } => ("fact", identity.to_vec(), Vec::new()),
+        Purge::Stream { source } => ("stream", value(source)?, Vec::new()),
+        Purge::Source { source } => ("source", value(source)?, Vec::new()),
+        Purge::Entity { target: t } => ("entity", target(t)?, Vec::new()),
+        Purge::EntityFromSource { target: t, source } => {
+            ("entity_from_source", target(t)?, value(source)?)
+        }
+    })
+}
+
+/// Keeps `matched`, a purge whose targets are keyed match values, as the standing rule `rule`,
+/// named by the purge event `event`.
+pub(crate) fn stand(
+    tx: &Connection,
+    rule: &str,
+    matched: &Purge,
+    event: EventId,
+) -> Result<(), Error> {
+    let (kind, a, b) = rule_of(matched)?;
+    tx.prepare_cached(
+        "INSERT INTO _purge_rules(rule, kind, a, b, event) VALUES (?1, ?2, ?3, ?4, ?5)",
+    )?
+    .execute(params![rule, kind, a, b, event.to_string()])?;
+    Ok(())
+}
+
+/// Whether the store keeps any standing rule.
+pub(crate) fn standing(tx: &Connection) -> Result<bool, Error> {
+    Ok(tx
+        .prepare_cached("SELECT EXISTS(SELECT 1 FROM _purge_rules)")?
+        .query_row([], |row| row.get(0))?)
+}
+
+/// Whether a standing rule matches the hearing `of`, written and heard from `source`: by its
+/// identity, its write source, its hearing source, its node or link, that from `source`, or, for
+/// a link, everything about either of its ends.
+pub(crate) fn purged(tx: &Connection, key: &Key, of: &Of, source: &str) -> Result<bool, Error> {
+    let identity = of.identity(key, source)?;
+    let source = source.to_string();
+    let mut candidates = vec![
+        Purge::Fact { identity },
+        Purge::Stream {
+            source: source.clone(),
+        },
+        Purge::Source {
+            source: source.clone(),
+        },
+    ];
+    let target = match of {
+        Of::Node(node) => Target::Node(NodeRef::new(&node.class, &node.key)),
+        Of::Link(link) => {
+            for end in [&link.from, &link.to] {
+                candidates.push(Purge::Entity {
+                    target: Target::Node(end.clone()),
+                });
+            }
+            Target::Link {
+                relation: link.relation.clone(),
+                from: link.from.clone(),
+                to: link.to.clone(),
+            }
+        }
+    };
+    candidates.push(Purge::EntityFromSource {
+        target: target.clone(),
+        source,
+    });
+    candidates.push(Purge::Entity { target });
+    for candidate in candidates {
+        let (kind, a, b) = rule_of(&candidate.matched(key))?;
+        let found: bool = tx
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM _purge_rules WHERE kind = ?1 AND a = ?2 AND b = ?3)",
+            )?
+            .query_row(params![kind, a, b], |row| row.get(0))?;
+        if found {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// `change` as it is kept on arrival: a write without each hearing a standing rule matches, or
+/// `None` when nothing is left of it.
+pub(crate) fn arriving(
+    tx: &Connection,
+    key: &Key,
+    change: &Change,
+) -> Result<Option<Change>, Error> {
+    let Change::Wrote {
+        source,
+        added,
+        wrong_kind,
+        check,
+    } = change
+    else {
+        return Ok(Some(change.clone()));
+    };
+    if !standing(tx)? {
+        return Ok(Some(change.clone()));
+    }
+    let mut kept = Vec::new();
+    for fact in added {
+        if !purged(tx, key, &Of::fact(fact), source)? {
+            kept.push(fact.clone());
+        }
+    }
+    if kept.len() == added.len() {
+        return Ok(Some(change.clone()));
+    }
+    Ok(
+        (!kept.is_empty() || !wrong_kind.is_empty()).then(|| Change::Wrote {
+            source: source.clone(),
+            added: kept,
+            wrong_kind: wrong_kind.clone(),
+            check: check.clone(),
+        }),
+    )
+}
+
 /// A node or a link as the hearings name it: its entity, its key and, for a link, its target's.
 type Entity = (String, String, Option<String>);
 
@@ -735,14 +882,16 @@ impl Graph {
         let (event, snapshots) = secure(&mut self.conn, |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             purge_in(&tx, &Ontology::load(&tx)?, &key, &target)?;
+            let matched = target.matched(&key);
             let event = append(
                 &tx,
                 Change::Purged {
                     source: source.to_string(),
                     rule: rule.to_string(),
-                    purge: target.matched(&key),
+                    purge: matched.clone(),
                 },
             )?;
+            stand(&tx, rule, &matched, event.id)?;
             let snapshots: Vec<String> = tx
                 .prepare_cached("SELECT path FROM _snapshots ORDER BY path")?
                 .query_map([], |row| row.get(0))?

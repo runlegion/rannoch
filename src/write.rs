@@ -20,6 +20,7 @@ use crate::open::{
     CLASS, Class, Graph, HistoryKey, Ontology, RELATION, Relation, Value, ValueType, class_table,
     concat, property_column, relation_index, relation_table, schema_version,
 };
+use crate::purge::{Purge, Target, purged, stand, standing};
 use crate::read::NodeRef;
 
 /// The most changes one piece holds (a node is one change, a link is one); a unit larger than
@@ -586,6 +587,8 @@ pub(crate) struct Piece<'a> {
     held: BTreeSet<Cursor>,
     /// Whether an arriving event renamed a hearing it was identical to.
     renamed: bool,
+    /// Whether the store keeps a standing purge rule, which each hearing is checked against.
+    standing: bool,
 }
 
 impl<'a> Piece<'a> {
@@ -607,7 +610,13 @@ impl<'a> Piece<'a> {
             closed: Vec::new(),
             held: BTreeSet::new(),
             renamed: false,
+            standing: false,
         }
+    }
+
+    /// Whether a standing purge rule matches `of`, heard from this piece's source.
+    fn purged(&self, of: &Of) -> Result<bool, Error> {
+        Ok(self.standing && purged(self.tx, self.key, of, self.source)?)
     }
 
     /// Hears `of`: the identical hearing held, or a new one, which current state takes only
@@ -774,6 +783,9 @@ impl<'a> Piece<'a> {
             to: NodeRef::new(&relation.to, &link.to),
             valid: link.valid.clone(),
         };
+        if self.purged(&Of::Link(&fact))? {
+            return Ok(());
+        }
         let from = node_id(self.tx, &relation.from, &link.from)?;
         let to = node_id(self.tx, &relation.to, &link.to)?;
         self.heard_link(fact, from.zip(to))
@@ -917,8 +929,9 @@ impl<'a> Piece<'a> {
 
 /// Applies one event's change to the state in `tx`, as it was applied when the event was
 /// written: a declaration builds what it needs, a write puts what it added, a closing moves its
-/// open link into its relation, a forget removes the node and its links, a replacement records
-/// the node's fate, and a purge changes nothing. Facts are stamped as recorded at `recorded`. Returns false when the event is
+/// open link into its relation, a forget removes the node and its links and stands as that
+/// node's purge rule, a replacement records the node's fate, and a purge stands as a rule.
+/// Facts are stamped as recorded at `recorded`. Returns false when the event is
 /// a write whose every fact is identical to a hearing held, so it adds nothing and its id is
 /// held only as an alias.
 pub(crate) fn replay(
@@ -966,16 +979,20 @@ pub(crate) fn replay(
             let (from, to) = piece.ends(link)?;
             piece.close(link, from, to, &source)?;
         }
-        Change::Forgot { nodes, .. } => {
+        Change::Forgot { rule, nodes, .. } => {
             for node in nodes {
                 crate::events::remove(tx, ontology, node)?;
+                let purge = Purge::Entity {
+                    target: Target::Node(node.clone()),
+                };
+                stand(tx, rule, &purge.matched(key), event.id)?;
             }
         }
         Change::Replaced { class, old, new } => {
             record_fate(tx, class, old, new)?;
         }
-        // What a purge removed has already left every event before it.
-        Change::Purged { .. } => {}
+        // What a purge removed has already left every event before it; it stands as a rule.
+        Change::Purged { rule, purge, .. } => stand(tx, rule, purge, event.id)?,
         Change::Ended { .. } | Change::Corrected { .. } => conclude(tx, event.id, &event.change)?,
     }
     Ok(true)
@@ -1346,11 +1363,16 @@ fn put(
         arrived: false,
     };
     let mut piece = Piece::new(tx, ontology, key, source, stamp);
+    piece.standing = standing(tx)?;
     for unit in units {
         let node = NodeFact {
             derived_from: derived_from.to_vec(),
             ..unit.node.clone()
         };
+        // A unit a standing purge rule matches is kept as if it never came.
+        if piece.purged(&Of::Node(&node))? {
+            continue;
+        }
         let (_, new) = piece.node(&node)?;
         if new {
             piece.arrived(&unit.node.class, &unit.node.key)?;

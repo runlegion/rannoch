@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::history::{Key, aliases, hold_aliases, unhear};
 use crate::open::{Graph, Ontology, Value, class_table, open_keyed, relation_table};
-use crate::purge::Purge;
+use crate::purge::{Purge, arriving};
 use crate::read::NodeRef;
 use crate::write::{Declaration, Error, ValidTime, now_millis, replay};
 
@@ -448,12 +448,21 @@ fn replay_into(mut graph: Graph, events: &[Event]) -> Result<Graph, Error> {
                 }
             }
         }
-        let added = replay(&tx, &ontology, &key, recorded, event)?;
+        // What a standing purge rule matches is kept as if it never came.
+        let Some(change) = arriving(&tx, &key, &event.change)? else {
+            continue;
+        };
+        let event = Event {
+            id: event.id,
+            cursor: event.cursor,
+            change,
+        };
+        let added = replay(&tx, &ontology, &key, recorded, &event)?;
         if matches!(event.change, Change::Declared(_)) {
             ontology = Ontology::load(&tx)?;
         }
         if added {
-            store(&tx, event.id, Some(event.cursor), event.change.clone())?;
+            store(&tx, event.id, Some(event.cursor), event.change)?;
         }
     }
     tx.commit()?;
