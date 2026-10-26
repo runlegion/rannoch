@@ -19,12 +19,12 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
+use rannoch::{At, End, Failure, Hearing, HistoryKey, NodeFact, Queue, Ticket, ValueType, Version};
 use rannoch::{
     Change, Class, Count, Cursor, Date, Declaration, Description, Error, Event, EventId, Fact,
     Fate, Graph, GroupBy, Link, LinkFact, Node, NodeRef, OpenLink, PartOf, Relation, Snapshot,
     Step, Tally, Unit, ValidTime, Value, Write, WriteError,
 };
-use rannoch::{End, Failure, Hearing, HistoryKey, NodeFact, Queue, Ticket, ValueType};
 use rstest_bdd_macros::{given, scenarios, then, when};
 use tempfile::TempDir;
 
@@ -554,6 +554,7 @@ struct World {
     hearings: BTreeMap<String, Vec<Hearing>>,
     refusals: Vec<Error>,
     key: [u8; 32],
+    states: Vec<Option<Version>>,
 }
 
 #[rstest::fixture]
@@ -608,6 +609,7 @@ fn world() -> World {
         hearings: BTreeMap::new(),
         refusals: Vec::new(),
         key: KEY,
+        states: Vec::new(),
     }
 }
 
@@ -4712,6 +4714,8 @@ fn time_keyed_class(world: &mut World) {
 }
 
 #[given("a class declared with an integer key the writer supplies")]
+#[given("a class whose history is ordered by an integer key the writer supplies")]
+#[given("a class whose history is ordered by an integer the writer supplies")]
 fn integer_keyed_class(world: &mut World) {
     declare_kind(world.open(), "integer-keyed");
     world.mark_events();
@@ -5207,6 +5211,455 @@ fn rebuilt_under_other_key(world: &mut World) {
 #[then("both rebuilds are refused, and each refusal says the key differs from the graph's")]
 fn rebuilds_refused_key_differs(world: &mut World) {
     key_differs(world, 2);
+}
+
+// ---------- FR-RANNOCH-082, 083, 076: current state and state at a point on the axis ----------
+
+/// Midnight UTC on a day, as a point on the time axis.
+fn on(year: i32, month: u32, d: u32) -> SystemTime {
+    let days = |y: i32, m: u32, d: u32| {
+        // Days since 1970-01-01 (Howard Hinnant's days_from_civil).
+        let y = if m <= 2 { y - 1 } else { y };
+        let era = y.div_euclid(400);
+        let yoe = i64::from(y - era * 400);
+        let mp = i64::from((m + 9) % 12);
+        let doy = (153 * mp + 2) / 5 + i64::from(d) - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        i64::from(era) * 146_097 + doe - 719_468
+    };
+    let secs = u64::try_from(days(year, month, d) * 86_400).unwrap();
+    SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+}
+
+/// The graph's one class's node `k1` carrying `text`, at the time `point` or, in an
+/// integer-keyed class, with the integer key `point`.
+fn version_of(g: &Graph, text: &str, point: At) -> Unit {
+    let class = the_class(g).name;
+    let unit = Unit::new(class, "k1", [("text", text)], day(2026, 10, 1));
+    match point {
+        At::Time(time) => unit.at(time),
+        At::Key(key) => unit.integer(key),
+    }
+}
+
+/// Writes the versions of `k1` in order, each its own write, keeping every event written.
+fn write_versions(world: &mut World, versions: &[(&str, At)]) {
+    let mut written = Vec::new();
+    for (text, point) in versions {
+        let unit = version_of(world.g(), text, *point);
+        written.extend(world.g().write(&Write::new("crawler").unit(unit)).unwrap());
+    }
+    world.written = written;
+}
+
+fn k1(world: &mut World) -> NodeRef {
+    NodeRef::new(the_class(world.g()).name, "k1")
+}
+
+fn text_of(found: &Node) -> String {
+    text(&found.properties["text"])
+}
+
+fn found_text(world: &mut World) -> String {
+    let class = the_class(world.g()).name;
+    text_of(&world.find(&class, "k1"))
+}
+
+#[when(
+    "the app writes a node at 2025-06-01 and then writes the same node, with other properties, at 2024-03-01"
+)]
+#[when("the app writes a node at 2025-06-01 and then writes the same node at 2024-03-01")]
+fn writes_later_then_earlier(world: &mut World) {
+    let (june, march) = (At::Time(on(2025, 6, 1)), At::Time(on(2024, 3, 1)));
+    write_versions(world, &[("2025-06-01", june), ("2024-03-01", march)]);
+}
+
+#[then("find returns the node's state written at 2025-06-01")]
+fn finds_june(world: &mut World) {
+    assert_eq!(found_text(world), "2025-06-01");
+}
+
+#[when(
+    "the app writes a node with key 3 and then writes the same node, with other properties, with key 2"
+)]
+fn writes_key_3_then_2(world: &mut World) {
+    write_versions(world, &[("key 3", At::Key(3)), ("key 2", At::Key(2))]);
+}
+
+#[then("find returns the node's state written with key 3")]
+fn finds_key_3(world: &mut World) {
+    assert_eq!(found_text(world), "key 3");
+}
+
+#[when(
+    "the app writes a node, waits at least one millisecond, and writes the same node with other properties"
+)]
+fn writes_twice_apart(world: &mut World) {
+    let first = unit_of(world.g(), "k1", "first", 0);
+    world.write(&Write::new("crawler").unit(first));
+    std::thread::sleep(Duration::from_millis(2));
+    let second = unit_of(world.g(), "k1", "second", 0);
+    world.write(&Write::new("crawler").unit(second));
+}
+
+#[when(
+    "the app writes a node and, from the same process within the same millisecond, writes the same node with other properties"
+)]
+fn writes_twice_in_one_millisecond(world: &mut World) {
+    // Two writes land in one millisecond almost always; try again under a new key otherwise.
+    for attempt in 0..100 {
+        let key = format!("k{}", attempt + 1);
+        let class = the_class(world.g()).name;
+        for text in ["first", "second"] {
+            let unit = Unit::new(&class, &key, [("text", text)], day(2026, 10, 1));
+            world.g().write(&Write::new("crawler").unit(unit)).unwrap();
+        }
+        let hearings = world.g().hearings(&NodeRef::new(&class, &key)).unwrap();
+        if hearings[0].point == hearings[1].point {
+            world.content = key;
+            return;
+        }
+    }
+    panic!("no two writes landed in one millisecond");
+}
+
+#[then("find returns the node's state from the second write")]
+fn finds_second(world: &mut World) {
+    let class = the_class(world.g()).name;
+    // The key written, when the scenario named one; else k1.
+    let key = if world.content.is_empty() {
+        "k1".to_string()
+    } else {
+        world.content.clone()
+    };
+    assert_eq!(text_of(&world.find(&class, &key)), "second");
+}
+
+/// A node's state with when this store recorded it left out: that is the store's own.
+fn state_of(node: Node) -> (BTreeMap<String, Value>, String, ValidTime, Vec<EventId>) {
+    (node.properties, node.source, node.valid, node.derived_from)
+}
+
+/// Writes, in a time-keyed class with a relation `follows`, nodes a and b and a link from b to
+/// a three times, each write self-contained: at points 30, then 10 and 20, so the nodes' later
+/// versions arrive after newer ones; each link version is later than the one before.
+#[given(
+    "the events of a graph in which some versions of its nodes and links arrived after newer ones"
+)]
+fn events_with_late_versions(world: &mut World) {
+    declare_kind(world.open(), "time-keyed");
+    let follows = Relation::new("follows", "visit", "visit", false);
+    world.g().declare(&Declaration::Relation(follows)).unwrap();
+    for (n, valid) in [
+        (30, day(2026, 1, 1)),
+        (10, day(2026, 2, 2)),
+        (20, day(2026, 3, 3)),
+    ] {
+        let text = n.to_string();
+        let a = Unit::new("visit", "a", [("text", text.as_str())], valid.clone()).at(at(n));
+        let b = Unit::new("visit", "b", [("text", text.as_str())], valid.clone())
+            .at(at(n))
+            .link("follows", "b", "a", valid);
+        world
+            .g()
+            .write(&Write::new("crawler").unit(a).unit(b))
+            .unwrap();
+    }
+    world.log = world.all_events();
+}
+
+#[given("two writes of one node at point 2025-06-01 with different properties")]
+fn two_writes_at_one_point(world: &mut World) {
+    let june = At::Time(on(2025, 6, 1));
+    write_versions(world, &[("one", june), ("two", june)]);
+    world.log = world.all_events();
+}
+
+#[when("two new graphs are given those events, one in recorded order and one in reverse order")]
+#[when("one graph is given the two writes in one order and another graph in the other order")]
+fn given_in_both_orders(world: &mut World) {
+    let path = world.dir.path().join("recorded.rannoch");
+    let recorded = rannoch::rebuild(&world.log, path, Some(&KEY)).unwrap();
+    given_in_reverse(world);
+    let reversed = world.rebuilt.take().expect("the graph was rebuilt");
+    world.graphs = vec![recorded, reversed];
+}
+
+#[then("find returns the same result in both graphs for every node and link")]
+fn same_find_for_nodes_and_links(world: &mut World) {
+    let [recorded, reversed] = &world.graphs[..] else {
+        panic!("two graphs")
+    };
+    for key in ["a", "b"] {
+        let found = |g: &Graph| state_of(g.find("visit", key).unwrap().unwrap());
+        assert_eq!(found(recorded), found(reversed), "node {key}");
+        assert_eq!(text(&found(recorded).0["text"]), "30", "node {key}");
+    }
+    let link = |g: &Graph| {
+        let link = g.find_link("follows", "b", "a").unwrap().unwrap();
+        (link.source, link.valid)
+    };
+    assert_eq!(link(recorded), link(reversed));
+    assert_eq!(
+        link(recorded).1,
+        day(2026, 3, 3),
+        "the link's newest version"
+    );
+}
+
+#[then("find returns the same state for the node in both graphs")]
+fn same_find_for_the_node(world: &mut World) {
+    let found = |g: &Graph| state_of(g.find("visit", "k1").unwrap().unwrap());
+    let (one, other) = (found(&world.graphs[0]), found(&world.graphs[1]));
+    assert_eq!(one, other);
+    // The tie goes to the larger event id: the second write's.
+    assert_eq!(text(&one.0["text"]), "two");
+}
+
+#[then("a read of the node's state at 2024-06-01 returns the version written at 2024-03-01")]
+fn reads_march_in_june(world: &mut World) {
+    let node = k1(world);
+    let state = world.g().state_at(&node, At::Time(on(2024, 6, 1))).unwrap();
+    let state = state.expect("a version held then");
+    assert_eq!(text(&state.properties["text"]), "2024-03-01");
+    assert_eq!(state.point, on(2024, 3, 1));
+}
+
+#[given("a node written at points 10, 20 and 30")]
+fn written_at_10_20_30(world: &mut World) {
+    let points = [("10", at(10)), ("20", at(20)), ("30", at(30))];
+    write_versions(world, &points.map(|(t, p)| (t, At::Time(p))));
+}
+
+#[when("the app writes a node at points 10 and 30, and then at point 20")]
+fn written_at_10_30_then_20(world: &mut World) {
+    let points = [("10", at(10)), ("30", at(30)), ("20", at(20))];
+    write_versions(world, &points.map(|(t, p)| (t, At::Time(p))));
+}
+
+#[given("a node written with keys 1, 2 and 3")]
+fn written_with_keys(world: &mut World) {
+    let keys = [("key 1", 1), ("key 2", 2), ("key 3", 3)];
+    write_versions(world, &keys.map(|(t, k)| (t, At::Key(k))));
+}
+
+#[given("a node written at point 20 from a source with a valid time")]
+fn written_at_20_with_source(world: &mut World) {
+    let unit = Unit::new("visit", "k1", [("text", "20")], day(2024, 5, 1)).at(at(20));
+    world.write(&Write::new("crawler").unit(unit));
+}
+
+fn read_state(world: &mut World, point: At) {
+    let node = k1(world);
+    let state = world.g().state_at(&node, point).unwrap();
+    world.states.push(state);
+}
+
+#[when("the app reads the node's state at point {n}")]
+fn reads_state_at_point(world: &mut World, n: String) {
+    read_state(world, At::Time(at(n.parse().unwrap())));
+}
+
+#[when("the app reads the node's state at key {k}")]
+fn reads_state_at_key(world: &mut World, k: String) {
+    read_state(world, At::Key(k.parse().unwrap()));
+}
+
+/// The one state read.
+fn the_state(world: &World) -> Option<Version> {
+    let [state] = &world.states[..] else {
+        panic!("one read, got {:?}", world.states)
+    };
+    state.clone()
+}
+
+#[then("the read returns the version written at point 20")]
+fn returns_point_20(world: &mut World) {
+    let state = the_state(world).expect("a version held then");
+    assert_eq!(text(&state.properties["text"]), "20");
+    assert_eq!(state.point, at(20));
+}
+
+#[then("the read returns no version")]
+fn returns_no_version(world: &mut World) {
+    assert_eq!(the_state(world), None);
+}
+
+#[then("the read returns the version written with key 2")]
+fn returns_key_2(world: &mut World) {
+    let state = the_state(world).expect("a version held then");
+    assert_eq!(text(&state.properties["text"]), "key 2");
+    assert_eq!(state.integer, Some(2));
+}
+
+#[then("a read of the node's state at point 25 returns the version written at point 20")]
+fn reads_20_at_25(world: &mut World) {
+    read_state(world, At::Time(at(25)));
+    returns_point_20(world);
+}
+
+#[then("the answer names point 20, that source, that valid time and the version's event id")]
+fn answer_names_the_version(world: &mut World) {
+    let state = the_state(world).expect("a version held then");
+    assert_eq!(state.point, at(20));
+    assert_eq!(state.source, "crawler");
+    assert_eq!(state.valid, day(2024, 5, 1));
+    assert_eq!(state.event, world.written[0].id);
+    let node = k1(world);
+    assert_eq!(world.g().hearings(&node).unwrap()[0].event, state.event);
+}
+
+#[then("the answer names no table or column of the store")]
+fn answer_names_no_storage(world: &mut World) {
+    let state = the_state(world).expect("a version held then");
+    let point = state.point.duration_since(SystemTime::UNIX_EPOCH).unwrap();
+    let ValidTime::On(valid) = &state.valid else {
+        panic!("a valid time")
+    };
+    let mut texts = vec![
+        state.source.clone(),
+        valid.to_string(),
+        state.event.to_string(),
+        point.as_millis().to_string(),
+    ];
+    texts.extend(
+        state
+            .properties
+            .iter()
+            .map(|(p, v)| format!("{p} {}", text(v))),
+    );
+    assert_names_no_storage(world, &texts);
+}
+
+/// An event id minted at `time`, as the store that recorded an event then would mint it.
+fn id_at(time: SystemTime) -> EventId {
+    let since = time.duration_since(SystemTime::UNIX_EPOCH).unwrap();
+    let stamp = uuid::Timestamp::from_unix(uuid::NoContext, since.as_secs(), since.subsec_nanos());
+    serde_json::from_value(uuid::Uuid::new_v7(stamp).to_string().into()).unwrap()
+}
+
+/// A link's point is the record time of the store that first recorded it, carried in its
+/// event: the graph is given the link's write as recorded at point 10, then ends it at 30.
+#[given("a link written at point 10 that ended at point 30")]
+fn link_ended_at_30(world: &mut World) {
+    let follows = Relation::new("follows", "visit", "visit", false);
+    world.g().declare(&Declaration::Relation(follows)).unwrap();
+    let when = day(2026, 1, 1);
+    let a = Unit::new("visit", "a", [("text", "a")], when.clone()).at(at(10));
+    let b = Unit::new("visit", "b", [("text", "b")], when.clone())
+        .at(at(10))
+        .link("follows", "b", "a", when);
+    world
+        .g()
+        .write(&Write::new("crawler").unit(a).unit(b))
+        .unwrap();
+    let events: Vec<Event> = world
+        .all_events()
+        .into_iter()
+        .map(|event| match event.change {
+            Change::Wrote { .. } => Event {
+                id: id_at(at(10)),
+                ..event
+            },
+            _ => event,
+        })
+        .collect();
+    let path = world.dir.path().join("recorded-at-10.rannoch");
+    world.graph = Some(rannoch::rebuild(&events, path, Some(&KEY)).unwrap());
+    let hearings = world.g().link_hearings("follows", "b", "a").unwrap();
+    assert_eq!(hearings[0].point, at(10));
+    world
+        .g()
+        .end_link("follows", "b", "a", at(30), "moderator")
+        .unwrap();
+}
+
+#[when("the app reads the link's state at points 25 and 35")]
+fn reads_link_at_25_and_35(world: &mut World) {
+    for n in [25, 35] {
+        let state = world
+            .g()
+            .link_state_at("follows", "b", "a", At::Time(at(n)));
+        world.states.push(state.unwrap());
+    }
+}
+
+#[then("the link reads as live at point 25 and as ended at point 35")]
+fn link_live_then_ended(world: &mut World) {
+    let [Some(live), Some(ended)] = &world.states[..] else {
+        panic!("two versions, got {:?}", world.states)
+    };
+    assert!(!live.ended, "{live:?}");
+    assert!(ended.ended, "{ended:?}");
+    assert_eq!(live.point, at(10));
+}
+
+// FR-RANNOCH-076: first and last heard on the axis, first recorded and first true.
+
+#[when("the app writes a hearing of a node at 2025-06 and then one at 2024-03")]
+fn writes_hearings_june_then_march(world: &mut World) {
+    writes_later_then_earlier(world);
+}
+
+fn seen(world: &mut World) -> rannoch::Seen {
+    let node = k1(world);
+    world.g().seen(&node).unwrap().expect("the node was heard")
+}
+
+#[then("the node's first heard is 2024-03")]
+fn first_heard_march(world: &mut World) {
+    assert_eq!(seen(world).first_heard.point, on(2024, 3, 1));
+}
+
+#[then("the node's last heard is 2025-06")]
+fn last_heard_june(world: &mut World) {
+    assert_eq!(seen(world).last_heard.point, on(2025, 6, 1));
+}
+
+#[then("the node's first recorded is the 2025-06 write")]
+fn first_recorded_june(world: &mut World) {
+    let first = seen(world).first_recorded;
+    assert_eq!(first.event, world.written[0].id);
+    assert_eq!(first.point, on(2025, 6, 1));
+}
+
+#[given("a node written with a valid time of {valid}")]
+fn written_valid(world: &mut World, valid: String) {
+    declare_kind(world.open(), "keyless");
+    rewrites_valid(world, valid);
+}
+
+fn month(text: &str) -> ValidTime {
+    let (year, month) = text.split_once('-').unwrap();
+    ValidTime::On(Date::month(year.parse().unwrap(), month.parse().unwrap()))
+}
+
+#[when("the app rewrites it with a valid time of {valid}")]
+fn rewrites_valid(world: &mut World, valid: String) {
+    let unit = Unit::new("note", "k1", [("text", "words")], month(&valid));
+    world.write(&Write::new("crawler").unit(unit));
+}
+
+#[then("the node's first true is {valid}")]
+fn first_true_is(world: &mut World, valid: String) {
+    assert_eq!(seen(world).first_true, month(&valid));
+}
+
+#[given("the events of a graph in which a node was heard at 2025-06 and then at 2024-03")]
+fn events_june_then_march(world: &mut World) {
+    writes_later_then_earlier(world);
+    world.log = world.all_events();
+}
+
+#[then(
+    "the first graph's first recorded is the 2025-06 hearing and the new graph's first recorded is the 2024-03 hearing"
+)]
+fn first_recorded_per_store(world: &mut World) {
+    assert_eq!(seen(world).first_recorded.point, on(2025, 6, 1));
+    let rebuilt = world.rebuilt.as_ref().expect("the graph was rebuilt");
+    let node = NodeRef::new("visit", "k1");
+    let first = rebuilt.seen(&node).unwrap().unwrap().first_recorded;
+    assert_eq!(first.point, on(2024, 3, 1));
 }
 
 scenarios!("tests", fixtures = [world: World]);

@@ -8,10 +8,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::events::{Change, EventId, Fact, naming_key};
-use crate::open::{
-    Graph, Ontology, Relation, Value, class_table, concat, property_column, read_properties,
-    relation_table,
-};
+use crate::history::node_at;
+use crate::open::{Graph, Ontology, Relation, Value, class_table, property_column, relation_table};
 use crate::write::{Date, Error, ValidTime, node_id};
 
 /// A node named by its class and natural key.
@@ -212,46 +210,31 @@ fn find_in(
     key: &str,
 ) -> Result<Option<Node>, Error> {
     let class = ontology.class(class)?;
-    let sql = format!(
-        "SELECT source, valid, recorded{} FROM {} WHERE key = ?1",
-        concat(class.properties.keys(), |p| format!(
-            ", {}",
-            property_column(p)
-        )),
-        class_table(&class.name)
-    );
-    let Some(mut node) = conn
-        .prepare_cached(&sql)?
-        .query_row(params![key], |row| {
-            Ok(Node {
-                class: class.name.clone(),
-                key: key.to_string(),
-                properties: read_properties(class, row, 3)?,
-                source: row.get(0)?,
-                valid: ValidTime::from_sql(row.get(1)?),
-                recorded: recorded(row.get(2)?),
-                derived_from: Vec::new(),
-            })
-        })
-        .optional()?
-    else {
+    let Some((version, at)) = node_at(conn, class, key, i64::MAX)? else {
         return Ok(None);
     };
     let events: Vec<String> = conn
         .prepare_cached("SELECT event FROM _derived WHERE class = ?1 AND key = ?2 ORDER BY event")?
         .query_map(params![class.name, key], |row| row.get(0))?
         .collect::<Result<_, _>>()?;
-    node.derived_from = events
-        .iter()
-        .map(|event| serde_json::from_value(event.as_str().into()))
-        .collect::<Result<_, _>>()?;
-    Ok(Some(node))
+    Ok(Some(Node {
+        class: class.name.clone(),
+        key: key.to_string(),
+        properties: version.properties,
+        source: version.source,
+        valid: version.valid,
+        recorded: recorded(at),
+        derived_from: events
+            .iter()
+            .map(|event| serde_json::from_value(event.as_str().into()))
+            .collect::<Result<_, _>>()?,
+    }))
 }
 
 impl Graph {
-    /// The node of `class` with natural key `key`: the version that arrived last. For a class
-    /// with a declared history key that is not necessarily the newest version on that axis,
-    /// until the history requirements land.
+    /// The node of `class` with natural key `key` as it is now: its newest version by its
+    /// class's order (by point, or in an integer-keyed class by integer key and then point),
+    /// ties going to the larger event id, never the version that arrived last.
     ///
     /// # Errors
     /// The class is not declared, or the graph file cannot be read.
