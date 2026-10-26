@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OptionalExtension, ToSql, TransactionBehavior, params};
 
 use crate::events::{Change, Cursor, EventId, Events, Fact, LinkFact, NodeFact};
-use crate::open::{CLASS, Graph, HistoryKey, Ontology, RELATION, Value};
+use crate::open::{CLASS, Graph, HistoryKey, Ontology, RELATION, Value, table};
 use crate::read::NodeRef;
 use crate::write::{Error, Heard, Piece, Stamp, ValidTime};
 
@@ -649,12 +649,7 @@ pub(crate) fn see_all(conn: &mut Connection) -> Result<(), Error> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     // The tables are made in the same transaction as their rows, so a backfill that fails or is
     // cut off leaves no `_seen` behind and runs again; one another open finished first is done.
-    let done: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_seen')",
-        [],
-        |row| row.get(0),
-    )?;
-    if done {
+    if table(&tx, "_seen")? {
         return Ok(());
     }
     tx.execute_batch(HISTORY_TABLES)?;
