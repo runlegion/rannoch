@@ -385,6 +385,15 @@ pub(crate) fn open_keyed(path: impl AsRef<Path>, key: &Key) -> Result<Graph, Err
     Ok(graph)
 }
 
+/// Whether `conn` holds a table named `name`.
+pub(crate) fn table(conn: &Connection, name: &str) -> Result<bool, Error> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        [name],
+        |row| row.get(0),
+    )?)
+}
+
 /// Opens the graph at `path` without a key, to be read only.
 pub(crate) fn open_file(path: impl AsRef<Path>) -> Result<Graph, Error> {
     let mut conn = Connection::open(path)?;
@@ -394,19 +403,11 @@ pub(crate) fn open_file(path: impl AsRef<Path>) -> Result<Graph, Error> {
     )?;
     conn.set_prepared_statement_cache_capacity(256);
     conn.execute_batch(OWN_TABLES)?;
-    let table = |name: &str| -> Result<bool, Error> {
-        Ok(conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
-            [name],
-            |row| row.get(0),
-        )?)
-    };
     // A store whose hearings were written before what is seen of them was kept.
-    let unseen = table("_hearings")? && !table("_seen")?;
-    conn.execute_batch(HISTORY_TABLES)?;
-    if unseen {
+    if table(&conn, "_hearings")? && !table(&conn, "_seen")? {
         see_all(&mut conn)?;
     }
+    conn.execute_batch(HISTORY_TABLES)?;
     let schema_version = schema_version(&conn)?;
     let ontology = Ontology::load(&conn)?;
     let fresh = RefCell::new(Fresh {
