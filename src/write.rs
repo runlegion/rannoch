@@ -1060,7 +1060,9 @@ impl Graph {
     /// Ends the link of `relation` from the node keyed `from` to the node keyed `to` at the
     /// point `at`, from `source`, as one event: the ending is a new fact with its own point and
     /// the valid time `valid` when the link stopped holding in the world, which may be unknown,
-    /// and the link keeps every hearing. A later ending or correction of the link replaces it.
+    /// and the link keeps every hearing and every ending. The link has ended at the earliest
+    /// ending after its last live hearing, by point and then event id: a live hearing at a later
+    /// point reopens it, and a correction that arrives later masks its endings.
     ///
     /// # Errors
     /// The relation is not declared; [`Error::Refused`] when the graph holds no hearing of the

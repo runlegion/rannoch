@@ -11,7 +11,7 @@ use rusqlite::{Connection, ToSql};
 use serde::{Deserialize, Serialize};
 
 use crate::events::{Events, OWN_TABLES};
-use crate::history::{HISTORY_TABLES, Key, take};
+use crate::history::{HISTORY_TABLES, Key, see_all, take};
 use crate::write::Error;
 
 /// A class: a kind of node, with its natural key, its properties and each one's value type,
@@ -387,14 +387,26 @@ pub(crate) fn open_keyed(path: impl AsRef<Path>, key: &Key) -> Result<Graph, Err
 
 /// Opens the graph at `path` without a key, to be read only.
 pub(crate) fn open_file(path: impl AsRef<Path>) -> Result<Graph, Error> {
-    let conn = Connection::open(path)?;
+    let mut conn = Connection::open(path)?;
     conn.busy_handler(Some(retry_lock))?;
     conn.execute_batch(
         "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;",
     )?;
     conn.set_prepared_statement_cache_capacity(256);
     conn.execute_batch(OWN_TABLES)?;
+    let table = |name: &str| -> Result<bool, Error> {
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            [name],
+            |row| row.get(0),
+        )?)
+    };
+    // A store whose hearings were written before what is seen of them was kept.
+    let unseen = table("_hearings")? && !table("_seen")?;
     conn.execute_batch(HISTORY_TABLES)?;
+    if unseen {
+        see_all(&mut conn)?;
+    }
     let schema_version = schema_version(&conn)?;
     let ontology = Ontology::load(&conn)?;
     let fresh = RefCell::new(Fresh {

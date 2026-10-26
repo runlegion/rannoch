@@ -2,8 +2,9 @@
 //! hearing's identity is its content, hashed under the app's key: identical content is one
 //! hearing, and an identical event that arrives from another store under its own id is held as an
 //! alias of it. The key never reaches the store's files; the store keeps only a check value.
-//! A link that ends records its ending, at its own point, beside its hearings; a link found
-//! wrong records a correction, which is not an ending.
+//! A link that ends records its ending, at its own point, beside its hearings, and a live
+//! hearing at a later point reopens it; a link found wrong records a correction, which is not an
+//! ending. When each node and link was first and last heard is kept as it is recorded.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -18,9 +19,10 @@ use crate::write::{Error, Heard, Piece, Stamp, ValidTime};
 
 /// The hearings, one version row each, with no valid-to: `arrived` counts up as this store
 /// records them, `integer` is set only in an integer-keyed class, and `properties` holds a
-/// node's. Then the other ids each arrived under, how each link that ended or was found wrong
-/// came to that (`point` and `valid` are the ending's, `point` null for a correction and
-/// `valid` null when unknown), and the check value of the graph's key.
+/// node's. Then the other ids each arrived under; the latest conclusion to arrive for each link
+/// that ended or was found wrong (`point` null for a correction, which masks its endings); every
+/// ending of a link, at its point (`valid` null when unknown); what is kept of when each node and
+/// link was seen (see [`saw`]); and the check value of the graph's key.
 pub(crate) const HISTORY_TABLES: &str = "
     CREATE TABLE IF NOT EXISTS _hearings(
         arrived INTEGER PRIMARY KEY, identity BLOB NOT NULL UNIQUE, entity TEXT NOT NULL,
@@ -35,6 +37,15 @@ pub(crate) const HISTORY_TABLES: &str = "
         entity TEXT NOT NULL, key TEXT NOT NULL, to_key TEXT NOT NULL, event TEXT NOT NULL,
         source TEXT NOT NULL, point INTEGER, valid TEXT,
         PRIMARY KEY(entity, key, to_key)) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS _endings(
+        id INTEGER PRIMARY KEY, entity TEXT NOT NULL, key TEXT NOT NULL, to_key TEXT NOT NULL,
+        point INTEGER NOT NULL, event TEXT NOT NULL, source TEXT NOT NULL, valid TEXT,
+        UNIQUE(entity, key, to_key, point, event));
+    CREATE TABLE IF NOT EXISTS _seen(
+        entity TEXT NOT NULL, key TEXT NOT NULL, to_key TEXT NOT NULL,
+        first_hearing INTEGER, first_ending INTEGER, last_hearing INTEGER, last_ending INTEGER,
+        recorded_hearing INTEGER, recorded_ending INTEGER, first_true TEXT,
+        count INTEGER NOT NULL, PRIMARY KEY(entity, key, to_key)) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS _check(value TEXT NOT NULL);";
 
 /// The fixed label whose keyed hash is the check value.
@@ -181,6 +192,12 @@ pub(crate) fn hear(
         Of::Node(node) => Some(serde_json::to_string(&node.properties)?),
         Of::Link(_) => None,
     };
+    let integer = if by_integer(ontology, of)? {
+        of.integer()
+    } else {
+        None
+    };
+    let point = of.time().unwrap_or(stamp.id.millis());
     tx.prepare_cached(
         "INSERT INTO _hearings(identity, entity, key, to_key, event, seq, source, valid, point, \
          integer, recorded, properties) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
@@ -194,16 +211,196 @@ pub(crate) fn hear(
         stamp.cursor.0,
         source,
         of.valid().to_sql(),
-        of.time().unwrap_or(stamp.id.millis()),
-        if by_integer(ontology, of)? {
-            of.integer()
-        } else {
-            None
-        },
+        point,
+        integer,
         stamp.recorded,
         properties
     ])?;
+    let mark = Mark {
+        hearing: Some(tx.last_insert_rowid()),
+        ending: None,
+        integer,
+        point,
+        event: stamp.id.to_string(),
+    };
+    saw(tx, (&entity, from, to), &mark, of.valid().to_sql())?;
     Ok(None)
+}
+
+/// A fact a kept seen row names, by its row: a hearing by when this store recorded it, or an
+/// ending by its id; with what orders it among the others.
+struct Mark {
+    hearing: Option<i64>,
+    ending: Option<i64>,
+    integer: Option<i64>,
+    point: i64,
+    event: String,
+}
+
+impl Mark {
+    /// Its place in its class's order (see [`order`]): no integer key orders first, as SQL's
+    /// NULL does.
+    fn rank(&self) -> (Option<i64>, i64, &str) {
+        (self.integer, self.point, &self.event)
+    }
+
+    fn row(row: &rusqlite::Row, at: usize) -> rusqlite::Result<Mark> {
+        Ok(Mark {
+            hearing: row.get(at)?,
+            ending: row.get(at + 1)?,
+            integer: row.get(at + 2)?,
+            point: row.get(at + 3)?,
+            event: row.get(at + 4)?,
+        })
+    }
+}
+
+/// Keeps what is seen of `of` (entity, key, target key) up to date with `mark`, a new hearing or
+/// ending of it with the valid time `valid`, in the transaction that records it: the first and
+/// last of its facts by its class's order, the first this store recorded, the earliest valid
+/// time it was given (a month standing for its first day) and how many facts it has. A link's
+/// endings count among its facts, as its versions do.
+fn saw(
+    tx: &Connection,
+    (entity, key, to): (&str, &str, Option<&str>),
+    mark: &Mark,
+    valid: Option<&str>,
+) -> Result<(), Error> {
+    let to = to.unwrap_or_default();
+    let kept = tx
+        .prepare_cached(
+            "SELECT s.first_hearing, s.first_ending, fh.integer, coalesce(fh.point, fe.point), \
+             coalesce(fh.event, fe.event), s.last_hearing, s.last_ending, lh.integer, \
+             coalesce(lh.point, le.point), coalesce(lh.event, le.event) FROM _seen s \
+             LEFT JOIN _hearings fh ON fh.arrived = s.first_hearing \
+             LEFT JOIN _endings fe ON fe.id = s.first_ending \
+             LEFT JOIN _hearings lh ON lh.arrived = s.last_hearing \
+             LEFT JOIN _endings le ON le.id = s.last_ending \
+             WHERE s.entity = ?1 AND s.key = ?2 AND s.to_key = ?3",
+        )?
+        .query_row(params![entity, key, to], |row| {
+            Ok((Mark::row(row, 0)?, Mark::row(row, 5)?))
+        })
+        .optional()?;
+    let Some((first, last)) = kept else {
+        // One fact keeps no row, since it is its own first, last and first recorded; the second
+        // starts the row from the one before it.
+        let other = tx
+            .prepare_cached(
+                "SELECT * FROM (SELECT arrived, NULL, integer, point, event, valid FROM _hearings \
+                 WHERE entity = ?1 AND key = ?2 AND to_key IS nullif(?3, '') \
+                 AND arrived IS NOT ?4 UNION ALL SELECT NULL, id, NULL, point, event, valid \
+                 FROM _endings WHERE entity = ?1 AND key = ?2 AND to_key = ?3 AND id IS NOT ?5) \
+                 LIMIT 1",
+            )?
+            .query_row(params![entity, key, to, mark.hearing, mark.ending], |row| {
+                Ok((Mark::row(row, 0)?, row.get::<_, Option<String>>(5)?))
+            })
+            .optional()?;
+        let Some((other, was)) = other else {
+            return Ok(());
+        };
+        tx.prepare_cached("INSERT INTO _seen VALUES (?1, ?2, ?3, ?4, ?5, ?4, ?5, ?4, ?5, ?6, 1)")?
+            .execute(params![entity, key, to, other.hearing, other.ending, was])?;
+        let (first, last) = if mark.rank() < other.rank() {
+            (mark, &other)
+        } else {
+            (&other, mark)
+        };
+        return keep(tx, (entity, key, to), (first, last), (1, valid));
+    };
+    let first = if mark.rank() < first.rank() {
+        mark
+    } else {
+        &first
+    };
+    let last = if mark.rank() > last.rank() {
+        mark
+    } else {
+        &last
+    };
+    keep(tx, (entity, key, to), (first, last), (1, valid))
+}
+
+/// Keeps `first` and `last` as the first and last facts of `of` (its target key `''` for a
+/// node), adds `added` facts to its count and takes `valid` as its first true when earlier.
+fn keep(
+    tx: &Connection,
+    (entity, key, to): (&str, &str, &str),
+    (first, last): (&Mark, &Mark),
+    (added, valid): (i64, Option<&str>),
+) -> Result<(), Error> {
+    let earlier = format!("{} < {}", valid_day("?9"), valid_day("first_true"));
+    tx.prepare_cached(&format!(
+        "UPDATE _seen SET first_hearing = ?4, first_ending = ?5, last_hearing = ?6, \
+         last_ending = ?7, count = count + ?8, first_true = CASE WHEN ?9 IS NOT NULL \
+         AND (first_true IS NULL OR {earlier}) THEN ?9 ELSE first_true END \
+         WHERE entity = ?1 AND key = ?2 AND to_key = ?3"
+    ))?
+    .execute(params![
+        entity,
+        key,
+        to,
+        first.hearing,
+        first.ending,
+        last.hearing,
+        last.ending,
+        added,
+        valid
+    ])?;
+    Ok(())
+}
+
+/// Finds the first and last facts of the node or link the hearing `identity` is of again, by
+/// index seeks, after that hearing took another event's id and maybe another point.
+fn reseen(tx: &Connection, identity: [u8; 32]) -> Result<(), Error> {
+    let (entity, key, to): (String, String, Option<String>) = tx
+        .prepare_cached("SELECT entity, key, to_key FROM _hearings WHERE identity = ?1")?
+        .query_row(params![identity], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+    if let Some((first, last)) = edges(tx, (&entity, &key, to.as_deref()))? {
+        let of = (
+            entity.as_str(),
+            key.as_str(),
+            to.as_deref().unwrap_or_default(),
+        );
+        keep(tx, of, (&first, &last), (0, None))?;
+    }
+    Ok(())
+}
+
+/// The first and last facts of `of` (entity, key, target key), hearings and endings, by index
+/// seeks; `None` when it has none.
+fn edges(
+    tx: &Connection,
+    (entity, key, to): (&str, &str, Option<&str>),
+) -> Result<Option<(Mark, Mark)>, Error> {
+    let edge = |direction: &str| -> Result<Option<Mark>, Error> {
+        let hearing = tx
+            .prepare_cached(&format!(
+                "SELECT arrived, NULL, integer, point, event FROM _hearings \
+                 WHERE entity = ?1 AND key = ?2 AND to_key IS ?3 ORDER BY {} LIMIT 1",
+                order(direction)
+            ))?
+            .query_row(params![entity, key, to], |row| Mark::row(row, 0))
+            .optional()?;
+        let ending = tx
+            .prepare_cached(&format!(
+                "SELECT NULL, id, NULL, point, event FROM _endings \
+                 WHERE entity = ?1 AND key = ?2 AND to_key = ?3 \
+                 ORDER BY point {direction}, event {direction} LIMIT 1"
+            ))?
+            .query_row(params![entity, key, to], |row| Mark::row(row, 0))
+            .optional()?;
+        let later = direction == "DESC";
+        Ok(match (hearing, ending) {
+            (Some(h), Some(e)) if (e.rank() > h.rank()) == later => Some(e),
+            (Some(h), _) => Some(h),
+            (None, e) => e,
+        })
+    };
+    Ok(edge("ASC")?.zip(edge("DESC")?))
 }
 
 /// The current version of the node or link `of` (entity, key, target key): the newest by its
@@ -243,6 +440,7 @@ pub(crate) fn alias(
             cursor.0,
             held.time.unwrap_or(event.millis())
         ])?;
+        reseen(tx, held.identity)?;
     }
     let alias = if renamed { held.event } else { event };
     tx.prepare_cached("INSERT OR IGNORE INTO _aliases(identity, alias) VALUES (?1, ?2)")?
@@ -250,7 +448,8 @@ pub(crate) fn alias(
     Ok(renamed)
 }
 
-/// Drops the hearings of `node`, which left live state, and of `links`, which left with it.
+/// Drops the hearings of `node`, which left live state, and of `links`, which left with it, with
+/// the links' endings and what was seen of each.
 pub(crate) fn unhear(tx: &Connection, node: &NodeRef, links: &[LinkFact]) -> Result<(), Error> {
     let drop = |entity: String, key: &str, to: Option<&str>| -> Result<(), Error> {
         let of = "SELECT identity FROM _hearings WHERE entity = ?1 AND key = ?2 AND to_key IS ?3";
@@ -258,13 +457,19 @@ pub(crate) fn unhear(tx: &Connection, node: &NodeRef, links: &[LinkFact]) -> Res
             .execute(params![entity, key, to])?;
         tx.prepare_cached("DELETE FROM _hearings WHERE entity = ?1 AND key = ?2 AND to_key IS ?3")?
             .execute(params![entity, key, to])?;
+        tx.prepare_cached("DELETE FROM _seen WHERE entity = ?1 AND key = ?2 AND to_key = ?3")?
+            .execute(params![entity, key, to.unwrap_or_default()])?;
         Ok(())
     };
     drop(node_entity(&node.class), &node.key, None)?;
     for link in links {
         let entity = link_entity(&link.relation);
-        tx.prepare_cached("DELETE FROM _ends WHERE entity = ?1 AND key = ?2 AND to_key = ?3")?
+        for table in ["_ends", "_endings"] {
+            tx.prepare_cached(&format!(
+                "DELETE FROM {table} WHERE entity = ?1 AND key = ?2 AND to_key = ?3"
+            ))?
             .execute(params![entity, link.from.key, link.to.key])?;
+        }
         drop(entity, &link.from.key, Some(&link.to.key))?;
     }
     Ok(())
@@ -288,8 +493,9 @@ pub(crate) fn link_heard(
 
 /// Records how a link came to an end, when `change` is an ending (at its point, with its valid
 /// time) or a correction (with neither), as the event `event`; any other change records
-/// nothing. The latest replaces any before it. Ending, correcting and replaying either record
-/// through here.
+/// nothing. Every ending is kept, and counts as a fact of the link; the latest conclusion to
+/// arrive replaces any before it, so a correction that came last masks the endings. Ending,
+/// correcting and replaying either record through here.
 pub(crate) fn conclude(tx: &Connection, event: EventId, change: &Change) -> Result<(), Error> {
     let (source, relation, from, to, at, valid) = match change {
         Change::Ended {
@@ -323,6 +529,33 @@ pub(crate) fn conclude(tx: &Connection, event: EventId, change: &Change) -> Resu
         at,
         valid
     ])?;
+    if let Some(at) = at {
+        let entity = link_entity(relation);
+        let new = tx
+            .prepare_cached(
+                "INSERT OR IGNORE INTO _endings(entity, key, to_key, point, event, source, valid) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?
+            .execute(params![
+                entity,
+                from.key,
+                to.key,
+                at,
+                event.to_string(),
+                source,
+                valid
+            ])?;
+        if new == 1 {
+            let mark = Mark {
+                hearing: None,
+                ending: Some(tx.last_insert_rowid()),
+                integer: None,
+                point: at,
+                event: event.to_string(),
+            };
+            saw(tx, (&entity, &from.key, Some(&to.key)), &mark, valid)?;
+        }
+    }
     Ok(())
 }
 
@@ -385,6 +618,58 @@ pub(crate) fn take(conn: &mut Connection, key: &Key) -> Result<(), Error> {
     Ok(())
 }
 
+/// Keeps every ending and what is seen of each node and link of a store whose hearings were
+/// written before they were kept: its endings from each link's latest one, and a seen row for
+/// each node and link with more than one fact.
+pub(crate) fn see_all(conn: &mut Connection) -> Result<(), Error> {
+    /// A node or link to see: its entity, key and target key.
+    type Of = (String, String, Option<String>);
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    tx.execute(
+        "INSERT OR IGNORE INTO _endings(entity, key, to_key, point, event, source, valid) \
+         SELECT entity, key, to_key, point, event, source, valid FROM _ends \
+         WHERE point IS NOT NULL",
+        [],
+    )?;
+    let many: Vec<Of> = tx
+        .prepare(
+            "SELECT entity, key, to_key FROM (SELECT entity, key, to_key FROM _hearings \
+             UNION ALL SELECT entity, key, to_key FROM _endings) \
+             GROUP BY entity, key, to_key HAVING count(*) > 1",
+        )?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<Result<_, _>>()?;
+    let day = valid_day("valid");
+    for (entity, key, to) in many {
+        let Some((first, last)) = edges(&tx, (&entity, &key, to.as_deref()))? else {
+            continue;
+        };
+        tx.prepare_cached(&format!(
+            "INSERT INTO _seen SELECT ?1, ?2, coalesce(?3, ''), ?4, ?5, ?6, ?7, \
+             (SELECT min(arrived) FROM _hearings WHERE entity = ?1 AND key = ?2 AND to_key IS ?3), \
+             (SELECT min(id) FROM _endings WHERE entity = ?1 AND key = ?2 AND to_key = ?3 \
+             AND NOT EXISTS (SELECT 1 FROM _hearings WHERE entity = ?1 AND key = ?2 \
+             AND to_key IS ?3)), (SELECT valid FROM (SELECT valid FROM _hearings \
+             WHERE entity = ?1 AND key = ?2 AND to_key IS ?3 UNION ALL SELECT valid \
+             FROM _endings WHERE entity = ?1 AND key = ?2 AND to_key = ?3) \
+             WHERE valid IS NOT NULL ORDER BY {day} LIMIT 1), \
+             (SELECT count(*) FROM _hearings WHERE entity = ?1 AND key = ?2 AND to_key IS ?3) \
+             + (SELECT count(*) FROM _endings WHERE entity = ?1 AND key = ?2 AND to_key = ?3)"
+        ))?
+        .execute(params![
+            entity,
+            key,
+            to,
+            first.hearing,
+            first.ending,
+            last.hearing,
+            last.ending
+        ])?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 /// Milliseconds since the Unix epoch, negative before it.
 pub(crate) fn millis(time: SystemTime) -> i64 {
     let ms = |d: Duration| i64::try_from(d.as_millis()).unwrap_or(i64::MAX);
@@ -442,35 +727,46 @@ pub enum End {
 
 impl Graph {
     /// How the link of `relation` from the node keyed `from` to the node keyed `to` came to an
-    /// end, or `None` while it has neither ended nor been found wrong. Its hearings stay in
-    /// [`Graph::link_hearings`] either way.
+    /// end: found wrong, when a correction is its latest conclusion to arrive; else its ending,
+    /// the earliest after its last live hearing by point and then event id; `None` while it has
+    /// neither ended nor been found wrong, and once heard live after its endings. Its hearings
+    /// stay in [`Graph::link_hearings`] either way.
     ///
     /// # Errors
     /// The relation is not declared, or the graph file cannot be read.
     pub fn link_end(&self, relation: &str, from: &str, to: &str) -> Result<Option<End>, Error> {
         let relation = self.current_ontology()?.relation(relation)?.name.clone();
-        let row: Option<(String, String, Option<i64>, Option<String>)> = self
+        let link = params![link_entity(&relation), from, to];
+        let corrected: Option<(String, String)> = self
             .conn
             .prepare_cached(
-                "SELECT event, source, point, valid FROM _ends \
-                 WHERE entity = ?1 AND key = ?2 AND to_key = ?3",
+                "SELECT event, source FROM _ends \
+                 WHERE entity = ?1 AND key = ?2 AND to_key = ?3 AND point IS NULL",
             )?
-            .query_row(params![link_entity(&relation), from, to], |row| {
+            .query_row(link, |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()?;
+        if let Some((event, source)) = corrected {
+            let event = serde_json::from_value(event.into())?;
+            return Ok(Some(End::Corrected { source, event }));
+        }
+        let (ending, _) = ending_sql("e", ("?1", "?2", "?3"), None, "NULL");
+        let row: Option<(String, String, i64, Option<String>)> = self
+            .conn
+            .prepare_cached(&format!(
+                "SELECT event, source, point, valid FROM _endings e WHERE {ending}"
+            ))?
+            .query_row(link, |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
             })
             .optional()?;
         let Some((event, source, at, valid)) = row else {
             return Ok(None);
         };
-        let event = serde_json::from_value(event.into())?;
-        Ok(Some(match at {
-            Some(at) => End::Ended {
-                at: time(at),
-                valid: ValidTime::from_sql(valid),
-                source,
-                event,
-            },
-            None => End::Corrected { source, event },
+        Ok(Some(End::Ended {
+            at: time(at),
+            valid: ValidTime::from_sql(valid),
+            source,
+            event: serde_json::from_value(event.into())?,
         }))
     }
 
@@ -573,12 +869,14 @@ pub struct Version {
     pub integer: Option<i64>,
     /// A node's properties as that version holds them; a link has none.
     pub properties: BTreeMap<String, Value>,
-    /// Whether a link had ended by the point read; a node never has.
+    /// Whether a link had ended by the point read, or, as [`Seen`] names a link's fact, whether
+    /// that fact is one of its endings; a node never has.
     pub ended: bool,
 }
 
-/// When a node was heard: its first and last versions on its class's axis, the one this store
-/// recorded first, and the earliest valid time it has been given.
+/// When a node or a link was heard: its first and last facts on its class's axis, the one this
+/// store recorded first, the earliest valid time it has been given and how many facts it has. A
+/// link's endings are among its facts, each named as a version with `ended` set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Seen {
     pub first_heard: Version,
@@ -586,6 +884,12 @@ pub struct Seen {
     /// Per store: another store given the same events in another order may name another.
     pub first_recorded: Version,
     pub first_true: ValidTime,
+    /// Its hearings, and a link's endings with them.
+    pub count: u64,
+    /// When a link ended: the point of its earliest ending after its last live hearing, by
+    /// point and then event id; `None` for a node, and for a link that has not ended, was found
+    /// wrong or was heard live after its endings.
+    pub ended: Option<SystemTime>,
 }
 
 /// The order versions are chosen by, `DESC` putting the newest first: by integer key (only an
@@ -648,16 +952,34 @@ fn version_row(
     let Some((event, source, valid, point, integer, properties, recorded, identity)) = row else {
         return Ok(None);
     };
-    let version = Version {
+    let version = version_of((event, source, valid, point, integer, properties), false)?;
+    Ok(Some((version, recorded, identity)))
+}
+
+/// A version's columns as a row holds them: event, source, valid, point, integer key, properties.
+type VersionColumns = (
+    String,
+    String,
+    Option<String>,
+    i64,
+    Option<i64>,
+    Option<String>,
+);
+
+/// The version a row's [`VersionColumns`] name, `ended` when it is an ending.
+fn version_of(
+    (event, source, valid, point, integer, properties): VersionColumns,
+    ended: bool,
+) -> Result<Version, Error> {
+    Ok(Version {
         event: serde_json::from_value(event.into())?,
         source,
         valid: ValidTime::from_sql(valid),
         point: time(point),
         integer,
         properties: decode(properties.as_deref())?,
-        ended: false,
-    };
-    Ok(Some((version, recorded, identity)))
+        ended,
+    })
 }
 
 /// The version of the node keyed `key` in `class` that holds at `at` (a point, or an integer key
@@ -761,14 +1083,103 @@ pub(crate) fn link_as_of(
     Ok(Some(version))
 }
 
-/// The SQL deciding an ending, the `_ends` row `e`: that it is an ending (not a correction) heard
-/// by the point `known` when given, and that its valid time is on or before `day`, NULL unknown.
-pub(crate) fn ending_sql(e: &str, known: Option<&str>, day: &str) -> (String, String) {
-    let bound = known.map_or(String::new(), |known| format!(" AND {e}.point <= {known}"));
+/// The SQL deciding a link's ending, the `_endings` row `e`, of the link `(entity, from, to)` (SQL
+/// expressions): that it is the link's ending by the point `known` when given, and that its
+/// valid time is on or before `day`, NULL unknown. Its ending by then is the earliest ending,
+/// by point and then event id, after its last live hearing by then; there is none once a live
+/// hearing comes after every ending, or while a correction is its latest conclusion. Only the
+/// endings after that hearing are read, never its history.
+pub(crate) fn ending_sql(
+    e: &str,
+    (entity, from, to): (&str, &str, &str),
+    known: Option<&str>,
+    day: &str,
+) -> (String, String) {
+    let link =
+        |t: &str| format!("{t}.entity = {entity} AND {t}.key = {from} AND {t}.to_key = {to}");
+    let by = |t: &str| known.map_or(String::new(), |known| format!(" AND {t}.point <= {known}"));
+    // The last live hearing's point and event, or below every ending when there is none.
+    let live = |column: &str, none: &str| {
+        format!(
+            "coalesce((SELECT h.{column} FROM _hearings h WHERE {} AND h.integer IS NULL{} \
+             ORDER BY h.point DESC, h.event DESC LIMIT 1), {none})",
+            link("h"),
+            by("h")
+        )
+    };
+    let after = live("point", &i64::MIN.to_string());
     (
-        format!("{e}.point IS NOT NULL{bound}"),
+        format!(
+            "{e}.id = (SELECT x.id FROM _endings x \
+             WHERE {link_x}{by_x} AND x.point >= {after} AND (x.point, x.event) > ({after}, {}) \
+             ORDER BY x.point, x.event LIMIT 1) \
+             AND NOT EXISTS (SELECT 1 FROM _ends c WHERE {link_c} AND c.point IS NULL)",
+            live("event", "''"),
+            link_x = link("x"),
+            by_x = by("x"),
+            link_c = link("c"),
+        ),
         format!("{} <= {day}", valid_day(&format!("{e}.valid"))),
     )
+}
+
+/// The one read of what is seen of `?1`, `?2`, `?3` (its target key `''` for a node): its kept
+/// row, with the facts it names, each a hearing joined by when it arrived or an ending by its
+/// id; or, for a node or link with one fact, which keeps no row, that fact. Then when a link
+/// ended: count, first true, when it ended, then first heard, last heard and first recorded as
+/// event, source, valid time, point, integer key, properties and whether an ending.
+fn seen_sql() -> String {
+    let fact = |p: &str| {
+        format!(
+            "coalesce({p}h.event, {p}e.event), coalesce({p}h.source, {p}e.source), \
+             CASE WHEN {p}h.arrived IS NULL THEN {p}e.valid ELSE {p}h.valid END, \
+             coalesce({p}h.point, {p}e.point), {p}h.integer, {p}h.properties, \
+             {p}h.arrived IS NULL"
+        )
+    };
+    let join = |p: &str, column: &str| {
+        format!(
+            "LEFT JOIN _hearings {p}h ON {p}h.arrived = s.{column}_hearing \
+             LEFT JOIN _endings {p}e ON {p}e.id = s.{column}_ending"
+        )
+    };
+    let (ending, _) = ending_sql("n", ("?1", "?2", "?3"), None, "NULL");
+    // A node or link with one fact, a hearing or an ending, keeps no row: that fact is read.
+    let one = |fact: &str, from: &str, to: &str| {
+        format!(
+            "UNION ALL SELECT 1, valid, (SELECT n.point FROM _endings n WHERE {ending}), \
+             {fact}, {fact}, {fact} FROM {from} WHERE entity = ?1 AND key = ?2 AND {to} \
+             AND NOT EXISTS (SELECT 1 FROM _seen WHERE entity = ?1 AND key = ?2 AND to_key = ?3)"
+        )
+    };
+    format!(
+        "SELECT s.count, s.first_true, (SELECT n.point FROM _endings n WHERE {ending}), \
+         {}, {}, {} FROM _seen s {} {} {} WHERE s.entity = ?1 AND s.key = ?2 AND s.to_key = ?3 \
+         {} {} LIMIT 1",
+        fact("f"),
+        fact("l"),
+        fact("r"),
+        join("f", "first"),
+        join("l", "last"),
+        join("r", "recorded"),
+        one(
+            "event, source, valid, point, integer, properties, 0",
+            "_hearings",
+            "to_key IS nullif(?3, '')"
+        ),
+        one(
+            "event, source, valid, point, NULL, NULL, 1",
+            "_endings",
+            "to_key = ?3"
+        ),
+    )
+}
+
+/// Whether the link `?1`, `?2`, `?3` had ended by the point `?4`, and as of the valid time `?5`
+/// when given (NULL when its ending's valid time is unknown); no row when it had not ended.
+fn ended_sql() -> String {
+    let (ending, valid_by) = ending_sql("e", ("?1", "?2", "?3"), Some("?4"), "?5");
+    format!("SELECT ?5 IS NULL OR {valid_by} FROM _endings e WHERE {ending}")
 }
 
 /// Whether the link of `relation` from `from` to `to` had ended by the point `known` and, as of
@@ -780,13 +1191,8 @@ fn ended(
     known: i64,
     day: Option<&str>,
 ) -> Result<bool, Error> {
-    let (heard, valid_by) = ending_sql("e", Some("?4"), "?5");
-    let sql = format!(
-        "SELECT ?5 IS NULL OR {valid_by} FROM _ends e \
-         WHERE e.entity = ?1 AND e.key = ?2 AND e.to_key = ?3 AND {heard}"
-    );
     let ending: Option<Option<bool>> = conn
-        .prepare_cached(&sql)?
+        .prepare_cached(&ended_sql())?
         .query_row(
             params![link_entity(relation), from, to, known, day],
             |row| row.get(0),
@@ -860,41 +1266,67 @@ impl Graph {
     }
 
     /// When `node` was heard: its first and last versions on its class's axis, the version this
-    /// store recorded first, and the earliest valid time any of its versions was given (a month
-    /// standing for its first day). `None` when it has no version.
+    /// store recorded first, the earliest valid time any of its versions was given (a month
+    /// standing for its first day) and how many it has, read as one kept row. `None` when it
+    /// has no version.
     ///
     /// # Errors
     /// The class is not declared, or the graph file cannot be read.
     pub fn seen(&self, node: &NodeRef) -> Result<Option<Seen>, Error> {
-        let ontology = self.current_ontology()?;
-        let class = ontology.class(&node.class)?;
-        let entity = node_entity(&class.name);
-        let of = (entity.as_str(), node.key.as_str(), None);
-        let read = |tail: &str| version_row(&self.conn, of, tail, &[]);
-        let (Some((first_heard, ..)), Some((last_heard, ..)), Some((first_recorded, ..))) = (
-            read(&format!("ORDER BY {} LIMIT 1", order("ASC")))?,
-            newest(&self.conn, of)?,
-            read(
-                "AND arrived = (SELECT min(arrived) FROM _hearings \
-                 WHERE entity = ?1 AND key = ?2 AND to_key IS ?3)",
-            )?,
-        ) else {
+        let class = self.current_ontology()?.class(&node.class)?.name.clone();
+        self.seen_of((&node_entity(&class), &node.key, ""))
+    }
+
+    /// When the link of `relation` from the node keyed `from` to the node keyed `to` was heard,
+    /// as [`Graph::seen`] reads a node, its endings among its facts, and when it ended, in the
+    /// same one read. `None` when it has neither a hearing nor an ending.
+    ///
+    /// # Errors
+    /// The relation is not declared, or the graph file cannot be read.
+    pub fn link_seen(&self, relation: &str, from: &str, to: &str) -> Result<Option<Seen>, Error> {
+        let relation = self.current_ontology()?.relation(relation)?.name.clone();
+        self.seen_of((&link_entity(&relation), from, to))
+    }
+
+    /// The kept seen row of `of` (its target key `''` for a node), with the facts it names: each
+    /// a hearing joined by when it arrived, or an ending by its key.
+    fn seen_of(&self, of: (&str, &str, &str)) -> Result<Option<Seen>, Error> {
+        let sql = seen_sql();
+        let version = |row: &rusqlite::Row, at: usize| -> rusqlite::Result<_> {
+            let columns: VersionColumns = (
+                row.get(at)?,
+                row.get(at + 1)?,
+                row.get(at + 2)?,
+                row.get(at + 3)?,
+                row.get(at + 4)?,
+                row.get(at + 5)?,
+            );
+            Ok((columns, row.get::<_, bool>(at + 6)?))
+        };
+        let row = self
+            .conn
+            .prepare_cached(&sql)?
+            .query_row(params![of.0, of.1, of.2], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    [version(row, 3)?, version(row, 10)?, version(row, 17)?],
+                ))
+            })
+            .optional()?;
+        let Some((count, first_true, ended, facts)) = row else {
             return Ok(None);
         };
-        let first_true = self
-            .conn
-            .prepare_cached(&format!(
-                "SELECT valid FROM _hearings WHERE entity = ?1 AND key = ?2 AND to_key IS NULL \
-                 AND valid IS NOT NULL ORDER BY {} LIMIT 1",
-                valid_day("valid")
-            ))?
-            .query_row(params![of.0, of.1], |row| row.get(0))
-            .optional()?;
+        let [first_heard, last_heard, first_recorded] =
+            facts.map(|(columns, ended)| version_of(columns, ended));
         Ok(Some(Seen {
-            first_heard,
-            last_heard,
-            first_recorded,
+            first_heard: first_heard?,
+            last_heard: last_heard?,
+            first_recorded: first_recorded?,
             first_true: ValidTime::from_sql(first_true),
+            count: u64::try_from(count).unwrap_or(0),
+            ended: ended.map(time),
         }))
     }
 }
@@ -925,7 +1357,7 @@ mod tests {
                 .unit(voice("v2").link("knows", "v2", "v1", when.clone()))
                 .unit(voice("v3").link("knows", "v3", "v1", when.clone())),
         )?;
-        let at = UNIX_EPOCH + Duration::from_millis(1_760_000_000_123);
+        let at = UNIX_EPOCH + Duration::from_millis(4_102_444_800_123);
         let ended = ValidTime::On(Date::day(2025, 6, 1));
         g.end_link("knows", "v2", "v1", at, ended, "moderator")?;
         g.correct_link("knows", "v3", "v1", "moderator")?;
@@ -950,6 +1382,96 @@ mod tests {
             back.link_end("knows", "v3", "v1")?,
             Some(End::Corrected { .. })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn a_store_written_before_seen_was_kept_is_seen_from_its_hearings_and_endings()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("before-seen.rannoch");
+        let when = ValidTime::On(Date::day(2024, 3, 1));
+        let link = ("knows", "v2", "v1");
+        let read = |g: &crate::Graph| -> Result<_, crate::Error> {
+            let node = g.seen(&NodeRef::new("voice", "v2"))?;
+            Ok((
+                node,
+                g.link_seen(link.0, link.1, link.2)?,
+                g.link_end(link.0, link.1, link.2)?,
+            ))
+        };
+        let kept = {
+            let mut g = open(&path, Some(&crate::TEST_KEY))?;
+            g.declare(&Declaration::Class(Class::new("voice", ["name"])))?;
+            g.declare(&Declaration::Relation(Relation::new(
+                "knows", "voice", "voice", false,
+            )))?;
+            let voice = |key: &str, name: &str, valid: ValidTime| {
+                Unit::new("voice", key, [("name", name)], valid)
+            };
+            g.write(
+                &Write::new("swtor")
+                    .unit(voice("v1", "Ana", when.clone()))
+                    .unit(voice("v2", "Bo", when.clone()).link("knows", "v2", "v1", when.clone())),
+            )?;
+            let earlier = ValidTime::On(Date::day(2023, 1, 1));
+            g.write(&Write::new("reddit").unit(voice("v2", "Bob", earlier)))?;
+            let at = UNIX_EPOCH + Duration::from_millis(4_102_444_800_123);
+            g.end_link(link.0, link.1, link.2, at, ValidTime::Unknown, "moderator")?;
+            let kept = read(&g)?;
+            assert_eq!(kept.0.as_ref().map(|s| s.count), Some(2));
+            assert_eq!(
+                kept.1.as_ref().map(|s| (s.count, s.ended)),
+                Some((2, Some(at)))
+            );
+            // As a store written before endings and what is seen were kept.
+            g.conn
+                .execute_batch("DROP TABLE _seen; DROP TABLE _endings;")?;
+            kept
+        };
+        let g = open(&path, Some(&crate::TEST_KEY))?;
+        assert_eq!(read(&g)?, kept);
+        // A snapshot, and a graph rebuilt from it, are seen as the graph is.
+        let snapshot = g.snapshot(g.events().committed()?, dir.path().join("snap.rannoch"))?;
+        let back =
+            snapshot.rebuild(&[], dir.path().join("back.rannoch"), Some(&crate::TEST_KEY))?;
+        assert_eq!(read(&back)?, kept);
+        for fixture in ["store-0.1.1.rannoch", "store-0.2.0.rannoch"] {
+            let copy = dir.path().join(fixture);
+            std::fs::copy(
+                format!("{}/tests/fixtures/{fixture}", env!("CARGO_MANIFEST_DIR")),
+                &copy,
+            )?;
+            let g = open(&copy, Some(&crate::TEST_KEY))?;
+            let seen = g.seen(&NodeRef::new("book", "b1"))?;
+            assert_eq!(seen.map(|s| s.count), Some(1), "{fixture}");
+        }
+        Ok(())
+    }
+
+    /// The read of what is seen and the read of an ending each seek by key: neither scans the
+    /// hearings nor the endings, the endings are sought from after the last live hearing, and
+    /// neither reads the log.
+    #[test]
+    fn the_seen_read_and_the_ending_read_seek_and_never_scan()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let g = open(
+            tempfile::tempdir()?.path().join("plans.rannoch"),
+            Some(&crate::TEST_KEY),
+        )?;
+        for sql in [super::seen_sql(), super::ended_sql()] {
+            let mut explain = g.conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+            let unbound = vec![rusqlite::types::Null; explain.parameter_count()];
+            let plan: Vec<String> = explain
+                .query_map(rusqlite::params_from_iter(unbound), |row| row.get(3))?
+                .collect::<Result<_, _>>()?;
+            println!("{}", plan.join("\n"));
+            assert!(plan.iter().all(|step| !step.contains("SCAN")), "{plan:#?}");
+            // The endings are read from after the last live hearing: the trailing run only.
+            let mut endings = plan.iter().filter(|step| step.starts_with("SEARCH x "));
+            assert!(endings.all(|step| step.contains("point>?")), "{plan:#?}");
+            assert!(!sql.contains("_events"), "{sql}");
+        }
         Ok(())
     }
 

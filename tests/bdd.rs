@@ -593,6 +593,10 @@ struct World {
     key: [u8; 32],
     states: Vec<Option<Version>>,
     as_of_counts: Vec<(Date, Result<Vec<Tally>, Error>)>,
+    /// What one read of when the node or link was seen returned, and whether it read the link.
+    seen: Option<rannoch::Seen>,
+    reads_link: bool,
+    links: Vec<LinkAt>,
 }
 
 #[rstest::fixture]
@@ -649,6 +653,9 @@ fn world() -> World {
         key: KEY,
         states: Vec::new(),
         as_of_counts: Vec::new(),
+        seen: None,
+        reads_link: false,
+        links: Vec::new(),
     }
 }
 
@@ -4922,9 +4929,10 @@ fn link_heard_valid(world: &mut World, when: ValidTime) {
 
 // ---------- FR-RANNOCH-066: a link that ends, and a link found wrong ----------
 
-/// The point the scenarios end a link at, whole milliseconds as the graph keeps points.
+/// The point the scenarios end a link at, whole milliseconds as the graph keeps points: after
+/// every hearing they write, so no live hearing comes after the ending and reopens the link.
 fn ended_at() -> SystemTime {
-    SystemTime::UNIX_EPOCH + Duration::from_millis(1_760_000_000_123)
+    SystemTime::UNIX_EPOCH + Duration::from_millis(4_102_444_800_123)
 }
 
 #[given("a link that has been heard")]
@@ -5954,4 +5962,244 @@ fn known_now_then_at_30(world: &mut World) {
     assert_eq!(world.answers, ["heard at 40", "heard at 10"]);
 }
 
-scenarios!("tests", fixtures = [world: World]);
+// FR-RANNOCH-070, and FR-RANNOCH-066 and FR-RANNOCH-084 on a link heard after its ending: a
+// link's facts, each at its own point, given to a graph as the events that carry them.
+
+/// A fact of the `follows` link from `from` to `a`: a hearing from a source, or an ending with
+/// no valid time, at a point.
+#[derive(Clone, Copy)]
+enum LinkAt {
+    Heard(&'static str, &'static str, u64),
+    Ended(&'static str, u64),
+}
+
+/// Declares `follows` between the time-keyed class's nodes and writes nodes a, b and c, so the
+/// graph's events so far are what every graph built from link facts starts from.
+fn follows_between_visits(world: &mut World) {
+    let follows = Relation::new("follows", "visit", "visit", false);
+    world.g().declare(&Declaration::Relation(follows)).unwrap();
+    let mut write = Write::new("crawler");
+    for key in ["a", "b", "c"] {
+        let text = [("text", key)];
+        write = write.unit(Unit::new("visit", key, text, day(2026, 1, 1)).at(at(1)));
+    }
+    world.g().write(&write).unwrap();
+}
+
+/// A new graph given the world graph's events and then `facts`, each as an event minted at its
+/// point, as the store that recorded it then minted it.
+fn graph_of(world: &mut World, facts: &[LinkAt]) -> Graph {
+    let mut events = world.all_events();
+    let link = |from: &str| (NodeRef::new("visit", from), NodeRef::new("visit", "a"));
+    for fact in facts {
+        let (point, change) = match *fact {
+            LinkAt::Heard(from, source, n) => {
+                let (from, to) = link(from);
+                let valid = day(2026, 1, 1);
+                let fact = LinkFact {
+                    relation: "follows".into(),
+                    from,
+                    to,
+                    valid,
+                };
+                let added = vec![Fact::Link(fact)];
+                let source = source.into();
+                let wrote = Change::Wrote {
+                    source,
+                    added,
+                    wrong_kind: Vec::new(),
+                    check: None,
+                };
+                (at(n), wrote)
+            }
+            LinkAt::Ended(from, n) => {
+                let (from, to) = link(from);
+                let millis = at(n)
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis();
+                let ended = Change::Ended {
+                    source: "moderator".into(),
+                    relation: "follows".into(),
+                    from,
+                    to,
+                    at: i64::try_from(millis).unwrap(),
+                    valid: ValidTime::Unknown,
+                };
+                (at(n), ended)
+            }
+        };
+        let cursor = serde_json::from_value(serde_json::json!(events.len() + 1)).unwrap();
+        events.push(Event {
+            id: id_at(point),
+            cursor,
+            change,
+        });
+    }
+    let path = world
+        .dir
+        .path()
+        .join(format!("links-{}.rannoch", world.graphs.len()));
+    let _ = std::fs::remove_file(&path);
+    rannoch::rebuild(&events, path, Some(&KEY)).unwrap()
+}
+
+#[given("a node that has been heard from more than one source")]
+fn node_heard_from_two_sources(world: &mut World) {
+    declare_kind(world.open(), "time-keyed");
+    for (source, n) in [("crawler", 10), ("mirror", 20)] {
+        let unit = unit_of(world.g(), "k1", source, n);
+        world.write(&Write::new(source).unit(unit));
+    }
+}
+
+#[given("a link that has been heard from more than one source and has ended")]
+fn link_heard_from_two_sources_and_ended(world: &mut World) {
+    declare_kind(world.open(), "time-keyed");
+    follows_between_visits(world);
+    let facts = [
+        LinkAt::Heard("b", "crawler", 10),
+        LinkAt::Heard("b", "mirror", 20),
+        LinkAt::Ended("b", 30),
+    ];
+    world.graph = Some(graph_of(world, &facts));
+    world.reads_link = true;
+}
+
+#[when("the app reads it once")]
+fn reads_it_once(world: &mut World) {
+    let seen = if world.reads_link {
+        world.g().link_seen("follows", "b", "a")
+    } else {
+        let node = k1(world);
+        world.g().seen(&node)
+    };
+    world.seen = Some(seen.unwrap().expect("it was heard"));
+}
+
+#[then("the read returns its first heard and its last heard")]
+fn read_returns_first_and_last(world: &mut World) {
+    let seen = world.seen.as_ref().unwrap();
+    assert_eq!(
+        (seen.first_heard.point, seen.first_heard.source.as_str()),
+        (at(10), "crawler")
+    );
+    assert_eq!(
+        (seen.last_heard.point, seen.last_heard.source.as_str()),
+        (at(20), "mirror")
+    );
+    assert_eq!((seen.count, seen.ended), (2, None), "{seen:?}");
+}
+
+#[then("the read returns its first heard, its last heard and when it ended")]
+fn read_returns_first_last_and_ended(world: &mut World) {
+    let seen = world.seen.as_ref().unwrap();
+    assert_eq!(
+        (seen.first_heard.point, seen.first_heard.source.as_str()),
+        (at(10), "crawler")
+    );
+    // The ending is the link's last fact, as its last version.
+    assert!(seen.last_heard.ended, "{seen:?}");
+    assert_eq!(seen.last_heard.point, at(30));
+    assert_eq!((seen.ended, seen.count), (Some(at(30)), 3), "{seen:?}");
+}
+
+#[given(
+    "a link written at point 10 that ended at point 20, and another link written at point 10 that ended at point 30"
+)]
+fn two_links_ended_at_20_and_30(world: &mut World) {
+    follows_between_visits(world);
+    world.links = vec![
+        LinkAt::Heard("b", "crawler", 10),
+        LinkAt::Ended("b", 20),
+        LinkAt::Heard("c", "crawler", 10),
+        LinkAt::Ended("c", 30),
+    ];
+}
+
+/// Each link is written again from another source: the same content from the same source is
+/// one hearing (FR-RANNOCH-065), named by its first event, and so not a hearing at a new point.
+#[when("the app writes the first link again at point 30 and the second link again at point 20")]
+fn writes_links_again(world: &mut World) {
+    let mut facts = world.links.clone();
+    facts.extend([
+        LinkAt::Heard("b", "mirror", 30),
+        LinkAt::Heard("c", "mirror", 20),
+    ]);
+    world.graph = Some(graph_of(world, &facts));
+}
+
+/// Whether the link from `from` reads as ended at point `n`.
+fn ended_at_point(world: &mut World, from: &str, n: u64) -> bool {
+    let state = world
+        .g()
+        .link_state_at("follows", from, "a", At::Time(at(n)));
+    state.unwrap().expect("the link was heard by then").ended
+}
+
+#[then("the first link reads as ended at point 25 and as live at point 35")]
+fn first_link_ended_then_live(world: &mut World) {
+    assert!(ended_at_point(world, "b", 25));
+    assert!(!ended_at_point(world, "b", 35));
+    assert_eq!(world.g().link_end("follows", "b", "a").unwrap(), None);
+}
+
+#[then("the second link reads as ended at point 35")]
+fn second_link_ended(world: &mut World) {
+    assert!(ended_at_point(world, "c", 35));
+    let end = world.g().link_end("follows", "c", "a").unwrap();
+    assert!(
+        matches!(end, Some(End::Ended { at: when, .. }) if when == at(30)),
+        "{end:?}"
+    );
+}
+
+#[given(
+    "a link written at point 10, ended at point 20, written again at point 30, and ended at point 40 and again at point 50"
+)]
+fn link_ended_twice_in_a_row(world: &mut World) {
+    follows_between_visits(world);
+    world.links = vec![
+        LinkAt::Heard("b", "crawler", 10),
+        LinkAt::Ended("b", 20),
+        LinkAt::Heard("b", "mirror", 30),
+        LinkAt::Ended("b", 40),
+        LinkAt::Ended("b", 50),
+    ];
+}
+
+#[when(
+    "one new graph is given these events in that order and another new graph is given them in the opposite order"
+)]
+fn link_facts_in_both_orders(world: &mut World) {
+    let facts = world.links.clone();
+    let forward = graph_of(world, &facts);
+    world.graphs.push(forward);
+    let backward: Vec<LinkAt> = facts.into_iter().rev().collect();
+    let backward = graph_of(world, &backward);
+    world.graphs.push(backward);
+}
+
+#[then("both graphs return point 40 as when the link ended")]
+fn both_ended_at_40(world: &mut World) {
+    for g in &world.graphs {
+        let seen = g.link_seen("follows", "b", "a").unwrap().unwrap();
+        assert_eq!((seen.ended, seen.count), (Some(at(40)), 5), "{seen:?}");
+        let end = g.link_end("follows", "b", "a").unwrap();
+        assert!(
+            matches!(end, Some(End::Ended { at: when, .. }) if when == at(40)),
+            "{end:?}"
+        );
+    }
+}
+
+// FR-RANNOCH-084's other scenarios belong to #89, which brings their steps and drops this filter.
+scenarios!(
+    "tests",
+    fixtures = [world: World],
+    tags = "not (@criterion-01a1752f-2126-7ef3-8e7a-1fc5f265519a \
+            or @criterion-01a17540-2219-7e60-ad01-4420aefe6364 \
+            or @criterion-01a17540-2219-7e60-ad01-4434d39dc772 \
+            or @criterion-01a17759-c275-706d-ae91-072c9950dc21 \
+            or @criterion-01a17771-f692-7a92-8518-e5e663c774ae)"
+);

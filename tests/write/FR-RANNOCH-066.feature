@@ -1,4 +1,4 @@
-# Generated from legion requirement FR-RANNOCH-066, revision 2026-10-26T06:05:36.431522+00:00.
+# Generated from legion requirement FR-RANNOCH-066, revision 2026-10-26T11:06:00.742202+00:00.
 # Do not edit: regenerate with scripts/features.mjs.
 
 Feature: A link's ending is a new fact with its own point and, when known, its own valid time; a link found wrong is a correction
