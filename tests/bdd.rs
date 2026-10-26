@@ -1328,6 +1328,101 @@ fn s8_replaced_by_s9(world: &mut World) {
     assert_eq!(s8.replaced_by, Some(NodeRef::new("statement", "s9")));
 }
 
+// ---------- FR-RANNOCH-067: replacing a node carries its hearings and links ----------
+
+/// Statement `s9`, the node `s8` is replaced by in FR-RANNOCH-067's scenarios.
+fn s9(world: &mut World) {
+    let when = day(2021, 3, 2);
+    world.write(&Write::new("eavesdrop").unit(Unit::new(
+        "statement",
+        "s9",
+        [("text", "merged")],
+        when,
+    )));
+}
+
+#[given("a node with links")]
+fn node_with_links(world: &mut World) {
+    open_graph(world);
+    let when = day(2021, 3, 2);
+    world.write(
+        &Write::new("swtor")
+            .unit(Unit::new("voice", "v1", NONE, when.clone()))
+            .unit(Unit::new("finding", "f1", NONE, when.clone()))
+            .unit(
+                Unit::new("statement", "s8", [("text", "first")], when.clone())
+                    .link("said", "v1", "s8", when.clone())
+                    .link("supports", "s8", "f1", when),
+            ),
+    );
+    s9(world);
+}
+
+#[given("a node that has been heard more than once")]
+fn node_heard_twice(world: &mut World) {
+    open_graph(world);
+    for (source, text) in [("swtor", "first"), ("reddit", "again")] {
+        world.write(&Write::new(source).unit(Unit::new(
+            "statement",
+            "s8",
+            [("text", text)],
+            day(2021, 3, 2),
+        )));
+    }
+    let hearings = world
+        .g()
+        .hearings(&NodeRef::new("statement", "s8"))
+        .unwrap();
+    assert_eq!(hearings.len(), 2, "{hearings:?}");
+    world.hearings.insert("s8".into(), hearings);
+    s9(world);
+}
+
+#[when("the app replaces it by a node under a new key")]
+fn replaces_it_by_new_key(world: &mut World) {
+    replaces_s8_by_s9(world);
+}
+
+#[then("its links are on the new key")]
+fn links_on_new_key(world: &mut World) {
+    let g = world.g();
+    for (relation, from, to) in [("said", "v1", "s9"), ("supports", "s9", "f1")] {
+        assert!(
+            g.find_link(relation, from, to).unwrap().is_some(),
+            "{relation}"
+        );
+        assert_eq!(g.link_hearings(relation, from, to).unwrap().len(), 1);
+    }
+    for (relation, from, to) in [("said", "v1", "s8"), ("supports", "s8", "f1")] {
+        assert!(
+            g.find_link(relation, from, to).unwrap().is_none(),
+            "{relation}"
+        );
+        assert!(g.link_hearings(relation, from, to).unwrap().is_empty());
+    }
+    let s8 = g.describe(&NodeRef::new("statement", "s8")).unwrap();
+    assert!(
+        s8.relations_in.is_empty() && s8.relations_out.is_empty(),
+        "{s8:?}"
+    );
+}
+
+#[then("the new key holds every hearing the old key had")]
+fn new_key_holds_hearings(world: &mut World) {
+    let had = world.hearings["s8"].clone();
+    let g = world.g();
+    let now = g.hearings(&NodeRef::new("statement", "s9")).unwrap();
+    for hearing in &had {
+        assert!(now.contains(hearing), "{hearing:?} not in {now:?}");
+    }
+    assert_eq!(now.len(), had.len() + 1);
+    assert!(
+        g.hearings(&NodeRef::new("statement", "s8"))
+            .unwrap()
+            .is_empty()
+    );
+}
+
 // ---------- write: source, valid time, recorded time ----------
 
 #[given("an open graph")]

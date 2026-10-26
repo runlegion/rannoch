@@ -14,7 +14,7 @@ use crate::events::{
     event_at, holds, keep_derived, next_cursor, store,
 };
 use crate::history::{
-    Held, Key, Of, alias, conclude, hear, link_heard, millis, newest, node_entity,
+    Held, Key, Of, alias, carry, conclude, hear, link_heard, millis, newest, node_entity,
 };
 use crate::open::{
     CLASS, Class, Graph, HistoryKey, Ontology, RELATION, Relation, Value, ValueType, class_table,
@@ -973,6 +973,7 @@ pub(crate) fn replay(
         }
         Change::Replaced { class, old, new } => {
             record_fate(tx, class, old, new)?;
+            carry(tx, ontology, key, (class, old, new))?;
         }
         // What a purge removed has already left every event before it.
         Change::Purged { .. } => {}
@@ -1022,14 +1023,15 @@ impl Graph {
 
     /// Replaces the node `old` of `class` by the node `new` of the same class, under a different
     /// key, as one event naming the class, the old key and the new key. The old node stays in
-    /// the graph and describes as replaced by the new one. The event and the replacement land
-    /// together or not at all.
+    /// the graph and describes as replaced by the new one; its hearings and links move to the
+    /// new key. The event and the replacement land together or not at all.
     ///
     /// # Errors
-    /// `class` is not declared; [`Error::Refused`] when `old` and `new` are the same key;
+    /// [`Error::KeyMissing`] when the graph holds no key; `class` is not declared; [`Error::Refused`] when `old` and `new` are the same key;
     /// [`Error::NotFound`] when no node of `class` has key `old`, or key `new`; the graph file
     /// cannot be written.
     pub fn replace(&mut self, class: &str, old: &str, new: &str) -> Result<Event, Error> {
+        let key = self.key.as_ref().ok_or(Error::KeyMissing)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1051,6 +1053,7 @@ impl Graph {
             }
         }
         record_fate(&tx, &class, old, new)?;
+        carry(&tx, &ontology, key, (&class, old, new))?;
         let event = append(
             &tx,
             Change::Replaced {
