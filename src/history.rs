@@ -2,8 +2,9 @@
 //! hearing's identity is its content, hashed under the app's key: identical content is one
 //! hearing, and an identical event that arrives from another store under its own id is held as an
 //! alias of it. The key never reaches the store's files; the store keeps only a check value.
-//! A link that ends records its ending, at its own point, beside its hearings; a link found
-//! wrong records a correction, which is not an ending.
+//! A link that ends records its ending, at its own point, beside its hearings, and a live
+//! hearing at a later point reopens it; a link found wrong records a correction, which is not an
+//! ending. When each node and link was first and last heard is kept as it is recorded.
 
 use std::collections::BTreeMap;
 use std::fmt;
