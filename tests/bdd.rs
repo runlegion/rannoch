@@ -4390,8 +4390,8 @@ fn none_or_all(world: &mut World) {
     assert!(whole > 0, "no read saw the whole batch");
 }
 
-#[given("a queue holding a node and then a link from it, where the node will fail at commit")]
-fn link_after_failing_node(world: &mut World) {
+/// Declares class `item` (property `v`) and relation `next` from item to item.
+fn items_with_next(world: &mut World) {
     class_with(world, ValueType::Text);
     world
         .g()
@@ -4399,6 +4399,11 @@ fn link_after_failing_node(world: &mut World) {
             "next", "item", "item", false,
         )))
         .unwrap();
+}
+
+#[given("a queue holding a node and then a link from it, where the node will fail at commit")]
+fn link_after_failing_node(world: &mut World) {
+    items_with_next(world);
     let graph = world.graph.take().expect("the graph is open");
     world.queue = Some(Queue::open(graph, NEVER));
     item_fails_at_commit(world, "bad");
@@ -4421,6 +4426,115 @@ fn link_not_in_graph(world: &mut World) {
     assert!(g.find_link("next", "bad", "i2").unwrap().is_none());
     assert!(g.open_links().unwrap().is_empty(), "the link was left open");
     assert!(g.find("item", "i2").unwrap().is_none());
+}
+
+// ---------- write: a link's source must be heard; its target may wait ----------
+
+/// Node `item` `key`, valid from 2026-01-01.
+fn item(key: &str) -> Unit {
+    Unit::new("item", key, [("v", key)], day(2026, 1, 1))
+}
+
+#[given("a graph in which a key has never been heard")]
+fn key_never_heard(world: &mut World) {
+    items_with_next(world);
+    assert!(world.g().find("item", "ghost").unwrap().is_none());
+    assert!(
+        world
+            .g()
+            .hearings(&NodeRef::new("item", "ghost"))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[when("the app writes a link from that key")]
+fn writes_link_from_unheard(world: &mut World) {
+    world.mark_events();
+    let write = Write::new("app").unit(item("i1").link("next", "ghost", "i1", day(2026, 1, 1)));
+    world.write_error = Some(world.g().write(&write).expect_err("the write is refused"));
+}
+
+#[then("the write is refused naming that key")]
+fn refused_naming_unheard_key(world: &mut World) {
+    let error = world.write_error.as_ref().expect("the write was refused");
+    assert!(error.events.is_empty(), "{error:?}");
+    assert!(
+        matches!(&error.cause, Error::Refused(why)
+            if why == "relation next links from item ghost, which has never been heard"),
+        "{error:?}"
+    );
+    assert_eq!(world.all_events().len(), world.events_before);
+    assert!(world.g().find("item", "i1").unwrap().is_none());
+    assert!(world.g().open_links().unwrap().is_empty());
+}
+
+#[when("the app writes a node and a link from it in the same write")]
+fn writes_node_and_link_together(world: &mut World) {
+    items_with_next(world);
+    // The link comes before its source's unit, so the source is heard only later in the write.
+    let write = Write::new("app")
+        .unit(item("i2").link("next", "i1", "i2", day(2026, 1, 1)))
+        .unit(item("i1"));
+    world.write(&write);
+}
+
+#[then("the link is in the graph")]
+fn link_in_graph(world: &mut World) {
+    assert!(world.g().find_link("next", "i1", "i2").unwrap().is_some());
+    assert!(world.g().open_links().unwrap().is_empty());
+}
+
+#[given("a process that has written a node not yet committed")]
+fn process_wrote_uncommitted_node(world: &mut World) {
+    items_with_next(world);
+    let graph = world.graph.take().expect("the graph is open");
+    world.queue = Some(Queue::open(graph, NEVER));
+    enqueue(world, "i1");
+    assert_eq!(q(world).committed(), None);
+    assert!(!committed_elsewhere(world, "i1"));
+}
+
+#[when("the process writes a link from that node")]
+fn process_writes_link(world: &mut World) {
+    let write = Write::new("app").unit(item("i2").link("next", "i1", "i2", day(2026, 1, 1)));
+    let ticket = q(world).write(write).unwrap();
+    world.tickets.push(ticket);
+    let (flushed, failures) = q(world).flush();
+    assert!(failures.is_empty(), "{failures:?}");
+    world.flushed = flushed;
+}
+
+#[then("the link is accepted")]
+fn link_accepted(world: &mut World) {
+    assert!(world.flushed >= world.tickets.last().copied());
+    let g = rannoch::open(world.path(), Some(&KEY)).unwrap();
+    assert!(g.find_link("next", "i1", "i2").unwrap().is_some());
+}
+
+#[given("a graph with a heard node and a key never heard")]
+fn heard_node_and_unheard_key(world: &mut World) {
+    items_with_next(world);
+    world.write(&Write::new("app").unit(item("i1")));
+    assert!(world.g().find("item", "ghost").unwrap().is_none());
+}
+
+#[when("the app writes a link from the node to that key")]
+fn writes_link_to_unheard(world: &mut World) {
+    world.write(&Write::new("app").unit(item("i1").link("next", "i1", "ghost", day(2026, 1, 1))));
+}
+
+#[then("the link is listed as open")]
+fn listed_as_open(world: &mut World) {
+    assert_eq!(
+        world.g().open_links().unwrap(),
+        [OpenLink {
+            relation: "next".into(),
+            from: NodeRef::new("item", "i1"),
+            to: NodeRef::new("item", "ghost"),
+            waits_on: NodeRef::new("item", "ghost"),
+        }]
+    );
 }
 
 // ---------- queue: a write that fails at commit is reported, never dropped in silence ----------
