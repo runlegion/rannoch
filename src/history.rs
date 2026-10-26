@@ -14,6 +14,7 @@ use rusqlite::{Connection, OptionalExtension, ToSql, TransactionBehavior, params
 
 use crate::events::{Change, Cursor, EventId, Events, Fact, LinkFact, NodeFact};
 use crate::open::{CLASS, Graph, HistoryKey, Ontology, RELATION, Value, table};
+use crate::purge::stand_forgot;
 use crate::read::NodeRef;
 use crate::write::{Error, Heard, Piece, Stamp, ValidTime};
 
@@ -643,9 +644,12 @@ pub(crate) fn take(conn: &mut Connection, key: &Key) -> Result<(), Error> {
     for event in (Events { conn: &tx }).since(Cursor::START)? {
         let (source, added) = match &event.change {
             Change::Wrote { source, added, .. } => (source, added),
-            Change::Forgot { nodes, links, .. } => {
+            Change::Forgot {
+                rule, nodes, links, ..
+            } => {
                 for node in nodes {
                     unhear(&tx, node, links)?;
+                    stand_forgot(&tx, key, rule, node, event.id)?;
                 }
                 continue;
             }
@@ -2208,8 +2212,13 @@ mod tests {
         assert_eq!(g.hearings(&NodeRef::new("person", "p01"))?.len(), 1);
         g.write(&Write::new("tree").unit(ana()))?;
         assert_eq!(g.hearings(&NodeRef::new("person", "p01"))?.len(), 1);
-        g.write(&Write::new("tree").unit(bare("visitor", "p05")))?;
-        assert_eq!(g.hearings(&forgotten)?.len(), 1);
+        // The forget stands as a purge rule: the forgotten node written again stays gone.
+        assert_eq!(
+            g.write(&Write::new("tree").unit(bare("visitor", "p05")))?,
+            vec![]
+        );
+        assert_eq!(g.hearings(&forgotten)?, vec![]);
+        assert_eq!(g.find("visitor", "p05")?, None);
         Ok(())
     }
 }

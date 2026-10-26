@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::history::{Key, aliases, hold_aliases, unhear};
 use crate::open::{Graph, Ontology, Value, class_table, open_keyed, relation_table, table};
-use crate::purge::Purge;
+use crate::purge::{Purge, arriving};
 use crate::read::NodeRef;
 use crate::write::{Declaration, Error, ValidTime, now_millis, replay};
 
@@ -178,11 +178,14 @@ pub enum Change {
         links: Vec<LinkFact>,
     },
     /// A purge under the app's own `rule`, from `source`: its kind, with each target as its
-    /// keyed match value under the graph's key, never as content.
+    /// keyed match value under the graph's key, never as content, and each node it removed as
+    /// part of a whole, as keyed match values too, so each part stands under the rule as well.
     Purged {
         source: String,
         rule: String,
         purge: Purge,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        parts: Vec<NodeRef>,
     },
     /// The node `old` of `class` was replaced by the node `new` of the same class.
     Replaced {
@@ -511,11 +514,20 @@ fn replay_into(mut graph: Graph, events: &[Event]) -> Result<Graph, Error> {
                 }
             }
         }
-        replay(&tx, &ontology, &key, recorded, event)?;
+        // What a standing purge rule matches is kept as if it never came.
+        let Some(change) = arriving(&tx, &key, &ontology, &event.change)? else {
+            continue;
+        };
+        let event = Event {
+            id: event.id,
+            cursor: event.cursor,
+            change,
+        };
+        replay(&tx, &ontology, &key, recorded, &event)?;
         if matches!(event.change, Change::Declared(_)) {
             ontology = Ontology::load(&tx)?;
         }
-        store(&tx, event.id, Some(event.cursor), event.change.clone())?;
+        store(&tx, event.id, Some(event.cursor), event.change)?;
     }
     tx.commit()?;
     graph.ontology = ontology;

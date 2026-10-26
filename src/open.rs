@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::events::{Events, OWN_TABLES, upgrade};
 use crate::history::{HISTORY_TABLES, Key, point_aliases, see_all, take};
+use crate::purge::{PURGE_TABLES, stand_all};
 use crate::write::{Error, date_fates};
 
 /// A class: a kind of node, with its natural key, its properties and each one's value type,
@@ -381,6 +382,7 @@ pub fn open(path: impl AsRef<Path>, key: Option<&[u8; 32]>) -> Result<Graph, Err
 pub(crate) fn open_keyed(path: impl AsRef<Path>, key: &Key) -> Result<Graph, Error> {
     let mut graph = open_file(path)?;
     take(&mut graph.conn, key)?;
+    stand_all(&mut graph.conn, key)?;
     graph.key = Some(key.clone());
     Ok(graph)
 }
@@ -406,6 +408,7 @@ pub(crate) fn open_file(path: impl AsRef<Path>) -> Result<Graph, Error> {
     )?;
     conn.set_prepared_statement_cache_capacity(256);
     conn.execute_batch(OWN_TABLES)?;
+    conn.execute_batch(PURGE_TABLES)?;
     upgrade(&mut conn)?;
     date_fates(&mut conn)?;
     point_aliases(&mut conn)?;

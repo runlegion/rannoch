@@ -6132,6 +6132,13 @@ fn writes_snapshots_closes(world: &mut World) {
     "a byte search of the store's files, its write-ahead log and snapshots included, finds no copy of the key"
 )]
 fn key_in_no_file(world: &mut World) {
+    // In FR-RANNOCH-072's scenario the key is the purged node's; in the others, the
+    // content-identity key, and nothing is purged.
+    if !world.purge.targets.is_empty() {
+        assert_eq!(world.purge.snapshots.len(), 1);
+        assert_no_bytes(world, STANDING.as_bytes());
+        return;
+    }
     let hex = world.key.iter().fold(String::new(), |mut hex, b| {
         use std::fmt::Write as _;
         write!(hex, "{b:02x}").unwrap();
@@ -7611,6 +7618,12 @@ fn purges_alone_and_one(world: &mut World) {
     "hashing each purged hearing's exact content, plainly and under every key found in the store's files, matches nothing in them"
 )]
 fn no_hash_matches(world: &mut World) {
+    assert_unhashed(world, Some(KEY));
+}
+
+/// Asserts that hashing each of the scenario's purged contents, plainly and under every key found
+/// in the store's files (and under `key`, when given), matches nothing in them.
+fn assert_unhashed(world: &World, key: Option<[u8; 32]>) {
     let files = store_files(world);
     let raw: HashSet<&[u8]> = files.iter().flat_map(|(_, b)| b.windows(32)).collect();
     let text: HashSet<&[u8]> = files.iter().flat_map(|(_, b)| b.windows(64)).collect();
@@ -7618,7 +7631,7 @@ fn no_hash_matches(world: &mut World) {
         .iter()
         .map(|w| <[u8; 32]>::try_from(*w).unwrap())
         .collect();
-    keys.push(KEY);
+    keys.extend(key);
     for content in &world.purge.contents {
         let mut hashes = vec![blake3::hash(content)];
         hashes.extend(keys.iter().map(|key| blake3::keyed_hash(key, content)));
@@ -7707,6 +7720,284 @@ fn second_hearings_kept(world: &mut World) {
         (found.source.as_str(), &found.properties["note"]),
         ("second", &Value::from("second's word"))
     );
+}
+
+// FR-RANNOCH-072: a purged hearing is as if never recorded, one arriving after its rule included.
+
+/// The node the standing-rule scenarios hear, in a class whose history is ordered by time.
+fn visit() -> NodeRef {
+    NodeRef::new("visit", "v-72")
+}
+
+/// The point `secs` seconds after the epoch.
+fn secs(secs: u64) -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+}
+
+/// Writes the visit's hearing from `source` at `secs` on its axis, noting `note`; returns its
+/// events.
+fn hear_visit(g: &mut Graph, source: &str, at: u64, note: &str) -> Vec<Event> {
+    let unit = Unit::new("visit", "v-72", [("note", note)], day(2026, 10, 1)).at(secs(at));
+    g.write(&Write::new(source).unit(unit)).unwrap()
+}
+
+/// The purge scenarios' graph with a time-ordered `visit` class.
+fn visit_graph(world: &mut World) -> &mut Graph {
+    let g = purge_graph(world);
+    let mut class = Class::new("visit", ["note"]);
+    class.history = HistoryKey::Time;
+    g.declare(&Declaration::Class(class)).unwrap();
+    g
+}
+
+/// The visit's one hearing from `source`, as a fact purge.
+fn fact_from(g: &Graph, source: &str) -> Purge {
+    let hearings = g.hearings(&visit()).unwrap();
+    let mut from = hearings.iter().filter(|h| h.source == source);
+    let hearing = from.next().expect("a hearing from the source");
+    assert!(from.next().is_none(), "one hearing from {source}");
+    Purge::Fact {
+        identity: hearing.identity,
+    }
+}
+
+/// What is seen of the visit in `g`.
+fn seen_visit(g: &Graph) -> rannoch::Seen {
+    g.seen(&visit()).unwrap().expect("the visit was heard")
+}
+
+#[given("a fact heard from more than one source")]
+fn heard_from_many(world: &mut World) {
+    // Recorded a, b, c, d in that order; on the axis b (1000), d (1500), a (2000), c (3000).
+    let g = visit_graph(world);
+    for (source, at) in [("a", 2000), ("b", 1000), ("c", 3000), ("d", 1500)] {
+        hear_visit(g, source, at, source);
+    }
+    let seen = seen_visit(g);
+    assert_eq!(
+        (
+            seen.first_heard.source.as_str(),
+            seen.last_heard.source.as_str(),
+            seen.first_recorded.source.as_str()
+        ),
+        ("b", "c", "a")
+    );
+}
+
+#[when("the app purges the hearing earliest on the class's declared axis")]
+fn purges_earliest(world: &mut World) {
+    let purge = fact_from(world.g(), "b");
+    world.purge.targets.push(purge);
+    purge_targets(world);
+}
+
+#[then("the fact's first heard is the earliest surviving hearing on the axis")]
+fn first_heard_survivor(world: &mut World) {
+    let seen = seen_visit(world.g());
+    assert_eq!(
+        (seen.first_heard.source.as_str(), seen.first_heard.point),
+        ("d", secs(1500))
+    );
+    assert_eq!(seen.count, 3);
+}
+
+#[when("the app purges the hearing latest on the class's declared axis")]
+fn purges_latest(world: &mut World) {
+    let purge = fact_from(world.g(), "c");
+    world.purge.targets.push(purge);
+    purge_targets(world);
+}
+
+#[then("the fact's last heard is the latest surviving hearing on the axis")]
+fn last_heard_survivor(world: &mut World) {
+    let seen = seen_visit(world.g());
+    assert_eq!(
+        (seen.last_heard.source.as_str(), seen.last_heard.point),
+        ("a", secs(2000))
+    );
+    assert_eq!(seen.count, 3);
+}
+
+#[when("the app purges the hearing this store recorded first")]
+fn purges_first_recorded(world: &mut World) {
+    let purge = fact_from(world.g(), "a");
+    world.purge.targets.push(purge);
+    purge_targets(world);
+}
+
+#[then("the fact's first recorded is the surviving hearing this store recorded first")]
+fn first_recorded_survivor(world: &mut World) {
+    let seen = seen_visit(world.g());
+    assert_eq!(
+        (
+            seen.first_recorded.source.as_str(),
+            seen.first_recorded.point
+        ),
+        ("b", secs(1000))
+    );
+    assert_eq!(seen.count, 3);
+}
+
+#[given("a fact heard by more than one voice, one of them only once")]
+fn heard_by_voices(world: &mut World) {
+    let g = visit_graph(world);
+    hear_visit(g, "often", 1000, "often's first");
+    hear_visit(g, "once", 2000, "once's only");
+    hear_visit(g, "often", 3000, "often's second");
+    assert_eq!(seen_visit(g).count, 3);
+}
+
+#[when("the app purges that voice's only hearing and reads the distinct count of voices")]
+fn purges_only_hearing(world: &mut World) {
+    let purge = fact_from(world.g(), "once");
+    world.purge.targets.push(purge);
+    purge_targets(world);
+}
+
+#[then("the count no longer counts that voice")]
+fn count_drops_voice(world: &mut World) {
+    let g = world.g();
+    let hearings = g.hearings(&visit()).unwrap();
+    assert!(hearings.iter().all(|h| h.source == "often"), "{hearings:?}");
+    assert_eq!(seen_visit(g).count, 2);
+}
+
+/// The note the purged source's late hearing carries: found nowhere else in a scenario.
+const LATE: &str = "zq-late-hearing-72";
+
+#[given("a fact heard from two sources, and a purge rule for one of them")]
+fn two_sources_and_rule(world: &mut World) {
+    let g = visit_graph(world);
+    hear_visit(g, "keeps", 1000, "kept first");
+    hear_visit(g, "purged", 2000, "purged's word");
+    hear_visit(g, "keeps", 3000, "kept last");
+    world.purge.targets.push(Purge::EntityFromSource {
+        target: Target::Node(visit()),
+        source: "purged".into(),
+    });
+    purge_targets(world);
+}
+
+#[given(
+    "a fact heard from two sources, a purge rule for one of them, and a snapshot taken after the purge"
+)]
+fn two_sources_rule_snapshot(world: &mut World) {
+    two_sources_and_rule(world);
+    let path = world.dir.path().join("snapshot-72.rannoch");
+    let at = world.g().events().committed().unwrap();
+    world.snapshot = Some(world.g().snapshot(at, &path).unwrap());
+}
+
+/// Writes the purged source's late hearing, earlier on the axis than any it heard, into `g`, and
+/// asserts the write returns as if it never came.
+fn late_hearing(g: &mut Graph) {
+    let events = hear_visit(g, "purged", 500, LATE);
+    assert!(events.is_empty(), "{events:?}");
+}
+
+#[when("the app writes a hearing of the fact from the purged source")]
+fn writes_late_hearing(world: &mut World) {
+    late_hearing(world.g());
+}
+
+#[when(
+    "the graph is rebuilt from the snapshot and the app writes a hearing of the fact from the purged source"
+)]
+fn rebuilt_and_late_hearing(world: &mut World) {
+    let path = world.dir.path().join("rebuilt-72.rannoch");
+    let snapshot = world.snapshot.as_ref().expect("a snapshot was taken");
+    let mut rebuilt = snapshot.rebuild(&[], path, Some(&KEY)).unwrap();
+    late_hearing(&mut rebuilt);
+    world.rebuilt = Some(rebuilt);
+}
+
+/// Asserts `g` holds nothing of the late hearing, and sees the visit as the keeping source's two
+/// hearings alone.
+fn only_survivor(g: &Graph) {
+    let hearings = g.hearings(&visit()).unwrap();
+    assert!(hearings.iter().all(|h| h.source == "keeps"), "{hearings:?}");
+    assert_no_event_holds(g, LATE);
+    let seen = seen_visit(g);
+    assert_eq!(
+        (
+            seen.first_heard.point,
+            seen.last_heard.point,
+            seen.count,
+            seen.first_heard.source.as_str(),
+            seen.last_heard.source.as_str()
+        ),
+        (secs(1000), secs(3000), 2, "keeps", "keeps")
+    );
+    let node = g.find("visit", "v-72").unwrap().unwrap();
+    assert_eq!(node.properties["note"], Value::from("kept last"));
+}
+
+#[then(
+    "nothing of that hearing remains in the store, and the fact's first heard, last heard and distinct count are those of the surviving source alone"
+)]
+fn late_hearing_gone(world: &mut World) {
+    only_survivor(world.g());
+}
+
+#[then(
+    "nothing of that hearing remains in the rebuilt graph, and the fact's first heard, last heard and distinct count are those of the surviving source alone"
+)]
+fn late_hearing_gone_rebuilt(world: &mut World) {
+    only_survivor(world.rebuilt.as_ref().expect("the graph was rebuilt"));
+}
+
+/// The key of the node the standing rule purges: found nowhere else in a scenario's files.
+const STANDING: &str = "zq-standing-key-72";
+
+#[given("a graph holding a node whose key is a unique token")]
+fn node_keyed_by_token(world: &mut World) {
+    let g = purge_graph(world);
+    g.write(
+        &Write::new("app")
+            .unit(person(STANDING, "standing"))
+            .unit(person("p-stays", "stays")),
+    )
+    .unwrap();
+    world.purge.targets.push(Purge::Entity {
+        target: Target::Node(NodeRef::new("person", STANDING)),
+    });
+    world.purge.contents.push(STANDING.as_bytes().to_vec());
+}
+
+#[when("the app purges the node, takes a snapshot and closes the queue")]
+fn purges_node_snapshots_closes(world: &mut World) {
+    purge_targets(world);
+    let path = world.dir.path().join("snapshot-72.rannoch");
+    let at = world.g().events().committed().unwrap();
+    world.g().snapshot(at, &path).unwrap();
+    world.purge.snapshots.push(path);
+    close_store(world);
+}
+
+#[then("hashing the key under every key found in the store's files matches nothing in them")]
+fn key_unhashed(world: &mut World) {
+    assert_unhashed(world, None);
+}
+
+#[when("the graph is reopened and the app writes a hearing of that node")]
+fn reopened_and_writes_node(world: &mut World) {
+    let g = world.open();
+    let events = g
+        .write(&Write::new("app").unit(person(STANDING, "back again")))
+        .unwrap();
+    assert!(events.is_empty(), "{events:?}");
+}
+
+#[then("nothing of that hearing remains in the store")]
+fn nothing_of_node_hearing(world: &mut World) {
+    let g = world.g();
+    let node = NodeRef::new("person", STANDING);
+    assert_eq!(g.find("person", STANDING).unwrap(), None);
+    assert!(g.hearings(&node).unwrap().is_empty());
+    assert_eq!(g.seen(&node).unwrap(), None);
+    assert_no_event_holds(g, STANDING);
+    assert_no_event_holds(g, "back again");
+    assert!(g.find("person", "p-stays").unwrap().is_some());
 }
 
 // FR-RANNOCH-066: an ending is a version of the link, held whether or not a live hearing of
