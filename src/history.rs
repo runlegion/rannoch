@@ -1465,8 +1465,9 @@ impl Graph {
     }
 
     /// The version of the link of `relation` from the node keyed `from` to the node keyed `to`
-    /// that held at the time `at`, by point and then event id, and whether the link had ended
-    /// by then. `None` before its first version.
+    /// that held at the time `at`: the newest of its live hearings and endings at or before it,
+    /// by point and then event id, and whether the link had ended by then. `None` before its
+    /// first version.
     ///
     /// # Errors
     /// [`Error::Refused`] when `at` is an integer key; the relation is not declared, or the
@@ -1480,12 +1481,34 @@ impl Graph {
     ) -> Result<Option<Version>, Error> {
         let (_, at) = known_bound(None, at)?;
         let relation = self.current_ontology()?.relation(relation)?.name.clone();
-        let entity = link_entity(&relation);
-        let Some((mut version, ..)) =
-            version_row(&self.conn, (&entity, from, Some(to)), &by_point(), &[&at])?
-        else {
+        let sql = format!(
+            "SELECT event, source, valid, point, integer, properties, ending FROM ( \
+             SELECT event, source, valid, point, integer, properties, 0 AS ending FROM _hearings \
+             WHERE entity = ?1 AND key = ?2 AND to_key = ?3 AND integer IS NULL AND point <= ?4 \
+             UNION ALL SELECT event, source, valid, point, NULL, NULL, 1 FROM _endings \
+             WHERE entity = ?1 AND key = ?2 AND to_key = ?3 AND point <= ?4) \
+             ORDER BY {} LIMIT 1",
+            order("DESC")
+        );
+        let newest = self
+            .conn
+            .prepare_cached(&sql)?
+            .query_row(params![link_entity(&relation), from, to, at], |row| {
+                let columns: VersionColumns = (
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                );
+                Ok((columns, row.get::<_, bool>(6)?))
+            })
+            .optional()?;
+        let Some((columns, ending)) = newest else {
             return Ok(None);
         };
+        let mut version = version_of(columns, ending)?;
         version.ended = ended(&self.conn, &relation, (from, to), at, None)?;
         Ok(Some(version))
     }
@@ -1681,6 +1704,63 @@ mod tests {
         assert_eq!(heard(&g)?, keyed);
         assert_eq!(g.link_hearings("knows", "v2", "v1")?.len(), 2);
         Ok(())
+    }
+
+    /// A graph that received note n1 from two other stores, under its own id and under one
+    /// minted later, larger first when `larger_first`, rebuilt again from its own events.
+    fn aliases_rebuilt(larger_first: bool) -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let mut g = open(dir.path().join("other.rannoch"), Some(&crate::TEST_KEY))?;
+        g.declare(&Declaration::Class(Class::new("note", ["text"])))?;
+        g.write(&Write::new("app").unit(Unit::new(
+            "note",
+            "n1",
+            [("text", "hello")],
+            ValidTime::Unknown,
+        )))?;
+        let mut events = g.events().since(Cursor::START)?;
+        let smaller = events[1].clone();
+        let mut larger = smaller.clone();
+        larger.id = crate::EventId::now();
+        let (mut first, mut second) = if larger_first {
+            (larger.clone(), smaller.clone())
+        } else {
+            (smaller.clone(), larger.clone())
+        };
+        first.cursor = Cursor(2);
+        second.cursor = Cursor(3);
+        events.truncate(1);
+        events.extend([first, second]);
+        let source = rebuild(
+            &events,
+            dir.path().join("source.rannoch"),
+            Some(&crate::TEST_KEY),
+        )?;
+        let n1 = NodeRef::new("note", "n1");
+        let held = source.hearings(&n1)?;
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert_eq!(held[0].event, smaller.id);
+        assert_eq!(held[0].aliases, [larger.id]);
+
+        let back = rebuild(
+            &source.events().since(Cursor::START)?,
+            dir.path().join("back.rannoch"),
+            Some(&crate::TEST_KEY),
+        )?;
+        assert_eq!(back.hearings(&n1)?, held);
+        Ok(())
+    }
+
+    #[test]
+    fn aliases_delivered_larger_first_survive_a_rebuild_from_events()
+    -> Result<(), Box<dyn std::error::Error>> {
+        aliases_rebuilt(true)
+    }
+
+    #[test]
+    fn aliases_delivered_smaller_first_survive_a_rebuild_from_events()
+    -> Result<(), Box<dyn std::error::Error>> {
+        aliases_rebuilt(false)
     }
 
     #[test]
