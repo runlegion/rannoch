@@ -1,4 +1,4 @@
-# Generated from legion requirement FR-RANNOCH-065, revision 2026-10-25T23:26:13.575528+00:00.
+# Generated from legion requirement FR-RANNOCH-065, revision 2026-10-26T18:05:14.099304+00:00.
 # Do not edit: regenerate with scripts/features.mjs.
 
 Feature: Identical content from the same source is one hearing in every class; another source or other content adds a hearing
