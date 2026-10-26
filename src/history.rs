@@ -230,7 +230,6 @@ pub(crate) fn hear(
 
 /// A fact a kept seen row names: a hearing, by when this store recorded it, or an ending, which
 /// has no `arrived`, by its point and event; with what orders it among the others.
-#[derive(Clone)]
 struct Mark {
     arrived: Option<i64>,
     integer: Option<i64>,
@@ -304,29 +303,25 @@ fn saw(
     } else {
         &last
     };
-    keep_edges(tx, (entity, key, to), first, last)?;
-    let earlier = format!("{} < {}", valid_day("?4"), valid_day("first_true"));
-    tx.prepare_cached(&format!(
-        "UPDATE _seen SET count = count + 1, first_true = CASE WHEN ?4 IS NOT NULL \
-         AND (first_true IS NULL OR {earlier}) THEN ?4 ELSE first_true END \
-         WHERE entity = ?1 AND key = ?2 AND to_key = ?3"
-    ))?
-    .execute(params![entity, key, to, valid])?;
-    Ok(())
+    keep(tx, (entity, key, to), (first, last), (1, valid))
 }
 
-/// Keeps `first` and `last` as the first and last facts of `of` (its target key `''` for a node).
-fn keep_edges(
+/// Keeps `first` and `last` as the first and last facts of `of` (its target key `''` for a
+/// node), adds `added` facts to its count and takes `valid` as its first true when earlier.
+fn keep(
     tx: &Connection,
     (entity, key, to): (&str, &str, &str),
-    first: &Mark,
-    last: &Mark,
+    (first, last): (&Mark, &Mark),
+    (added, valid): (i64, Option<&str>),
 ) -> Result<(), Error> {
-    tx.prepare_cached(
+    let earlier = format!("{} < {}", valid_day("?13"), valid_day("first_true"));
+    tx.prepare_cached(&format!(
         "UPDATE _seen SET first_arrived = ?4, first_integer = ?5, first_point = ?6, \
          first_event = ?7, last_arrived = ?8, last_integer = ?9, last_point = ?10, \
-         last_event = ?11 WHERE entity = ?1 AND key = ?2 AND to_key = ?3",
-    )?
+         last_event = ?11, count = count + ?12, first_true = CASE WHEN ?13 IS NOT NULL \
+         AND (first_true IS NULL OR {earlier}) THEN ?13 ELSE first_true END \
+         WHERE entity = ?1 AND key = ?2 AND to_key = ?3"
+    ))?
     .execute(params![
         entity,
         key,
@@ -338,7 +333,9 @@ fn keep_edges(
         last.arrived,
         last.integer,
         last.point,
-        last.event
+        last.event,
+        added,
+        valid
     ])?;
     Ok(())
 }
@@ -376,12 +373,12 @@ fn reseen(tx: &Connection, identity: [u8; 32]) -> Result<(), Error> {
         })
     };
     if let (Some(first), Some(last)) = (edge("ASC")?, edge("DESC")?) {
-        keep_edges(
-            tx,
-            (&entity, &key, to.as_deref().unwrap_or_default()),
-            &first,
-            &last,
-        )?;
+        let of = (
+            entity.as_str(),
+            key.as_str(),
+            to.as_deref().unwrap_or_default(),
+        );
+        keep(tx, of, (&first, &last), (0, None))?;
     }
     Ok(())
 }
