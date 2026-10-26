@@ -46,7 +46,7 @@ pub use events::{
 #[cfg(test)]
 pub(crate) const TEST_KEY: [u8; 32] = *b"rannoch unit tests' identity key";
 
-pub use history::Hearing;
+pub use history::{End, Hearing};
 pub use open::{Class, Graph, HistoryKey, Ontology, Relation, Value, ValueType, open};
 pub use queue::{Failure, Queue, Ticket};
 pub use read::{

@@ -124,6 +124,22 @@ pub enum Change {
         old: String,
         new: String,
     },
+    /// The link of `relation` from `from` to `to` ended at its own point `at`, in milliseconds
+    /// since the Unix epoch (UTC). Its hearings stay.
+    Ended {
+        source: String,
+        relation: String,
+        from: NodeRef,
+        to: NodeRef,
+        at: i64,
+    },
+    /// The link of `relation` from `from` to `to` was found wrong: a correction, not an ending.
+    Corrected {
+        source: String,
+        relation: String,
+        from: NodeRef,
+        to: NodeRef,
+    },
 }
 
 /// One thing a piece added.
