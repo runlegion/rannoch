@@ -125,13 +125,15 @@ pub enum Change {
         new: String,
     },
     /// The link of `relation` from `from` to `to` ended at its own point `at`, in milliseconds
-    /// since the Unix epoch (UTC). Its hearings stay.
+    /// since the Unix epoch (UTC), and stopped holding in the world at `valid`, which may be
+    /// unknown. Its hearings stay.
     Ended {
         source: String,
         relation: String,
         from: NodeRef,
         to: NodeRef,
         at: i64,
+        valid: ValidTime,
     },
     /// The link of `relation` from `from` to `to` was found wrong: a correction, not an ending.
     Corrected {

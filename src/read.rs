@@ -8,7 +8,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::events::{Change, EventId, Fact, naming_key};
-use crate::history::node_at;
+use crate::history::{link_entity, node_at};
 use crate::open::{Graph, Ontology, Relation, Value, class_table, property_column, relation_table};
 use crate::write::{Date, Error, ValidTime, node_id};
 
@@ -147,7 +147,9 @@ pub struct GroupBy {
 
 /// An exact count from many roots of one class, along a path of relations. It counts the
 /// nodes the path ends on. With `as_of`, every node and link the count reads must be valid on
-/// or before that date; one whose valid time is unknown is never counted.
+/// or before that date; one whose valid time is unknown is never counted. A link whose ending
+/// is valid on or before that date is not followed, and a count that would follow a link whose
+/// ending's valid time is unknown is refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Count {
     pub class: String,
@@ -193,6 +195,11 @@ fn on_or_before(valid: &Date, as_of: (u16, u8, u8)) -> bool {
 /// NULL, and the condition on NULL is never true.
 fn valid_by_sql(column: &str) -> String {
     format!("(CASE WHEN length({column}) = 7 THEN {column} || '-01' ELSE {column} END) <= ?2")
+}
+
+/// `text` as an SQL string literal.
+fn literal(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "''"))
 }
 
 /// A relation named in a path, and whether it is read backwards (`name<-`).
@@ -575,9 +582,10 @@ impl Graph {
     /// total, and both per group. Returns one tally per root, in the order given.
     ///
     /// # Errors
-    /// [`Error::Refused`] when `as_of` is not a real date, a class, relation or property is not
-    /// declared, or a relation on the path does not join the class the path has reached; the
-    /// graph file cannot be read.
+    /// [`Error::Refused`] when `as_of` is not a real date, the count as of it would follow a link
+    /// whose ending's valid time is unknown, a class, relation or property is not declared, or a
+    /// relation on the path does not join the class the path has reached; the graph file cannot
+    /// be read.
     pub fn count(&self, count: &Count) -> Result<Vec<Tally>, Error> {
         let as_of: Option<String> = count
             .as_of
@@ -596,6 +604,13 @@ impl Graph {
         let mut tallies: HashMap<String, Tally> = HashMap::new();
         let mut last: Option<(String, i64)> = None;
         while let Some(row) = rows.next()? {
+            if let Some(link) = row.get::<_, Option<String>>(4)? {
+                return Err(Error::Refused(format!(
+                    "the {link} ended, and its ending's valid time is unknown: \
+                     the count as of {} cannot say whether the link held",
+                    as_of.unwrap_or_default()
+                )));
+            }
             let root: String = row.get(0)?;
             let end: i64 = row.get(1)?;
             // A group is read as its value's text, whatever its property's declared type.
@@ -633,7 +648,8 @@ impl Graph {
     }
 }
 
-/// The one query a count runs: a row per root, end node and group, with the number of paths.
+/// The one query a count runs: a row per root, end node and group, with the number of paths
+/// and, as of a date, a link on those paths whose ending's valid time is unknown.
 fn count_query(ontology: &Ontology, count: &Count) -> Result<String, Error> {
     let root_class = ontology.class(&count.class)?;
     let mut joins = vec![format!("FROM {} n0", class_table(&root_class.name))];
@@ -645,6 +661,9 @@ fn count_query(ontology: &Ontology, count: &Count) -> Result<String, Error> {
         conditions.push(valid_by_sql("n0.valid"));
     }
     let mut at: Vec<(&str, String)> = vec![(root_class.name.as_str(), "n0.id".to_string())];
+    // As of a date, each step's ending, if its link ended: one valid on or before the date is
+    // not followed, and one of unknown valid time names its link for the refusal.
+    let mut unknown_endings = Vec::new();
     for (i, step) in count.path.iter().enumerate() {
         let (class, node) = at[i].clone();
         let (relation, backwards) = parse(ontology, &step.via)?;
@@ -676,6 +695,12 @@ fn count_query(ontology: &Ontology, count: &Count) -> Result<String, Error> {
                 valid_by_sql(&format!("{r}.valid")),
                 valid_by_sql(&format!("{n}.valid"))
             ));
+            let near = format!("n{i}");
+            let ends = if backwards { (&n, &near) } else { (&near, &n) };
+            let (join, condition, unknown) = ending(&relation.name, ends, i + 1);
+            joins.push(join);
+            conditions.push(condition);
+            unknown_endings.push(unknown);
         }
         if let Some(filter) = &step.filter {
             conditions.push(filter_condition(
@@ -715,12 +740,41 @@ fn count_query(ontology: &Ontology, count: &Count) -> Result<String, Error> {
         }
     };
     let end = &at[at.len() - 1].1;
+    let unknown_ending = if unknown_endings.is_empty() {
+        "NULL".to_string()
+    } else {
+        format!("max(CASE {} END)", unknown_endings.join(" "))
+    };
     Ok(format!(
-        "SELECT n0.key, {end}, {group}, count(*) {} WHERE {} \
+        "SELECT n0.key, {end}, {group}, count(*), {unknown_ending} {} WHERE {} \
          GROUP BY n0.id, {end}, {group} ORDER BY n0.id, {end}",
         joins.join(" "),
         conditions.join(" AND ")
     ))
+}
+
+/// As of a date (`?2`), the ending of step `step`'s link of `relation` between the nodes
+/// `from` and `to`, if it ended: the join that reads it, the condition that an ending valid on
+/// or before the date is not followed, and the case naming the link when its ending's valid
+/// time is unknown. A correction is not an ending and joins nothing.
+fn ending(relation: &str, (from, to): (&String, &String), step: usize) -> (String, String, String) {
+    let e = format!("e{step}");
+    (
+        format!(
+            "LEFT JOIN _ends {e} ON {e}.entity = {} AND {e}.key = {from}.key \
+             AND {e}.to_key = {to}.key AND {e}.point IS NOT NULL",
+            literal(&link_entity(relation))
+        ),
+        format!(
+            "({e}.valid IS NULL OR NOT {})",
+            valid_by_sql(&format!("{e}.valid"))
+        ),
+        format!(
+            "WHEN {e}.event IS NOT NULL AND {e}.valid IS NULL \
+             THEN {} || {from}.key || ' to ' || {to}.key",
+            literal(&format!("{relation} link from "))
+        ),
+    )
 }
 
 /// The condition a step's filter puts on the node it reached, `reached`, against the root.

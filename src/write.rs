@@ -1054,8 +1054,9 @@ impl Graph {
     }
 
     /// Ends the link of `relation` from the node keyed `from` to the node keyed `to` at the
-    /// point `at`, from `source`, as one event: the ending is a new fact with its own point, and
-    /// the link keeps every hearing. A later ending or correction of the link replaces it.
+    /// point `at`, from `source`, as one event: the ending is a new fact with its own point and
+    /// the valid time `valid` when the link stopped holding in the world, which may be unknown,
+    /// and the link keeps every hearing. A later ending or correction of the link replaces it.
     ///
     /// # Errors
     /// The relation is not declared; [`Error::Refused`] when the graph holds no hearing of the
@@ -1066,9 +1067,10 @@ impl Graph {
         from: &str,
         to: &str,
         at: SystemTime,
+        valid: ValidTime,
         source: &str,
     ) -> Result<Event, Error> {
-        self.conclude_link(relation, from, to, source, Some(millis(at)))
+        self.conclude_link(relation, from, to, source, Some((millis(at), valid)))
     }
 
     /// Records that the link of `relation` from the node keyed `from` to the node keyed `to`
@@ -1088,14 +1090,14 @@ impl Graph {
         self.conclude_link(relation, from, to, source, None)
     }
 
-    /// Ends the link at `at`, or with no point records it as found wrong.
+    /// Ends the link at `at` with its valid time, or with neither records it as found wrong.
     fn conclude_link(
         &mut self,
         relation: &str,
         from: &str,
         to: &str,
         source: &str,
-        at: Option<i64>,
+        at: Option<(i64, ValidTime)>,
     ) -> Result<Event, Error> {
         let tx = self
             .conn
@@ -1115,12 +1117,13 @@ impl Graph {
             NodeRef::new(&declared.to, to),
         );
         let change = match at {
-            Some(at) => Change::Ended {
+            Some((at, valid)) => Change::Ended {
                 source,
                 relation,
                 from,
                 to,
                 at,
+                valid,
             },
             None => Change::Corrected {
                 source,

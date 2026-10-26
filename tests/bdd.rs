@@ -555,6 +555,7 @@ struct World {
     refusals: Vec<Error>,
     key: [u8; 32],
     states: Vec<Option<Version>>,
+    as_of_counts: Vec<(Date, Result<Vec<Tally>, Error>)>,
 }
 
 #[rstest::fixture]
@@ -610,6 +611,7 @@ fn world() -> World {
         refusals: Vec::new(),
         key: KEY,
         states: Vec::new(),
+        as_of_counts: Vec::new(),
     }
 }
 
@@ -4849,11 +4851,14 @@ fn node_heard(world: &mut World) {
 
 #[given("a link that has been heard from one source")]
 fn link_heard(world: &mut World) {
+    link_heard_valid(world, day(2021, 3, 2));
+}
+
+fn link_heard_valid(world: &mut World, when: ValidTime) {
     let g = world.open();
     for d in t9b() {
         g.declare(&d).unwrap();
     }
-    let when = day(2021, 3, 2);
     let statement = Unit::new("statement", "s1", [("text", "words")], when.clone()).link(
         "said",
         "v1",
@@ -4893,11 +4898,149 @@ fn ends_the_link_at(world: &mut World) {
 
 #[when("the app ends the link")]
 fn ends_the_link(world: &mut World) {
+    ends_the_link_valid(world, ValidTime::Unknown);
+}
+
+fn ends_the_link_valid(world: &mut World, valid: ValidTime) {
     let event = world
         .g()
-        .end_link("said", "v1", "s1", ended_at(), "moderator")
+        .end_link("said", "v1", "s1", ended_at(), valid, "moderator")
         .unwrap();
     world.written.push(event);
+}
+
+#[given("a link that has been heard, valid from 2024-01-01")]
+fn a_link_heard_from_2024(world: &mut World) {
+    link_heard_valid(world, day(2024, 1, 1));
+}
+
+#[when("the app ends the link at a time, with a valid time of 2025-06-01")]
+fn ends_the_link_valid_2025(world: &mut World) {
+    ends_the_link_valid(world, day(2025, 6, 1));
+}
+
+#[then("the link's history holds an ending at that time with a valid time of 2025-06-01")]
+fn history_holds_the_valid_ending(world: &mut World) {
+    let event = world.written.last().unwrap().id;
+    assert_eq!(
+        world.g().link_end("said", "v1", "s1").unwrap(),
+        Some(End::Ended {
+            at: ended_at(),
+            valid: day(2025, 6, 1),
+            source: "moderator".into(),
+            event,
+        })
+    );
+    assert!(
+        matches!(
+            &world.written.last().unwrap().change,
+            Change::Ended { valid, .. } if *valid == day(2025, 6, 1)
+        ),
+        "the ending's event carries its valid time"
+    );
+    let hearings = world.g().link_hearings("said", "v1", "s1").unwrap();
+    assert_eq!(hearings.len(), 1, "{hearings:?}");
+    assert_eq!(hearings[0].valid, day(2024, 1, 1));
+}
+
+/// Statement s1 supports finding f1 by a link valid from 2024-01-01, both nodes valid from
+/// 2023-01-01, and the link ends with the valid time `ended`.
+fn supports_then_ended(world: &mut World, ended: ValidTime) {
+    open_graph(world);
+    let nodes = day(2023, 1, 1);
+    world.write(
+        &Write::new("swtor")
+            .unit(Unit::new("finding", "f1", NONE, nodes.clone()))
+            .unit(
+                Unit::new("statement", "s1", [("text", "words")], nodes).link(
+                    "supports",
+                    "s1",
+                    "f1",
+                    day(2024, 1, 1),
+                ),
+            ),
+    );
+    world
+        .g()
+        .end_link("supports", "s1", "f1", ended_at(), ended, "moderator")
+        .unwrap();
+}
+
+#[given(
+    "a statement that supports finding f1 by a link valid from 2024-01-01, and the link ended with a valid time of 2025-06-01"
+)]
+fn supports_ended_2025(world: &mut World) {
+    supports_then_ended(world, day(2025, 6, 1));
+}
+
+#[given(
+    "a statement that supports finding f1 by a link valid from 2024-01-01, and the link ended with no valid time"
+)]
+fn supports_ended_unknown(world: &mut World) {
+    supports_then_ended(world, ValidTime::Unknown);
+}
+
+#[when(
+    "the app counts statements supporting f1 as of valid time {a}, as of valid time {b} and as of valid time {c}"
+)]
+fn counts_f1_as_of_three(world: &mut World, a: String, b: String, c: String) {
+    for when in [a, b, c] {
+        let as_of = date(&when);
+        let counted = world.g().count(&Count {
+            class: "finding".into(),
+            roots: vec!["f1".into()],
+            path: vec![Step::new("supports<-")],
+            group_by: None,
+            as_of: Some(as_of.clone()),
+        });
+        world.as_of_counts.push((as_of, counted));
+    }
+}
+
+/// The statements counted as of `when`, when that count was answered.
+fn counted_as_of(world: &World, when: &str) -> u64 {
+    let (_, counted) = world
+        .as_of_counts
+        .iter()
+        .find(|(as_of, _)| *as_of == date(when))
+        .unwrap();
+    let tallies = counted.as_ref().unwrap();
+    assert_eq!(tallies[0].distinct, tallies[0].total, "{tallies:?}");
+    tallies[0].distinct
+}
+
+#[then("the statement is counted as of 2024-12-01 and not as of 2025-06-01 or 2025-12-01")]
+fn counted_until_the_ending(world: &mut World) {
+    assert_eq!(counted_as_of(world, "2024-12-01"), 1);
+    assert_eq!(counted_as_of(world, "2025-06-01"), 0);
+    assert_eq!(counted_as_of(world, "2025-12-01"), 0);
+}
+
+#[then("the count as of 2023-06-01 is answered and does not count the statement")]
+fn answered_before_the_link(world: &mut World) {
+    assert_eq!(counted_as_of(world, "2023-06-01"), 0);
+}
+
+#[then(
+    "the counts as of 2024-12-01 and 2100-01-01 are refused, each saying the link's ending's valid time is unknown"
+)]
+fn refused_on_the_unknown_ending(world: &mut World) {
+    for when in ["2024-12-01", "2100-01-01"] {
+        let (_, counted) = world
+            .as_of_counts
+            .iter()
+            .find(|(as_of, _)| *as_of == date(when))
+            .unwrap();
+        match counted {
+            Err(Error::Refused(why)) => assert!(
+                why.contains("supports link from s1 to f1")
+                    && why.contains("ending's valid time is unknown")
+                    && why.contains(when),
+                "as of {when}: {why}"
+            ),
+            other => panic!("as of {when}, not refused: {other:?}"),
+        }
+    }
 }
 
 #[when("the app finds the link wrong")]
@@ -4916,6 +5059,7 @@ fn history_holds_the_ending(world: &mut World) {
         world.g().link_end("said", "v1", "s1").unwrap(),
         Some(End::Ended {
             at: ended_at(),
+            valid: ValidTime::Unknown,
             source: "moderator".into(),
             event,
         })
@@ -5570,7 +5714,7 @@ fn link_ended_at_30(world: &mut World) {
     assert_eq!(hearings[0].point, at(10));
     world
         .g()
-        .end_link("follows", "b", "a", at(30), "moderator")
+        .end_link("follows", "b", "a", at(30), ValidTime::Unknown, "moderator")
         .unwrap();
 }
 
