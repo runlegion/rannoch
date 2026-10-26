@@ -584,8 +584,6 @@ pub(crate) struct Piece<'a> {
     closed: Vec<LinkFact>,
     /// The places of the events naming hearings identical to what a write heard again.
     held: BTreeSet<Cursor>,
-    /// Whether an arriving event renamed a hearing it was identical to.
-    renamed: bool,
 }
 
 impl<'a> Piece<'a> {
@@ -606,7 +604,6 @@ impl<'a> Piece<'a> {
             wrong_kind: Vec::new(),
             closed: Vec::new(),
             held: BTreeSet::new(),
-            renamed: false,
         }
     }
 
@@ -645,9 +642,7 @@ impl<'a> Piece<'a> {
     /// id, and with it maybe another point, so current state is read again from the versions.
     pub(crate) fn held(&mut self, held: &Held, written: bool) -> Result<bool, Error> {
         if self.stamp.arrived || written {
-            let renamed = alias(self.tx, held, self.stamp.id, self.stamp.cursor)?;
-            self.renamed |= renamed;
-            return Ok(renamed);
+            return alias(self.tx, held, self.stamp.id, self.stamp.cursor);
         }
         self.held.insert(held.cursor);
         Ok(false)
@@ -926,16 +921,16 @@ impl<'a> Piece<'a> {
 /// Applies one event's change to the state in `tx`, as it was applied when the event was
 /// written: a declaration builds what it needs, a write puts what it added, a closing moves its
 /// open link into its relation, a forget removes the node and its links, a replacement records
-/// the node's fate, and a purge changes nothing. Facts are stamped as recorded at `recorded`. Returns false when the event is
-/// a write whose every fact is identical to a hearing held, so it adds nothing and its id is
-/// held only as an alias.
+/// the node's fate, and a purge changes nothing. Facts are stamped as recorded at `recorded`. A
+/// write whose every fact is identical to a hearing held adds nothing but its id, held as an
+/// alias.
 pub(crate) fn replay(
     tx: &Connection,
     ontology: &Ontology,
     key: &Key,
     recorded: i64,
     event: &Event,
-) -> Result<bool, Error> {
+) -> Result<(), Error> {
     let stamp = Stamp {
         id: event.id,
         cursor: event.cursor,
@@ -960,7 +955,6 @@ pub(crate) fn replay(
                     Fact::Opened(link) => piece.heard_link(link.clone(), None)?,
                 }
             }
-            return Ok(added.is_empty() || !piece.added.is_empty() || piece.renamed);
         }
         Change::Closed(link) => {
             let source: String = tx
@@ -986,7 +980,7 @@ pub(crate) fn replay(
         Change::Purged { .. } => {}
         Change::Ended { .. } | Change::Corrected { .. } => conclude(tx, event.id, &event.change)?,
     }
-    Ok(true)
+    Ok(())
 }
 
 /// Records that the node `old` of `class` was replaced by the node `new`. Replacing and
