@@ -5,7 +5,7 @@
 //! after, so no purged byte stays in a free page or in the log.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, ToSql, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -668,13 +668,7 @@ fn rewrite(
 }
 
 /// Runs `purge` on `conn` with `secure_delete` on, so every page it frees or rewrites is zeroed,
-/// restores the setting after and checkpoints the write-ahead log, truncating it, so no purged
-/// byte stays in the log.
-///
-/// # Errors
-/// [`Error::Refused`] when the purge committed but a reader still open kept the checkpoint from
-/// truncating the log once the busy handler gave up: the log still holds purged bytes until a
-/// checkpoint runs after the readers close.
+/// and restores the setting after.
 fn secure<T>(
     conn: &mut Connection,
     purge: impl FnOnce(&mut Connection) -> Result<T, Error>,
@@ -683,7 +677,16 @@ fn secure<T>(
     conn.pragma_update(None, "secure_delete", 1)?;
     let purged = purge(conn);
     conn.pragma_update(None, "secure_delete", before)?;
-    let purged = purged?;
+    purged
+}
+
+/// Checkpoints the write-ahead log of `conn`, truncating it, so no purged byte stays in it.
+///
+/// # Errors
+/// [`Error::Refused`] when a reader still open kept the checkpoint from truncating the log once
+/// the busy handler gave up: the purge committed, and the log holds purged bytes until a
+/// checkpoint runs after the readers close.
+fn truncate_log(conn: &Connection) -> Result<(), Error> {
     let busy: i64 = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
     if busy != 0 {
         return Err(Error::Refused(format!(
@@ -693,7 +696,19 @@ fn secure<T>(
             conn.path().unwrap_or("the graph file")
         )));
     }
-    Ok(purged)
+    Ok(())
+}
+
+/// Purges the snapshot file at `path` as the store was purged, and truncates its log.
+fn purge_snapshot(path: &Path, key: &Key, target: &Purge) -> Result<(), Error> {
+    let mut snapshot = open_keyed(path, key)?;
+    secure(&mut snapshot.conn, |conn| {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        purge_in(&tx, &Ontology::load(&tx)?, key, target)?;
+        tx.commit()?;
+        Ok(())
+    })?;
+    truncate_log(&snapshot.conn)
 }
 
 impl Graph {
@@ -701,14 +716,16 @@ impl Graph {
     /// store and every snapshot the store made, with nothing of it left. Returns the purge event,
     /// which names the rule and the kind with each target as its keyed match value; a purge that
     /// matches nothing still writes it, as a standing rule. The store's removal lands in one
-    /// transaction or not at all; each snapshot that still exists is purged after it, and one
-    /// recorded that no longer exists is skipped.
+    /// transaction or not at all; each snapshot that still exists is purged after it, even when
+    /// the store's log could not be truncated, and one recorded that no longer exists is skipped.
     ///
     /// # Errors
     /// [`Error::KeyMissing`] without a key; [`Error::Refused`] when the target's class or
-    /// relation is not declared, or when the purge committed but a reader still open on the
-    /// store or a snapshot kept its write-ahead log from being truncated, so the log holds purged
-    /// bytes until a checkpoint runs after the readers close; the graph file or a snapshot file cannot be read or written.
+    /// relation is not declared; [`Error::Refused`] when the purge committed but a reader still
+    /// open on the store kept its write-ahead log from being truncated, so the log holds purged
+    /// bytes until a checkpoint runs after the readers close; [`Error::Refused`] naming the
+    /// snapshot file when a snapshot could not be purged or its log truncated, after every other
+    /// snapshot was tried; the graph file cannot be read or written.
     #[allow(
         clippy::needless_pass_by_value,
         reason = "the interface #85 names takes it by value"
@@ -733,20 +750,26 @@ impl Graph {
             tx.commit()?;
             Ok((event, snapshots))
         })?;
+        // The purge committed: every snapshot is purged whether or not the store's log could be
+        // truncated, and the store's error comes first.
+        let store = truncate_log(&self.conn);
+        let mut failed = None;
         for path in snapshots
             .into_iter()
             .map(PathBuf::from)
             .filter(|p| p.exists())
         {
-            let mut snapshot = open_keyed(&path, &key)?;
-            secure(&mut snapshot.conn, |conn| {
-                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                purge_in(&tx, &Ontology::load(&tx)?, &key, &target)?;
-                tx.commit()?;
-                Ok(())
-            })?;
+            if let Err(error) = purge_snapshot(&path, &key, &target) {
+                failed.get_or_insert_with(|| {
+                    Error::Refused(format!(
+                        "the snapshot {} was not purged: {error}",
+                        path.display()
+                    ))
+                });
+            }
         }
-        Ok(event)
+        store?;
+        failed.map_or(Ok(event), Err)
     }
 }
 
@@ -754,8 +777,10 @@ impl Graph {
 mod tests {
     use crate::{Class, Declaration, Error, NodeRef, Purge, Target, Unit, ValidTime, Write, open};
 
+    const TOKEN: &[u8] = b"zq-reader-token";
+
     #[test]
-    fn a_purge_with_a_reader_open_says_the_log_still_holds_purged_bytes()
+    fn a_purge_with_a_reader_open_says_the_log_still_holds_purged_bytes_and_purges_snapshots()
     -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("graph.rannoch");
@@ -767,6 +792,8 @@ mod tests {
             [("text", "zq-reader-token")],
             ValidTime::Unknown,
         )))?;
+        let snapshot_path = dir.path().join("snapshot.rannoch");
+        g.snapshot(g.events().committed()?, &snapshot_path)?;
         let reader = rusqlite::Connection::open(&path)?;
         reader.execute_batch("BEGIN; SELECT count(*) FROM _events;")?;
         let target = Target::Node(NodeRef::new("note", "n1"));
@@ -779,6 +806,13 @@ mod tests {
         );
         assert_eq!(g.find("note", "n1")?, None, "the purge itself committed");
         reader.execute_batch("COMMIT")?;
+        let snapshot = std::fs::read(&snapshot_path)?;
+        assert!(
+            !snapshot.windows(TOKEN.len()).any(|w| w == TOKEN),
+            "the snapshot still holds the purged token"
+        );
+        let wal = std::fs::read(format!("{}-wal", snapshot_path.display())).unwrap_or_default();
+        assert!(!wal.windows(TOKEN.len()).any(|w| w == TOKEN));
         Ok(())
     }
 }
