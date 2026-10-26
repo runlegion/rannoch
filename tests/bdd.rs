@@ -2428,7 +2428,8 @@ fn same_states(world: &World, last: u64) {
 #[given(
     "a graph of a time-keyed class whose nodes and links have several versions each, some arriving after newer ones, and a snapshot at a cursor"
 )]
-fn late_versions_and_snapshot(world: &mut World) {
+#[given("a graph of a time-keyed class with a snapshot at a cursor")]
+fn visits_and_snapshot(world: &mut World) {
     visits_before_snapshot(world);
     snapshot_at_end(world);
 }
@@ -2445,12 +2446,6 @@ fn rebuilt_from_snapshot_alone(world: &mut World) {
 )]
 fn snapshot_answers_the_past(world: &mut World) {
     same_states(world, 49);
-}
-
-#[given("a graph of a time-keyed class with a snapshot at a cursor")]
-fn visits_and_snapshot(world: &mut World) {
-    visits_before_snapshot(world);
-    snapshot_at_end(world);
 }
 
 #[given("events after the cursor, some at points before the snapshot's newest point")]
