@@ -248,18 +248,26 @@ pub(crate) fn link_heard(
         .is_some())
 }
 
-/// Records how the link of `relation` from `from` to `to` came to an end, by `event` from
-/// `source`: ended at the point `at`, or, with no point, found wrong. The latest replaces any
+/// Records how a link came to an end, when `change` is an ending (at its point) or a correction
+/// (with none), as the event `event`; any other change records nothing. The latest replaces any
 /// before it. Ending, correcting and replaying either record through here.
-pub(crate) fn conclude(
-    tx: &Connection,
-    relation: &str,
-    from: &str,
-    to: &str,
-    event: EventId,
-    source: &str,
-    at: Option<i64>,
-) -> Result<(), Error> {
+pub(crate) fn conclude(tx: &Connection, event: EventId, change: &Change) -> Result<(), Error> {
+    let (source, relation, from, to, at) = match change {
+        Change::Ended {
+            source,
+            relation,
+            from,
+            to,
+            at,
+        } => (source, relation, from, to, Some(*at)),
+        Change::Corrected {
+            source,
+            relation,
+            from,
+            to,
+        } => (source, relation, from, to, None),
+        _ => return Ok(()),
+    };
     tx.prepare_cached(
         "INSERT INTO _ends(entity, key, to_key, event, source, at) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(entity, key, to_key) DO UPDATE SET \
@@ -267,8 +275,8 @@ pub(crate) fn conclude(
     )?
     .execute(params![
         link_entity(relation),
-        from,
-        to,
+        from.key,
+        to.key,
         event.to_string(),
         source,
         at

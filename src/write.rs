@@ -893,27 +893,7 @@ pub(crate) fn replay(
         Change::Replaced { class, old, new } => {
             record_fate(tx, class, old, new)?;
         }
-        Change::Ended {
-            source,
-            relation,
-            from,
-            to,
-            at,
-        } => conclude(
-            tx,
-            relation,
-            &from.key,
-            &to.key,
-            event.id,
-            source,
-            Some(*at),
-        )?,
-        Change::Corrected {
-            source,
-            relation,
-            from,
-            to,
-        } => conclude(tx, relation, &from.key, &to.key, event.id, source, None)?,
+        Change::Ended { .. } | Change::Corrected { .. } => conclude(tx, event.id, &event.change)?,
     }
     Ok(true)
 }
@@ -1057,28 +1037,28 @@ impl Graph {
                 "no {name} link from {from} to {to} has been heard"
             )));
         }
-        let (source, relation) = (source.to_string(), name.clone());
+        let (source, relation) = (source.to_string(), name);
         let (from, to) = (
             NodeRef::new(&declared.from, from),
             NodeRef::new(&declared.to, to),
         );
         let change = match at {
             Some(at) => Change::Ended {
-                source: source.clone(),
+                source,
                 relation,
-                from: from.clone(),
-                to: to.clone(),
+                from,
+                to,
                 at,
             },
             None => Change::Corrected {
-                source: source.clone(),
+                source,
                 relation,
-                from: from.clone(),
-                to: to.clone(),
+                from,
+                to,
             },
         };
         let event = append(&tx, change)?;
-        conclude(&tx, &name, &from.key, &to.key, event.id, &source, at)?;
+        conclude(&tx, event.id, &event.change)?;
         tx.commit()?;
         self.loaded(version, ontology);
         Ok(event)
