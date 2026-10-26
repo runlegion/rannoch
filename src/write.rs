@@ -1001,7 +1001,7 @@ impl Graph {
     /// [`WriteError`] when a piece fails: the pieces before it are kept, and the error holds
     /// their events.
     pub fn write(&mut self, write: &Write) -> Result<Vec<Event>, WriteError> {
-        let mut events = Vec::new();
+        let events = Vec::new();
         // The version is read before the load: a declaration landing between them leaves the
         // cached version behind the ontology, which costs the next read a reload and nothing more.
         match schema_version(&self.conn).and_then(|v| Ok((v, Ontology::load(&self.conn)?))) {
@@ -1011,20 +1011,28 @@ impl Graph {
         if let Err(cause) = check(&self.conn, &self.ontology, write) {
             return Err(WriteError { events, cause });
         }
-        let mut held = Vec::new();
+        let mut put = Put {
+            wrote: events,
+            held: Vec::new(),
+        };
         for (i, piece) in pieces(&write.units).into_iter().enumerate() {
             if i > 0 {
                 std::thread::sleep(BETWEEN_PIECES);
             }
             match self.piece(&write.source, &write.derived_from, piece) {
-                Ok(put) => {
-                    events.extend(put.wrote);
-                    held.extend(put.held);
+                Ok(piece) => {
+                    put.wrote.extend(piece.wrote);
+                    put.held.extend(piece.held);
                 }
-                Err(cause) => return Err(WriteError { events, cause }),
+                Err(cause) => {
+                    return Err(WriteError {
+                        events: put.wrote,
+                        cause,
+                    });
+                }
             }
         }
-        Ok(if events.is_empty() { held } else { events })
+        Ok(put.events())
     }
 
     fn piece(
