@@ -22,8 +22,8 @@ use std::time::{Duration, Instant, SystemTime};
 use rannoch::{At, End, Failure, Hearing, HistoryKey, NodeFact, Queue, Ticket, ValueType, Version};
 use rannoch::{
     Change, Class, Count, Cursor, Date, Declaration, Description, Error, Event, EventId, Fact,
-    Fate, Graph, GroupBy, Link, LinkFact, Node, NodeRef, OpenLink, PartOf, Relation, Snapshot,
-    Step, Tally, Unit, ValidTime, Value, Write, WriteError,
+    Fate, Graph, GroupBy, Link, LinkFact, Node, NodeRef, OpenLink, PartOf, Purge, Relation,
+    Snapshot, Step, Tally, Target, Unit, ValidTime, Value, Write, WriteError,
 };
 use rstest_bdd_macros::{given, scenarios, then, when};
 use tempfile::TempDir;
@@ -566,9 +566,8 @@ struct World {
     open_links: Vec<OpenLink>,
     instances: Instances,
     rebuilt: Option<Graph>,
-    forgot: Option<Event>,
     content: String,
-    named: Vec<(EventId, Vec<Fact>)>,
+    purge: Purged,
     described: Option<Description>,
     answers: Vec<String>,
     shared: Option<Graph>,
@@ -626,9 +625,8 @@ fn world() -> World {
         open_links: Vec::new(),
         instances: Instances::default(),
         rebuilt: None,
-        forgot: None,
         content: String::new(),
-        named: Vec::new(),
+        purge: Purged::default(),
         described: None,
         answers: Vec::new(),
         shared: None,
@@ -1918,7 +1916,8 @@ fn folds_from_events(world: &mut World) {
             Change::Declared(_)
             | Change::Replaced { .. }
             | Change::Ended { .. }
-            | Change::Corrected { .. } => (Vec::new(), Vec::new()),
+            | Change::Corrected { .. }
+            | Change::Purged { .. } => (Vec::new(), Vec::new()),
             Change::Forgot { links, .. } => (Vec::new(), links),
         };
         for link in added {
@@ -1980,131 +1979,6 @@ fn fold_equals_live(world: &mut World) {
             tally.root
         );
     }
-}
-
-// ---------- events: forgetting ----------
-
-/// The voice the forget scenarios forget. Its 10 statements (st1, st501, ...) all support f1.
-fn forgotten() -> NodeRef {
-    NodeRef::new("voice", "v7")
-}
-
-/// Whether an event, as JSON, holds `content` (a JSON string, quotes included).
-fn holds(event: &Event, content: &str) -> bool {
-    serde_json::to_string(&event.change)
-        .unwrap()
-        .contains(content)
-}
-
-/// Per event, the facts that name `node`: as the node itself, or as an end of a link.
-fn naming(events: &[Event], node: &NodeRef) -> Vec<(EventId, Vec<Fact>)> {
-    let ends = |l: &rannoch::LinkFact| l.from == *node || l.to == *node;
-    events
-        .iter()
-        .filter_map(|e| {
-            let facts: Vec<Fact> = match &e.change {
-                Change::Wrote { added, .. } => added
-                    .iter()
-                    .filter(|f| match f {
-                        Fact::Node(n) => n.class == node.class && n.key == node.key,
-                        Fact::Link(l) | Fact::Opened(l) => ends(l),
-                    })
-                    .cloned()
-                    .collect(),
-                Change::Closed(l) if ends(l) => vec![Fact::Link(l.clone())],
-                _ => Vec::new(),
-            };
-            (!facts.is_empty()).then_some((e.id, facts))
-        })
-        .collect()
-}
-
-/// Forgets the voice, keeping its content as JSON and, per earlier event that named it, the
-/// facts it should still name once its content is stripped.
-fn forget_voice(world: &mut World) {
-    let voice = forgotten();
-    let content =
-        serde_json::to_string(&world.find(&voice.class, &voice.key).properties["name"]).unwrap();
-    let before = world.all_events();
-    assert!(before.iter().any(|e| holds(e, &content)));
-    let mut named = naming(&before, &voice);
-    for (_, facts) in &mut named {
-        for fact in facts {
-            if let Fact::Node(node) = fact {
-                assert!(!node.properties.is_empty());
-                node.properties.clear();
-            }
-        }
-    }
-    assert!(named.len() > 1);
-    world.content = content;
-    world.named = named;
-    world.forgot = Some(
-        world
-            .g()
-            .forget(&voice, "the voice asked to be forgotten", "eavesdrop")
-            .unwrap(),
-    );
-}
-
-fn f1_voices(world: &mut World) -> u64 {
-    world
-        .g()
-        .count(&Count {
-            class: "finding".into(),
-            roots: vec!["f1".into()],
-            path: vec![Step::new("supports<-"), Step::new("said<-")],
-            group_by: None,
-            as_of: None,
-            known_at: None,
-        })
-        .unwrap()[0]
-        .distinct
-}
-
-#[when("the app forgets one voice")]
-fn forgets_one_voice(world: &mut World) {
-    forget_voice(world);
-}
-
-#[given("a graph after the app forgets one voice")]
-fn t2_after_forget(world: &mut World) {
-    t2(world.open());
-    let before = f1_voices(world);
-    forget_voice(world);
-    let voice = forgotten();
-    assert_eq!(world.g().find(&voice.class, &voice.key).unwrap(), None);
-    assert_eq!(f1_voices(world), before - 1);
-}
-
-#[then("no event read from the start holds that voice's content")]
-fn no_event_holds_content(world: &mut World) {
-    let content = world.content.clone();
-    let events = world.all_events();
-    assert!(!events.is_empty());
-    assert!(events.iter().all(|e| !holds(e, &content)));
-}
-
-#[then("the forget event names the voice by id and kind and holds none of its content")]
-fn forget_event_names_voice(world: &mut World) {
-    let forgot = world.forgot.clone().expect("the app forgot a voice");
-    assert_eq!(world.all_events().last(), Some(&forgot));
-    match &forgot.change {
-        Change::Forgot { nodes, .. } => assert_eq!(nodes, &[forgotten()]),
-        other => panic!("expected a forget event, got {other:?}"),
-    }
-    assert!(!holds(&forgot, &world.content));
-}
-
-#[then("the earlier events that named it still name its id, its kind and its links' endpoints")]
-fn earlier_events_keep_ids(world: &mut World) {
-    let forgot = world.forgot.clone().expect("the app forgot a voice");
-    let earlier: Vec<Event> = world
-        .all_events()
-        .into_iter()
-        .filter(|e| e.cursor < forgot.cursor)
-        .collect();
-    assert_eq!(naming(&earlier, &forgotten()), world.named);
 }
 
 // ---------- events: snapshots ----------
@@ -2233,7 +2107,8 @@ fn rebuilt_matches_live(world: &mut World) {
 fn fates_before_snapshot(world: &mut World) {
     events_around_cursor(world);
     let g = world.g();
-    g.forget(&NodeRef::new("statement", "s0"), "living", "eavesdrop")
+    let target = Target::Node(NodeRef::new("statement", "s0"));
+    g.purge(Purge::Entity { target }, "living", "eavesdrop")
         .unwrap();
     g.replace("statement", "s1", "s2").unwrap();
     snapshot_at_end(world);
@@ -3411,7 +3286,13 @@ impl World {
 fn shared_s7_forgotten(world: &mut World) {
     world
         .shared()
-        .forget(&NodeRef::new("statement", "s7"), "superseded", "eavesdrop")
+        .purge(
+            Purge::Entity {
+                target: Target::Node(NodeRef::new("statement", "s7")),
+            },
+            "superseded",
+            "eavesdrop",
+        )
         .unwrap();
     assert_eq!(world.shared().find("statement", "s7").unwrap(), None);
 }
@@ -6380,6 +6261,647 @@ fn both_ended_at_40(world: &mut World) {
             "{end:?}"
         );
     }
+}
+
+// ---------- purge ----------
+
+/// The token the purged fact's property carries: found nowhere else in a scenario's files.
+const TOKEN: &str = "zq-purged-token-71";
+
+/// What the purge scenarios hold: what is purged, what it was, and where the snapshots are.
+#[derive(Default)]
+struct Purged {
+    /// What each purge names, in order.
+    targets: Vec<Purge>,
+    /// The purged hearings' exact contents, as their content identity hashes them.
+    contents: Vec<Vec<u8>>,
+    /// The keys and source strings that must be gone from the store.
+    gone: Vec<String>,
+    snapshots: Vec<PathBuf>,
+    /// The event ids the test recorded before the purge: the hearing written alone's, then the
+    /// two-hearing write's.
+    ids: Vec<EventId>,
+    /// Hearings that must stay, by node.
+    kept: Vec<(NodeRef, Vec<Hearing>)>,
+}
+
+/// The purge scenarios' declarations: people who know people and live in houses, and rooms
+/// part of houses and shelves part of rooms.
+fn purge_graph(world: &mut World) -> &mut Graph {
+    let g = world.open();
+    for d in [
+        Declaration::Class(Class::new("person", ["note"])),
+        Declaration::Class(Class::new("house", ["name"])),
+        Declaration::Class(Class::new("room", ["name"])),
+        Declaration::Class(Class::new("shelf", ["name"])),
+        Declaration::Relation(Relation::new("knows", "person", "person", false)),
+        Declaration::Relation(Relation::new("lives", "person", "house", false)),
+        Declaration::Relation(Relation::new("in_house", "room", "house", true)),
+        Declaration::Relation(Relation::new("in_room", "shelf", "room", true)),
+    ] {
+        g.declare(&d).unwrap();
+    }
+    g
+}
+
+fn person(key: &str, note: &str) -> Unit {
+    Unit::new("person", key, [("note", note)], day(2026, 10, 1))
+}
+
+/// The bytes a hearing's content identity hashes: a node's content heard from `source`.
+fn node_content(unit_key: &str, note: &str, source: &str) -> Vec<u8> {
+    let properties: BTreeMap<String, Value> = BTreeMap::from([("note".into(), Value::from(note))]);
+    serde_json::to_vec(&(
+        "node",
+        "person",
+        unit_key,
+        &day(2026, 10, 1),
+        source,
+        &properties,
+        None::<i64>,
+        None::<i64>,
+    ))
+    .unwrap()
+}
+
+/// A graph holding the fact p-gone, whose note carries the token, written in one write with
+/// p-stays, and other people's facts around it; the fact to purge is p-gone's one hearing.
+fn token_fact(world: &mut World) {
+    let g = purge_graph(world);
+    g.write(&Write::new("app").unit(person("p-other", "before")))
+        .unwrap();
+    g.write(
+        &Write::new("app")
+            .unit(person("p-gone", TOKEN))
+            .unit(person("p-stays", "stays")),
+    )
+    .unwrap();
+    g.write(&Write::new("app").unit(person("p-after", "after")))
+        .unwrap();
+    let hearing = &g.hearings(&NodeRef::new("person", "p-gone")).unwrap()[0];
+    world.purge.targets.push(Purge::Fact {
+        identity: hearing.identity,
+    });
+    world
+        .purge
+        .contents
+        .push(node_content("p-gone", TOKEN, "app"));
+    world.purge.gone.push(TOKEN.into());
+}
+
+/// Purges each target the scenario named, under one rule.
+fn purge_targets(world: &mut World) {
+    for target in world.purge.targets.clone() {
+        let event = world.g().purge(target, "rule-71", "app").unwrap();
+        assert!(matches!(event.change, Change::Purged { .. }), "{event:?}");
+    }
+}
+
+/// Closes every handle on the store, as an app does when its queue closes.
+fn close_store(world: &mut World) {
+    world.queue = None;
+    world.graph = None;
+}
+
+/// Every file the store and its snapshots keep, write-ahead logs included, as bytes.
+fn store_files(world: &World) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut bases = vec![world.path()];
+    bases.extend(world.purge.snapshots.iter().cloned());
+    files_of(&bases)
+}
+
+/// The files of each graph file in `bases`, write-ahead logs and journals included, as bytes.
+fn files_of(bases: &[PathBuf]) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut files = Vec::new();
+    for base in bases {
+        for suffix in ["", "-wal", "-journal"] {
+            let path = PathBuf::from(format!("{}{suffix}", base.display()));
+            if let Ok(bytes) = std::fs::read(&path) {
+                files.push((path, bytes));
+            }
+        }
+    }
+    assert!(!files.is_empty());
+    files
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Asserts no file of the store or its snapshots holds `needle`.
+fn assert_no_bytes(world: &World, needle: &[u8]) {
+    for (path, bytes) in store_files(world) {
+        assert!(
+            !find_bytes(&bytes, needle),
+            "{} holds {}",
+            path.display(),
+            String::from_utf8_lossy(needle)
+        );
+    }
+}
+
+/// Asserts no event the graph `g` holds encodes `text` as a JSON string.
+fn assert_no_event_holds(g: &Graph, text: &str) {
+    let quoted = serde_json::to_string(text).unwrap();
+    for event in g.events().since(Cursor::START).unwrap() {
+        let body = serde_json::to_string(&event.change).unwrap();
+        assert!(!body.contains(&quoted), "{event:?} holds {text}");
+    }
+}
+
+#[given("a graph holding a fact in its events")]
+fn graph_holding_fact(world: &mut World) {
+    token_fact(world);
+    world.purge.gone.push("p-gone".into());
+}
+
+#[given("a graph holding a fact whose property carries a unique token")]
+fn graph_holding_token(world: &mut World) {
+    token_fact(world);
+}
+
+#[given("a graph from which the app has purged a fact")]
+fn graph_purged_fact(world: &mut World) {
+    graph_holding_fact(world);
+    purge_targets(world);
+}
+
+#[given("a graph with a snapshot holding a fact")]
+fn graph_snapshot_fact(world: &mut World) {
+    graph_holding_fact(world);
+    let path = world.dir.path().join("snapshot-1.rannoch");
+    let at = world.g().events().committed().unwrap();
+    world.g().snapshot(at, &path).unwrap();
+    world.purge.snapshots.push(path);
+}
+
+#[given(
+    "a snapshot taken at one cursor and, after later writes, another snapshot at a later cursor"
+)]
+fn two_snapshots(world: &mut World) {
+    for (i, later) in ["later-1", "later-2"].into_iter().enumerate() {
+        let path = world.dir.path().join(format!("snapshot-{i}.rannoch"));
+        let at = world.g().events().committed().unwrap();
+        world.g().snapshot(at, &path).unwrap();
+        world.purge.snapshots.push(path);
+        world
+            .g()
+            .write(&Write::new("app").unit(person(later, later)))
+            .unwrap();
+    }
+}
+
+#[when("the app purges the fact")]
+fn purges_fact(world: &mut World) {
+    purge_targets(world);
+}
+
+#[when("the app purges the fact and the queue is closed")]
+fn purges_fact_closed(world: &mut World) {
+    purge_targets(world);
+    close_store(world);
+}
+
+#[then("no event in the store holds its key, kind, endpoints or properties")]
+fn no_event_holds_fact(world: &mut World) {
+    for gone in world.purge.gone.clone() {
+        assert_no_event_holds(world.g(), &gone);
+    }
+    let g = world.g();
+    assert_eq!(g.find("person", "p-gone").unwrap(), None);
+    assert_eq!(
+        g.hearings(&NodeRef::new("person", "p-stays"))
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[then("no snapshot holds anything of it")]
+fn no_snapshot_holds_fact(world: &mut World) {
+    close_store(world);
+    for path in world.purge.snapshots.clone() {
+        for (file, bytes) in files_of(std::slice::from_ref(&path)) {
+            for gone in &world.purge.gone {
+                assert!(
+                    !find_bytes(&bytes, gone.as_bytes()),
+                    "{} holds {gone}",
+                    file.display()
+                );
+            }
+        }
+        let back = rannoch::open(&path, Some(&KEY)).unwrap();
+        assert_eq!(back.find("person", "p-gone").unwrap(), None);
+        assert!(
+            back.hearings(&NodeRef::new("person", "p-gone"))
+                .unwrap()
+                .is_empty()
+        );
+        for gone in &world.purge.gone {
+            assert_no_event_holds(&back, gone);
+        }
+    }
+}
+
+#[then(
+    "a byte search of the store's files, its write-ahead log included, finds no copy of the token"
+)]
+fn no_token_in_files(world: &mut World) {
+    assert!(world.purge.snapshots.is_empty());
+    assert_no_bytes(world, TOKEN.as_bytes());
+}
+
+#[then("a byte search of each of the two snapshots finds no copy of the token")]
+fn no_token_in_snapshots(world: &mut World) {
+    assert_eq!(world.purge.snapshots.len(), 2);
+    assert_no_bytes(world, TOKEN.as_bytes());
+}
+
+#[when("the graph is rebuilt")]
+fn graph_rebuilt(world: &mut World) {
+    let events = world.all_events();
+    let path = world.dir.path().join("rebuilt.rannoch");
+    world.rebuilt = Some(rannoch::rebuild(&events, path, Some(&KEY)).unwrap());
+}
+
+#[then("the rebuilt graph holds nothing of the purged fact")]
+fn rebuilt_holds_nothing(world: &mut World) {
+    let rebuilt = world.rebuilt.as_ref().expect("the graph was rebuilt");
+    assert_eq!(rebuilt.find("person", "p-gone").unwrap(), None);
+    assert!(
+        rebuilt
+            .hearings(&NodeRef::new("person", "p-gone"))
+            .unwrap()
+            .is_empty()
+    );
+    for gone in &world.purge.gone {
+        assert_no_event_holds(rebuilt, gone);
+    }
+    let stays = rebuilt.find("person", "p-stays").unwrap().unwrap();
+    assert_eq!(stays.properties["note"], Value::from("stays"));
+}
+
+/// The stream the stream scenario purges, by its write source.
+const STREAM: &str = "zq-stream-71";
+
+#[given("a graph holding a stream")]
+fn graph_holding_stream(world: &mut World) {
+    let g = purge_graph(world);
+    let when = day(2026, 10, 1);
+    g.write(
+        &Write::new("app")
+            .unit(person("p-both", "app's word"))
+            .unit(person("p-other", "other")),
+    )
+    .unwrap();
+    g.write(&Write::new("app").unit(person("p-c", "c").link(
+        "knows",
+        "p-c",
+        "p-both",
+        when.clone(),
+    )))
+    .unwrap();
+    g.write(
+        &Write::new(STREAM)
+            .unit(person("p-stream", "stream only").link(
+                "knows",
+                "p-stream",
+                "p-both",
+                when.clone(),
+            ))
+            .unit(person("p-both", "the stream's word")),
+    )
+    .unwrap();
+    let at = SystemTime::UNIX_EPOCH + Duration::from_hours(500_000);
+    g.end_link("knows", "p-c", "p-both", at, when, STREAM)
+        .unwrap();
+    g.correct_link("knows", "p-stream", "p-both", STREAM)
+        .unwrap();
+    world.purge.targets.push(Purge::Stream {
+        source: STREAM.into(),
+    });
+    world.purge.gone.extend([
+        STREAM.into(),
+        "p-stream".into(),
+        "stream only".into(),
+        "the stream's word".into(),
+    ]);
+}
+
+#[when("the app purges the stream")]
+fn purges_stream(world: &mut World) {
+    purge_targets(world);
+}
+
+#[then("nothing of the stream remains in the store")]
+fn nothing_of_stream(world: &mut World) {
+    for gone in world.purge.gone.clone() {
+        assert_no_event_holds(world.g(), &gone);
+    }
+    let g = world.g();
+    assert_eq!(g.find("person", "p-stream").unwrap(), None);
+    let both = g.hearings(&NodeRef::new("person", "p-both")).unwrap();
+    assert_eq!(both.len(), 1);
+    assert_eq!(both[0].source, "app");
+    let node = g.find("person", "p-both").unwrap().unwrap();
+    assert_eq!(
+        (node.source.as_str(), &node.properties["note"]),
+        ("app", &Value::from("app's word"))
+    );
+    assert_eq!(g.link_end("knows", "p-c", "p-both").unwrap(), None);
+    assert!(
+        g.link_hearings("knows", "p-stream", "p-both")
+            .unwrap()
+            .is_empty()
+    );
+    close_store(world);
+    for gone in world.purge.gone.clone() {
+        assert_no_bytes(world, gone.as_bytes());
+    }
+}
+
+#[given("a graph holding facts about one node and two nodes declared part of it")]
+fn graph_node_and_parts(world: &mut World) {
+    let g = purge_graph(world);
+    let when = day(2026, 10, 1);
+    let named = |class: &str, key: &str| {
+        Unit::new(class, key, [("name", format!("{key} named"))], when.clone())
+    };
+    g.write(
+        &Write::new("app")
+            .unit(named("house", "h-gone"))
+            .unit(named("house", "h-stays")),
+    )
+    .unwrap();
+    g.write(&Write::new("app").unit(named("room", "r-gone").link(
+        "in_house",
+        "r-gone",
+        "h-gone",
+        when.clone(),
+    )))
+    .unwrap();
+    g.write(&Write::new("app").unit(named("shelf", "s-gone").link(
+        "in_room",
+        "s-gone",
+        "r-gone",
+        when.clone(),
+    )))
+    .unwrap();
+    g.write(&Write::new("other").unit(named("room", "r-gone")))
+        .unwrap();
+    g.write(&Write::new("app").unit(named("room", "r-stays").link(
+        "in_house",
+        "r-stays",
+        "h-stays",
+        when.clone(),
+    )))
+    .unwrap();
+    g.write(&Write::new("app").unit(person("p-lives", "lives").link(
+        "lives",
+        "p-lives",
+        "h-gone",
+        when.clone(),
+    )))
+    .unwrap();
+    world.purge.targets.push(Purge::Entity {
+        target: Target::Node(NodeRef::new("house", "h-gone")),
+    });
+    world
+        .purge
+        .gone
+        .extend(["h-gone", "r-gone", "s-gone"].map(String::from));
+}
+
+#[when("the app purges everything about that node")]
+fn purges_node(world: &mut World) {
+    purge_targets(world);
+}
+
+#[then("nothing about the node or either of its parts remains in the store")]
+fn nothing_about_node(world: &mut World) {
+    for gone in world.purge.gone.clone() {
+        assert_no_event_holds(world.g(), &gone);
+    }
+    let g = world.g();
+    for (class, key) in [("house", "h-gone"), ("room", "r-gone"), ("shelf", "s-gone")] {
+        assert_eq!(g.find(class, key).unwrap(), None, "{key}");
+        assert!(
+            g.hearings(&NodeRef::new(class, key)).unwrap().is_empty(),
+            "{key}"
+        );
+    }
+    assert!(g.find("room", "r-stays").unwrap().is_some());
+    assert!(g.find("person", "p-lives").unwrap().is_some());
+    assert!(
+        g.link_hearings("lives", "p-lives", "h-gone")
+            .unwrap()
+            .is_empty()
+    );
+    assert!(g.open_links().unwrap().is_empty());
+    close_store(world);
+    for gone in world.purge.gone.clone() {
+        assert_no_bytes(world, gone.as_bytes());
+    }
+}
+
+#[given("a source whose hearings back more than one node and link")]
+fn source_backs_many(world: &mut World) {
+    let g = purge_graph(world);
+    let when = day(2026, 10, 1);
+    g.write(
+        &Write::new("other")
+            .unit(person("p-a", "other's a"))
+            .unit(person("p-c", "c")),
+    )
+    .unwrap();
+    g.write(
+        &Write::new("gone-source")
+            .unit(person("p-a", "gone's a").link("knows", "p-a", "p-c", when.clone()))
+            .unit(person("p-b", "gone's b").link("knows", "p-b", "p-a", when.clone())),
+    )
+    .unwrap();
+    g.write(&Write::new("other").unit(person("p-c", "c").link(
+        "knows",
+        "p-c",
+        "p-a",
+        when.clone(),
+    )))
+    .unwrap();
+    world.purge.targets.push(Purge::Source {
+        source: "gone-source".into(),
+    });
+}
+
+#[when("the app purges that source")]
+fn purges_source(world: &mut World) {
+    purge_targets(world);
+}
+
+#[then("no node or link holds a hearing from it")]
+fn no_hearing_from_source(world: &mut World) {
+    let g = world.g();
+    for key in ["p-a", "p-b", "p-c"] {
+        for hearing in g.hearings(&NodeRef::new("person", key)).unwrap() {
+            assert_ne!(hearing.source, "gone-source", "{key}");
+        }
+    }
+    for (from, to) in [("p-a", "p-c"), ("p-b", "p-a"), ("p-c", "p-a")] {
+        for hearing in g.link_hearings("knows", from, to).unwrap() {
+            assert_ne!(hearing.source, "gone-source", "{from} {to}");
+        }
+    }
+    assert_eq!(g.hearings(&NodeRef::new("person", "p-a")).unwrap().len(), 1);
+    assert_eq!(
+        g.find("person", "p-a").unwrap().unwrap().properties["note"],
+        Value::from("other's a")
+    );
+    assert_eq!(g.find("person", "p-b").unwrap(), None);
+    assert!(g.find_link("knows", "p-c", "p-a").unwrap().is_some());
+    assert_no_event_holds(g, "gone-source");
+}
+
+#[given(
+    "a graph holding a hearing written alone, and one write whose event names two hearings, each event id recorded by the test before the purge"
+)]
+fn alone_and_pair(world: &mut World) {
+    let g = purge_graph(world);
+    let alone = g
+        .write(&Write::new("app").unit(person("p-alone", "alone")))
+        .unwrap();
+    let pair = g
+        .write(
+            &Write::new("app")
+                .unit(person("p-one", "one"))
+                .unit(person("p-two", "two")),
+        )
+        .unwrap();
+    let targets: Vec<Purge> = ["p-alone", "p-one"]
+        .into_iter()
+        .map(|key| Purge::Fact {
+            identity: g.hearings(&NodeRef::new("person", key)).unwrap()[0].identity,
+        })
+        .collect();
+    world.purge.ids = vec![alone[0].id, pair[0].id];
+    world.purge.targets = targets;
+    world
+        .purge
+        .contents
+        .push(node_content("p-alone", "alone", "app"));
+    world
+        .purge
+        .contents
+        .push(node_content("p-one", "one", "app"));
+}
+
+#[when(
+    "the app purges the hearing written alone and one of the write's two hearings, and the queue is closed"
+)]
+fn purges_alone_and_one(world: &mut World) {
+    purge_targets(world);
+    close_store(world);
+}
+
+#[then(
+    "hashing each purged hearing's exact content, plainly and under every key found in the store's files, matches nothing in them"
+)]
+fn no_hash_matches(world: &mut World) {
+    let files = store_files(world);
+    let raw: HashSet<&[u8]> = files.iter().flat_map(|(_, b)| b.windows(32)).collect();
+    let text: HashSet<&[u8]> = files.iter().flat_map(|(_, b)| b.windows(64)).collect();
+    let mut keys: Vec<[u8; 32]> = raw
+        .iter()
+        .map(|w| <[u8; 32]>::try_from(*w).unwrap())
+        .collect();
+    keys.push(KEY);
+    for content in &world.purge.contents {
+        let mut hashes = vec![blake3::hash(content)];
+        hashes.extend(keys.iter().map(|key| blake3::keyed_hash(key, content)));
+        for hash in hashes {
+            assert!(
+                !raw.contains(hash.as_bytes().as_slice()),
+                "a purged hearing's hash is in the files"
+            );
+            assert!(
+                !text.contains(hash.to_hex().as_bytes()),
+                "a purged hearing's hash is in the files as text"
+            );
+        }
+    }
+}
+
+#[then("no id in the store's files equals the event id of the hearing written alone")]
+fn no_alone_id(world: &mut World) {
+    let id = world.purge.ids[0];
+    assert_no_bytes(world, id.to_string().as_bytes());
+    let raw: uuid::Uuid = serde_json::from_value(serde_json::to_value(id).unwrap()).unwrap();
+    assert_no_bytes(world, raw.as_bytes());
+}
+
+#[then("a write naming the two-hearing write's event id as its derived-from source is accepted")]
+fn pair_id_accepted(world: &mut World) {
+    let pair = world.purge.ids[1];
+    let g = world.open();
+    g.write(
+        &Write::new("app")
+            .unit(person("p-derived", "derived"))
+            .derived_from([pair]),
+    )
+    .unwrap();
+    assert_eq!(
+        g.derived(pair).unwrap(),
+        [NodeRef::new("person", "p-derived")]
+    );
+    assert_eq!(
+        g.hearings(&NodeRef::new("person", "p-two")).unwrap()[0].event,
+        pair
+    );
+}
+
+#[given("a node heard from two sources")]
+fn node_two_sources(world: &mut World) {
+    let g = purge_graph(world);
+    g.write(&Write::new("first").unit(person("p-n", "first's word")))
+        .unwrap();
+    g.write(&Write::new("second").unit(person("p-n", "second's word")))
+        .unwrap();
+    g.write(&Write::new("first").unit(person("p-n", "first's next word")))
+        .unwrap();
+    let node = NodeRef::new("person", "p-n");
+    let second: Vec<Hearing> = g
+        .hearings(&node)
+        .unwrap()
+        .into_iter()
+        .filter(|h| h.source == "second")
+        .collect();
+    world.purge.kept = vec![(node.clone(), second)];
+    world.purge.targets.push(Purge::EntityFromSource {
+        target: Target::Node(node),
+        source: "first".into(),
+    });
+}
+
+#[when("the app purges what the first source said about that node")]
+fn purges_first_source(world: &mut World) {
+    purge_targets(world);
+}
+
+#[then("the node holds no hearing from the first source")]
+fn no_first_hearing(world: &mut World) {
+    let hearings = world.g().hearings(&NodeRef::new("person", "p-n")).unwrap();
+    assert!(hearings.iter().all(|h| h.source != "first"), "{hearings:?}");
+    assert_no_event_holds(world.g(), "first's word");
+}
+
+#[then("it still holds every hearing from the second source")]
+fn second_hearings_kept(world: &mut World) {
+    let (node, kept) = world.purge.kept[0].clone();
+    assert_eq!(world.g().hearings(&node).unwrap(), kept);
+    let found = world.g().find("person", "p-n").unwrap().unwrap();
+    assert_eq!(
+        (found.source.as_str(), &found.properties["note"]),
+        ("second", &Value::from("second's word"))
+    );
 }
 
 // FR-RANNOCH-084's other scenarios belong to #89, which brings their steps and drops this filter.

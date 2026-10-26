@@ -1,0 +1,741 @@
+//! Purging: an app's forgetting rule removes a fact, a stream, everything about a node or a link,
+//! or one source's word, from the store and from every snapshot the store made, and leaves nothing
+//! of it: no event body, no hearing, no content identity, and no event id that names nothing left.
+//! A purge runs in one transaction with `secure_delete` on and checkpoints the write-ahead log
+//! after, so no purged byte stays in a free page or in the log.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
+
+use rusqlite::{Connection, OptionalExtension, ToSql, TransactionBehavior, params};
+use serde::{Deserialize, Serialize};
+
+use crate::events::{
+    Change, Cursor, Event, Fact, LinkFact, Stored, append, drop_derived, naming_key, remove, unlink,
+};
+use crate::history::{Key, Of, link_entity, newest, node_entity, see};
+use crate::open::{CLASS, Graph, Ontology, RELATION, class_table, open_keyed, relation_table};
+use crate::read::NodeRef;
+use crate::write::{Error, Piece, Stamp, node_id};
+
+/// What a purge names: a node, or a link by its relation and both of its ends.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Target {
+    Node(NodeRef),
+    Link {
+        relation: String,
+        from: NodeRef,
+        to: NodeRef,
+    },
+}
+
+/// What an app's forgetting rule purges.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Purge {
+    /// One hearing, by its content identity.
+    Fact { identity: [u8; 32] },
+    /// Every hearing, ending and correction written under the write source `source`.
+    Stream { source: String },
+    /// Everything about one node and every node transitively part of it, with their links,
+    /// hearings, endings and corrections; or a link's hearings, endings and corrections.
+    Entity { target: Target },
+    /// The node's or link's hearings, endings and corrections from the hearing source `source`.
+    EntityFromSource { target: Target, source: String },
+    /// Every hearing, ending and correction from the hearing source `source`, on every node and
+    /// link.
+    Source { source: String },
+}
+
+impl Purge {
+    /// The purge with each of its targets as its keyed match value under `key`, as its event
+    /// records it: it names what it matched and holds none of it.
+    pub(crate) fn matched(&self, key: &Key) -> Purge {
+        let text = |text: &str| key.matched(text.as_bytes()).to_hex().to_string();
+        let node = |n: &NodeRef| NodeRef::new(text(&n.class), text(&n.key));
+        let target = |t: &Target| match t {
+            Target::Node(n) => Target::Node(node(n)),
+            Target::Link { relation, from, to } => Target::Link {
+                relation: text(relation),
+                from: node(from),
+                to: node(to),
+            },
+        };
+        match self {
+            Purge::Fact { identity } => Purge::Fact {
+                identity: *key.matched(identity).as_bytes(),
+            },
+            Purge::Stream { source } => Purge::Stream {
+                source: text(source),
+            },
+            Purge::Entity { target: t } => Purge::Entity { target: target(t) },
+            Purge::EntityFromSource { target: t, source } => Purge::EntityFromSource {
+                target: target(t),
+                source: text(source),
+            },
+            Purge::Source { source } => Purge::Source {
+                source: text(source),
+            },
+        }
+    }
+}
+
+/// A node or a link as the hearings name it: its entity, its key and, for a link, its target's.
+type Entity = (String, String, Option<String>);
+
+/// A hearing a purge removes: its identity, what it is of, and the event it is named by, with
+/// that event's place in the log.
+struct Heard {
+    identity: [u8; 32],
+    of: Entity,
+    event: String,
+    seq: i64,
+}
+
+/// What a purge matched.
+#[derive(Default)]
+struct Chosen {
+    hearings: BTreeMap<[u8; 32], Heard>,
+    /// The ending and correction events, with the link each concluded.
+    concluded: BTreeMap<String, Entity>,
+    /// The nodes that leave whole, with their links.
+    nodes: BTreeSet<NodeRef>,
+    /// The links that leave whole: relation, from key, to key.
+    links: BTreeSet<(String, String, String)>,
+}
+
+impl Chosen {
+    fn hear(&mut self, tx: &Connection, filter: &str, args: &[&dyn ToSql]) -> Result<(), Error> {
+        let sql = format!(
+            "SELECT identity, entity, key, to_key, event, seq FROM _hearings WHERE {filter}"
+        );
+        let mut statement = tx.prepare_cached(&sql)?;
+        let mut rows = statement.query(args)?;
+        while let Some(row) = rows.next()? {
+            let identity: [u8; 32] = row.get(0)?;
+            self.hearings.insert(
+                identity,
+                Heard {
+                    identity,
+                    of: (row.get(1)?, row.get(2)?, row.get(3)?),
+                    event: row.get(4)?,
+                    seq: row.get(5)?,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn conclude(
+        &mut self,
+        tx: &Connection,
+        filter: &str,
+        args: &[&dyn ToSql],
+    ) -> Result<(), Error> {
+        let sql = format!(
+            "SELECT event, entity, key, to_key FROM _ends WHERE {filter} \
+             UNION SELECT event, entity, key, to_key FROM _endings WHERE {filter}"
+        );
+        let mut statement = tx.prepare_cached(&sql)?;
+        let mut rows = statement.query(args)?;
+        while let Some(row) = rows.next()? {
+            self.concluded
+                .insert(row.get(0)?, (row.get(1)?, row.get(2)?, row.get(3)?));
+        }
+        Ok(())
+    }
+
+    /// Every hearing, ending and correction written under the write source `source`.
+    fn stream(&mut self, tx: &Connection, key: &Key, source: &str) -> Result<(), Error> {
+        for (_, stored) in naming_key(tx, source)? {
+            match &stored.change {
+                Change::Wrote {
+                    source: s, added, ..
+                } if s == source => {
+                    for fact in added {
+                        let of = match fact {
+                            Fact::Node(node) => Of::Node(node),
+                            Fact::Link(link) | Fact::Opened(link) => Of::Link(link),
+                        };
+                        let identity = of.identity(key, s)?;
+                        self.hear(tx, "identity = ?1", params![identity])?;
+                    }
+                }
+                Change::Ended {
+                    source: s,
+                    relation,
+                    from,
+                    to,
+                    ..
+                }
+                | Change::Corrected {
+                    source: s,
+                    relation,
+                    from,
+                    to,
+                } if s == source => {
+                    let of = (
+                        link_entity(relation),
+                        from.key.clone(),
+                        Some(to.key.clone()),
+                    );
+                    self.concluded.insert(stored.id.to_string(), of);
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Everything about `whole` and every node part of it: their hearings, and their links'
+    /// hearings, endings and corrections; each of them leaves whole.
+    fn whole_node(
+        &mut self,
+        tx: &Connection,
+        ontology: &Ontology,
+        whole: &NodeRef,
+    ) -> Result<(), Error> {
+        for node in with_parts(tx, ontology, whole)? {
+            self.hear(
+                tx,
+                "entity = ?1 AND key = ?2 AND to_key IS NULL",
+                params![node_entity(&node.class), node.key],
+            )?;
+            for relation in ontology.relations.values() {
+                for (end, column) in [(&relation.from, "key"), (&relation.to, "to_key")] {
+                    if *end != node.class {
+                        continue;
+                    }
+                    let filter = format!("entity = ?1 AND {column} = ?2");
+                    let args = params![link_entity(&relation.name), node.key];
+                    self.hear(tx, &filter, args)?;
+                    self.conclude(tx, &filter, args)?;
+                }
+            }
+            self.nodes.insert(node);
+        }
+        let links: Vec<Entity> = self
+            .hearings
+            .values()
+            .map(|h| h.of.clone())
+            .chain(self.concluded.values().cloned())
+            .filter(|(_, _, to)| to.is_some())
+            .collect();
+        for (entity, from, to) in links {
+            self.links.insert(link_key(&(entity, from, to)));
+        }
+        Ok(())
+    }
+
+    /// Whether a fact names a node or a link that leaves whole.
+    fn names(&self, fact: &Fact) -> bool {
+        match fact {
+            Fact::Node(node) => self.nodes.contains(&NodeRef::new(&node.class, &node.key)),
+            Fact::Link(link) | Fact::Opened(link) => self.whole_link(link),
+        }
+    }
+
+    fn whole_link(&self, link: &LinkFact) -> bool {
+        self.nodes.contains(&link.from)
+            || self.nodes.contains(&link.to)
+            || self.links.contains(&(
+                link.relation.clone(),
+                link.from.key.clone(),
+                link.to.key.clone(),
+            ))
+    }
+}
+
+/// A link as the hearings name it, as its relation, from key and to key.
+fn link_key((entity, from, to): &Entity) -> (String, String, String) {
+    let relation = entity.split_once(':').map_or(entity.as_str(), |(_, r)| r);
+    (
+        relation.to_string(),
+        from.clone(),
+        to.clone().unwrap_or_default(),
+    )
+}
+
+/// The node or link `target` names, as its hearings name it.
+fn entity(ontology: &Ontology, target: &Target) -> Result<Entity, Error> {
+    Ok(match target {
+        Target::Node(node) => (
+            node_entity(&ontology.class(&node.class)?.name),
+            node.key.clone(),
+            None,
+        ),
+        Target::Link { relation, from, to } => (
+            link_entity(&ontology.relation(relation)?.name),
+            from.key.clone(),
+            Some(to.key.clone()),
+        ),
+    })
+}
+
+/// `node` and every node transitively part of it, following inbound containment links at any
+/// depth, as a description walks them.
+fn with_parts(tx: &Connection, ontology: &Ontology, node: &NodeRef) -> Result<Vec<NodeRef>, Error> {
+    let root = NodeRef::new(&ontology.class(&node.class)?.name, &node.key);
+    let mut all = vec![root.clone()];
+    let mut frontier = vec![root];
+    while let Some(whole) = frontier.pop() {
+        for relation in ontology.relations.values() {
+            if !relation.containment || relation.to != whole.class {
+                continue;
+            }
+            let sql = format!(
+                "SELECT p.key FROM {} r JOIN {} p ON p.id = r.src JOIN {} w ON w.id = r.dst \
+                 WHERE w.key = ?1",
+                relation_table(&relation.name),
+                class_table(&relation.from),
+                class_table(&relation.to)
+            );
+            let parts: Vec<String> = tx
+                .prepare_cached(&sql)?
+                .query_map(params![whole.key], |row| row.get(0))?
+                .collect::<Result<_, _>>()?;
+            for key in parts {
+                let part = NodeRef::new(&relation.from, key);
+                if !all.contains(&part) {
+                    all.push(part.clone());
+                    frontier.push(part);
+                }
+            }
+        }
+    }
+    Ok(all)
+}
+
+/// What `purge` matches in the store `tx` holds.
+fn choose(tx: &Connection, ontology: &Ontology, key: &Key, purge: &Purge) -> Result<Chosen, Error> {
+    let mut chosen = Chosen::default();
+    match purge {
+        Purge::Fact { identity } => chosen.hear(tx, "identity = ?1", params![identity])?,
+        Purge::Source { source } => {
+            chosen.hear(tx, "source = ?1", params![source])?;
+            chosen.conclude(tx, "source = ?1", params![source])?;
+        }
+        Purge::Stream { source } => chosen.stream(tx, key, source)?,
+        Purge::EntityFromSource { target, source } => {
+            let (entity, from, to) = entity(ontology, target)?;
+            let args = params![entity, from, to, source];
+            chosen.hear(
+                tx,
+                "entity = ?1 AND key = ?2 AND to_key IS ?3 AND source = ?4",
+                args,
+            )?;
+            chosen.conclude(
+                tx,
+                "entity = ?1 AND key = ?2 AND to_key IS ?3 AND source = ?4",
+                args,
+            )?;
+        }
+        Purge::Entity {
+            target: target @ Target::Link { .. },
+        } => {
+            let (entity, from, to) = entity(ontology, target)?;
+            let args = params![entity, from, to];
+            chosen.hear(tx, "entity = ?1 AND key = ?2 AND to_key IS ?3", args)?;
+            chosen.conclude(tx, "entity = ?1 AND key = ?2 AND to_key IS ?3", args)?;
+            chosen.links.insert(link_key(&(entity, from, to)));
+        }
+        Purge::Entity {
+            target: Target::Node(node),
+        } => chosen.whole_node(tx, ontology, node)?,
+    }
+    Ok(chosen)
+}
+
+/// Removes the link of `relation` from `from` to `to` from live state: from its relation, or
+/// from the open links.
+fn drop_link(
+    tx: &Connection,
+    ontology: &Ontology,
+    (relation, from, to): (&str, &str, &str),
+) -> Result<(), Error> {
+    let relation = ontology.relation(relation)?;
+    tx.prepare_cached(&format!(
+        "DELETE FROM {} WHERE src = (SELECT id FROM {} WHERE key = ?1) \
+         AND dst = (SELECT id FROM {} WHERE key = ?2)",
+        relation_table(&relation.name),
+        class_table(&relation.from),
+        class_table(&relation.to)
+    ))?
+    .execute(params![from, to])?;
+    tx.prepare_cached("DELETE FROM _open WHERE rel = ?1 AND from_key = ?2 AND to_key = ?3")?
+        .execute(params![relation.name, from, to])?;
+    Ok(())
+}
+
+/// What is left of a touched node or link once its purged hearings are gone.
+#[derive(Default)]
+struct Left {
+    /// Nodes with no hearing left, which left live state; their links wait open.
+    nodes: BTreeSet<NodeRef>,
+    /// Links with no hearing left, which left live state.
+    links: BTreeSet<(String, String, String)>,
+}
+
+/// Puts the current state of `of` back from its newest version left, as every write chooses it;
+/// a node or link with no version left leaves live state, and a node's links that still have
+/// hearings wait open for it.
+fn current(
+    tx: &Connection,
+    ontology: &Ontology,
+    key: &Key,
+    (entity, at, to): &Entity,
+    left: &mut Left,
+) -> Result<(), Error> {
+    let version = newest(tx, (entity, at, to.as_deref()))?;
+    let stamp = |recorded| Stamp {
+        id: crate::events::EventId::now(),
+        cursor: Cursor::START,
+        recorded,
+        arrived: true,
+    };
+    let (kind, name) = entity.split_once(':').unwrap_or_default();
+    if kind == CLASS {
+        let class = ontology.class(name)?;
+        if let Some((v, recorded, _)) = version {
+            let piece = Piece::new(tx, ontology, key, &v.source, stamp(recorded));
+            piece.put(class, at, &v.source, &v.valid, recorded, &v.properties)?;
+            return Ok(());
+        }
+        let node = NodeRef::new(&class.name, at.as_str());
+        let Some(id) = node_id(tx, &class.name, at)? else {
+            return Ok(());
+        };
+        for link in unlink(tx, ontology, &node, id)? {
+            let entity = link_entity(&link.relation);
+            let of = (
+                entity.as_str(),
+                link.from.key.as_str(),
+                Some(link.to.key.as_str()),
+            );
+            if let Some((v, ..)) = newest(tx, of)? {
+                tx.prepare_cached(
+                    "INSERT OR REPLACE INTO _open(rel, from_key, to_key, source, valid) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                )?
+                .execute(params![
+                    link.relation,
+                    link.from.key,
+                    link.to.key,
+                    v.source,
+                    v.valid.to_sql()
+                ])?;
+            }
+        }
+        tx.prepare_cached(&format!(
+            "DELETE FROM {} WHERE id = ?1",
+            class_table(&class.name)
+        ))?
+        .execute(params![id])?;
+        drop_derived(tx, &class.name, at)?;
+        left.nodes.insert(node);
+    } else if kind == RELATION {
+        let relation = ontology.relation(name)?;
+        let to = to.clone().unwrap_or_default();
+        let Some((v, recorded, _)) = version else {
+            drop_link(tx, ontology, (&relation.name, at, &to))?;
+            left.links.insert((relation.name.clone(), at.clone(), to));
+            return Ok(());
+        };
+        let fact = LinkFact {
+            relation: relation.name.clone(),
+            from: NodeRef::new(&relation.from, at.as_str()),
+            to: NodeRef::new(&relation.to, to.as_str()),
+            valid: v.valid.clone(),
+        };
+        let ends = node_id(tx, &relation.from, at)?.zip(node_id(tx, &relation.to, &to)?);
+        let piece = Piece::new(tx, ontology, key, &v.source, stamp(recorded));
+        piece.current_link(&fact, ends, &v.source, &v.valid)?;
+    }
+    Ok(())
+}
+
+/// `change` without what the purge removed, or `None` when nothing is left of it. A link whose
+/// node left with no hearing waits open in every event that wrote it.
+fn without(
+    change: &Change,
+    stripped: Option<&BTreeSet<[u8; 32]>>,
+    key: &Key,
+    (chosen, left): (&Chosen, &Left),
+) -> Result<Option<Change>, Error> {
+    let left_link = |link: &LinkFact| {
+        left.nodes.contains(&link.from)
+            || left.nodes.contains(&link.to)
+            || left.links.contains(&(
+                link.relation.clone(),
+                link.from.key.clone(),
+                link.to.key.clone(),
+            ))
+    };
+    Ok(match change {
+        Change::Wrote {
+            source,
+            added,
+            wrong_kind,
+            check,
+        } => {
+            let mut kept = Vec::new();
+            for fact in added {
+                let of = match fact {
+                    Fact::Node(node) => Of::Node(node),
+                    Fact::Link(link) | Fact::Opened(link) => Of::Link(link),
+                };
+                let gone = match stripped {
+                    Some(stripped) => stripped.contains(&of.identity(key, source)?),
+                    None => false,
+                };
+                if gone || chosen.names(fact) {
+                    continue;
+                }
+                kept.push(match fact {
+                    Fact::Link(link)
+                        if left.nodes.contains(&link.from) || left.nodes.contains(&link.to) =>
+                    {
+                        Fact::Opened(link.clone())
+                    }
+                    other => other.clone(),
+                });
+            }
+            let wrong_kind: Vec<_> = wrong_kind
+                .iter()
+                .filter(|w| !chosen.nodes.contains(&w.arrived) && !chosen.whole_link(&w.waiting))
+                .cloned()
+                .collect();
+            (!kept.is_empty() || !wrong_kind.is_empty()).then(|| Change::Wrote {
+                source: source.clone(),
+                added: kept,
+                wrong_kind,
+                check: check.clone(),
+            })
+        }
+        Change::Closed(link) => {
+            (!chosen.whole_link(link) && !left_link(link)).then(|| change.clone())
+        }
+        Change::Replaced { class, old, new } => (!chosen.nodes.contains(&NodeRef::new(class, old))
+            && !chosen.nodes.contains(&NodeRef::new(class, new)))
+        .then(|| change.clone()),
+        other => Some(other.clone()),
+    })
+}
+
+/// Removes what `purge` matches from the store `tx` holds: the hearings and conclusions it
+/// matched, the nodes and links that leave whole, what every event body holds of them, and each
+/// event id that then names nothing left; then puts back what is seen of every node and link it
+/// touched and their current state.
+fn purge_in(tx: &Connection, ontology: &Ontology, key: &Key, purge: &Purge) -> Result<(), Error> {
+    let chosen = choose(tx, ontology, key, purge)?;
+    // Every id each purged hearing goes by, with the identities that event's body loses, and the
+    // events to read again: by place where the hearing names it, by id otherwise.
+    let mut stripped: BTreeMap<String, BTreeSet<[u8; 32]>> = BTreeMap::new();
+    let mut by_id: BTreeSet<String> = chosen.concluded.keys().cloned().collect();
+    let mut places: BTreeSet<i64> = BTreeSet::new();
+    for heard in chosen.hearings.values() {
+        stripped
+            .entry(heard.event.clone())
+            .or_default()
+            .insert(heard.identity);
+        places.insert(heard.seq);
+        let aliases: Vec<String> = tx
+            .prepare_cached("SELECT alias FROM _aliases WHERE identity = ?1")?
+            .query_map(params![heard.identity], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        for alias in aliases {
+            stripped
+                .entry(alias.clone())
+                .or_default()
+                .insert(heard.identity);
+            by_id.insert(alias);
+        }
+    }
+    for node in &chosen.nodes {
+        remove(tx, ontology, node)?;
+        tx.prepare_cached(
+            "DELETE FROM _fates WHERE class = ?1 AND (key = ?2 OR replaced_by = ?2)",
+        )?
+        .execute(params![node.class, node.key])?;
+    }
+    for (relation, from, to) in &chosen.links {
+        drop_link(tx, ontology, (relation, from, to))?;
+    }
+    for identity in chosen.hearings.keys() {
+        tx.prepare_cached("DELETE FROM _aliases WHERE identity = ?1")?
+            .execute(params![identity])?;
+        tx.prepare_cached("DELETE FROM _hearings WHERE identity = ?1")?
+            .execute(params![identity])?;
+    }
+    for event in chosen.concluded.keys() {
+        for table in ["_ends", "_endings"] {
+            tx.prepare_cached(&format!("DELETE FROM {table} WHERE event = ?1"))?
+                .execute(params![event])?;
+        }
+    }
+    let touched: BTreeSet<&Entity> = chosen
+        .hearings
+        .values()
+        .map(|h| &h.of)
+        .chain(chosen.concluded.values())
+        .collect();
+    let mut left = Left::default();
+    for of in touched {
+        see(tx, (&of.0, &of.1, of.2.as_deref()))?;
+        let (kind, name) = of.0.split_once(':').unwrap_or_default();
+        let whole = if kind == CLASS {
+            chosen.nodes.contains(&NodeRef::new(name, of.1.as_str()))
+        } else {
+            chosen.links.contains(&link_key(of))
+        };
+        if !whole {
+            current(tx, ontology, key, of, &mut left)?;
+        }
+    }
+    rewrite(tx, key, (&chosen, &left), &stripped, (places, by_id))
+}
+
+/// Rewrites each event body the purge reaches without what it removed: each event a purged
+/// hearing or conclusion goes by (`places` in the log, or ids in `by_id`), and each event naming a
+/// node or link that left. An event left with nothing is deleted, and its id leaves every
+/// derived-from list.
+fn rewrite(
+    tx: &Connection,
+    key: &Key,
+    (chosen, left): (&Chosen, &Left),
+    stripped: &BTreeMap<String, BTreeSet<[u8; 32]>>,
+    (places, by_id): (BTreeSet<i64>, BTreeSet<String>),
+) -> Result<(), Error> {
+    let mut events: BTreeMap<i64, Stored> = BTreeMap::new();
+    for seq in places {
+        let body: Option<String> = tx
+            .prepare_cached("SELECT body FROM _events WHERE seq = ?1")?
+            .query_row(params![seq], |row| row.get(0))
+            .optional()?;
+        if let Some(body) = body {
+            events.insert(seq, serde_json::from_str(&body)?);
+        }
+    }
+    let keys = by_id
+        .iter()
+        .cloned()
+        .chain(
+            chosen
+                .nodes
+                .iter()
+                .chain(&left.nodes)
+                .map(|n| n.key.clone()),
+        )
+        .chain(
+            chosen
+                .links
+                .iter()
+                .chain(&left.links)
+                .map(|(_, from, _)| from.clone()),
+        );
+    for named in keys {
+        events.extend(naming_key(tx, &named)?);
+    }
+    let mut removed = Vec::new();
+    for (seq, stored) in events {
+        let id = stored.id.to_string();
+        let kept = match &stored.change {
+            Change::Ended { .. } | Change::Corrected { .. }
+                if chosen.concluded.contains_key(&id) =>
+            {
+                None
+            }
+            change => without(change, stripped.get(&id), key, (chosen, left))?,
+        };
+        match kept {
+            Some(change) if change == stored.change => {}
+            Some(change) => {
+                let body = serde_json::to_string(&Stored {
+                    id: stored.id,
+                    change,
+                })?;
+                tx.prepare_cached("UPDATE _events SET body = ?1 WHERE seq = ?2")?
+                    .execute(params![body, seq])?;
+            }
+            None => {
+                tx.prepare_cached("DELETE FROM _events WHERE seq = ?1")?
+                    .execute(params![seq])?;
+                removed.push(id);
+            }
+        }
+    }
+    for id in removed {
+        tx.prepare_cached("DELETE FROM _derived WHERE event = ?1")?
+            .execute(params![id])?;
+    }
+    Ok(())
+}
+
+/// Runs `purge` on `conn` with `secure_delete` on, so every page it frees or rewrites is zeroed,
+/// restores the setting after and checkpoints the write-ahead log, truncating it, so no purged
+/// byte stays in the log.
+fn secure<T>(
+    conn: &mut Connection,
+    purge: impl FnOnce(&mut Connection) -> Result<T, Error>,
+) -> Result<T, Error> {
+    let before: i64 = conn.query_row("PRAGMA secure_delete", [], |row| row.get(0))?;
+    conn.pragma_update(None, "secure_delete", 1)?;
+    let purged = purge(conn);
+    conn.pragma_update(None, "secure_delete", before)?;
+    let purged = purged?;
+    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+    Ok(purged)
+}
+
+impl Graph {
+    /// Purges `target` under the app's own `rule`, from `source`: what it matches leaves the
+    /// store and every snapshot the store made, with nothing of it left. Returns the purge event,
+    /// which names the rule and the kind with each target as its keyed match value; a purge that
+    /// matches nothing still writes it, as a standing rule. The store's removal lands in one
+    /// transaction or not at all; each snapshot that still exists is purged after it, and one
+    /// recorded that no longer exists is skipped.
+    ///
+    /// # Errors
+    /// [`Error::KeyMissing`] without a key; [`Error::Refused`] when the target's class or
+    /// relation is not declared; the graph file or a snapshot file cannot be read or written.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the interface #85 names takes it by value"
+    )]
+    pub fn purge(&mut self, target: Purge, rule: &str, source: &str) -> Result<Event, Error> {
+        let key = self.key.clone().ok_or(Error::KeyMissing)?;
+        let (event, snapshots) = secure(&mut self.conn, |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            purge_in(&tx, &Ontology::load(&tx)?, &key, &target)?;
+            let event = append(
+                &tx,
+                Change::Purged {
+                    source: source.to_string(),
+                    rule: rule.to_string(),
+                    purge: target.matched(&key),
+                },
+            )?;
+            let snapshots: Vec<String> = tx
+                .prepare_cached("SELECT path FROM _snapshots ORDER BY path")?
+                .query_map([], |row| row.get(0))?
+                .collect::<Result<_, _>>()?;
+            tx.commit()?;
+            Ok((event, snapshots))
+        })?;
+        for path in snapshots
+            .into_iter()
+            .map(PathBuf::from)
+            .filter(|p| p.exists())
+        {
+            let mut snapshot = open_keyed(&path, &key)?;
+            secure(&mut snapshot.conn, |conn| {
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                purge_in(&tx, &Ontology::load(&tx)?, &key, &target)?;
+                tx.commit()?;
+                Ok(())
+            })?;
+        }
+        Ok(event)
+    }
+}
