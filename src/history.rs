@@ -952,16 +952,34 @@ fn version_row(
     let Some((event, source, valid, point, integer, properties, recorded, identity)) = row else {
         return Ok(None);
     };
-    let version = Version {
+    let version = version_of((event, source, valid, point, integer, properties), false)?;
+    Ok(Some((version, recorded, identity)))
+}
+
+/// A version's columns as a row holds them: event, source, valid, point, integer key, properties.
+type VersionColumns = (
+    String,
+    String,
+    Option<String>,
+    i64,
+    Option<i64>,
+    Option<String>,
+);
+
+/// The version a row's [`VersionColumns`] name, `ended` when it is an ending.
+fn version_of(
+    (event, source, valid, point, integer, properties): VersionColumns,
+    ended: bool,
+) -> Result<Version, Error> {
+    Ok(Version {
         event: serde_json::from_value(event.into())?,
         source,
         valid: ValidTime::from_sql(valid),
         point: time(point),
         integer,
         properties: decode(properties.as_deref())?,
-        ended: false,
-    };
-    Ok(Some((version, recorded, identity)))
+        ended,
+    })
 }
 
 /// The version of the node keyed `key` in `class` that holds at `at` (a point, or an integer key
@@ -1275,15 +1293,15 @@ impl Graph {
     fn seen_of(&self, of: (&str, &str, &str)) -> Result<Option<Seen>, Error> {
         let sql = seen_sql();
         let version = |row: &rusqlite::Row, at: usize| -> rusqlite::Result<_> {
-            Ok((
-                row.get::<_, String>(at)?,
-                row.get::<_, String>(at + 1)?,
-                row.get::<_, Option<String>>(at + 2)?,
-                row.get::<_, i64>(at + 3)?,
-                row.get::<_, Option<i64>>(at + 4)?,
-                row.get::<_, Option<String>>(at + 5)?,
-                row.get::<_, bool>(at + 6)?,
-            ))
+            let columns: VersionColumns = (
+                row.get(at)?,
+                row.get(at + 1)?,
+                row.get(at + 2)?,
+                row.get(at + 3)?,
+                row.get(at + 4)?,
+                row.get(at + 5)?,
+            );
+            Ok((columns, row.get::<_, bool>(at + 6)?))
         };
         let row = self
             .conn
@@ -1300,19 +1318,8 @@ impl Graph {
         let Some((count, first_true, ended, facts)) = row else {
             return Ok(None);
         };
-        let [first_heard, last_heard, first_recorded] = facts.map(
-            |(event, source, valid, point, integer, properties, ended)| {
-                Ok::<_, Error>(Version {
-                    event: serde_json::from_value(event.into())?,
-                    source,
-                    valid: ValidTime::from_sql(valid),
-                    point: time(point),
-                    integer,
-                    properties: decode(properties.as_deref())?,
-                    ended,
-                })
-            },
-        );
+        let [first_heard, last_heard, first_recorded] =
+            facts.map(|(columns, ended)| version_of(columns, ended));
         Ok(Some(Seen {
             first_heard: first_heard?,
             last_heard: last_heard?,
