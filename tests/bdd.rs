@@ -4034,6 +4034,156 @@ fn mark_is_remaining(world: &mut World) {
     assert_eq!(mark(world), Some(fifth));
 }
 
+// ---------- events: the committed watermark across a rebuild and a purge ----------
+
+fn rebuilt_committed(world: &World) -> Cursor {
+    let rebuilt = world.rebuilt.as_ref().expect("the graph was rebuilt");
+    rebuilt.events().committed().unwrap()
+}
+
+#[given("a graph with committed events and a snapshot at the cursor of its last event")]
+fn snapshot_at_last_event(world: &mut World) {
+    events_around_cursor(world);
+    snapshot_at_end(world);
+}
+
+#[then("the rebuilt graph's committed watermark equals the snapshot's cursor")]
+fn rebuilt_watermark_is_snapshot(world: &mut World) {
+    let cursor = world.snapshot.as_ref().unwrap().cursor();
+    assert_eq!(rebuilt_committed(world), cursor);
+}
+
+#[given("a graph with a snapshot at a cursor and three committed events after it")]
+fn snapshot_then_three(world: &mut World) {
+    events_around_cursor(world);
+    snapshot_at_end(world);
+    for v in 10..13 {
+        world
+            .g()
+            .write(&Write::new("eavesdrop").unit(Unit::new(
+                "voice",
+                format!("v{v}"),
+                NONE,
+                day(2026, 10, 14),
+            )))
+            .unwrap();
+    }
+    world.log = world.all_events();
+}
+
+#[then("the rebuilt graph's committed watermark is the cursor of the third event")]
+fn rebuilt_watermark_is_third(world: &mut World) {
+    let after = logged_after(world, world.cursor);
+    assert_eq!(after.len(), 3);
+    assert_eq!(rebuilt_committed(world), after[2].cursor);
+}
+
+/// A graph whose last event, at `World::cursor`, holds the one hearing of p-gone, the fact to
+/// purge.
+#[given("a graph whose last committed event is a hearing a purge rule matches, at cursor c")]
+fn last_event_purgeable(world: &mut World) {
+    let g = purge_graph(world);
+    g.write(&Write::new("app").unit(person("p-other", "before")))
+        .unwrap();
+    g.write(&Write::new("app").unit(person("p-gone", TOKEN)))
+        .unwrap();
+    let hearing = &g.hearings(&NodeRef::new("person", "p-gone")).unwrap()[0];
+    world.purge.targets.push(Purge::Fact {
+        identity: hearing.identity,
+    });
+    world.cursor = world.all_events().last().unwrap().cursor;
+    assert_eq!(world.g().events().committed().unwrap(), world.cursor);
+}
+
+#[when("the purge runs")]
+fn purge_runs(world: &mut World) {
+    purge_targets(world);
+}
+
+#[then("the committed watermark is the purge event's cursor, which is greater than c")]
+fn watermark_is_purge_event(world: &mut World) {
+    let purged = world.all_events().last().unwrap().clone();
+    assert!(matches!(purged.change, Change::Purged { .. }), "{purged:?}");
+    assert_eq!(world.g().events().committed().unwrap(), purged.cursor);
+    assert!(purged.cursor > world.cursor);
+}
+
+#[given("a graph whose last event before cursor c was purged, so no event is at c")]
+fn purged_at_cursor(world: &mut World) {
+    last_event_purgeable(world);
+    purge_targets(world);
+    let c = world.cursor;
+    assert!(world.all_events().iter().all(|e| e.cursor != c));
+}
+
+#[when("a snapshot is taken at c and a graph is rebuilt from it with no later events")]
+fn snapshot_at_c_rebuilt(world: &mut World) {
+    take_snapshot(world);
+    rebuilt_from_snapshot_alone(world);
+}
+
+#[then("the rebuilt graph's committed watermark is at least c")]
+fn rebuilt_watermark_at_least_c(world: &mut World) {
+    assert!(rebuilt_committed(world) >= world.cursor);
+}
+
+const READER: &str = "reader";
+
+#[given(
+    "a graph with a registered follower whose stored cursor is after the second event, and a \
+     snapshot at the cursor of the fifth event"
+)]
+fn follower_second_snapshot_fifth(world: &mut World) {
+    events_around_cursor(world);
+    let second = after_event(world, 2);
+    let events = world.g().events();
+    events.register(READER).unwrap();
+    events.advance(READER, second).unwrap();
+    world.cursor = after_event(world, 5);
+    take_snapshot(world);
+}
+
+#[then("the follower's stored cursor in the rebuilt graph is the cursor after the second event")]
+fn rebuilt_follower_at_second(world: &mut World) {
+    let rebuilt = world.rebuilt.as_ref().expect("the graph was rebuilt");
+    assert_eq!(
+        rebuilt.events().followers().unwrap(),
+        vec![(READER.to_string(), after_event(world, 2))]
+    );
+}
+
+#[given(
+    "a graph rebuilt from a snapshot, with a registered follower whose stored cursor is before \
+     the snapshot's cursor"
+)]
+fn rebuilt_with_follower_behind(world: &mut World) {
+    events_around_cursor(world);
+    let second = after_event(world, 2);
+    let events = world.g().events();
+    events.register(READER).unwrap();
+    events.advance(READER, second).unwrap();
+    take_snapshot(world);
+    rebuild_from_snapshot(world);
+}
+
+#[when("the app advances the follower to the snapshot's cursor")]
+fn advances_to_snapshot(world: &mut World) {
+    let rebuilt = world.rebuilt.as_ref().expect("the graph was rebuilt");
+    if let Err(error) = rebuilt.events().advance(READER, world.cursor) {
+        world.refusals.push(error);
+    }
+}
+
+#[then("the advance is accepted and the follower's stored cursor is the snapshot's cursor")]
+fn advance_accepted(world: &mut World) {
+    assert!(world.refusals.is_empty(), "{:?}", world.refusals);
+    let rebuilt = world.rebuilt.as_ref().expect("the graph was rebuilt");
+    assert_eq!(
+        rebuilt.events().followers().unwrap(),
+        vec![(READER.to_string(), world.cursor)]
+    );
+}
+
 // ---------- queue: a heartbeat commits the in-memory write queue ----------
 
 /// A heartbeat long enough that no scenario races it: those scenarios commit by flushing.
