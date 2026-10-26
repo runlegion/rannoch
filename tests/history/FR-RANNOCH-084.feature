@@ -1,4 +1,4 @@
-# Generated from legion requirement FR-RANNOCH-084, revision 2026-10-26T11:06:01.133814+00:00.
+# Generated from legion requirement FR-RANNOCH-084, revision 2026-10-26T20:52:54.571370+00:00.
 # Do not edit: regenerate with scripts/features.mjs.
 
 Feature: The same events in any arrival order give the same answers, except first recorded
@@ -22,7 +22,7 @@ Feature: The same events in any arrival order give the same answers, except firs
     And one hearing's content delivered twice, under event ids A and B, A the smaller
     And another version of the same node at the same point, with other properties, under an event id between A and B
     When one new graph is given A, the other version, then B, and another new graph is given B, the other version, then A
-    Then find returns the other version as the node's state in both graphs
+    Then find returns the hearing delivered under A and B as the node's state in both graphs
 
   @criterion-01a17759-c275-706d-ae91-072c9950dc21 @module-history
   Scenario: when a link ended and first true do not depend on arrival
