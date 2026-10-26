@@ -5,25 +5,30 @@
 //! A link that ends records its ending, at its own point, beside its hearings; a link found
 //! wrong records a correction, which is not an ending.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::events::{Change, Cursor, EventId, Events, Fact, LinkFact, NodeFact};
-use crate::open::{CLASS, Graph, RELATION};
+use crate::open::{CLASS, Graph, HistoryKey, Ontology, RELATION, Value};
 use crate::read::NodeRef;
-use crate::write::{Error, ValidTime};
+use crate::write::{Error, Stamp, ValidTime};
 
-/// The hearings, the other ids each arrived under, how each link that ended or was found wrong
+/// The hearings, one version row each, with no valid-to: `arrived` counts up as this store
+/// records them, `integer` is set only in an integer-keyed class, and `properties` holds a
+/// node's. Then the other ids each arrived under, how each link that ended or was found wrong
 /// came to that (`point` is the ending's, and null for a correction), and the check value of
 /// the graph's key.
 pub(crate) const HISTORY_TABLES: &str = "
     CREATE TABLE IF NOT EXISTS _hearings(
-        identity BLOB PRIMARY KEY, entity TEXT NOT NULL, key TEXT NOT NULL, to_key TEXT,
-        event TEXT NOT NULL, seq INTEGER NOT NULL, source TEXT NOT NULL, valid TEXT,
-        point INTEGER NOT NULL, integer INTEGER) WITHOUT ROWID;
-    CREATE INDEX IF NOT EXISTS _hearings_of ON _hearings(entity, key, to_key);
+        arrived INTEGER PRIMARY KEY, identity BLOB NOT NULL UNIQUE, entity TEXT NOT NULL,
+        key TEXT NOT NULL, to_key TEXT, event TEXT NOT NULL, seq INTEGER NOT NULL,
+        source TEXT NOT NULL, valid TEXT, point INTEGER NOT NULL, integer INTEGER,
+        recorded INTEGER NOT NULL, properties TEXT);
+    CREATE INDEX IF NOT EXISTS _hearings_at
+        ON _hearings(entity, key, to_key, integer, point, event);
     CREATE TABLE IF NOT EXISTS _aliases(
         identity BLOB NOT NULL, alias TEXT NOT NULL, PRIMARY KEY(identity, alias)) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS _ends(
@@ -99,7 +104,7 @@ impl Of<'_> {
 
     /// Its identity: its content heard from `source`, hashed under `key`. A point rannoch
     /// assigns is not content; a time or an integer key the writer supplied is.
-    fn identity(&self, key: &Key, source: &str) -> Result<[u8; 32], Error> {
+    pub(crate) fn identity(&self, key: &Key, source: &str) -> Result<[u8; 32], Error> {
         let content = match self {
             Of::Node(n) => serde_json::to_vec(&(
                 "node",
@@ -119,6 +124,14 @@ impl Of<'_> {
     }
 }
 
+/// Whether what `of` is a hearing of orders its history by an integer key.
+fn by_integer(ontology: &Ontology, of: &Of) -> Result<bool, Error> {
+    Ok(match of {
+        Of::Node(node) => ontology.class(&node.class)?.history == HistoryKey::Integer,
+        Of::Link(_) => false,
+    })
+}
+
 fn node_entity(class: &str) -> String {
     format!("{CLASS}:{class}")
 }
@@ -136,18 +149,19 @@ pub(crate) struct Held {
     time: Option<i64>,
 }
 
-/// Records what `of` heard from `source` as a new hearing named by `event`, at `cursor` in the
-/// log, and returns `None`; or, when the graph holds a hearing identical to it, records nothing
-/// and returns that one.
+/// Records what `of` heard from `source`, whose content identity is `identity`, as a new version
+/// row named by `stamp`'s event and
+/// returns `None`; or, when the graph holds a hearing identical to it, records nothing and
+/// returns that one. Its integer key is kept only when its class is ordered by one, so every
+/// other class's rows order by point alone.
 pub(crate) fn hear(
     tx: &Connection,
-    key: &Key,
-    event: EventId,
-    cursor: Cursor,
+    identity: [u8; 32],
+    stamp: &Stamp,
     source: &str,
     of: &Of,
+    ontology: &Ontology,
 ) -> Result<Option<Held>, Error> {
-    let identity = of.identity(key, source)?;
     let held = tx
         .prepare_cached("SELECT event, seq FROM _hearings WHERE identity = ?1")?
         .query_row(params![identity], |row| {
@@ -163,23 +177,72 @@ pub(crate) fn hear(
         }));
     }
     let (entity, from, to) = of.entity();
+    let properties = match of {
+        Of::Node(node) => Some(serde_json::to_string(&node.properties)?),
+        Of::Link(_) => None,
+    };
     tx.prepare_cached(
         "INSERT INTO _hearings(identity, entity, key, to_key, event, seq, source, valid, point, \
-         integer) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+         integer, recorded, properties) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
     )?
     .execute(params![
         identity,
         entity,
         from,
         to,
-        event.to_string(),
-        cursor.0,
+        stamp.id.to_string(),
+        stamp.cursor.0,
         source,
         of.valid().to_sql(),
-        of.time().unwrap_or(event.millis()),
-        of.integer()
+        of.time().unwrap_or(stamp.id.millis()),
+        if by_integer(ontology, of)? {
+            of.integer()
+        } else {
+            None
+        },
+        stamp.recorded,
+        properties
     ])?;
     Ok(None)
+}
+
+/// The newest version of what `of` is a hearing of, by its class's order: its identity, source,
+/// valid time, record time and properties.
+pub(crate) fn newest(tx: &Connection, of: &Of) -> Result<Option<Newest>, Error> {
+    let (entity, key, to) = of.entity();
+    Ok(tx
+        .prepare_cached(
+            "SELECT identity, source, valid, recorded, properties FROM _hearings \
+             WHERE entity = ?1 AND key = ?2 AND to_key IS ?3 \
+             ORDER BY integer DESC, point DESC, event DESC LIMIT 1",
+        )?
+        .query_row(params![entity, key, to], |row| {
+            Ok(Newest {
+                identity: row.get(0)?,
+                source: row.get(1)?,
+                valid: ValidTime::from_sql(row.get(2)?),
+                recorded: row.get(3)?,
+                properties: row.get(4)?,
+            })
+        })
+        .optional()?)
+}
+
+/// A node's or a link's newest version, as [`newest`] reads it.
+pub(crate) struct Newest {
+    pub(crate) identity: [u8; 32],
+    pub(crate) source: String,
+    pub(crate) valid: ValidTime,
+    pub(crate) recorded: i64,
+    properties: Option<String>,
+}
+
+impl Newest {
+    pub(crate) fn properties(&self) -> Result<BTreeMap<String, Value>, Error> {
+        Ok(serde_json::from_str(
+            self.properties.as_deref().unwrap_or("{}"),
+        )?)
+    }
 }
 
 /// Holds `event`, at `cursor`, as an alias of `held`, whose content it arrived with. When
@@ -309,6 +372,7 @@ pub(crate) fn take(conn: &mut Connection, key: &Key) -> Result<(), Error> {
         return same(held);
     }
     tx.execute("INSERT INTO _check(value) VALUES (?1)", params![key.check])?;
+    let ontology = Ontology::load(&tx)?;
     for event in (Events { conn: &tx }).since(Cursor::START)? {
         let (source, added) = match &event.change {
             Change::Wrote { source, added, .. } => (source, added),
@@ -320,12 +384,19 @@ pub(crate) fn take(conn: &mut Connection, key: &Key) -> Result<(), Error> {
             }
             _ => continue,
         };
+        let stamp = Stamp {
+            id: event.id,
+            cursor: event.cursor,
+            recorded: event.id.millis(),
+            arrived: true,
+        };
         for fact in added {
             let of = match fact {
                 Fact::Node(node) => Of::Node(node),
                 Fact::Link(link) | Fact::Opened(link) => Of::Link(link),
             };
-            if let Some(held) = hear(&tx, key, event.id, event.cursor, source, &of)? {
+            let identity = of.identity(key, source)?;
+            if let Some(held) = hear(&tx, identity, &stamp, source, &of, &ontology)? {
                 alias(&tx, &held, event.id, event.cursor)?;
             }
         }
@@ -362,7 +433,7 @@ pub struct Hearing {
     /// Its point on the time axis: the time its writer supplied, or else the record time of
     /// the store that first recorded it, which its event's id carries.
     pub point: SystemTime,
-    /// The integer key its writer supplied.
+    /// The integer key its writer supplied, in an integer-keyed class.
     pub integer: Option<i64>,
     /// Its content identity: its content hashed under the graph's key.
     pub identity: [u8; 32],
@@ -483,6 +554,222 @@ impl Graph {
             });
         }
         Ok(hearings)
+    }
+}
+
+/// A point to read a node's or a link's state at: a time on the axis, or, in an integer-keyed
+/// class, an integer key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum At {
+    Time(SystemTime),
+    Key(i64),
+}
+
+/// One version of a node or a link: the hearing that held at a point, by its class's order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Version {
+    /// The event it is named by: the smallest id it arrived under.
+    pub event: EventId,
+    pub source: String,
+    pub valid: ValidTime,
+    /// Its point on the time axis.
+    pub point: SystemTime,
+    /// Its integer key, in an integer-keyed class.
+    pub integer: Option<i64>,
+    /// A node's properties as that version holds them; a link has none.
+    pub properties: BTreeMap<String, Value>,
+    /// Whether a link had ended by the point read; a node never has.
+    pub ended: bool,
+}
+
+/// When a node was heard: its first and last versions on its class's axis, the one this store
+/// recorded first, and the earliest valid time it has been given.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Seen {
+    pub first_heard: Version,
+    pub last_heard: Version,
+    /// Per store: another store given the same events in another order may name another.
+    pub first_recorded: Version,
+    pub first_true: ValidTime,
+}
+
+/// Picks the newest version row at or before the point `?4`, in a class not ordered by an
+/// integer key (and for a link, which is never ordered by one).
+const BY_POINT: &str =
+    "AND integer IS NULL AND point <= ?4 ORDER BY point DESC, event DESC LIMIT 1";
+
+/// Reads one version row of `entity` keyed `key` (and `to`, for a link), as `tail` picks it,
+/// with `at` bound as `?4` when the tail names it: the version and when this store recorded it.
+fn version_row(
+    conn: &Connection,
+    (entity, key, to): (&str, &str, Option<&str>),
+    tail: &str,
+    at: Option<i64>,
+) -> Result<Option<(Version, i64)>, Error> {
+    /// A version row: event, source, valid time, point, integer key, properties, record time.
+    type Row = (
+        String,
+        String,
+        Option<String>,
+        i64,
+        Option<i64>,
+        Option<String>,
+        i64,
+    );
+    let sql = format!(
+        "SELECT event, source, valid, point, integer, properties, recorded FROM _hearings \
+         WHERE entity = ?1 AND key = ?2 AND to_key IS ?3 {tail}"
+    );
+    let mut statement = conn.prepare_cached(&sql)?;
+    let read = |row: &rusqlite::Row| -> rusqlite::Result<Row> {
+        Ok((
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+            row.get(5)?,
+            row.get(6)?,
+        ))
+    };
+    let row = match at {
+        Some(at) => statement.query_row(params![entity, key, to, at], read),
+        None => statement.query_row(params![entity, key, to], read),
+    }
+    .optional()?;
+    let Some((event, source, valid, point, integer, properties, recorded)) = row else {
+        return Ok(None);
+    };
+    let version = Version {
+        event: serde_json::from_value(event.into())?,
+        source,
+        valid: ValidTime::from_sql(valid),
+        point: time(point),
+        integer,
+        properties: serde_json::from_str(properties.as_deref().unwrap_or("{}"))?,
+        ended: false,
+    };
+    Ok(Some((version, recorded)))
+}
+
+/// The version of the node keyed `key` in `class` that holds at `at` (a point, or an integer key
+/// when the class is ordered by one): the greatest by the class's order at or before it, ties
+/// going to the larger event id. At `i64::MAX` it is the node's current version.
+pub(crate) fn node_at(
+    conn: &Connection,
+    class: &crate::Class,
+    key: &str,
+    at: i64,
+) -> Result<Option<(Version, i64)>, Error> {
+    let tail = if class.history == HistoryKey::Integer {
+        "AND integer <= ?4 ORDER BY integer DESC, point DESC, event DESC LIMIT 1"
+    } else {
+        BY_POINT
+    };
+    version_row(conn, (&node_entity(&class.name), key, None), tail, Some(at))
+}
+
+/// Refuses an integer key for a class not ordered by one, and a time for one that is.
+fn axis(class: &crate::Class, at: At) -> Result<i64, Error> {
+    match (class.history == HistoryKey::Integer, at) {
+        (false, At::Time(time)) => Ok(millis(time)),
+        (true, At::Key(key)) => Ok(key),
+        _ => Err(Error::Refused(format!(
+            "class {} is not read at {at:?}: it is ordered by {:?}",
+            class.name, class.history
+        ))),
+    }
+}
+
+impl Graph {
+    /// The version of `node` that held at `at`: the newest by its class's order at or before
+    /// it (by point, or in an integer-keyed class by integer key and then point), ties going to
+    /// the larger event id. `None` before its first version. A version that arrived late
+    /// answers at its own point like any other.
+    ///
+    /// # Errors
+    /// [`Error::Refused`] when `at` is a time and the class is integer-keyed, or an integer key
+    /// and it is not; the class is not declared, or the graph file cannot be read.
+    pub fn state_at(&self, node: &NodeRef, at: At) -> Result<Option<Version>, Error> {
+        let ontology = self.current_ontology()?;
+        let class = ontology.class(&node.class)?;
+        Ok(node_at(&self.conn, class, &node.key, axis(class, at)?)?.map(|(v, _)| v))
+    }
+
+    /// The version of the link of `relation` from the node keyed `from` to the node keyed `to`
+    /// that held at the time `at`, by point and then event id, and whether the link had ended
+    /// by then. `None` before its first version.
+    ///
+    /// # Errors
+    /// [`Error::Refused`] when `at` is an integer key; the relation is not declared, or the
+    /// graph file cannot be read.
+    pub fn link_state_at(
+        &self,
+        relation: &str,
+        from: &str,
+        to: &str,
+        at: At,
+    ) -> Result<Option<Version>, Error> {
+        let At::Time(at) = at else {
+            return Err(Error::Refused(format!(
+                "a link of {relation} is read at a time, not at {at:?}"
+            )));
+        };
+        let relation = self.current_ontology()?.relation(relation)?.name.clone();
+        let entity = link_entity(&relation);
+        let Some((mut version, _)) = version_row(
+            &self.conn,
+            (&entity, from, Some(to)),
+            BY_POINT,
+            Some(millis(at)),
+        )?
+        else {
+            return Ok(None);
+        };
+        version.ended = matches!(
+            self.link_end(&relation, from, to)?,
+            Some(End::Ended { at: ended, .. }) if ended <= at
+        );
+        Ok(Some(version))
+    }
+
+    /// When `node` was heard: its first and last versions on its class's axis, the version this
+    /// store recorded first, and the earliest valid time any of its versions was given (a month
+    /// standing for its first day). `None` when it has no version.
+    ///
+    /// # Errors
+    /// The class is not declared, or the graph file cannot be read.
+    pub fn seen(&self, node: &NodeRef) -> Result<Option<Seen>, Error> {
+        let ontology = self.current_ontology()?;
+        let class = ontology.class(&node.class)?;
+        let entity = node_entity(&class.name);
+        let of = (entity.as_str(), node.key.as_str(), None);
+        let read = |tail: &str| version_row(&self.conn, of, tail, None);
+        let (Some((first_heard, _)), Some((last_heard, _)), Some((first_recorded, _))) = (
+            read("ORDER BY integer, point, event LIMIT 1")?,
+            read("ORDER BY integer DESC, point DESC, event DESC LIMIT 1")?,
+            read(
+                "AND arrived = (SELECT min(arrived) FROM _hearings \
+                 WHERE entity = ?1 AND key = ?2 AND to_key IS ?3)",
+            )?,
+        ) else {
+            return Ok(None);
+        };
+        let first_true = self
+            .conn
+            .prepare_cached(
+                "SELECT valid FROM _hearings WHERE entity = ?1 AND key = ?2 AND to_key IS NULL \
+                 AND valid IS NOT NULL \
+                 ORDER BY CASE WHEN length(valid) = 7 THEN valid || '-01' ELSE valid END LIMIT 1",
+            )?
+            .query_row(params![of.0, of.1], |row| row.get(0))
+            .optional()?;
+        Ok(Some(Seen {
+            first_heard,
+            last_heard,
+            first_recorded,
+            first_true: ValidTime::from_sql(first_true),
+        }))
     }
 }
 

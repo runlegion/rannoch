@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rusqlite::types::ToSqlOutput;
-use rusqlite::{Connection, Row, ToSql};
+use rusqlite::{Connection, ToSql};
 use serde::{Deserialize, Serialize};
 
 use crate::events::{Events, OWN_TABLES};
@@ -189,26 +189,6 @@ impl Value {
             _ => false,
         }
     }
-
-    /// Reads the value of type `of` from column `i` of `row`, or `None` when it is null.
-    pub(crate) fn read(row: &Row, i: usize, of: ValueType) -> rusqlite::Result<Option<Value>> {
-        Ok(match of {
-            ValueType::Text => row.get::<_, Option<String>>(i)?.map(Value::Text),
-            ValueType::Integer => row.get::<_, Option<i64>>(i)?.map(Value::Integer),
-            ValueType::Decimal => row.get::<_, Option<String>>(i)?.map(Value::Decimal),
-            ValueType::Float => row.get::<_, Option<f64>>(i)?.map(Value::Float),
-            ValueType::FloatVector(_) => row.get::<_, Option<Vec<u8>>>(i)?.map(|bytes| {
-                Value::FloatVector(
-                    bytes
-                        .as_chunks::<8>()
-                        .0
-                        .iter()
-                        .map(|b| f64::from_le_bytes(*b))
-                        .collect(),
-                )
-            }),
-        })
-    }
 }
 
 /// Text and decimals are held as text, so a decimal keeps every digit; a float vector as its
@@ -236,22 +216,6 @@ impl ValueType {
             ValueType::FloatVector(_) => "BLOB",
         }
     }
-}
-
-/// The properties of `class` held in `row` from column `first` on, in the class's order; a
-/// property that is null is absent.
-pub(crate) fn read_properties(
-    class: &Class,
-    row: &Row,
-    first: usize,
-) -> rusqlite::Result<BTreeMap<String, Value>> {
-    let mut properties = BTreeMap::new();
-    for (i, (name, of)) in class.properties.iter().enumerate() {
-        if let Some(value) = Value::read(row, first + i, *of)? {
-            properties.insert(name.clone(), value);
-        }
-    }
-    Ok(properties)
 }
 
 /// A relation: links from a node of one class to a node of another. A containment relation

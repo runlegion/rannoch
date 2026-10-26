@@ -13,7 +13,7 @@ use crate::events::{
     Change, Cursor, Event, EventId, Fact, LinkFact, NodeFact, WrongKind, add_derived, append,
     event_at, holds, keep_derived, next_cursor, store,
 };
-use crate::history::{Held, Key, Of, alias, conclude, hear, link_heard, millis};
+use crate::history::{Held, Key, Of, alias, conclude, hear, link_heard, millis, newest};
 use crate::open::{
     CLASS, Class, Graph, HistoryKey, Ontology, RELATION, Relation, Value, ValueType, class_table,
     concat, property_column, relation_index, relation_table, schema_version,
@@ -550,11 +550,19 @@ fn check(conn: &Connection, ontology: &Ontology, write: &Write) -> Result<(), Er
 
 /// The event a piece writes or replays: its id, its place in the log, when its facts are
 /// recorded, and whether it arrived carrying its own id (a replay or a sync).
-struct Stamp {
-    id: EventId,
-    cursor: Cursor,
-    recorded: i64,
-    arrived: bool,
+pub(crate) struct Stamp {
+    pub(crate) id: EventId,
+    pub(crate) cursor: Cursor,
+    pub(crate) recorded: i64,
+    pub(crate) arrived: bool,
+}
+
+/// What hearing a fact did: one identical to a hearing held, a new newest version, or a new
+/// version older on its class's axis than one held.
+enum Heard {
+    Held(Held),
+    Newest,
+    Older,
 }
 
 /// What a piece is writing: its transaction, source, event and what it added so far.
@@ -596,86 +604,131 @@ impl<'a> Piece<'a> {
     }
 
     /// Hears `of`: `None` when it is a new hearing, else the identical hearing held.
-    fn hear(&self, of: &Of) -> Result<Option<Held>, Error> {
-        hear(
+    /// Hears `of`: the identical hearing held, or a new one, which current state takes only
+    /// when it is now its node's or link's newest version.
+    fn hear(&self, of: &Of) -> Result<Heard, Error> {
+        let identity = of.identity(self.key, self.source)?;
+        if let Some(held) = hear(
             self.tx,
-            self.key,
-            self.stamp.id,
-            self.stamp.cursor,
+            identity,
+            &self.stamp,
             self.source,
             of,
-        )
+            self.ontology,
+        )? {
+            return Ok(Heard::Held(held));
+        }
+        Ok(match newest(self.tx, of)? {
+            Some(newest) if newest.identity != identity => Heard::Older,
+            _ => Heard::Newest,
+        })
     }
 
     /// Answers a hearing identical to what the piece heard: an event that arrived with its own
     /// id, or one `written` for what else it adds, is held as an alias of it; otherwise the write
-    /// returns the event the hearing is named by.
-    fn held(&mut self, held: &Held, written: bool) -> Result<(), Error> {
+    /// returns the event the hearing is named by. Returns whether the hearing took this event's
+    /// id, and with it maybe another point, so current state is read again from the versions.
+    fn held(&mut self, held: &Held, written: bool) -> Result<bool, Error> {
         if self.stamp.arrived || written {
-            self.renamed |= alias(self.tx, held, self.stamp.id, self.stamp.cursor)?;
-        } else {
-            self.held.insert(held.cursor);
+            let renamed = alias(self.tx, held, self.stamp.id, self.stamp.cursor)?;
+            self.renamed |= renamed;
+            return Ok(renamed);
         }
-        Ok(())
+        self.held.insert(held.cursor);
+        Ok(false)
     }
 
     /// Writes a node, or a new version of it. Returns the node's id and whether it is new. A
     /// node identical to a hearing held is that hearing, and changes nothing but the sources it
-    /// names.
+    /// names; a version older on the class's axis than one held is kept as a version only.
     fn node(&mut self, node: &NodeFact) -> Result<(i64, bool), Error> {
         let class = self.ontology.class(&node.class)?;
-        let table = class_table(&class.name);
-        let have = node_id(self.tx, &class.name, &node.key)?;
-        if let Some(held) = self.hear(&Of::Node(node))? {
-            // Naming sources it did not name yet records them.
-            let derived = add_derived(self.tx, node)?;
-            if derived {
-                self.added.push(Fact::Node(node.clone()));
-            }
-            self.held(&held, derived)?;
-            let id = have.ok_or_else(|| Error::NotFound {
+        let have = || {
+            node_id(self.tx, &class.name, &node.key)?.ok_or_else(|| Error::NotFound {
                 class: class.name.clone(),
                 key: node.key.clone(),
-            })?;
-            return Ok((id, false));
+            })
+        };
+        match self.hear(&Of::Node(node))? {
+            Heard::Held(held) => {
+                // Naming sources it did not name yet records them.
+                let derived = add_derived(self.tx, node)?;
+                if derived {
+                    self.added.push(Fact::Node(node.clone()));
+                }
+                if self.held(&held, derived)?
+                    && let Some(n) = newest(self.tx, &Of::Node(node))?
+                {
+                    self.put(
+                        class,
+                        &node.key,
+                        &n.source,
+                        &n.valid,
+                        n.recorded,
+                        &n.properties()?,
+                    )?;
+                }
+                return Ok((have()?, false));
+            }
+            Heard::Older => {
+                self.added.push(Fact::Node(node.clone()));
+                return Ok((have()?, false));
+            }
+            Heard::Newest => {}
         }
+        let put = self.put(
+            class,
+            &node.key,
+            self.source,
+            &node.valid,
+            self.stamp.recorded,
+            &node.properties,
+        )?;
+        keep_derived(self.tx, node)?;
+        self.added.push(Fact::Node(node.clone()));
+        Ok(put)
+    }
+
+    /// Puts a version of the node keyed `key` into its class's table as its current state.
+    /// Returns the node's id and whether it is new.
+    fn put(
+        &self,
+        class: &Class,
+        key: &str,
+        source: &str,
+        valid: &ValidTime,
+        recorded: i64,
+        properties: &BTreeMap<String, Value>,
+    ) -> Result<(i64, bool), Error> {
+        let table = class_table(&class.name);
         let columns: Vec<String> = class
             .properties
             .keys()
             .map(|p| property_column(p))
             .collect();
-        let valid = node.valid.to_sql();
-        let values: Vec<Option<&Value>> = class
-            .properties
-            .keys()
-            .map(|p| node.properties.get(p))
-            .collect();
-        let (id, new) = if let Some(id) = have {
+        let valid = valid.to_sql();
+        let values: Vec<Option<&Value>> =
+            class.properties.keys().map(|p| properties.get(p)).collect();
+        if let Some(id) = node_id(self.tx, &class.name, key)? {
             let sets = concat(&columns, |c| format!(", {c} = ?"));
             let update = format!(
                 "UPDATE {table} SET source = ?, valid = ?, recorded = ?{sets} WHERE id = ?"
             );
-            let mut args: Vec<&dyn rusqlite::ToSql> =
-                vec![&self.source, &valid, &self.stamp.recorded];
+            let mut args: Vec<&dyn rusqlite::ToSql> = vec![&source, &valid, &recorded];
             args.extend(values.iter().map(|v| v as &dyn rusqlite::ToSql));
             args.push(&id);
             self.tx.prepare_cached(&update)?.execute(&args[..])?;
-            (id, false)
-        } else {
-            let insert = format!(
-                "INSERT INTO {table}(key, source, valid, recorded{}) VALUES (?, ?, ?, ?{})",
-                concat(&columns, |c| format!(", {c}")),
-                ", ?".repeat(columns.len())
-            );
-            let mut args: Vec<&dyn rusqlite::ToSql> =
-                vec![&node.key, &self.source, &valid, &self.stamp.recorded];
-            args.extend(values.iter().map(|v| v as &dyn rusqlite::ToSql));
-            self.tx.prepare_cached(&insert)?.execute(&args[..])?;
-            (self.tx.last_insert_rowid(), true)
-        };
-        keep_derived(self.tx, node)?;
-        self.added.push(Fact::Node(node.clone()));
-        Ok((id, new))
+            return Ok((id, false));
+        }
+        let insert = format!(
+            "INSERT INTO {table}(key, source, valid, recorded{}) VALUES (?, ?, ?, ?{})",
+            concat(&columns, |c| format!(", {c}")),
+            ", ?".repeat(columns.len())
+        );
+        let mut args: Vec<&dyn rusqlite::ToSql> = vec![&key, &source, &valid, &recorded];
+        args.extend(values.iter().map(|v| v as &dyn rusqlite::ToSql));
+        self.tx.prepare_cached(&insert)?.execute(&args[..])?;
+        Ok((self.tx.last_insert_rowid(), true))
     }
 
     /// Puts a link between two present nodes into its relation. Returns whether it changed.
@@ -721,16 +774,40 @@ impl<'a> Piece<'a> {
     /// Hears a link. A new hearing goes into its relation when `ends` are both present, and
     /// otherwise waits open; a link identical to a hearing held is that hearing.
     fn heard_link(&mut self, fact: LinkFact, ends: Option<(i64, i64)>) -> Result<(), Error> {
-        if let Some(held) = self.hear(&Of::Link(&fact))? {
-            return self.held(&held, false);
+        let of = Of::Link(&fact);
+        match self.hear(&of)? {
+            Heard::Held(held) => {
+                if self.held(&held, false)?
+                    && let Some(n) = newest(self.tx, &of)?
+                {
+                    self.current_link(&fact, ends, &n.source, &n.valid)?;
+                }
+                return Ok(());
+            }
+            Heard::Newest => self.current_link(&fact, ends, self.source, &fact.valid)?,
+            Heard::Older => {}
         }
-        if let Some((from, to)) = ends {
-            self.relate(&fact.relation, from, to, self.source, &fact.valid)?;
-            self.added.push(Fact::Link(fact));
+        self.added.push(if ends.is_some() {
+            Fact::Link(fact)
         } else {
-            self.open(&fact.relation, &fact.from.key, &fact.to.key, &fact.valid)?;
-            self.added.push(Fact::Opened(fact));
-        }
+            Fact::Opened(fact)
+        });
+        Ok(())
+    }
+
+    /// Puts a link's current state: into its relation when `ends` are both present, else open.
+    fn current_link(
+        &self,
+        fact: &LinkFact,
+        ends: Option<(i64, i64)>,
+        source: &str,
+        valid: &ValidTime,
+    ) -> Result<(), Error> {
+        let (relation, from, to) = (&fact.relation, &fact.from.key, &fact.to.key);
+        match ends {
+            Some((from, to)) => self.relate(relation, from, to, source, valid)?,
+            None => self.open(relation, from, to, source, valid)?,
+        };
         Ok(())
     }
 
@@ -740,6 +817,7 @@ impl<'a> Piece<'a> {
         relation: &str,
         from_key: &str,
         to_key: &str,
+        source: &str,
         valid: &ValidTime,
     ) -> Result<bool, Error> {
         let changed = self
@@ -751,13 +829,7 @@ impl<'a> Piece<'a> {
                  source = excluded.source, valid = excluded.valid \
                  WHERE source IS NOT excluded.source OR valid IS NOT excluded.valid",
             )?
-            .execute(params![
-                relation,
-                from_key,
-                to_key,
-                self.source,
-                valid.to_sql()
-            ])?;
+            .execute(params![relation, from_key, to_key, source, valid.to_sql()])?;
         Ok(changed > 0)
     }
 
