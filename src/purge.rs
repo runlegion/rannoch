@@ -1022,52 +1022,31 @@ fn rewrite(
 }
 
 /// Drops the removed event `id` from the derived-from list of every node and link fact in the
-/// log that names it. `_derived` names each fact that lists `id`; that fact's hearings and their
-/// aliases name the events whose bodies carry it.
+/// log that names it. The bodies are found by the id itself, not through `_derived`, which names
+/// only each fact's newest sources and nothing for an older version heard late.
 fn underive(tx: &Connection, id: &str) -> Result<(), Error> {
-    let facts: Vec<(String, String, String)> = tx
-        .prepare_cached("SELECT class, key, to_key FROM _derived WHERE event = ?1")?
-        .query_map(params![id], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })?
+    let bodies: Vec<(i64, String)> = tx
+        .prepare_cached("SELECT seq, body FROM _events WHERE instr(body, ?1) > 0")?
+        .query_map(params![id], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<Result<_, _>>()?;
-    for (class, key, to_key) in facts {
-        let (entity, to) = if to_key.is_empty() {
-            (node_entity(&class), None)
-        } else {
-            (link_entity(&class), Some(to_key))
+    for (seq, body) in bodies {
+        let mut stored: Stored = serde_json::from_str(&body)?;
+        let Change::Wrote { added, .. } = &mut stored.change else {
+            continue;
         };
-        let bodies: Vec<(i64, String)> = tx
-            .prepare_cached(
-                "SELECT seq, body FROM _events WHERE id IN ( \
-                 SELECT event FROM _hearings WHERE entity = ?1 AND key = ?2 AND to_key IS ?3 \
-                 UNION SELECT a.alias FROM _aliases a JOIN _hearings h \
-                 ON h.identity = a.identity \
-                 WHERE h.entity = ?1 AND h.key = ?2 AND h.to_key IS ?3)",
-            )?
-            .query_map(params![entity, key, to], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })?
-            .collect::<Result<_, _>>()?;
-        for (seq, body) in bodies {
-            let mut stored: Stored = serde_json::from_str(&body)?;
-            let Change::Wrote { added, .. } = &mut stored.change else {
-                continue;
+        let mut changed = false;
+        for fact in added {
+            let derived_from = match fact {
+                Fact::Node(node) => &mut node.derived_from,
+                Fact::Link(link) | Fact::Opened(link) => &mut link.derived_from,
             };
-            let mut changed = false;
-            for fact in added {
-                let derived_from = match fact {
-                    Fact::Node(node) => &mut node.derived_from,
-                    Fact::Link(link) | Fact::Opened(link) => &mut link.derived_from,
-                };
-                let before = derived_from.len();
-                derived_from.retain(|event| event.to_string() != id);
-                changed |= derived_from.len() != before;
-            }
-            if changed {
-                tx.prepare_cached("UPDATE _events SET body = ?1 WHERE seq = ?2")?
-                    .execute(params![serde_json::to_string(&stored)?, seq])?;
-            }
+            let before = derived_from.len();
+            derived_from.retain(|event| event.to_string() != id);
+            changed |= derived_from.len() != before;
+        }
+        if changed {
+            tx.prepare_cached("UPDATE _events SET body = ?1 WHERE seq = ?2")?
+                .execute(params![serde_json::to_string(&stored)?, seq])?;
         }
     }
     Ok(())
@@ -1631,6 +1610,66 @@ mod tests {
             assert_eq!(closed, 1, "the open link closed when n3 arrived");
             assert_eq!(links.len(), 3, "both links remain, one opened then closed");
             assert!(links.iter().all(|link| link.derived_from.is_empty()));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_purged_event_leaves_no_copy_of_its_id_in_versions_derived_from_it_and_since_replaced()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::time::{Duration, UNIX_EPOCH};
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("graph.rannoch");
+        let mut g = open(&path, Some(&crate::TEST_KEY))?;
+        g.declare(&Declaration::Class(Class::new("note", ["text"])))?;
+        g.declare(&Declaration::Relation(Relation::new(
+            "cites", "note", "note", false,
+        )))?;
+        let note =
+            |key: &str, text: &str| Unit::new("note", key, [("text", text)], ValidTime::Unknown);
+        let source = g.write(&Write::new("app").unit(note("e", "words")))?[0].id;
+        g.write(&Write::new("app").unit(note("n2", "words")))?;
+        g.write(
+            &Write::new("app")
+                .unit(note("n1", "words").link("cites", "n1", "n2", ValidTime::Unknown))
+                .derived_from([source]),
+        )?;
+        // n1 and its link are each rewritten without the event.
+        let since = ValidTime::On(crate::Date::day(2026, 10, 1));
+        g.write(&Write::new("app").unit(note("n1", "rewritten").link("cites", "n1", "n2", since)))?;
+        // An older version of n3, derived from the event, is heard after its newer one.
+        let day = Duration::from_hours(24);
+        g.write(&Write::new("app").unit(note("n3", "newer").at(UNIX_EPOCH + day * 20_000)))?;
+        g.write(
+            &Write::new("app")
+                .unit(note("n3", "older").at(UNIX_EPOCH + day * 10_000))
+                .derived_from([source]),
+        )?;
+        assert!(
+            g.derived(source)?.is_empty(),
+            "no fact's newest sources name the event, so _derived cannot find these bodies"
+        );
+        let snapshot_path = dir.path().join("snapshot.rannoch");
+        g.snapshot(g.events().committed()?, &snapshot_path)?;
+        let target = Target::Node(NodeRef::new("note", "e"));
+        g.purge(Purge::Entity { target }, "retention", "app")?;
+
+        let id = source.to_string();
+        for file in [
+            path.clone(),
+            dir.path().join("graph.rannoch-wal"),
+            snapshot_path.clone(),
+            dir.path().join("snapshot.rannoch-wal"),
+        ] {
+            let bytes = std::fs::read(&file).unwrap_or_default();
+            assert!(
+                !bytes.windows(id.len()).any(|w| w == id.as_bytes()),
+                "{} still holds the purged event's id",
+                file.display()
+            );
+        }
+        for key in ["n1", "n2", "n3"] {
+            assert!(g.find("note", key)?.is_some(), "{key} remains");
         }
         Ok(())
     }
