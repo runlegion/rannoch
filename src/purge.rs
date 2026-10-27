@@ -90,7 +90,42 @@ pub(crate) const PURGE_TABLES: &str = "
         rule TEXT NOT NULL, kind TEXT NOT NULL, match_a BLOB NOT NULL, match_b BLOB NOT NULL,
         event TEXT NOT NULL);
     CREATE UNIQUE INDEX IF NOT EXISTS _purge_rules_one
-        ON _purge_rules(kind, match_a, match_b);";
+        ON _purge_rules(kind, match_a, match_b);
+    CREATE TABLE IF NOT EXISTS _secure_delete(clean INTEGER NOT NULL);";
+
+/// Records, the first time the store is opened with `secure_delete` always on, whether its free
+/// pages can still hold leftovers: they can when the file `existed` as a graph before, written
+/// while `secure_delete` was on only during a purge.
+pub(crate) fn mark_secure(conn: &Connection, existed: bool) -> Result<(), Error> {
+    conn.execute(
+        "INSERT INTO _secure_delete(clean) SELECT ?1 WHERE NOT EXISTS (SELECT 1 FROM _secure_delete)",
+        [!existed],
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times a purge vacuumed the store on this thread, so a test can see one.
+    pub(crate) static VACUUMS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Rewrites the store once when its free pages can still hold leftovers of bodies written before
+/// `secure_delete` was always on, then records it clean and truncates the log the vacuum wrote.
+fn vacuum_once(conn: &Connection) -> Result<(), Error> {
+    let clean: Option<bool> = conn
+        .query_row("SELECT clean FROM _secure_delete", [], |row| row.get(0))
+        .optional()?;
+    if clean == Some(true) {
+        return Ok(());
+    }
+    #[cfg(test)]
+    VACUUMS.with(|vacuums| vacuums.set(vacuums.get() + 1));
+    conn.execute_batch(
+        "VACUUM; DELETE FROM _secure_delete; INSERT INTO _secure_delete(clean) VALUES (1);",
+    )?;
+    truncate_log(conn)
+}
 
 /// The kind and the values `match_a` and `match_b` a standing rule is kept and looked up under,
 /// from a purge whose targets are keyed match values: a node is its class's and its key's, a link
@@ -1149,7 +1184,7 @@ impl Graph {
         })?;
         // The purge committed: every snapshot is purged whether or not the store's log could be
         // truncated, and the store's error comes first.
-        let store = truncate_log(&self.conn);
+        let store = truncate_log(&self.conn).and_then(|()| vacuum_once(&self.conn));
         let mut failed = None;
         for path in snapshots
             .into_iter()
@@ -1671,6 +1706,93 @@ mod tests {
         for key in ["n1", "n2", "n3"] {
             assert!(g.find("note", key)?.is_some(), "{key} remains");
         }
+        Ok(())
+    }
+
+    const OLD: &[u8] = b"zq-old-leftover-124";
+
+    /// A store written as one was before `secure_delete` was always on: 60 notes, the first
+    /// carrying `OLD`, written with `secure_delete` off, then opened again by this build.
+    fn written_before_secure(
+        path: &std::path::Path,
+    ) -> Result<crate::Graph, Box<dyn std::error::Error>> {
+        {
+            let mut g = open(path, Some(&crate::TEST_KEY))?;
+            g.conn.pragma_update(None, "secure_delete", 0)?;
+            g.declare(&Declaration::Class(Class::new("note", ["text"])))?;
+            for n in 0..60 {
+                let text = if n == 0 {
+                    String::from_utf8_lossy(OLD).into_owned()
+                } else {
+                    format!("note body {n} {}", "x".repeat(200))
+                };
+                g.write(&Write::new("app").unit(Unit::new(
+                    "note",
+                    format!("n{n}"),
+                    [("text", text)],
+                    ValidTime::Unknown,
+                )))?;
+            }
+            g.conn
+                .execute_batch("DELETE FROM _secure_delete; PRAGMA wal_checkpoint(TRUNCATE);")?;
+        }
+        Ok(open(path, Some(&crate::TEST_KEY))?)
+    }
+
+    fn vacuums() -> usize {
+        super::VACUUMS.with(std::cell::Cell::get)
+    }
+
+    fn holds(path: &std::path::Path, token: &[u8]) -> Result<bool, std::io::Error> {
+        let file = std::fs::read(path)?;
+        let wal = std::fs::read(format!("{}-wal", path.display())).unwrap_or_default();
+        Ok([file, wal]
+            .iter()
+            .any(|bytes| bytes.windows(token.len()).any(|w| w == token)))
+    }
+
+    #[test]
+    fn a_store_written_before_secure_delete_holds_no_leftover_after_its_first_purge()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("graph.rannoch");
+        let mut g = written_before_secure(&path)?;
+        let target = Target::Node(NodeRef::new("note", "n0"));
+        let before = vacuums();
+        g.purge(Purge::Entity { target }, "n0-gone", "app")?;
+        assert_eq!(vacuums(), before + 1);
+        drop(g);
+        assert!(!holds(&path, OLD)?, "the store still holds the purged body");
+        Ok(())
+    }
+
+    #[test]
+    fn a_second_purge_does_not_vacuum() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("graph.rannoch");
+        let mut g = written_before_secure(&path)?;
+        let before = vacuums();
+        for n in ["n0", "n1"] {
+            let target = Target::Node(NodeRef::new("note", n));
+            g.purge(Purge::Entity { target }, "gone", "app")?;
+        }
+        drop(g);
+        let mut g = open(&path, Some(&crate::TEST_KEY))?;
+        let target = Target::Node(NodeRef::new("note", "n2"));
+        g.purge(Purge::Entity { target }, "gone", "app")?;
+        assert_eq!(vacuums(), before + 1, "only the first purge vacuums");
+        Ok(())
+    }
+
+    #[test]
+    fn a_store_this_build_started_does_not_vacuum() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let mut g = people(&dir.path().join("graph.rannoch"))?;
+        g.write(&Write::new("app").unit(bare("house", "h1")))?;
+        let before = vacuums();
+        let target = Target::Node(NodeRef::new("house", "h1"));
+        g.purge(Purge::Entity { target }, "h1-gone", "app")?;
+        assert_eq!(vacuums(), before);
         Ok(())
     }
 }
