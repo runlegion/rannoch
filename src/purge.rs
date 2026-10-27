@@ -815,6 +815,7 @@ pub(crate) fn current(
             from: NodeRef::new(&relation.from, at.as_str()),
             to: NodeRef::new(&relation.to, to.as_str()),
             valid: v.valid.clone(),
+            time: None,
             derived_from: Vec::new(),
         };
         let ends = node_id(tx, &relation.from, at)?.zip(node_id(tx, &relation.to, &to)?);
@@ -1265,7 +1266,8 @@ mod tests {
         )?;
         let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(9);
         for refused in [
-            g.end_link("knows", "p1", "p2", at, ValidTime::Unknown, "b"),
+            g.end_link("knows", "p1", "p2", at, ValidTime::Unknown, "b")
+                .map(|ending| ending.event),
             g.correct_link("knows", "p1", "p2", "b"),
         ] {
             let Err(Error::Refused(why)) = refused else {
@@ -1360,6 +1362,7 @@ mod tests {
                     from: NodeRef::new(class, key),
                     to: NodeRef::new(whole.0, whole.1),
                     valid: ValidTime::Unknown,
+                    time: None,
                     derived_from: Vec::new(),
                 }),
             ],

@@ -259,6 +259,11 @@ pub struct LinkFact {
     pub from: NodeRef,
     pub to: NodeRef,
     pub valid: ValidTime,
+    /// The time its unit's writer supplied, in milliseconds since the Unix epoch (UTC), when
+    /// its unit's class is ordered by a time the writer supplies: the link's point. `None`
+    /// puts it at the record time, as every link of another class.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time: Option<i64>,
     /// The events the link was derived from.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub derived_from: Vec<EventId>,
@@ -838,6 +843,7 @@ pub(crate) fn unlink(
                     from,
                     to,
                     valid: ValidTime::from_sql(valid),
+                    time: None,
                     derived_from: Vec::new(),
                 });
             }
