@@ -1200,7 +1200,9 @@ impl Graph {
     /// the valid time `valid` when the link stopped holding in the world, which may be unknown,
     /// and the link keeps every hearing and every ending. The link has ended at the earliest
     /// ending after its last live hearing, by point and then event id: a live hearing at a later
-    /// point reopens it, and a correction that arrives later masks its endings.
+    /// point reopens it, and a correction that arrives later masks its endings. Returns the
+    /// ending's event and, when the link still reads as live after it, the point of the later
+    /// live hearing that keeps it so.
     ///
     /// # Errors
     /// The relation is not declared; [`Error::Refused`] naming the rule when a standing purge
