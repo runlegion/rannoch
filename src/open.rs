@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::events::{Events, OWN_TABLES, upgrade};
 use crate::history::{HISTORY_TABLES, Key, point_aliases, see_all, take};
-use crate::purge::{PURGE_TABLES, stand_all};
+use crate::purge::{PURGE_TABLES, mark_secure, stand_all};
 use crate::write::{Error, date_fates};
 
 /// A class: a kind of node, with its natural key, its properties and each one's value type,
@@ -407,8 +407,10 @@ pub(crate) fn open_file(path: impl AsRef<Path>) -> Result<Graph, Error> {
          PRAGMA secure_delete=ON;",
     )?;
     conn.set_prepared_statement_cache_capacity(256);
+    let existed = table(&conn, "_events")?;
     conn.execute_batch(OWN_TABLES)?;
     conn.execute_batch(PURGE_TABLES)?;
+    mark_secure(&conn, existed)?;
     upgrade(&mut conn)?;
     date_fates(&mut conn)?;
     point_aliases(&mut conn)?;
