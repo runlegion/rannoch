@@ -6379,8 +6379,8 @@ fn state_of(node: Node) -> (BTreeMap<String, Value>, String, ValidTime, Vec<Even
 }
 
 /// Writes, in a time-keyed class with a relation `follows`, nodes a and b and a link from b to
-/// a three times, each write self-contained: at points 30, then 10 and 20, so the nodes' later
-/// versions arrive after newer ones; each link version is later than the one before.
+/// a three times, each write self-contained: at points 30, then 10 and 20, so the later versions
+/// of the nodes and of the link, which takes its unit's point, arrive after newer ones.
 #[given(
     "the events of a graph in which some versions of its nodes and links arrived after newer ones"
 )]
@@ -6440,8 +6440,8 @@ fn same_find_for_nodes_and_links(world: &mut World) {
     assert_eq!(link(recorded), link(reversed));
     assert_eq!(
         link(recorded).1,
-        day(2026, 3, 3),
-        "the link's newest version"
+        day(2026, 1, 1),
+        "the link's newest version, at point 30"
     );
 }
 
