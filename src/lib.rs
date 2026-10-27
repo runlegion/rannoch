@@ -56,4 +56,4 @@ pub use read::{
     Count, Description, Filter, GroupBy, Link, Node, NodeRef, OpenLink, PartOf, Step, Tally, Walk,
 };
 pub use refs::Fate;
-pub use write::{Date, Declaration, Error, Unit, ValidTime, Write, WriteError};
+pub use write::{Date, Declaration, Ending, Error, Unit, ValidTime, Write, WriteError};

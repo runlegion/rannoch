@@ -21,8 +21,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use rannoch::{At, End, Failure, Hearing, HistoryKey, NodeFact, Queue, Ticket, ValueType, Version};
 use rannoch::{
-    Change, Class, Count, Cursor, Date, Declaration, Description, Error, Event, EventId, Fact,
-    FactRef, Fate, Graph, GroupBy, Link, LinkFact, Node, NodeRef, OpenLink, PartOf, Purge,
+    Change, Class, Count, Cursor, Date, Declaration, Description, Ending, Error, Event, EventId,
+    Fact, FactRef, Fate, Graph, GroupBy, Link, LinkFact, Node, NodeRef, OpenLink, PartOf, Purge,
     Relation, Snapshot, Step, Tally, Target, Unit, ValidTime, Value, Write, WriteError,
 };
 use rstest_bdd_macros::{given, scenarios, then, when};
@@ -598,6 +598,8 @@ struct World {
     links: Vec<LinkAt>,
     /// The node whose history a scenario walks.
     walking: Option<NodeRef>,
+    /// What ending a link returned.
+    ending: Option<Ending>,
 }
 
 #[rstest::fixture]
@@ -657,6 +659,7 @@ fn world() -> World {
         reads_link: false,
         links: Vec::new(),
         walking: None,
+        ending: None,
     }
 }
 
@@ -1752,6 +1755,7 @@ fn reports_wrong_kind(world: &mut World) {
                 from: NodeRef::new("statement", "s2"),
                 to: NodeRef::new("statement", "s1"),
                 valid: day(2021, 3, 2),
+                time: None,
                 derived_from: Vec::new(),
             }
         )]
@@ -5764,11 +5768,11 @@ fn ends_the_link(world: &mut World) {
 }
 
 fn ends_the_link_valid(world: &mut World, valid: ValidTime) {
-    let event = world
+    let ending = world
         .g()
         .end_link("said", "v1", "s1", ended_at(), valid, "moderator")
         .unwrap();
-    world.written.push(event);
+    world.written.push(ending.event);
 }
 
 #[given("a link that has been heard, valid from 2024-01-01")]
@@ -6812,6 +6816,7 @@ fn graph_of(world: &mut World, facts: &[LinkAt]) -> Graph {
                     from,
                     to,
                     valid,
+                    time: None,
                     derived_from: Vec::new(),
                 };
                 let added = vec![Fact::Link(fact)];
@@ -8549,6 +8554,193 @@ fn same_fates(world: &mut World) {
     for (i, g) in world.graphs.iter().enumerate() {
         assert_eq!(fates_of(g), original, "graph {i}");
     }
+}
+
+// FR-RANNOCH-085: an app writes its existing history, and every link and ending keeps its time.
+
+/// Writes `facts` to `g` through the write API: a hearing as a unit of the time-keyed class at
+/// its point holding its `follows` link to a, and an ending as `end_link` at its point.
+fn write_history(g: &mut Graph, facts: &[LinkAt]) -> Vec<Ending> {
+    let when = day(2026, 1, 1);
+    let mut endings = Vec::new();
+    for fact in facts {
+        match *fact {
+            LinkAt::Heard(from, source, n) => {
+                let unit = Unit::new("visit", from, [("text", from)], when.clone())
+                    .at(at(n))
+                    .link("follows", from, "a", when.clone());
+                g.write(&Write::new(source).unit(unit)).unwrap();
+            }
+            LinkAt::Ended(from, n) => {
+                let ended =
+                    g.end_link("follows", from, "a", at(n), ValidTime::Unknown, "moderator");
+                endings.push(ended.unwrap());
+            }
+        }
+    }
+    endings
+}
+
+/// Declares `follows` between the time-keyed class's nodes and writes node a at point 1.
+fn follows_to_a(g: &mut Graph) {
+    let follows = Relation::new("follows", "visit", "visit", false);
+    g.declare(&Declaration::Relation(follows)).unwrap();
+    let a = Unit::new("visit", "a", [("text", "a")], day(2026, 1, 1)).at(at(1));
+    g.write(&Write::new("crawler").unit(a)).unwrap();
+}
+
+#[when("the app writes a unit at point 10 that holds a link")]
+fn writes_unit_with_link_at_10(world: &mut World) {
+    follows_to_a(world.g());
+    write_history(world.g(), &[LinkAt::Heard("b", "crawler", 10)]);
+}
+
+#[then("the link's hearing is at point 10")]
+fn link_heard_at_10(world: &mut World) {
+    let hearings = world.g().link_hearings("follows", "b", "a").unwrap();
+    let points: Vec<SystemTime> = hearings.iter().map(|h| h.point).collect();
+    assert_eq!(points, [at(10)]);
+}
+
+#[when("the app writes a unit at point 10 that holds a link, and then ends the link at point 20")]
+fn writes_link_at_10_ends_at_20(world: &mut World) {
+    follows_to_a(world.g());
+    let facts = [LinkAt::Heard("b", "crawler", 10), LinkAt::Ended("b", 20)];
+    world.ending = write_history(world.g(), &facts).pop();
+}
+
+#[when("both are recorded at a time later than point 20")]
+fn recorded_after_20(world: &mut World) {
+    let events = world.all_events();
+    let recorded = |event: &Event| {
+        let id = uuid::Uuid::parse_str(&event.id.to_string()).unwrap();
+        let (secs, nanos) = id.get_timestamp().unwrap().to_unix();
+        SystemTime::UNIX_EPOCH + Duration::new(secs, nanos)
+    };
+    let wrote_and_ended: Vec<&Event> = events
+        .iter()
+        .filter(|e| matches!(e.change, Change::Wrote { .. } | Change::Ended { .. }))
+        .collect();
+    assert_eq!(
+        wrote_and_ended.len(),
+        3,
+        "a, the unit holding the link, the ending"
+    );
+    for event in wrote_and_ended {
+        assert!(recorded(event) > at(20), "{event:?}");
+    }
+}
+
+#[then("the link reads as live at point 15 and as ended at point 25")]
+fn link_live_at_15_ended_at_25(world: &mut World) {
+    let state = |g: &Graph, n| {
+        g.link_state_at("follows", "b", "a", At::Time(at(n)))
+            .unwrap()
+            .unwrap_or_else(|| panic!("the link holds a state at point {n}"))
+    };
+    let (live, ended) = (state(world.g(), 15), state(world.g(), 25));
+    assert!(!live.ended, "{live:?}");
+    assert_eq!(live.point, at(10));
+    assert!(ended.ended, "{ended:?}");
+}
+
+#[given("a link written at point 10 and written again at point 30")]
+fn link_written_at_10_and_30(world: &mut World) {
+    follows_to_a(world.g());
+    let facts = [
+        LinkAt::Heard("b", "crawler", 10),
+        LinkAt::Heard("b", "crawler", 30),
+    ];
+    write_history(world.g(), &facts);
+}
+
+#[when("the app ends the link at point 20")]
+fn ends_link_at_20(world: &mut World) {
+    world.ending = write_history(world.g(), &[LinkAt::Ended("b", 20)]).pop();
+}
+
+#[then("the ending is recorded at point 20")]
+fn ending_recorded_at_20(world: &mut World) {
+    let ending = world.ending.as_ref().expect("the link was ended");
+    let Change::Ended { at: point, .. } = ending.event.change else {
+        panic!("an ending, got {:?}", ending.event)
+    };
+    let millis = at(20)
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    assert_eq!(point, i64::try_from(millis).unwrap());
+    let seen = world.g().link_seen("follows", "b", "a").unwrap().unwrap();
+    assert_eq!(seen.count, 3, "two hearings and the ending: {seen:?}");
+}
+
+#[then("the result says the link reads as live from point 30")]
+fn result_says_live_from_30(world: &mut World) {
+    let ending = world.ending.as_ref().expect("the link was ended");
+    assert_eq!(ending.live_from, Some(at(30)));
+    assert_eq!(world.g().link_end("follows", "b", "a").unwrap(), None);
+}
+
+#[given("a history of three units holding links and two endings")]
+fn three_units_two_endings(world: &mut World) {
+    world.links = vec![
+        LinkAt::Heard("b", "crawler", 10),
+        LinkAt::Ended("b", 15),
+        LinkAt::Heard("b", "crawler", 20),
+        LinkAt::Ended("b", 30),
+        LinkAt::Heard("b", "crawler", 40),
+    ];
+}
+
+#[when("one graph is written in that order and another in reverse")]
+fn history_written_both_ways(world: &mut World) {
+    let facts = world.links.clone();
+    let backward: Vec<LinkAt> = facts.iter().rev().copied().collect();
+    for (name, facts) in [("forward", facts), ("backward", backward)] {
+        let path = world.dir.path().join(format!("{name}.rannoch"));
+        let mut g = rannoch::open(path, Some(&KEY)).unwrap();
+        declare_kind(&mut g, "time-keyed");
+        follows_to_a(&mut g);
+        write_history(&mut g, &facts);
+        world.graphs.push(g);
+    }
+}
+
+#[then("every link reads the same at every point in both graphs")]
+fn same_link_states_both_ways(world: &mut World) {
+    let states = |g: &Graph| -> Vec<Option<(SystemTime, bool, String)>> {
+        (0..=50)
+            .map(|n| {
+                g.link_state_at("follows", "b", "a", At::Time(at(n)))
+                    .unwrap()
+                    .map(|v| (v.point, v.ended, v.source))
+            })
+            .collect()
+    };
+    let [forward, backward] = &world.graphs[..] else {
+        panic!("two graphs, got {}", world.graphs.len())
+    };
+    let (forward, backward) = (states(forward), states(backward));
+    assert_eq!(forward, backward);
+    let ended = |n: usize| forward[n].as_ref().map(|(_, ended, _)| *ended);
+    assert_eq!(
+        [
+            ended(5),
+            ended(12),
+            ended(17),
+            ended(25),
+            ended(35),
+            ended(45)
+        ],
+        [
+            None,
+            Some(false),
+            Some(true),
+            Some(false),
+            Some(true),
+            Some(false)
+        ]
+    );
 }
 
 scenarios!("tests", fixtures = [world: World]);

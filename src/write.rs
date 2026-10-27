@@ -381,6 +381,14 @@ impl Unit {
     }
 }
 
+/// What ending a link recorded: its event, and, when a live hearing at a later point keeps the
+/// link reading as live after it, that hearing's point.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ending {
+    pub event: Event,
+    pub live_from: Option<SystemTime>,
+}
+
 /// A write: whole units from one source, and the events its nodes and links were derived from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Write {
@@ -629,6 +637,7 @@ impl<'a> Piece<'a> {
                 from: NodeRef::new(&relation.from, &link.from),
                 to: NodeRef::new(&relation.to, &link.to),
                 valid: link.valid.clone(),
+                time: None,
                 derived_from: Vec::new(),
             });
         }
@@ -798,15 +807,21 @@ impl<'a> Piece<'a> {
         Ok(changed > 0)
     }
 
-    /// Writes one link of a unit, derived from `derived_from`: into its relation when both ends
-    /// are present, else open.
-    fn link(&mut self, link: &LinkSpec, derived_from: &[EventId]) -> Result<(), Error> {
+    /// Writes one link of a unit, at the unit's time `time`, derived from `derived_from`: into
+    /// its relation when both ends are present, else open.
+    fn link(
+        &mut self,
+        link: &LinkSpec,
+        time: Option<i64>,
+        derived_from: &[EventId],
+    ) -> Result<(), Error> {
         let relation = self.ontology.relation(&link.relation)?;
         let fact = LinkFact {
             relation: relation.name.clone(),
             from: NodeRef::new(&relation.from, &link.from),
             to: NodeRef::new(&relation.to, &link.to),
             valid: link.valid.clone(),
+            time,
             derived_from: derived_from.to_vec(),
         };
         if self.purged(&Of::Link(&fact))? {
@@ -937,6 +952,7 @@ impl<'a> Piece<'a> {
                                 from: NodeRef::new(&relation.from, from_key),
                                 to: NodeRef::new(&relation.to, to_key),
                                 valid: ValidTime::from_sql(valid),
+                                time: None,
                                 derived_from: Vec::new(),
                             },
                         });
@@ -952,6 +968,7 @@ impl<'a> Piece<'a> {
                         from: NodeRef::new(&relation.from, from_key),
                         to: NodeRef::new(&relation.to, to_key),
                         valid: ValidTime::from_sql(valid),
+                        time: None,
                         derived_from: Vec::new(),
                     };
                     self.close(&link, from, to, &source)?;
@@ -1197,8 +1214,15 @@ impl Graph {
         at: SystemTime,
         valid: ValidTime,
         source: &str,
-    ) -> Result<Event, Error> {
-        self.conclude_link(relation, from, to, source, Some((millis(at), valid)))
+    ) -> Result<Ending, Error> {
+        let event = self.conclude_link(relation, from, to, source, Some((millis(at), valid)))?;
+        let live_from = match self.link_end(relation, from, to)? {
+            Some(_) => None,
+            None => self
+                .link_seen(relation, from, to)?
+                .map(|seen| seen.last_heard.point),
+        };
+        Ok(Ending { event, live_from })
     }
 
     /// Records that the link of `relation` from the node keyed `from` to the node keyed `to`
@@ -1490,8 +1514,13 @@ fn put(
         if new {
             piece.arrived(&unit.node.class, &unit.node.key)?;
         }
+        // A link takes its unit's time only in a class ordered by a time the writer supplies.
+        let time = match piece.ontology.class(&unit.node.class)?.history {
+            HistoryKey::Time => unit.node.time,
+            HistoryKey::Origin | HistoryKey::Integer => None,
+        };
         for link in &unit.links {
-            piece.link(link, derived_from)?;
+            piece.link(link, time, derived_from)?;
         }
     }
     let Piece {

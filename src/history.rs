@@ -122,7 +122,7 @@ impl<'a> Of<'a> {
     pub(crate) fn time(&self) -> Option<i64> {
         match self {
             Of::Node(node) => node.time,
-            Of::Link(_) => None,
+            Of::Link(link) => link.time,
         }
     }
 
@@ -147,9 +147,22 @@ impl<'a> Of<'a> {
                 n.time,
                 n.integer,
             ))?,
-            Of::Link(l) => {
-                serde_json::to_vec(&("link", &l.relation, &l.from, &l.to, &l.valid, source))?
-            }
+            // A link's time joins its content only when its writer supplied one, so every link
+            // heard without one keeps the identity it always had.
+            Of::Link(l) => match l.time {
+                None => {
+                    serde_json::to_vec(&("link", &l.relation, &l.from, &l.to, &l.valid, source))?
+                }
+                Some(time) => serde_json::to_vec(&(
+                    "link",
+                    &l.relation,
+                    &l.from,
+                    &l.to,
+                    &l.valid,
+                    source,
+                    time,
+                ))?,
+            },
         };
         Ok(*blake3::keyed_hash(&key.bytes, &content).as_bytes())
     }
