@@ -7946,6 +7946,146 @@ fn late_hearing_gone_rebuilt(world: &mut World) {
     only_survivor(world.rebuilt.as_ref().expect("the graph was rebuilt"));
 }
 
+// ---------- purge: the purge event carries only the rule (FR-RANNOCH-078) ----------
+
+/// The follower that reads past a purge.
+const FOLLOWER_78: &str = "follower-78";
+
+/// Everything of the purged fact no purge event or follower may see: its property value, its
+/// key, and each of its hearings' event ids and content identity, as hex and as bytes.
+fn purged_fact_marks(world: &World) -> Vec<String> {
+    let mut marks = vec![TOKEN.to_owned(), "\"p-gone\"".to_owned()];
+    for hearing in &world.hearings["purged"] {
+        marks.push(hearing.event.to_string());
+        marks.extend(hearing.aliases.iter().map(ToString::to_string));
+        marks.push(
+            blake3::Hash::from_bytes(hearing.identity)
+                .to_hex()
+                .to_string(),
+        );
+        marks.push(serde_json::to_string(&hearing.identity).unwrap());
+    }
+    marks
+}
+
+/// Asserts `text` holds none of `marks`.
+fn assert_holds_none(text: &str, marks: &[String]) {
+    for mark in marks {
+        assert!(!text.contains(mark.as_str()), "{text} holds {mark}");
+    }
+}
+
+#[given("a graph holding a fact")]
+fn graph_holding_a_fact(world: &mut World) {
+    token_fact(world);
+    // Its one hearing, kept so the scenario can name its event ids and content identity.
+    let hearings = world
+        .g()
+        .hearings(&NodeRef::new("person", "p-gone"))
+        .unwrap();
+    world.hearings.insert("purged".into(), hearings);
+}
+
+#[when("the app purges the fact under a rule")]
+fn purges_fact_under_rule(world: &mut World) {
+    world.cursor = world.g().events().committed().unwrap();
+    purge_targets(world);
+}
+
+#[then("the event log gains a purge event carrying the rule's name")]
+fn log_gains_rule_event(world: &mut World) {
+    let cursor = world.cursor;
+    let gained = world.g().events().since(cursor).unwrap();
+    assert_eq!(gained.len(), 1, "{gained:?}");
+    let Change::Purged { rule, purge, .. } = &gained[0].change else {
+        panic!("{gained:?}");
+    };
+    assert_eq!(rule, "rule-71");
+    assert!(matches!(purge, Purge::Fact { .. }), "{purge:?}");
+}
+
+#[then("the purge event holds no id or content of the fact and no copy of the fact's key")]
+fn rule_event_names_nothing(world: &mut World) {
+    let marks = purged_fact_marks(world);
+    let cursor = world.cursor;
+    let purge = world.g().events().since(cursor).unwrap()[0].id;
+    let file = rusqlite::Connection::open(world.path()).unwrap();
+    let body: String = file
+        .query_row(
+            "SELECT body FROM _events WHERE id = ?1",
+            [purge.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(body.contains("rule-71"), "{body}");
+    assert_holds_none(&body, &marks);
+}
+
+#[given("a follower whose cursor is before a fact was written")]
+fn follower_before_fact(world: &mut World) {
+    let g = purge_graph(world);
+    g.write(&Write::new("app").unit(person("p-other", "before")))
+        .unwrap();
+    let log = g.events();
+    log.register(FOLLOWER_78).unwrap();
+    log.advance(FOLLOWER_78, log.committed().unwrap()).unwrap();
+    // The fact is written alone, so the purge removes its write event whole.
+    g.write(&Write::new("app").unit(person("p-gone", TOKEN)))
+        .unwrap();
+    g.write(&Write::new("app").unit(person("p-after", "after")))
+        .unwrap();
+    let hearings = g.hearings(&NodeRef::new("person", "p-gone")).unwrap();
+    world.purge.targets.push(Purge::Fact {
+        identity: hearings[0].identity,
+    });
+    world.hearings.insert("purged".into(), hearings);
+}
+
+#[when("the app purges the fact and the follower reads since its cursor")]
+fn purges_and_follower_reads(world: &mut World) {
+    purge_targets(world);
+    let events = world.g().events();
+    let (_, cursor) = events
+        .followers()
+        .unwrap()
+        .into_iter()
+        .find(|(name, _)| name == FOLLOWER_78)
+        .unwrap();
+    world.read = events.since(cursor).unwrap();
+}
+
+#[then("the follower receives no id or content of the fact")]
+fn follower_receives_nothing_purged(world: &mut World) {
+    let marks = purged_fact_marks(world);
+    assert!(
+        world
+            .read
+            .iter()
+            .any(|e| matches!(&e.change, Change::Purged { rule, .. } if rule == "rule-71")),
+        "the follower learns of the purge from its rule event: {:?}",
+        world.read
+    );
+    for event in &world.read {
+        let text = format!(
+            "{} {}",
+            event.id,
+            serde_json::to_string(&event.change).unwrap()
+        );
+        assert_holds_none(&text, &marks);
+    }
+}
+
+#[when(
+    "the graph is rebuilt from its events and the app writes a hearing of the fact from the purged source"
+)]
+fn rebuilt_from_events_and_late_hearing(world: &mut World) {
+    let events = world.all_events();
+    let path = world.dir.path().join("rebuilt-78.rannoch");
+    let mut rebuilt = rannoch::rebuild(&events, path, Some(&KEY)).unwrap();
+    late_hearing(&mut rebuilt);
+    world.rebuilt = Some(rebuilt);
+}
+
 /// The key of the node the standing rule purges: found nowhere else in a scenario's files.
 const STANDING: &str = "zq-standing-key-72";
 
