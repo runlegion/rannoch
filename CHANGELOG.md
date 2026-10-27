@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.4.0
+
+Minor release: two public signatures change, which while rannoch is 0.x makes this a minor release. `Graph::end_link` returns `Ending { event, live_from }` instead of `Event`, and `LinkFact` gains `time`. No schema migration: a link stored without a time keeps its old content identity, so a store written by 0.3.0 opens as it was. The tag is still the release: pin `rannoch = { git = "https://github.com/runlegion/rannoch", tag = "v0.4.0" }`.
+
+An app can now write its existing history through the ordinary write API, and every link and every ending keeps its real time (FR-RANNOCH-085). Until now a link written in a unit of a time-keyed class was heard at the store's record time, so an ending at its real, earlier time sat before the link's own hearing and silently reopened the link.
+
+### Added
+
+- **A link takes its unit's time** (PR #135, #134, FR-RANNOCH-085): for a unit of a `HistoryKey::Time` class, the write path passes the unit's time to its links in `LinkFact::time`, and the time travels in the `Wrote` event, so a rebuild and any arrival order place the link at the same point. The time joins the link's content identity only when one was supplied. Links of origin- and integer-keyed classes are unchanged. An ending at its own earlier time now compares against the link's real point, so history written long after it happened keeps its endings.
+- **An ending says when a later hearing keeps the link live** (PR #135, #134): `Graph::end_link` returns `Ending { event, live_from }`. When the ending lies before a later live hearing the link still reads as live, and `live_from` is the point of that hearing, read from `link_seen`; otherwise it is `None`.
+
+### Changed
+
+- **A link's newest version follows its unit's point** (PR #135, #134): a link written in a time-keyed unit is now ordered at that unit's time rather than the record time, so links arriving after newer ones are really ordered by the time they carry. Callers that used `end_link`'s returned `Event` read `ending.event`.
+
 ## 0.3.0
 
 Minor release: the public signatures change again, which while rannoch is 0.x makes this a minor release. `rannoch::open`, `rannoch::rebuild` and `Snapshot::rebuild` take a 32-byte history key (`Option<&[u8; 32]>`, and `None` is refused), `HistoryKey::Recorded` is renamed `HistoryKey::Origin`, `find_as_of` and `walk_as_of` take a `known_at: Option<At>` and `Count` gains the same field, `Graph::forget` is replaced by `Graph::purge`, `Graph::end_link` takes a `ValidTime`, `Graph::derived` returns `FactRef`, `LinkFact` gains `derived_from`, and two writes that used to land are now refused: a link from a source never heard, and a write to a time- or integer-keyed class missing its key. A store written by 0.2.0 (kept as `tests/fixtures/store-0.2.0.rannoch`) opens whole, but its schema is migrated in place at open. At open, `_derived` is re-keyed by (class, key, to_key), `_events` gains an indexed `id` column, replacement fates gain their point and event id, aliases gain a point, and a store that already held a graph is recorded as not yet clean of pre-`secure_delete` leftovers. The first time it is opened under a key, the log is heard into the new history tables (`_hearings`, `_aliases`, `_ends`, `_endings`, `_seen`) and a standing rule is kept in `_purge_rules` for each earlier forget or purge.
