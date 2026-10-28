@@ -1,0 +1,16 @@
+[package]
+name = "rannoch-processor-after"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+repository = "https://github.com/runlegion/rannoch"
+authors = ["Sean Silvius"]
+description = "Send a CloudEvent to the inbox at the event's time plus a delay."
+publish = false
+
+[dependencies]
+rannoch-processor = { path = "../rannoch-processor" }
+
+[lints]
+workspace = true

@@ -152,6 +152,22 @@ impl Events<'_> {
         high_water(self.conn)
     }
 
+    /// The place the next event appended to the log takes.
+    ///
+    /// # Errors
+    /// The graph file cannot be read.
+    pub fn next(&self) -> Result<Cursor, Error> {
+        next_cursor(self.conn)
+    }
+
+    /// The event at `cursor`, if the log holds one there.
+    ///
+    /// # Errors
+    /// The graph file cannot be read, or the event's id in it cannot be decoded.
+    pub fn at(&self, cursor: Cursor) -> Result<Option<Event>, Error> {
+        event_at(self.conn, cursor)
+    }
+
     /// Every event after `cursor`, in the order they were written.
     ///
     /// # Errors

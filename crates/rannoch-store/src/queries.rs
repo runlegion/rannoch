@@ -404,9 +404,6 @@ pub(crate) const RELEASE: &str = "RELEASE event";
 
 pub(crate) const ROLLBACK_TO: &str = "ROLLBACK TO event; RELEASE event";
 
-pub(crate) const TABLE_EXISTS: &str =
-    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)";
-
 pub(crate) const SCHEMA_VERSION: &str = "PRAGMA schema_version";
 
 pub(crate) const LOAD_ONTOLOGY: &str = "SELECT kind, body FROM _ontology";

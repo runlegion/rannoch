@@ -29,8 +29,7 @@ use crate::log::{append, store};
 use crate::ontology::build;
 use crate::queries::{
     CLOSE_OPEN, FILLED, HISTORY_TABLES, OPEN_LINK, OWN_TABLES, PRAGMAS, RELEASE, ROLLBACK_TO,
-    SAVEPOINT, SCHEMA_VERSION, SET_FILLED, TABLE_EXISTS, node_id, upsert_link, upsert_node,
-    waiting,
+    SAVEPOINT, SCHEMA_VERSION, SET_FILLED, node_id, upsert_link, upsert_node, waiting,
 };
 
 /// Why rannoch did not do what was asked.
@@ -65,11 +64,6 @@ pub(crate) fn schema_version(conn: &Connection) -> Result<i64, Error> {
     Ok(conn
         .prepare_cached(SCHEMA_VERSION)?
         .query_row([], |row| row.get(0))?)
-}
-
-/// Whether `conn` holds a table named `name`.
-pub(crate) fn table(conn: &Connection, name: &str) -> Result<bool, Error> {
-    Ok(conn.query_row(TABLE_EXISTS, [name], |row| row.get(0))?)
 }
 
 /// One graph file.

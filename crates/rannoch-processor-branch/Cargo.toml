@@ -1,0 +1,16 @@
+[package]
+name = "rannoch-processor-branch"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+repository = "https://github.com/runlegion/rannoch"
+authors = ["Sean Silvius"]
+description = "Continue at the first case whose guard holds, else at the default, else end."
+publish = false
+
+[dependencies]
+rannoch-processor = { path = "../rannoch-processor" }
+
+[lints]
+workspace = true
