@@ -29,7 +29,7 @@ tempfile = "3"
 workspace = true
 
 [workspace]
-members = ["crates/rannoch-probe"]
+members = ["crates/rannoch-probe", "crates/rannoch-store"]
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
