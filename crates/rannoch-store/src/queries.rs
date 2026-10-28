@@ -503,12 +503,10 @@ pub(crate) fn upsert_link(relation: &str, from: &str, to: &str) -> String {
     )
 }
 
-/// Reads the node keyed `?1` from its class's table: its source, valid time, record time, then
-/// one column per property in `properties`' order.
-pub(crate) fn select_node(class: &str, properties: &[&str]) -> String {
-    let columns = concat(properties, |p| format!(", {}", property_column(p)));
+/// Reads the node keyed `?1` from its class's table: its source, valid time and record time.
+pub(crate) fn select_node(class: &str) -> String {
     format!(
-        "SELECT source, valid, recorded{columns} FROM {} WHERE key = ?1",
+        "SELECT source, valid, recorded FROM {} WHERE key = ?1",
         class_table(class)
     )
 }

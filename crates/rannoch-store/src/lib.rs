@@ -72,7 +72,7 @@ pub struct Graph {
     pub(crate) conn: Connection,
     /// The app's content-identity key, which every hearing's identity is hashed under.
     pub(crate) key: Key,
-    /// As of the last load by `open_file` or a `&mut self` method; what `ontology()` returns.
+    /// As of the last load by `open` or a `&mut self` method; what `ontology()` returns.
     pub(crate) ontology: Ontology,
     /// What reads use: the ontology and the `PRAGMA schema_version` it was loaded at.
     pub(crate) fresh: RefCell<Fresh>,
@@ -92,11 +92,6 @@ pub(crate) struct Fresh {
 /// [`Error::KeyDiffers`] when the graph holds another key's check value; the file cannot be
 /// opened as a graph file.
 pub fn open(path: impl AsRef<Path>, key: &[u8; 32]) -> Result<Graph, Error> {
-    open_file(path, key)
-}
-
-/// Opens the graph at `path` under `key`. A path that holds no graph yet starts an empty graph.
-pub(crate) fn open_file(path: impl AsRef<Path>, key: &[u8; 32]) -> Result<Graph, Error> {
     let mut conn = Connection::open(path)?;
     conn.busy_handler(Some(retry_lock))?;
     conn.execute_batch(PRAGMAS)?;
@@ -120,7 +115,7 @@ pub(crate) fn open_file(path: impl AsRef<Path>, key: &[u8; 32]) -> Result<Graph,
 }
 
 impl Graph {
-    /// The graph's ontology as of this handle's last load, by `open_file` or by one of its own
+    /// The graph's ontology as of this handle's last load, by `open` or by one of its own
     /// declarations: every class and relation declared on its stream by then.
     #[must_use]
     pub fn ontology(&self) -> &Ontology {

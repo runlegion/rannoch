@@ -95,7 +95,7 @@ fn find_in(
     }
     // A replaced node keeps its row and nothing else: its history is the new key's now.
     Ok(conn
-        .prepare_cached(&select_node(&class.name, &[]))?
+        .prepare_cached(&select_node(&class.name))?
         .query_row(params![key], |row| {
             Ok(Node {
                 class: class.name.clone(),
