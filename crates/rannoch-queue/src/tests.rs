@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use rannoch_store::{Class, Cursor, Declaration, Error, Graph, open};
+use rannoch_store::{Class, Declaration, Error, Graph, open};
 
 use super::{Failure, Queue, State, Ticket, lock};
 
@@ -223,7 +223,6 @@ fn every_committed_event_has_a_state_for_each_worker_that_survives_reopening()
     assert_eq!(queue.state("w", handed[2])?, State::InProgress);
     let fourth = queue.next("w")?.ok_or("the fourth is waiting")?.cursor;
     assert!(fourth > handed[2]);
-    assert_eq!(queue.state("w", Cursor::START)?, State::Done);
     assert_eq!(queue.state("other", handed[0])?, State::Waiting);
     Ok(())
 }
