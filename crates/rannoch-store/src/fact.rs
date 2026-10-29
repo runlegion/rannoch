@@ -18,10 +18,14 @@ impl From<rannoch_cloudevents::Error> for Error {
     }
 }
 
-/// Reads `body` as a `CloudEvent` and checks what it says against `ontology`. A body that is not
-/// a `CloudEvents` 1.0 event, or a node or link the ontology does not allow is refused with the
-/// reason.
-pub(crate) fn read(body: &str, ontology: &Ontology) -> Result<Fact, Error> {
+/// Reads `body` as a `CloudEvent` and checks what it says against `ontology`: its format, its class
+/// or relation, the history key its class is ordered by, its values' types and a link's ends. A
+/// body that is not a `CloudEvents` 1.0 event, or a node or link the ontology does not allow, is
+/// refused with the reason.
+///
+/// # Errors
+/// [`Error::Refused`] with the reason, or [`Error::Encoding`] when the body is not JSON.
+pub fn check(body: &str, ontology: &Ontology) -> Result<Fact, Error> {
     let fact = rannoch_cloudevents::read(body)?;
     match &fact {
         Fact::Node(node) => {
