@@ -356,7 +356,122 @@ fn ends(relation: &Relation) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::Value;
+    use std::collections::BTreeMap;
+
+    use super::{Class, Declaration, HistoryKey, Ontology, Relation, Value, ValueType};
+
+    fn declared() -> Ontology {
+        let mut ontology = Ontology::default();
+        for class in [
+            Class::new("author", ["name"]),
+            Class::new("book", ["title"]),
+        ] {
+            ontology.classes.insert(class.name.clone(), class);
+        }
+        let wrote = Relation::new("wrote", "author", "book", false);
+        ontology.relations.insert(wrote.name.clone(), wrote);
+        ontology
+    }
+
+    #[test]
+    fn a_declaration_identical_to_what_is_declared_changes_nothing() {
+        let ontology = declared();
+        for declaration in [
+            Declaration::Class(Class::new("author", ["name"])),
+            Declaration::Relation(Relation::new("wrote", "author", "book", false)),
+            Declaration::Property {
+                class: "book".into(),
+                property: "title".into(),
+                of: ValueType::Text,
+            },
+        ] {
+            assert_eq!(ontology.check(&declaration), Ok(false), "{declaration:?}");
+        }
+        assert_eq!(
+            ontology.check(&Declaration::Class(Class::new("shelf", ["label"]))),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn a_conflicting_declaration_is_refused_naming_what_differs_and_no_table() {
+        let ontology = declared();
+        let mut ordered = Class::new("author", ["name"]);
+        ordered.history = HistoryKey::Integer;
+        for (declaration, names) in [
+            (
+                Declaration::Class(Class::new("author", ["born"])),
+                "class author",
+            ),
+            (Declaration::Class(ordered), "class author"),
+            (
+                Declaration::Relation(Relation::new("wrote", "book", "author", false)),
+                "relation wrote",
+            ),
+            (
+                Declaration::Property {
+                    class: "book".into(),
+                    property: "title".into(),
+                    of: ValueType::Integer,
+                },
+                "property title of class book",
+            ),
+            (
+                Declaration::Property {
+                    class: "shelf".into(),
+                    property: "label".into(),
+                    of: ValueType::Text,
+                },
+                "class shelf",
+            ),
+            (
+                Declaration::Relation(Relation::new("holds", "shelf", "book", true)),
+                "class shelf",
+            ),
+        ] {
+            let Err(refused) = ontology.check(&declaration) else {
+                panic!("{declaration:?} must be refused");
+            };
+            let refused = refused.0;
+            assert!(refused.contains(names), "{refused}");
+            assert!(!refused.contains("table"), "{refused}");
+        }
+    }
+
+    #[test]
+    fn a_link_holds_only_between_its_relations_classes() {
+        let wrote = Relation::new("wrote", "author", "book", false);
+        assert_eq!(wrote.holds("author", "book"), Ok(()));
+        assert!(wrote.holds("book", "author").is_err());
+        assert!(wrote.holds("author", "author").is_err());
+    }
+
+    #[test]
+    fn a_value_is_checked_against_its_propertys_declared_type() {
+        let mut book = Class::new("book", ["title"]);
+        book.properties.insert("pages".into(), ValueType::Integer);
+        book.properties
+            .insert("embedding".into(), ValueType::FloatVector(2));
+        let check = |pairs: &[(&str, Value)]| {
+            book.check(
+                &pairs
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), v.clone()))
+                    .collect::<BTreeMap<_, _>>(),
+            )
+        };
+        assert_eq!(
+            check(&[
+                ("title", Value::from("Dune")),
+                ("pages", Value::Integer(412)),
+                ("embedding", Value::FloatVector(vec![0.5, 1.0])),
+            ]),
+            Ok(())
+        );
+        assert!(check(&[("pages", Value::from("412"))]).is_err());
+        assert!(check(&[("embedding", Value::FloatVector(vec![0.5]))]).is_err());
+        assert!(check(&[("isbn", Value::from("x"))]).is_err());
+    }
 
     #[test]
     fn a_value_survives_its_encoding_and_bare_text_is_text()
