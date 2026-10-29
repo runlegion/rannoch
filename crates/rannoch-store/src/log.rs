@@ -1,11 +1,9 @@
 //! The log: every change to a graph is an event, read in order from a cursor and kept. An
 //! event's body is the `CloudEvent` itself, as JSON.
 
-use std::fmt;
-
+use rannoch_cloudevents::EventId;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 use crate::Error;
 use crate::queries::{APPEND_EVENT, EVENT_AT, EVENTS_BETWEEN, HIGH_WATER};
@@ -20,48 +18,6 @@ pub struct Cursor(pub(crate) i64);
 impl Cursor {
     /// Before the first event.
     pub const START: Cursor = Cursor(0);
-}
-
-/// An event's own id (`UUIDv7`), minted when the event is written and never derived from its
-/// content. Ids order as they were minted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct EventId(pub(crate) Uuid);
-
-impl EventId {
-    /// Mints a new id. `Uuid::now_v7` is monotonic within one process: within a millisecond it
-    /// fills the rest of the timestamp field with a counter, so ids minted later sort later.
-    pub(crate) fn now() -> EventId {
-        EventId(Uuid::now_v7())
-    }
-
-    /// The millisecond the id was minted at: when the store that minted it recorded its event.
-    /// None when the id carries no timestamp, as an id that is not a `UUIDv7` may not.
-    pub(crate) fn millis(self) -> Option<i64> {
-        self.0.get_timestamp().map(|at| {
-            let (seconds, nanos) = at.to_unix();
-            i64::try_from(seconds)
-                .unwrap_or(i64::MAX)
-                .saturating_mul(1_000)
-                .saturating_add(i64::from(nanos / 1_000_000))
-        })
-    }
-
-    /// The millisecond the id was minted at, for an event that came from outside this store's
-    /// own write path: refused when the id carries none, since no other time stands in for it.
-    pub(crate) fn recorded(self) -> Result<i64, Error> {
-        self.millis().ok_or_else(|| {
-            Error::Refused(format!(
-                "event {self} has no record time: its id is not a UUIDv7"
-            ))
-        })
-    }
-}
-
-impl fmt::Display for EventId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
 }
 
 /// One change to a graph: its id, its place in the log, and its body, the `CloudEvent` as JSON.

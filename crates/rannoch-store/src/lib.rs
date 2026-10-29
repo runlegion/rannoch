@@ -15,11 +15,11 @@ mod ontology;
 mod queries;
 mod read;
 
-pub use fact::{Date, ValidTime};
 pub use history::{At, End, Hearing, Seen, Version};
-pub use log::{Cursor, Event, EventId, Events};
+pub use log::{Cursor, Event, Events};
+pub use rannoch_cloudevents::{Date, EventId, NodeRef, ValidTime};
 pub use rannoch_ontology::{Class, Declaration, HistoryKey, Ontology, Relation, Value, ValueType};
-pub use read::{Node, NodeRef};
+pub use read::Node;
 
 use crate::history::{
     Heard, Key, Of, Stamp, alias, conclude, heard, link_entity, newest, node_entity, take,
@@ -238,7 +238,7 @@ impl Graph {
                 ))
             };
             to = event.cursor;
-            let recorded = event.id.recorded().map_err(failed)?;
+            let recorded = event.id.recorded().map_err(Error::from).map_err(failed)?;
             let stamp = Stamp {
                 cursor: event.cursor,
                 recorded,
@@ -334,7 +334,7 @@ fn put_node(
     properties: &BTreeMap<String, Value>,
 ) -> Result<(), Error> {
     let names: Vec<&str> = properties.keys().map(String::as_str).collect();
-    let valid = valid.to_sql();
+    let valid = valid.as_text();
     let mut values: Vec<&dyn rusqlite::ToSql> = vec![&key, &source, &valid, &recorded];
     let bound: Vec<Bound<'_>> = properties.values().map(Bound).collect();
     values.extend(bound.iter().map(|v| v as &dyn rusqlite::ToSql));
@@ -353,7 +353,7 @@ fn put_link(
     (source, valid, recorded): (&str, &ValidTime, i64),
 ) -> Result<(), Error> {
     let declared = ontology.relation(relation)?;
-    let valid = valid.to_sql();
+    let valid = valid.as_text();
     if present(tx, &declared.from, from)? && present(tx, &declared.to, to)? {
         tx.prepare_cached(&upsert_link(relation, &declared.from, &declared.to))?
             .execute(rusqlite::params![from, to, source, valid, recorded])?;
@@ -416,7 +416,7 @@ fn arrived(
                     "data": {
                         "from": {"class": relation.from, "key": from_key},
                         "to": {"class": relation.to, "key": to_key},
-                        "valid": ValidTime::from_sql(valid),
+                        "valid": ValidTime::from_text(valid),
                     },
                 });
                 store(tx, id, None, &body.to_string())?;

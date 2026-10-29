@@ -1046,6 +1046,13 @@ dependencies = [
 [[package]]
 name = "rannoch-cloudevents"
 version = "0.1.0"
+dependencies = [
+ "rannoch-ontology",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "uuid",
+]
 
 [[package]]
 name = "rannoch-harness"
@@ -1177,6 +1184,7 @@ name = "rannoch-store"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "rannoch-cloudevents",
  "rannoch-ontology",
  "rusqlite",
  "serde",
