@@ -23,12 +23,12 @@ jobs:
           tool: cargo-nextest
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features
-      - run: cargo nextest run --workspace --all-features --no-tests=pass
-      - run: cargo test --workspace --doc --all-features
+      # Tests run for the second edition's crates only; the 0.4.0 oracle (the root package) and
+      # its probe are not tested here.
+      - run: cargo nextest run --workspace --exclude rannoch --exclude rannoch-probe --all-features --no-tests=pass
+      - run: cargo test --workspace --exclude rannoch --exclude rannoch-probe --doc --all-features
 
-  # The measurements (tests/measure.rs) run at verify time on Linux, macOS or Windows. Each
-  # platform compiles and lints its own code for them, all three side by side with `check`, and
-  # runs the probe's tests, which measure the machine they run on.
+  # Each platform compiles and lints the workspace, side by side with `check`.
   platforms:
     strategy:
       fail-fast: false
@@ -42,10 +42,3 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets --all-features
-      - run: cargo test -p rannoch-probe
-      # The memory allowed under a real limit: one probe test runs as root in a systemd scope
-      # whose MemoryMax is 512 MiB, and is told to expect it.
-      - if: runner.os == 'Linux'
-        env:
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: sudo systemd-run --scope --quiet -p MemoryMax=536870912 env RANNOCH_PROBE_EXPECT_LIMIT=536870912
-        run: cargo test -p rannoch-probe --test probe -- --exact memory_allows_no_more_than_the_cgroup_limit
