@@ -12,7 +12,6 @@
 //! after a crash sends again exactly what was lost, and nothing twice.
 
 use std::any::Any;
-use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
@@ -81,10 +80,12 @@ struct Shared {
     panic_beat: std::sync::atomic::AtomicBool,
 }
 
+/// The producer an event came from and the position in its source it reached.
+type Origin = (String, String);
+
 struct Inbox {
-    queued: Vec<(Ticket, String)>,
-    /// Each producer's latest position since the last commit.
-    positions: BTreeMap<String, String>,
+    /// Each held event, with the producer and the position in its source it came from.
+    queued: Vec<(Ticket, String, Option<Origin>)>,
     last: u64,
     committed: Option<Ticket>,
     /// The highest place in the log a commit has landed; nothing past it is handed out.
@@ -113,7 +114,6 @@ impl Queue {
             graph: Mutex::new(graph),
             state: Mutex::new(Inbox {
                 queued: Vec::new(),
-                positions: BTreeMap::new(),
                 last: 0,
                 committed: None,
                 watermark,
@@ -160,12 +160,13 @@ impl Queue {
     /// [`Graph::declare`]; [`Error::Encoding`] when the body is not JSON.
     pub fn accept(&self, body: impl Into<String>) -> Result<Ticket, Error> {
         let body = self.checked(body.into())?;
-        let mut state = lock(&self.shared.state);
-        Ok(state.hold(body))
+        Ok(lock(&self.shared.state).hold(body, None))
     }
 
     /// Accepts `body` as [`Queue::accept`] does, from `producer`, which has reached `position` in
-    /// its source: the position commits in the same transaction as the event.
+    /// its source: the position commits in the same transaction as the event. Should the event
+    /// fail at commit, the producer's later events in the same batch are not committed and its
+    /// position stays at its last event that landed, so it resumes at the failed event.
     ///
     /// # Errors
     /// As [`Queue::accept`]; a refused event leaves the producer's position as it was.
@@ -176,11 +177,8 @@ impl Queue {
         position: impl Into<String>,
     ) -> Result<Ticket, Error> {
         let body = self.checked(body.into())?;
-        let mut state = lock(&self.shared.state);
-        state
-            .positions
-            .insert(producer.to_string(), position.into());
-        Ok(state.hold(body))
+        let from = (producer.to_string(), position.into());
+        Ok(lock(&self.shared.state).hold(body, Some(from)))
     }
 
     fn checked(&self, body: String) -> Result<String, Error> {
@@ -299,11 +297,11 @@ impl Queue {
 }
 
 impl Inbox {
-    /// Holds `body` under the next ticket.
-    fn hold(&mut self, body: String) -> Ticket {
+    /// Holds `body`, from the producer and position `from`, under the next ticket.
+    fn hold(&mut self, body: String, from: Option<Origin>) -> Ticket {
         self.last += 1;
         let ticket = Ticket(self.last);
-        self.queued.push((ticket, body));
+        self.queued.push((ticket, body, from));
         ticket
     }
 }
@@ -319,18 +317,11 @@ impl Shared {
     /// interleave.
     fn commit(&self) {
         let mut graph = lock(&self.graph);
-        let (batch, positions) = {
-            let mut state = lock(&self.state);
-            (
-                std::mem::take(&mut state.queued),
-                std::mem::take(&mut state.positions),
-            )
-        };
-        let Some(&(last, _)) = batch.last() else {
+        let batch = std::mem::take(&mut lock(&self.state).queued);
+        let Some(&(last, ..)) = batch.last() else {
             return;
         };
-        // A panic while the batch is written rolls its transaction back; the batch and positions
-        // go back to the front of the queue, in order, for the next flush, close or drop.
+        // A panic while the batch is written rolls its transaction back; the batch goes back to the front of the queue, in order, for the next flush, close or drop.
         let written = catch_unwind(AssertUnwindSafe(|| {
             #[cfg(test)]
             if self
@@ -339,22 +330,21 @@ impl Shared {
             {
                 std::panic::resume_unwind(Box::new("the heartbeat panics"));
             }
-            let bodies: Vec<&str> = batch.iter().map(|(_, body)| body.as_str()).collect();
-            let places: Vec<(&str, &str)> = positions
+            let bodies: Vec<&str> = batch.iter().map(|(_, body, _)| body.as_str()).collect();
+            let places: Vec<(usize, &str, &str)> = batch
                 .iter()
-                .map(|(producer, position)| (producer.as_str(), position.as_str()))
+                .enumerate()
+                .filter_map(|(index, (_, _, from))| {
+                    from.as_ref()
+                        .map(|(producer, position)| (index, producer.as_str(), position.as_str()))
+                })
                 .collect();
             graph.commit(&bodies, &places)
         }));
         let written = match written {
             Ok(written) => written,
             Err(panic) => {
-                let mut state = lock(&self.state);
-                state.queued.splice(0..0, batch);
-                for (producer, position) in positions {
-                    state.positions.entry(producer).or_insert(position);
-                }
-                drop(state);
+                lock(&self.state).queued.splice(0..0, batch);
                 std::panic::resume_unwind(panic);
             }
         };
@@ -362,7 +352,7 @@ impl Shared {
         let mut failed = Vec::new();
         match written {
             Ok(results) => {
-                for ((ticket, _), result) in batch.iter().zip(results) {
+                for ((ticket, ..), result) in batch.iter().zip(results) {
                     match result {
                         Ok(event) => landed = Some(event.cursor),
                         Err(error) => failed.push(Failure::Event {
@@ -376,7 +366,7 @@ impl Shared {
             // last keeps the cause itself.
             Err(cause) => {
                 let text = format!("the batch's transaction failed: {cause}");
-                for (ticket, _) in &batch[..batch.len() - 1] {
+                for (ticket, ..) in &batch[..batch.len() - 1] {
                     failed.push(Failure::Event {
                         ticket: *ticket,
                         error: Error::Refused(text.clone()),

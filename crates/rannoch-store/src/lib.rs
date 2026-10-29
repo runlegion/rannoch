@@ -194,30 +194,65 @@ impl Graph {
     /// Appends a batch of events, each body a `CloudEvent` as JSON, in one transaction, in the
     /// order given, with a savepoint per event: an event that fails to append rolls back alone,
     /// and the others land. Bodies are not read here: checking them against the ontology is the
-    /// queue's, before they are accepted ([`check`]). Each producer's position in `positions`
-    /// lands in the same transaction. The answer holds one result per body, in the same order: the
-    /// event as logged, or why it did not land.
+    /// queue's, before they are accepted ([`check`]).
+    ///
+    /// Each entry `(index, producer, position)` in `positions` says the body at `index` took
+    /// `producer` to `position` in its source. Each producer's position lands in the same
+    /// transaction, as of its last body that landed. Once one of a producer's bodies fails, its
+    /// later bodies in the batch are not appended, so its position stops at the failed event and
+    /// a producer that resumes there sends nothing twice and loses nothing. The answer holds one
+    /// result per body, in the same order: the event as logged, or why it did not land.
     ///
     /// # Errors
     /// The graph file cannot be written; nothing of the batch lands, positions included.
     pub fn commit(
         &mut self,
         bodies: &[&str],
-        positions: &[(&str, &str)],
+        positions: &[(usize, &str, &str)],
     ) -> Result<Vec<Result<Event, Error>>, Error> {
+        let mut from: Vec<Option<(&str, &str)>> = vec![None; bodies.len()];
+        for &(index, producer, position) in positions {
+            if let Some(slot) = from.get_mut(index) {
+                *slot = Some((producer, position));
+            }
+        }
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut results = Vec::with_capacity(bodies.len());
-        for body in bodies {
+        // Each producer's position as of its last body that landed, and whether one has failed.
+        let mut reached: BTreeMap<&str, (Option<&str>, bool)> = BTreeMap::new();
+        for (body, from) in bodies.iter().zip(from) {
+            let producer = from.map(|(producer, position)| {
+                (
+                    reached.entry(producer).or_insert((None, false)),
+                    producer,
+                    position,
+                )
+            });
+            if let Some(((_, true), producer, _)) = &producer {
+                results.push(Err(Error::Refused(format!(
+                    "an earlier event from producer {producer} failed at commit"
+                ))));
+                continue;
+            }
             tx.execute_batch(SAVEPOINT)?;
             let landed = append(&tx, body);
             tx.execute_batch(if landed.is_ok() { RELEASE } else { ROLLBACK_TO })?;
+            if let Some(((held, stopped), _, position)) = producer {
+                if landed.is_ok() {
+                    *held = Some(position);
+                } else {
+                    *stopped = true;
+                }
+            }
             results.push(landed);
         }
-        for (producer, position) in positions {
-            tx.prepare_cached(SET_POSITION)?
-                .execute([producer, position])?;
+        for (producer, (position, _)) in reached {
+            if let Some(position) = position {
+                tx.prepare_cached(SET_POSITION)?
+                    .execute([producer, position])?;
+            }
         }
         tx.commit()?;
         Ok(results)
@@ -652,11 +687,41 @@ mod tests {
         let bad = node("book", "bad", "x");
         let results = g.commit(
             &[&node("book", "b1", "hi"), &bad, &node("book", "b2", "yo")],
-            &[("shop", "3")],
+            &[],
         )?;
         assert!(results[0].is_ok() && results[1].is_err() && results[2].is_ok());
         assert_eq!(g.events().since(before)?.len(), 2);
-        assert_eq!(g.position("shop")?.as_deref(), Some("3"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_producer_stops_at_its_first_failed_event() -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = graph("stops")?;
+        g.conn.execute_batch(
+            "CREATE TRIGGER bad_fails BEFORE INSERT ON _events WHEN NEW.body LIKE '%\"bad\"%' \
+             BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END;",
+        )?;
+        let before = g.events().committed()?;
+        let (b1, bad, b3, other) = (
+            node("book", "b1", "hi"),
+            node("book", "bad", "x"),
+            node("book", "b3", "yo"),
+            node("book", "b4", "ok"),
+        );
+        let results = g.commit(
+            &[&b1, &bad, &b3, &other],
+            &[
+                (0, "shop", "1"),
+                (1, "shop", "2"),
+                (2, "shop", "3"),
+                (3, "feed", "9"),
+            ],
+        )?;
+        let landed: Vec<bool> = results.iter().map(Result::is_ok).collect();
+        assert_eq!(landed, [true, false, false, true]);
+        assert_eq!(g.events().since(before)?.len(), 2);
+        assert_eq!(g.position("shop")?.as_deref(), Some("1"));
+        assert_eq!(g.position("feed")?.as_deref(), Some("9"));
         Ok(())
     }
 

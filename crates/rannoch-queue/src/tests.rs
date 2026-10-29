@@ -271,3 +271,32 @@ fn a_batch_taken_by_a_panicking_heartbeat_is_kept() -> Result<(), Box<dyn std::e
     assert_eq!(queue.position("feed")?.as_deref(), Some("line 1"));
     Ok(())
 }
+
+#[test]
+fn a_producer_resumes_at_its_failed_event_without_loss_or_doubling()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let g = graph(&path(&dir))?;
+    failing_bad(&path(&dir), "ABORT")?;
+    let queue = Queue::open(g, HOUR)?;
+    queue.accept_from(item("i1"), "feed", "1")?;
+    let bad = queue.accept_from(item("bad"), "feed", "2")?;
+    let after = queue.accept_from(item("i3"), "feed", "3")?;
+    let (_, failed) = queue.flush();
+    assert_eq!(tickets(failed), [bad, after]);
+    assert_eq!(queue.position("feed")?.as_deref(), Some("1"));
+    // Resuming after position 1 sends i3 again; it was not committed before, so it lands once.
+    queue.accept_from(item("i3"), "feed", "3")?;
+    let (_, failed) = queue.flush();
+    assert!(failed.is_empty(), "{failed:?}");
+    assert_eq!(queue.position("feed")?.as_deref(), Some("3"));
+    let reader = open(path(&dir), &KEY)?;
+    let i3 = reader
+        .events()
+        .since(rannoch_store::Cursor::START)?
+        .iter()
+        .filter(|e| e.body.contains("\"subject\":\"i3\""))
+        .count();
+    assert_eq!(i3, 1, "i3 was doubled or lost");
+    Ok(())
+}

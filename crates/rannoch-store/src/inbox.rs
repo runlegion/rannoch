@@ -148,7 +148,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("rannoch-inbox-{}.db", uuid::Uuid::now_v7()));
         let mut g = open(&path, &[7; 32])?;
         let body = r#"{"specversion":"1.0","id":"x","source":"s","type":"t"}"#;
-        g.commit(&[body, body, body, body], &[("p", "line 4")])?;
+        g.commit(&[body, body, body, body], &[(3, "p", "line 4")])?;
         let until = g.events().committed()?;
         let mut handed = Vec::new();
         while let Some(event) = g.next("w", until)? {
