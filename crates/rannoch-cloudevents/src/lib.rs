@@ -37,7 +37,7 @@ pub enum Error {
 /// content. Ids order as they were minted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct EventId(pub Uuid);
+pub struct EventId(Uuid);
 
 impl EventId {
     /// Mints a new id. `Uuid::now_v7` is monotonic within one process: within a millisecond it
@@ -70,6 +70,16 @@ impl EventId {
                 "event {self} has no record time: its id is not a UUIDv7"
             ))
         })
+    }
+}
+
+/// An id as the log holds it: any UUID, since the store minted it. An id from outside is read
+/// through the event's own id, which must be a `UUIDv7`.
+impl std::str::FromStr for EventId {
+    type Err = uuid::Error;
+
+    fn from_str(id: &str) -> Result<EventId, uuid::Error> {
+        id.parse().map(EventId)
     }
 }
 

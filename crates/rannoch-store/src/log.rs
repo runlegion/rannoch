@@ -57,12 +57,12 @@ pub(crate) fn event_at(conn: &Connection, cursor: Cursor) -> Result<Option<Event
         .optional()?;
     row.map(|(id, body)| {
         Ok(Event {
-            id: EventId(id.parse().map_err(|_| {
+            id: id.parse().map_err(|_| {
                 Error::Refused(format!(
                     "event at {} has an id that is not a UUID",
                     cursor.0
                 ))
-            })?),
+            })?,
             cursor,
             body,
         })
@@ -145,9 +145,9 @@ impl Events<'_> {
             let seq: i64 = row.get(0)?;
             let id: String = row.get(1)?;
             events.push(Event {
-                id: EventId(id.parse().map_err(|_| {
+                id: id.parse().map_err(|_| {
                     Error::Refused(format!("event at {seq} has an id that is not a UUID"))
-                })?),
+                })?,
                 cursor: Cursor(seq),
                 body: row.get(2)?,
             });
