@@ -15,18 +15,17 @@ mod ontology;
 mod queries;
 mod read;
 
+pub use fact::{Date, ValidTime};
 pub use history::{At, End, Hearing, Seen, Version};
 pub use log::{Cursor, Event, EventId, Events};
-pub use ontology::{
-    Class, Date, Declaration, HistoryKey, Ontology, Relation, ValidTime, Value, ValueType,
-};
+pub use rannoch_ontology::{Class, Declaration, HistoryKey, Ontology, Relation, Value, ValueType};
 pub use read::{Node, NodeRef};
 
 use crate::history::{
     Heard, Key, Of, Stamp, alias, conclude, heard, link_entity, newest, node_entity, take,
 };
 use crate::log::{append, store};
-use crate::ontology::build;
+use crate::ontology::{Bound, build, load};
 use crate::queries::{
     CLOSE_OPEN, FILLED, HISTORY_TABLES, OPEN_LINK, OWN_TABLES, PRAGMAS, RELEASE, ROLLBACK_TO,
     SAVEPOINT, SCHEMA_VERSION, SET_FILLED, node_id, upsert_link, upsert_node, waiting,
@@ -101,7 +100,7 @@ pub fn open(path: impl AsRef<Path>, key: &[u8; 32]) -> Result<Graph, Error> {
     let key = Key::new(key);
     take(&mut conn, &key)?;
     let schema_version = schema_version(&conn)?;
-    let ontology = Ontology::load(&conn)?;
+    let ontology = load(&conn)?;
     let fresh = RefCell::new(Fresh {
         schema_version,
         ontology: Arc::new(ontology.clone()),
@@ -133,7 +132,7 @@ impl Graph {
                 return Ok(Arc::clone(&fresh.ontology));
             }
         }
-        let ontology = Arc::new(Ontology::load(&self.conn)?);
+        let ontology = Arc::new(load(&self.conn)?);
         *self.fresh.borrow_mut() = Fresh {
             schema_version: version,
             ontology: Arc::clone(&ontology),
@@ -173,7 +172,7 @@ impl Graph {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let ontology = Ontology::load(&tx)?;
+        let ontology = load(&tx)?;
         if !build(&tx, &ontology, declaration)? {
             let version = schema_version(&tx)?;
             drop(tx);
@@ -181,7 +180,7 @@ impl Graph {
             return Ok(None);
         }
         let event = append(&tx, body)?;
-        let ontology = Ontology::load(&tx)?;
+        let ontology = load(&tx)?;
         let version = schema_version(&tx)?;
         tx.commit()?;
         self.loaded(version, ontology);
@@ -199,7 +198,7 @@ impl Graph {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let ontology = Ontology::load(&tx)?;
+        let ontology = load(&tx)?;
         let mut results = Vec::with_capacity(bodies.len());
         for body in bodies {
             tx.execute_batch(SAVEPOINT)?;
@@ -227,7 +226,7 @@ impl Graph {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let ontology = Ontology::load(&tx)?;
+        let ontology = load(&tx)?;
         let from = Cursor(tx.prepare_cached(FILLED)?.query_row([], |row| row.get(0))?);
         let events = Events { conn: &tx }.since(from)?;
         let mut to = from;
@@ -337,7 +336,8 @@ fn put_node(
     let names: Vec<&str> = properties.keys().map(String::as_str).collect();
     let valid = valid.to_sql();
     let mut values: Vec<&dyn rusqlite::ToSql> = vec![&key, &source, &valid, &recorded];
-    values.extend(properties.values().map(|v| v as &dyn rusqlite::ToSql));
+    let bound: Vec<Bound<'_>> = properties.values().map(Bound).collect();
+    values.extend(bound.iter().map(|v| v as &dyn rusqlite::ToSql));
     tx.prepare_cached(&upsert_node(class, &names))?
         .execute(values.as_slice())?;
     Ok(())

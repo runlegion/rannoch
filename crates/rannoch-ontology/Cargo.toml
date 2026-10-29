@@ -10,6 +10,11 @@ description = "What an app's world is: classes with natural keys and typed prope
 publish = false
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+
+[dev-dependencies]
+serde_json = "1"
 
 [lints]
 workspace = true

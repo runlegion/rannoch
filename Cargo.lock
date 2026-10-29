@@ -1060,6 +1060,11 @@ dependencies = [
 [[package]]
 name = "rannoch-ontology"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
 
 [[package]]
 name = "rannoch-probe"
@@ -1172,6 +1177,7 @@ name = "rannoch-store"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "rannoch-ontology",
  "rusqlite",
  "serde",
  "serde_json",

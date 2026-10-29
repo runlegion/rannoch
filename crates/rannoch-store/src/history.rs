@@ -10,11 +10,12 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use rannoch_ontology::{Class, HistoryKey, Ontology, Value};
 use rusqlite::{Connection, OptionalExtension, ToSql, TransactionBehavior, params};
 
-use crate::fact::{Conclusion, LinkFact, NodeFact};
+use crate::fact::{Conclusion, LinkFact, NodeFact, ValidTime};
 use crate::log::{Cursor, EventId};
-use crate::ontology::{CLASS, Class, HistoryKey, Ontology, RELATION, ValidTime, Value};
+use crate::ontology::{CLASS, RELATION};
 use crate::queries::{
     ALIAS, ALIASES_OF, CHECK, CONCLUDE, CORRECTED, ENDING, HEAR, HEARING_OF, HELD, RENAME,
     SEEN_OTHER, SEEN_START, SET_CHECK, as_of, by_integer_key, by_point, edge_ending, edge_hearing,

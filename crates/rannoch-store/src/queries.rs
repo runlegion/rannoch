@@ -2,7 +2,7 @@
 //! statement; [`ident`] is the only function that quotes an identifier, and every value reaches
 //! SQL as a bound parameter.
 
-use crate::ontology::{CLASS, RELATION, concat};
+use crate::ontology::{CLASS, RELATION};
 
 /// How a connection is opened. Freed space is zeroed on every deletion and page split, so no copy
 /// of a removed body is left in free space by a split made before the removal. A commit is
@@ -529,4 +529,9 @@ pub(crate) fn add_property_column(class: &str, property: &str, column_type: &str
         class_table(class),
         property_column(property)
     )
+}
+
+/// Each item formatted by `each` and joined into one string.
+pub(crate) fn concat<T>(items: impl IntoIterator<Item = T>, each: impl Fn(T) -> String) -> String {
+    items.into_iter().map(each).collect::<Vec<_>>().concat()
 }

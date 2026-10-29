@@ -12,11 +12,11 @@
 
 use std::collections::BTreeMap;
 
-use serde::Deserialize;
+use rannoch_ontology::{HistoryKey, Ontology, Relation, Value};
+use serde::{Deserialize, Serialize};
 
 use crate::Error;
 use crate::log::EventId;
-use crate::ontology::{HistoryKey, Ontology, Relation, ValidTime, Value};
 use crate::read::NodeRef;
 
 /// The `CloudEvents` 1.0 attributes the store reads.
@@ -194,20 +194,7 @@ pub(crate) fn read(body: &str, ontology: &Ontology) -> Result<Fact, Error> {
                     class.name
                 )));
             }
-            for (property, value) in &node.properties {
-                let declared = class.properties.get(property).ok_or_else(|| {
-                    Error::Refused(format!(
-                        "property {property} is not declared on class {}",
-                        class.name
-                    ))
-                })?;
-                if !value.is(*declared) {
-                    return Err(Error::Refused(format!(
-                        "property {property} of class {} is declared {declared:?}",
-                        class.name
-                    )));
-                }
-            }
+            class.check(&node.properties)?;
             if let ValidTime::On(date) = &node.valid {
                 date.parts()?;
             }
@@ -281,11 +268,99 @@ fn concluded(
 
 /// Refuses a link whose ends are not of its relation's classes.
 fn ends(relation: &Relation, from: &NodeRef, to: &NodeRef) -> Result<(), Error> {
-    if from.class != relation.from || to.class != relation.to {
-        return Err(Error::Refused(format!(
-            "relation {} holds from {} to {}; this link is from {} to {}",
-            relation.name, relation.from, relation.to, from.class, to.class
-        )));
+    Ok(relation.holds(&from.class, &to.class)?)
+}
+
+/// A date a fact was true from: a year and month, or a year, month and day.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Date(String);
+
+impl Date {
+    #[must_use]
+    pub fn month(year: u16, month: u8) -> Date {
+        Date(format!("{year:04}-{month:02}"))
     }
-    Ok(())
+
+    #[must_use]
+    pub fn day(year: u16, month: u8, day: u8) -> Date {
+        Date(format!("{year:04}-{month:02}-{day:02}"))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Year, month and day; a month date's day is 1. Err when the month is outside 1..=12 or
+    /// the day is outside the month (leap years counted).
+    pub(crate) fn parts(&self) -> Result<(u16, u8, u8), Error> {
+        let refused =
+            |why: String| Error::Refused(format!("valid time {self} is not a date: {why}"));
+        let fields: Vec<&str> = self.0.split('-').collect();
+        let (year, month, day) = match fields.as_slice() {
+            [year, month] => (*year, *month, None),
+            [year, month, day] => (*year, *month, Some(*day)),
+            _ => {
+                return Err(refused(
+                    "it is not year-month or year-month-day".to_string(),
+                ));
+            }
+        };
+        let number = |field: &str, part: &str| -> Result<u16, Error> {
+            if field.is_empty() || !field.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(refused(format!("{part} {field} is not a number")));
+            }
+            field
+                .parse()
+                .map_err(|_| refused(format!("{part} {field} is out of range")))
+        };
+        let year = number(year, "year")?;
+        let month = u8::try_from(number(month, "month")?)
+            .ok()
+            .filter(|m| (1..=12).contains(m))
+            .ok_or_else(|| refused(format!("month {month} is out of range")))?;
+        let Some(day) = day else {
+            return Ok((year, month, 1));
+        };
+        let leap =
+            (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400);
+        let last = match month {
+            2 if leap => 29,
+            2 => 28,
+            4 | 6 | 9 | 11 => 30,
+            _ => 31,
+        };
+        let day = u8::try_from(number(day, "day")?)
+            .ok()
+            .filter(|d| (1..=last).contains(d))
+            .ok_or_else(|| refused(format!("day {day} is out of range")))?;
+        Ok((year, month, day))
+    }
+}
+
+impl std::fmt::Display for Date {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// When a fact was true: a date, or stated unknown. Unknown is never read as now.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidTime {
+    On(Date),
+    Unknown,
+}
+
+impl ValidTime {
+    pub(crate) fn to_sql(&self) -> Option<&str> {
+        match self {
+            ValidTime::On(date) => Some(date.as_str()),
+            ValidTime::Unknown => None,
+        }
+    }
+
+    pub(crate) fn from_sql(value: Option<String>) -> ValidTime {
+        value.map_or(ValidTime::Unknown, |date| ValidTime::On(Date(date)))
+    }
 }
