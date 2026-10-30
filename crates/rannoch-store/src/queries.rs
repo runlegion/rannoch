@@ -51,6 +51,10 @@ pub(crate) const SET_PLACE: &str = "INSERT INTO _places(worker, cursor) VALUES (
 pub(crate) const NEXT_EVENT: &str =
     "SELECT seq, id, body FROM _events WHERE seq > ?1 AND seq <= ?2 ORDER BY seq LIMIT 1";
 
+/// Worker `?1`'s events still in progress, oldest first.
+pub(crate) const OPEN_WORK: &str =
+    "SELECT seq FROM _work WHERE worker = ?1 AND reason IS NULL ORDER BY seq";
+
 /// Marks event `?2` in progress for worker `?1`.
 pub(crate) const START_WORK: &str = "INSERT INTO _work(worker, seq, reason) VALUES (?1, ?2, NULL)";
 

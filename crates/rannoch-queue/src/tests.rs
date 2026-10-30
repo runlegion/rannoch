@@ -221,6 +221,11 @@ fn every_committed_event_has_a_state_for_each_worker_that_survives_reopening()
         State::Failed("no such book".to_string())
     );
     assert_eq!(queue.state("w", handed[2])?, State::InProgress);
+    let back = queue.next("w")?.ok_or("the third comes back")?.cursor;
+    assert_eq!(
+        back, handed[2],
+        "what the earlier run left in progress is handed back first"
+    );
     let fourth = queue.next("w")?.ok_or("the fourth is waiting")?.cursor;
     assert!(fourth > handed[2]);
     assert_eq!(queue.state("other", handed[0])?, State::Waiting);

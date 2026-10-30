@@ -4,9 +4,9 @@
 
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
-use crate::log::{Cursor, Event, decode};
+use crate::log::{Cursor, Event, decode, event_at};
 use crate::queries::{
-    DONE_WORK, FAIL_WORK, NEXT_EVENT, PLACE, POSITION, SET_PLACE, START_WORK, WORK,
+    DONE_WORK, FAIL_WORK, NEXT_EVENT, OPEN_WORK, PLACE, POSITION, SET_PLACE, START_WORK, WORK,
 };
 use crate::{Error, Graph};
 
@@ -37,8 +37,10 @@ impl Graph {
             .optional()?)
     }
 
-    /// Hands out to worker `worker` the first event after its place and at or below `until`,
-    /// marking it in progress and moving the worker's place to it, or `None` when there is none.
+    /// Hands out to worker `worker` its oldest event an earlier run left in progress (one this
+    /// handle has not handed out), so a worker that restarts gets back what it had not closed;
+    /// otherwise the first event after its place and at or below `until`, marking it in progress
+    /// and moving the worker's place to it; `None` when there is neither.
     ///
     /// # Errors
     /// The graph file cannot be read or written, or the event's id cannot be decoded.
@@ -46,6 +48,19 @@ impl Graph {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let open: Vec<i64> = tx
+            .prepare_cached(OPEN_WORK)?
+            .query_map([worker], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        if let Some(seq) = open
+            .into_iter()
+            .find(|seq| !self.handed.contains(&(worker.to_string(), *seq)))
+        {
+            let event = event_at(&tx, Cursor(seq))?;
+            drop(tx);
+            self.handed.insert((worker.to_string(), seq));
+            return Ok(event);
+        }
         let place = place(&tx, worker)?;
         let row: Option<(i64, String, String)> = tx
             .prepare_cached(NEXT_EVENT)?
@@ -62,6 +77,7 @@ impl Graph {
         tx.prepare_cached(START_WORK)?
             .execute(params![worker, seq])?;
         tx.commit()?;
+        self.handed.insert((worker.to_string(), seq));
         Ok(Some(event))
     }
 
@@ -170,6 +186,26 @@ mod tests {
         );
         assert_eq!(g.state("other", Cursor(1))?, State::Waiting);
         assert_eq!(g.position("p")?.as_deref(), Some("line 4"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_worker_gets_back_what_it_left_in_progress() -> Result<(), Box<dyn std::error::Error>> {
+        let path = std::env::temp_dir().join(format!("rannoch-inbox-{}.db", uuid::Uuid::now_v7()));
+        let mut g = open(&path, &[7; 32])?;
+        let body = r#"{"specversion":"1.0","id":"x","source":"s","type":"t"}"#;
+        g.commit(&[body, body], &[])?;
+        let until = g.events().committed()?;
+        let first = g.next("w", until)?.map(|e| e.cursor);
+        drop(g);
+        let mut g = open(&path, &[7; 32])?;
+        assert_eq!(
+            g.next("w", until)?.map(|e| e.cursor),
+            first,
+            "handed back after reopening"
+        );
+        g.done("w", Cursor(1))?;
+        assert_eq!(g.next("w", until)?.map(|e| e.cursor), Some(Cursor(2)));
         Ok(())
     }
 
