@@ -10,9 +10,9 @@
 //! `data.integer`, as the oracle's `NodeFact` names them. A link that ended is type
 //! `rannoch.ended.<relation>`, its data `{from, to, at, valid}` with `at` its point in
 //! milliseconds; a link found wrong is type `rannoch.corrected.<relation>`, its data `{from, to}`:
-//! the oracle's `Change::Ended` and `Change::Corrected` fields. A node replaced by another of its
-//! class is type `rannoch.replaced.<class>`, its subject the old key and its data `{new}`, the
-//! new key: the oracle's `Change::Replaced` fields.
+//! the oracle's `Change::Ended` and `Change::Corrected` fields. An amendment, saying a node is
+//! known under another key of its class from now on, is type `rannoch.amended.<class>`, its
+//! subject the old key and its data `{to}`, the key it is known under now.
 //!
 //! Reading checks the format only: whether a class or relation is declared, and whether a fact
 //! fits it, is for the caller to check against its ontology.
@@ -263,8 +263,8 @@ struct EndedData {
 }
 
 #[derive(Deserialize)]
-struct ReplacedData {
-    new: String,
+struct AmendedData {
+    to: String,
 }
 
 #[derive(Deserialize)]
@@ -319,15 +319,16 @@ pub struct Conclusion {
     pub ended: Option<(i64, ValidTime)>,
 }
 
-/// A node of `class` replaced by another under the key `new`.
+/// An amendment: the node `from` of `class` is known under the key `to` from now on. The record
+/// of `from` stands; the amendment is a later entry on top of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Replacement {
+pub struct Amendment {
     /// The origin's event.
     pub event: EventId,
     pub source: String,
     pub class: String,
-    pub old: String,
-    pub new: String,
+    pub from: String,
+    pub to: String,
 }
 
 /// What one event says.
@@ -337,8 +338,8 @@ pub enum Fact {
     Link(LinkFact),
     /// A link that ended or was found wrong.
     Concluded(Conclusion),
-    /// A node replaced by another of its class.
-    Replaced(Replacement),
+    /// An amendment of a node's key.
+    Amended(Amendment),
     /// A declaration.
     Declared,
     /// An event of the app's own, or of rannoch's that says no fact.
@@ -430,17 +431,17 @@ pub fn read(body: &str) -> Result<Fact, Error> {
                 ended,
             }))
         }
-        "replaced" => {
-            let old = event
+        "amended" => {
+            let from = event
                 .subject
                 .ok_or_else(|| Error::Refused(format!("{} has no subject", event.ty)))?;
-            let replaced: ReplacedData = serde_json::from_value(data)?;
-            Ok(Fact::Replaced(Replacement {
+            let amended: AmendedData = serde_json::from_value(data)?;
+            Ok(Fact::Amended(Amendment {
                 event: origin(&event.id)?,
                 source,
                 class: name.to_string(),
-                old,
-                new: replaced.new,
+                from,
+                to: amended.to,
             }))
         }
         _ => Ok(Fact::None),
@@ -585,16 +586,16 @@ mod tests {
     }
 
     #[test]
-    fn a_replacement_reads_into_its_fact() -> Result<(), Box<dyn std::error::Error>> {
+    fn an_amendment_reads_into_its_fact() -> Result<(), Box<dyn std::error::Error>> {
         let body = format!(
-            r#"{{"specversion":"1.0","id":"{}:0","source":"rannoch:shop","type":"rannoch.replaced.book","subject":"b1","data":{{"new":"b2"}}}}"#,
+            r#"{{"specversion":"1.0","id":"{}:0","source":"rannoch:shop","type":"rannoch.amended.book","subject":"b1","data":{{"to":"b2"}}}}"#,
             crate::EventId::now()
         );
-        let Fact::Replaced(r) = read(&body)? else {
-            return Err("not a replacement".into());
+        let Fact::Amended(a) = read(&body)? else {
+            return Err("not an amendment".into());
         };
         assert_eq!(
-            (r.class.as_str(), r.old.as_str(), r.new.as_str()),
+            (a.class.as_str(), a.from.as_str(), a.to.as_str()),
             ("book", "b1", "b2")
         );
         Ok(())

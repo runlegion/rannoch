@@ -49,13 +49,13 @@ pub fn check(body: &str, ontology: &Ontology) -> Result<Fact, Error> {
         | Fact::Concluded(Conclusion {
             relation, from, to, ..
         }) => ends(ontology.relation(relation)?, from, to)?,
-        Fact::Replaced(replaced) => {
-            let class = ontology.class(&replaced.class)?;
-            if replaced.old == replaced.new {
+        Fact::Amended(amended) => {
+            let class = ontology.class(&amended.class)?;
+            if amended.from == amended.to {
                 return Err(Error::Refused(format!(
-                    "replacing {} {} by itself is not a replacement; a new version under the same \
+                    "amending {} {} to its own key changes nothing; a new version under the same \
                      key is a write",
-                    class.name, replaced.old
+                    class.name, amended.from
                 )));
             }
         }

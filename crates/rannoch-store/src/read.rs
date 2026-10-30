@@ -6,7 +6,7 @@ use std::time::SystemTime;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::history::{At, Versioned, newest, node_as_of, node_entity, time};
-use crate::queries::{FATE, select_node};
+use crate::queries::{AMENDED_TO, select_node};
 use crate::{Class, Date, Error, Graph, Ontology, ValidTime, Value};
 
 /// A node as the graph holds it now: where it came from, when it was true and when rannoch
@@ -19,8 +19,8 @@ pub struct Node {
     pub source: String,
     pub valid: ValidTime,
     pub recorded: SystemTime,
-    /// The key of the node that replaced this one, when one did.
-    pub replaced_by: Option<String>,
+    /// The key this node is known under now, when an amendment moved it.
+    pub amended_to: Option<String>,
 }
 
 impl Graph {
@@ -74,18 +74,15 @@ fn find_in(
     key: &str,
 ) -> Result<Option<Node>, Error> {
     let class = ontology.class(class)?;
-    let replaced_by: Option<String> = conn
-        .prepare_cached(FATE)?
+    let amended_to: Option<String> = conn
+        .prepare_cached(AMENDED_TO)?
         .query_row(params![class.name, key], |row| row.get(0))
         .optional()?;
     let version = newest(conn, (&node_entity(&class.name), key, None))?;
     if version.is_some() {
-        return Ok(node_in(class, key, version).map(|node| Node {
-            replaced_by,
-            ..node
-        }));
+        return Ok(node_in(class, key, version).map(|node| Node { amended_to, ..node }));
     }
-    // A replaced node keeps its row and nothing else: its history is the new key's now.
+    // An amended node keeps its row and nothing else: its history is under the key it is known by now.
     Ok(conn
         .prepare_cached(&select_node(&class.name))?
         .query_row(params![key], |row| {
@@ -96,14 +93,11 @@ fn find_in(
                 source: row.get(0)?,
                 valid: ValidTime::from_text(row.get(1)?),
                 recorded: time(row.get(2)?),
-                replaced_by: None,
+                amended_to: None,
             })
         })
         .optional()?
-        .map(|node| Node {
-            replaced_by,
-            ..node
-        }))
+        .map(|node| Node { amended_to, ..node }))
 }
 
 /// The node keyed `key` in `class` as its `version` holds it.
@@ -116,6 +110,6 @@ fn node_in(class: &Class, key: &str, version: Option<Versioned>) -> Option<Node>
         source: version.source,
         valid: version.valid,
         recorded: time(recorded),
-        replaced_by: None,
+        amended_to: None,
     })
 }
