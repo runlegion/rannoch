@@ -1,0 +1,13 @@
+[package]
+name = "rannoch-live"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+rannoch-store = { path = "../../crates/rannoch-store" }
+rannoch-queue = { path = "../../crates/rannoch-queue" }
+rannoch-cloudevents = { path = "../../crates/rannoch-cloudevents" }
+serde_json = "1"
+
+[workspace]
