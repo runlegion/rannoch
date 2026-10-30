@@ -29,7 +29,27 @@ tempfile = "3"
 workspace = true
 
 [workspace]
-members = ["crates/rannoch-probe"]
+members = [
+    "crates/rannoch-probe",
+    "crates/rannoch-store",
+    "crates/rannoch-cloudevents",
+    "crates/rannoch-ontology",
+    "crates/rannoch-queue",
+    "crates/rannoch-worker",
+    "crates/rannoch-harness",
+    "crates/rannoch-processor",
+    "crates/rannoch-processor-store",
+    "crates/rannoch-processor-lookup",
+    "crates/rannoch-processor-count",
+    "crates/rannoch-processor-emit",
+    "crates/rannoch-processor-wait",
+    "crates/rannoch-processor-approve",
+    "crates/rannoch-processor-after",
+    "crates/rannoch-processor-branch",
+    "crates/rannoch-processor-bin",
+    "crates/rannoch-processor-host",
+    "crates/rannoch-processor-onnx",
+]
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

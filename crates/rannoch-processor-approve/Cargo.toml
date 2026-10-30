@@ -1,0 +1,16 @@
+[package]
+name = "rannoch-processor-approve"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+repository = "https://github.com/runlegion/rannoch"
+authors = ["Sean Silvius"]
+description = "Wait for an approval signed with ed25519 by a named approver; bin a bad signature and keep waiting; send a late approval to its late row."
+publish = false
+
+[dependencies]
+rannoch-processor = { path = "../rannoch-processor" }
+
+[lints]
+workspace = true

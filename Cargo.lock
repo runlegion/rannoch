@@ -1044,6 +1044,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "rannoch-cloudevents"
+version = "0.1.0"
+
+[[package]]
+name = "rannoch-harness"
+version = "0.1.0"
+dependencies = [
+ "rannoch-processor",
+ "rannoch-queue",
+ "rannoch-store",
+ "rannoch-worker",
+]
+
+[[package]]
+name = "rannoch-ontology"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "rannoch-probe"
 version = "0.1.0"
 dependencies = [
@@ -1053,6 +1076,121 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "uuid",
+]
+
+[[package]]
+name = "rannoch-processor"
+version = "0.1.0"
+dependencies = [
+ "rannoch-cloudevents",
+ "rannoch-ontology",
+]
+
+[[package]]
+name = "rannoch-processor-after"
+version = "0.1.0"
+dependencies = [
+ "rannoch-processor",
+]
+
+[[package]]
+name = "rannoch-processor-approve"
+version = "0.1.0"
+dependencies = [
+ "rannoch-processor",
+]
+
+[[package]]
+name = "rannoch-processor-bin"
+version = "0.1.0"
+dependencies = [
+ "rannoch-processor",
+]
+
+[[package]]
+name = "rannoch-processor-branch"
+version = "0.1.0"
+dependencies = [
+ "rannoch-processor",
+]
+
+[[package]]
+name = "rannoch-processor-count"
+version = "0.1.0"
+dependencies = [
+ "rannoch-processor",
+]
+
+[[package]]
+name = "rannoch-processor-emit"
+version = "0.1.0"
+dependencies = [
+ "rannoch-processor",
+]
+
+[[package]]
+name = "rannoch-processor-host"
+version = "0.1.0"
+dependencies = [
+ "rannoch-processor",
+]
+
+[[package]]
+name = "rannoch-processor-lookup"
+version = "0.1.0"
+dependencies = [
+ "rannoch-processor",
+]
+
+[[package]]
+name = "rannoch-processor-onnx"
+version = "0.1.0"
+dependencies = [
+ "rannoch-processor",
+]
+
+[[package]]
+name = "rannoch-processor-store"
+version = "0.1.0"
+dependencies = [
+ "rannoch-processor",
+]
+
+[[package]]
+name = "rannoch-processor-wait"
+version = "0.1.0"
+dependencies = [
+ "rannoch-processor",
+]
+
+[[package]]
+name = "rannoch-queue"
+version = "0.1.0"
+dependencies = [
+ "rannoch-cloudevents",
+ "rannoch-ontology",
+ "rannoch-store",
+]
+
+[[package]]
+name = "rannoch-store"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "rannoch-ontology",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "uuid",
+]
+
+[[package]]
+name = "rannoch-worker"
+version = "0.1.0"
+dependencies = [
+ "rannoch-cloudevents",
+ "rannoch-ontology",
 ]
 
 [[package]]

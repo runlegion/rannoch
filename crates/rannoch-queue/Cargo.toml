@@ -1,0 +1,18 @@
+[package]
+name = "rannoch-queue"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+repository = "https://github.com/runlegion/rannoch"
+authors = ["Sean Silvius"]
+description = "The inbox: accepting CloudEvents, committing them about every 20 ms, telling workers what is committed, and never losing track of anything that arrived."
+publish = false
+
+[dependencies]
+rannoch-cloudevents = { path = "../rannoch-cloudevents" }
+rannoch-ontology = { path = "../rannoch-ontology" }
+rannoch-store = { path = "../rannoch-store" }
+
+[lints]
+workspace = true
