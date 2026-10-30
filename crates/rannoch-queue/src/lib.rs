@@ -236,6 +236,22 @@ impl Queue {
         lock(&self.shared.graph).state(worker, cursor)
     }
 
+    /// The processed mark: the lowest point every worker has finished ([`Graph::processed`]).
+    ///
+    /// # Errors
+    /// The graph file cannot be read.
+    pub fn processed(&self) -> Result<Cursor, Error> {
+        lock(&self.shared.graph).processed()
+    }
+
+    /// Removes `worker` and releases the processed mark it held ([`Graph::remove_worker`]).
+    ///
+    /// # Errors
+    /// The graph file cannot be written.
+    pub fn remove_worker(&self, worker: &str) -> Result<(), Error> {
+        lock(&self.shared.graph).remove_worker(worker)
+    }
+
     /// The committed watermark: the highest ticket the heartbeat or a flush has taken through a
     /// commit, or `None` before the first. An event that failed at commit is passed too, and is
     /// not lost: the queue keeps its [`Failure`] until it is reported.
