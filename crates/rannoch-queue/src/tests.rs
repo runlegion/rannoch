@@ -318,3 +318,19 @@ fn a_subscriber_can_take_its_next_event_from_the_queue() -> Result<(), Box<dyn s
     wait_for(|| !lock(&taken).is_empty());
     Ok(())
 }
+
+#[test]
+fn opening_the_queue_fills_what_the_log_holds_past_the_tables()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let mut g = graph(&path(&dir))?;
+    g.commit(&[&item("i1")], &[])?;
+    assert!(
+        g.find("item", "i1")?.is_none(),
+        "committed but not yet filled"
+    );
+    let queue = Queue::open(g, HOUR)?;
+    drop(queue);
+    assert!(open(path(&dir), &KEY)?.find("item", "i1")?.is_some());
+    Ok(())
+}

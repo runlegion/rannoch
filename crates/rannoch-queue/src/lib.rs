@@ -103,11 +103,14 @@ impl Queue {
     /// The heartbeat interval an app takes unless it needs another.
     pub const INTERVAL: Duration = Duration::from_millis(20);
 
-    /// Takes `graph` and starts a heartbeat that commits the queue every `interval`.
+    /// Takes `graph`, fills its tables with whatever the log holds past them (a process that
+    /// stopped between a commit and its fill leaves them behind), and starts a heartbeat that
+    /// commits the queue every `interval`.
     ///
     /// # Errors
-    /// The graph file cannot be read.
-    pub fn open(graph: Graph, interval: Duration) -> Result<Queue, Error> {
+    /// The graph file cannot be read, or the tables cannot be filled from the log.
+    pub fn open(mut graph: Graph, interval: Duration) -> Result<Queue, Error> {
+        graph.fill()?;
         let ontology = graph.ontology().clone();
         let watermark = graph.events().committed()?;
         let shared = Arc::new(Shared {
