@@ -167,6 +167,9 @@ pub(crate) const MADE_BY: &str = "SELECT arrived, entity, key, to_key, event, po
 pub(crate) const AMENDMENT: &str =
     "INSERT OR IGNORE INTO _amendments(target, point, event, seq) VALUES (?1, ?2, ?3, ?4)";
 
+/// The point of the latest amendment kept of the event at the place `?1`, if any.
+pub(crate) const LATEST_AMENDMENT: &str = "SELECT MAX(point) FROM _amendments WHERE target = ?1";
+
 /// Every amendment of the event at the place `?1` in point order, then event id: its point,
 /// event and body.
 pub(crate) const AMENDMENTS_OF: &str = "SELECT a.point, a.event, e.body FROM _amendments a \

@@ -20,10 +20,11 @@ use crate::ontology::{CLASS, RELATION};
 use crate::queries::{
     ALIAS, ALIASES_OF, AMENDED_OF, AMENDMENT, AMENDMENTS_OF, CHECK, CONCLUDE, CORRECTED,
     DROP_AMENDED, ENDING, EVENT_AT, EVENT_BY_ID, FACTS_KNOWN, HEAR, HEAR_AMENDED, HEARING_OF, HELD,
-    KNOWN_AGAIN, KNOWN_UNTIL, MADE_BY, PLACES_NAMING, RENAME, RENAMED, RENAMES_IN, SEEN_OTHER,
-    SEEN_PUT, SEEN_START, SET_CHECK, UNSEEN, WAS_RENAMED, as_of, by_integer_key, by_point,
-    edge_ending, edge_hearing, ended_sql, hearings, known_link_row, known_version_row, link_ending,
-    link_state, order, seen_keep, seen_kept, seen_recount, seen_sql, version_row,
+    KNOWN_AGAIN, KNOWN_UNTIL, LATEST_AMENDMENT, MADE_BY, PLACES_NAMING, RENAME, RENAMED,
+    RENAMES_IN, SEEN_OTHER, SEEN_PUT, SEEN_START, SET_CHECK, UNSEEN, WAS_RENAMED, as_of,
+    by_integer_key, by_point, edge_ending, edge_hearing, ended_sql, hearings, known_link_row,
+    known_version_row, link_ending, link_state, order, seen_keep, seen_kept, seen_recount,
+    seen_sql, version_row,
 };
 use crate::{Error, Graph};
 
@@ -556,6 +557,31 @@ pub(crate) fn amend(
         )));
     }
     let point = event.recorded()?;
+    // The target's own point: the record time its own id carries, as the amendment's does.
+    let written_at = serde_json::from_str::<serde_json::Value>(&written)?
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|own| own.split(':').next())
+        .and_then(|own| own.parse::<EventId>().ok())
+        .ok_or_else(|| {
+            Error::Refused(format!(
+                "amendment {id} names {target}, whose id has no point"
+            ))
+        })?
+        .recorded()?;
+    let latest: Option<i64> = tx
+        .prepare_cached(LATEST_AMENDMENT)?
+        .query_row(params![seq], |row| row.get(0))?;
+    if let Some(before) = std::iter::once(written_at)
+        .chain(latest)
+        .filter(|at| point < *at)
+        .max()
+    {
+        return Err(Error::Refused(format!(
+            "amendment {id} of {target} is at {point}, before {before}, which the event already \
+             reads as of: an amendment before the event or its latest amendment is refused"
+        )));
+    }
     let by = event.to_string();
     tx.prepare_cached(AMENDMENT)?
         .execute(params![seq, point, by, cursor.0])?;

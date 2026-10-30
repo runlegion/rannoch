@@ -1110,11 +1110,10 @@ mod tests {
     fn amendments_stack_in_point_order() -> Result<(), Box<dyn std::error::Error>> {
         let mut g = graph("stack")?;
         let b1 = logged(&mut g, &book_at(1_000, "b1", "one"))?;
-        // The later amendment arrives first; each still patches the one before it on the axis.
         g.commit(
             &[
-                &amended(3_000, b1.id, r#"{"source":"rannoch:editor"}"#),
                 &amended(2_000, b1.id, r#"{"data":{"properties":{"title":"two"}}}"#),
+                &amended(3_000, b1.id, r#"{"source":"rannoch:editor"}"#),
             ],
             &[],
         )?;
@@ -1495,6 +1494,85 @@ mod tests {
         let written: serde_json::Value = serde_json::from_str(&body)?;
         let held: serde_json::Value = serde_json::from_str(&event.body)?;
         assert_eq!(held, written, "the event is never changed");
+        Ok(())
+    }
+
+    #[test]
+    fn an_amendment_fill_cannot_apply_never_stops_fill() -> Result<(), Box<dyn std::error::Error>> {
+        let mut elsewhere = graph("elsewhere")?;
+        let stranger = logged(&mut elsewhere, &book_at(1_000, "b0", "not here"))?;
+        let mut g = graph("unappliable")?;
+        g.set_try_limit(1)?;
+        let bad = logged(
+            &mut g,
+            &amended(
+                2_000,
+                stranger.id,
+                r#"{"data":{"properties":{"title":"x"}}}"#,
+            ),
+        )?;
+        logged(&mut g, &book_at(3_000, "b2", "after"))?;
+        g.fill()?;
+        assert_eq!(
+            title(&g, "b2")?,
+            Some("after".into()),
+            "the event after it fills"
+        );
+        let stopped = g.stopped()?;
+        assert_eq!(stopped.len(), 1, "the amendment stops at the limit");
+        assert_eq!(stopped[0].0, bad.cursor);
+        Ok(())
+    }
+
+    #[test]
+    fn an_amendment_before_the_latest_one_is_refused() -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = graph("before")?;
+        g.set_try_limit(1)?;
+        let b1 = logged(&mut g, &book_at(1_000, "b1", "one"))?;
+        logged(
+            &mut g,
+            &amended(2_000, b1.id, r#"{"data":{"properties":{"title":"two"}}}"#),
+        )?;
+        g.fill()?;
+        let late = logged(
+            &mut g,
+            &amended(1_500, b1.id, r#"{"data":{"properties":{"title":"x"}}}"#),
+        )?;
+        let before = logged(
+            &mut g,
+            &amended(500, b1.id, r#"{"data":{"properties":{"title":"y"}}}"#),
+        )?;
+        g.fill()?;
+        assert_eq!(
+            title(&g, "b1")?,
+            Some("two".into()),
+            "it reads as amended at 2000"
+        );
+        assert_eq!(title_known(&g, "b1", 1_700)?, Some("one".into()));
+        let stopped: Vec<crate::Cursor> = g.stopped()?.into_iter().map(|(at, _)| at).collect();
+        assert_eq!(stopped, [late.cursor, before.cursor], "both are refused");
+        Ok(())
+    }
+
+    #[test]
+    fn amendments_at_one_point_stack_by_event_id() -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = graph("same-point")?;
+        let b1 = logged(&mut g, &book_at(1_000, "b1", "one"))?;
+        let first = amended(2_000, b1.id, r#"{"data":{"properties":{"title":"a"}}}"#);
+        let second = amended(2_000, b1.id, r#"{"data":{"properties":{"title":"b"}}}"#);
+        let id = |body: &str| -> Result<String, serde_json::Error> {
+            let v: serde_json::Value = serde_json::from_str(body)?;
+            Ok(v["id"].as_str().unwrap_or_default().to_owned())
+        };
+        let last = if id(&first)? < id(&second)? { "b" } else { "a" };
+        g.commit(&[&second, &first], &[])?;
+        g.fill()?;
+        assert!(g.stopped()?.is_empty(), "one point is not before another");
+        assert_eq!(
+            title(&g, "b1")?,
+            Some(last.into()),
+            "the higher event id is on top"
+        );
         Ok(())
     }
 }
