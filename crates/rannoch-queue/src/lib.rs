@@ -266,8 +266,9 @@ impl Queue {
     }
 
     /// Calls `subscriber` after each commit with the committed watermark, the cursor of the last
-    /// committed event. A subscriber must not call back into the queue, which holds the commit
-    /// that is telling it.
+    /// committed event. The commit has released the graph when it tells subscribers, so a
+    /// subscriber may call back into the queue to take its next event; it must not subscribe,
+    /// flush or close from inside the call.
     pub fn subscribe(&self, subscriber: impl FnMut(Cursor) + Send + 'static) {
         lock(&self.shared.subscribers).push(Box::new(subscriber));
     }
@@ -313,8 +314,8 @@ impl Shared {
     }
 
     /// Commits what is held with the producers' positions, fills the tables, moves the watermark,
-    /// then tells the subscribers. The graph's lock is held throughout, so commits never
-    /// interleave.
+    /// then releases the graph and tells the subscribers. Commits never interleave; a subscriber
+    /// that calls back into the queue finds the graph free.
     fn commit(&self) {
         let mut graph = lock(&self.graph);
         let batch = std::mem::take(&mut lock(&self.state).queued);
@@ -395,6 +396,7 @@ impl Shared {
             state.failed.extend(failed);
             state.watermark
         };
+        drop(graph);
         // A subscriber that panics is reported and the others are still told; the heartbeat lives
         // on, and a drop that is already unwinding does not abort.
         for subscriber in lock(&self.subscribers).iter_mut() {

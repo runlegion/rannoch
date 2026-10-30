@@ -300,3 +300,21 @@ fn a_producer_resumes_at_its_failed_event_without_loss_or_doubling()
     assert_eq!(i3, 1, "i3 was doubled or lost");
     Ok(())
 }
+
+#[test]
+fn a_subscriber_can_take_its_next_event_from_the_queue() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let queue = Arc::new(Queue::open(graph(&path(&dir))?, Queue::INTERVAL)?);
+    let taken = Arc::new(Mutex::new(Vec::new()));
+    let (from, into) = (Arc::downgrade(&queue), Arc::clone(&taken));
+    queue.subscribe(move |_| {
+        if let Some(queue) = from.upgrade()
+            && let Ok(Some(event)) = queue.next("w")
+        {
+            lock(&into).push(event.cursor);
+        }
+    });
+    queue.accept(item("i1"))?;
+    wait_for(|| !lock(&taken).is_empty());
+    Ok(())
+}
