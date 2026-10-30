@@ -4,27 +4,10 @@ use std::collections::BTreeMap;
 use std::time::SystemTime;
 
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::{Deserialize, Serialize};
 
 use crate::history::{At, Versioned, newest, node_as_of, node_entity, time};
 use crate::queries::select_node;
 use crate::{Class, Date, Error, Graph, Ontology, ValidTime, Value};
-
-/// A node named by its class and natural key.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct NodeRef {
-    pub class: String,
-    pub key: String,
-}
-
-impl NodeRef {
-    pub fn new(class: impl Into<String>, key: impl Into<String>) -> Self {
-        NodeRef {
-            class: class.into(),
-            key: key.into(),
-        }
-    }
-}
 
 /// A node as the graph holds it now: where it came from, when it was true and when rannoch
 /// recorded it. A property the node was not written with is absent.
@@ -102,7 +85,7 @@ fn find_in(
                 key: key.to_string(),
                 properties: BTreeMap::new(),
                 source: row.get(0)?,
-                valid: ValidTime::from_sql(row.get(1)?),
+                valid: ValidTime::from_text(row.get(1)?),
                 recorded: time(row.get(2)?),
             })
         })

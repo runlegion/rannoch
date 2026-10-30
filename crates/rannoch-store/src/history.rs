@@ -13,8 +13,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rannoch_ontology::{Class, HistoryKey, Ontology, Value};
 use rusqlite::{Connection, OptionalExtension, ToSql, TransactionBehavior, params};
 
-use crate::fact::{Conclusion, LinkFact, NodeFact, ValidTime};
-use crate::log::{Cursor, EventId};
+use rannoch_cloudevents::{Conclusion, EventId, LinkFact, NodeFact, NodeRef, ValidTime};
+
+use crate::log::Cursor;
 use crate::ontology::{CLASS, RELATION};
 use crate::queries::{
     ALIAS, ALIASES_OF, CHECK, CONCLUDE, CORRECTED, ENDING, HEAR, HEARING_OF, HELD, RENAME,
@@ -22,7 +23,6 @@ use crate::queries::{
     ended_sql, hearings, link_ending, link_state, order, seen_keep, seen_kept, seen_sql,
     version_row,
 };
-use crate::read::NodeRef;
 use crate::{Error, Graph};
 
 /// The fixed label whose keyed hash is the check value.
@@ -214,7 +214,7 @@ fn hear(
         of.event().to_string(),
         stamp.cursor.0,
         of.source(),
-        of.valid().to_sql(),
+        of.valid().as_text(),
         point,
         integer,
         stamp.recorded,
@@ -227,7 +227,7 @@ fn hear(
         point,
         event: of.event().to_string(),
     };
-    saw(tx, (&entity, from, to), &mark, of.valid().to_sql())?;
+    saw(tx, (&entity, from, to), &mark, of.valid().as_text())?;
     Ok(None)
 }
 
@@ -465,7 +465,7 @@ pub(crate) fn conclude(tx: &Connection, conclusion: &Conclusion) -> Result<(), E
         ended,
     } = conclusion;
     let at = ended.as_ref().map(|(at, _)| *at);
-    let valid = ended.as_ref().and_then(|(_, valid)| valid.to_sql());
+    let valid = ended.as_ref().and_then(|(_, valid)| valid.as_text());
     let entity = link_entity(relation);
     tx.prepare_cached(CONCLUDE)?.execute(params![
         entity,
@@ -705,7 +705,7 @@ fn version_of(
     Ok(Version {
         event: serde_json::from_value(event.into())?,
         source,
-        valid: ValidTime::from_sql(valid),
+        valid: ValidTime::from_text(valid),
         point: time(point),
         integer,
         properties: decode(properties.as_deref())?,
@@ -842,7 +842,7 @@ impl Graph {
         };
         Ok(Some(End::Ended {
             at: time(at),
-            valid: ValidTime::from_sql(valid),
+            valid: ValidTime::from_text(valid),
             source,
             event: serde_json::from_value(event.into())?,
         }))
@@ -905,7 +905,7 @@ impl Graph {
             hearings.push(Hearing {
                 event: serde_json::from_value(event.into())?,
                 source,
-                valid: ValidTime::from_sql(valid),
+                valid: ValidTime::from_text(valid),
                 point: time(point),
                 integer,
                 identity,
@@ -1031,7 +1031,7 @@ impl Graph {
             first_heard: first_heard?,
             last_heard: last_heard?,
             first_recorded: first_recorded?,
-            first_true: ValidTime::from_sql(first_true),
+            first_true: ValidTime::from_text(first_true),
             count: u64::try_from(count).unwrap_or(0),
             ended: ended.map(time),
         }))

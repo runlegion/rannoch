@@ -10,6 +10,7 @@ description = "Rannoch's store, on SQLite."
 publish = false
 
 [dependencies]
+rannoch-cloudevents = { path = "../rannoch-cloudevents" }
 rannoch-ontology = { path = "../rannoch-ontology" }
 blake3 = "1.8"
 rusqlite = { version = "0.40", features = ["bundled"] }
