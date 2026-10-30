@@ -200,6 +200,20 @@ pub(crate) const WAS_RENAMED: &str =
 
 /// The places of the events with a hearing of the entity `?1` keyed `?2` (as a link's target
 /// key when `?3` is true).
+/// Copies the endings of the links of `?1` whose start (`?4` false) or end (`?4` true) is keyed
+/// `?2` onto the key `?3`, so a renamed node's links keep their endings under its new key.
+pub(crate) const RENAME_ENDINGS: &str = "INSERT OR IGNORE INTO _endings(entity, line, key, \
+     to_key, point, event, source, valid) SELECT entity, line, CASE WHEN ?4 THEN key ELSE ?3 END, \
+     CASE WHEN ?4 THEN ?3 ELSE to_key END, point, event, source, valid FROM _endings \
+     WHERE entity = ?1 AND line = 'main' AND CASE WHEN ?4 THEN to_key = ?2 ELSE key = ?2 END";
+
+/// Copies the conclusions of the links of `?1` keyed `?2` at one end onto `?3`, as
+/// [`RENAME_ENDINGS`] does for endings.
+pub(crate) const RENAME_ENDS: &str = "INSERT OR IGNORE INTO _ends(entity, line, key, to_key, \
+     event, source, point, valid) SELECT entity, line, CASE WHEN ?4 THEN key ELSE ?3 END, \
+     CASE WHEN ?4 THEN ?3 ELSE to_key END, event, source, point, valid FROM _ends \
+     WHERE entity = ?1 AND line = 'main' AND CASE WHEN ?4 THEN to_key = ?2 ELSE key = ?2 END";
+
 pub(crate) const PLACES_NAMING: &str = "SELECT DISTINCT seq FROM _hearings WHERE line = 'main' \
      AND entity = ?1 AND CASE WHEN ?3 THEN to_key = ?2 ELSE key = ?2 END";
 

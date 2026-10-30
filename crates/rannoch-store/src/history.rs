@@ -20,11 +20,11 @@ use crate::ontology::{CLASS, RELATION};
 use crate::queries::{
     ALIAS, ALIASES_OF, AMENDED_OF, AMENDMENT, AMENDMENTS_OF, CHECK, CONCLUDE, CORRECTED,
     DROP_AMENDED, ENDING, EVENT_AT, EVENT_BY_ID, FACTS_KNOWN, HEAR, HEAR_AMENDED, HEARING_OF, HELD,
-    KNOWN_AGAIN, KNOWN_UNTIL, LATEST_AMENDMENT, MADE_BY, PLACES_NAMING, RENAME, RENAMED,
-    RENAMES_IN, SEEN_OTHER, SEEN_PUT, SEEN_START, SET_CHECK, UNSEEN, WAS_RENAMED, as_of,
-    by_integer_key, by_point, edge_ending, edge_hearing, ended_sql, hearings, known_link_row,
-    known_version_row, link_ending, link_state, order, seen_keep, seen_kept, seen_recount,
-    seen_sql, version_row,
+    KNOWN_AGAIN, KNOWN_UNTIL, LATEST_AMENDMENT, MADE_BY, PLACES_NAMING, RENAME, RENAME_ENDINGS,
+    RENAME_ENDS, RENAMED, RENAMES_IN, SEEN_OTHER, SEEN_PUT, SEEN_START, SET_CHECK, UNSEEN,
+    WAS_RENAMED, as_of, by_integer_key, by_point, edge_ending, edge_hearing, ended_sql, hearings,
+    known_link_row, known_version_row, link_ending, link_state, order, seen_keep, seen_kept,
+    seen_recount, seen_sql, version_row,
 };
 use crate::{Error, Graph};
 
@@ -470,10 +470,19 @@ pub(crate) fn conclude(tx: &Connection, conclusion: &Conclusion) -> Result<(), E
     let at = ended.as_ref().map(|(at, _)| *at);
     let valid = ended.as_ref().and_then(|(_, valid)| valid.as_text());
     let entity = link_entity(relation);
+    // The ends as renamed by now: a conclusion naming a renamed key concludes the renamed link.
+    let now = |end: &NodeRef| -> Result<String, Error> {
+        Ok(resolve(
+            &renames_in(tx, &node_entity(&end.class))?,
+            &end.key,
+            (i64::MAX, "\u{10ffff}"),
+        ))
+    };
+    let (from, to) = (&now(from)?, &now(to)?);
     tx.prepare_cached(CONCLUDE)?.execute(params![
         entity,
-        from.key,
-        to.key,
+        from,
+        to,
         event.to_string(),
         source,
         at,
@@ -482,8 +491,8 @@ pub(crate) fn conclude(tx: &Connection, conclusion: &Conclusion) -> Result<(), E
     if let Some(at) = at {
         let new = tx.prepare_cached(ENDING)?.execute(params![
             entity,
-            from.key,
-            to.key,
+            from,
+            to,
             at,
             event.to_string(),
             source,
@@ -497,7 +506,7 @@ pub(crate) fn conclude(tx: &Connection, conclusion: &Conclusion) -> Result<(), E
                 point: at,
                 event: event.to_string(),
             };
-            saw(tx, (&entity, &from.key, Some(&to.key)), &mark, valid)?;
+            saw(tx, (&entity, from, Some(to)), &mark, valid)?;
         }
     }
     Ok(())
@@ -557,7 +566,9 @@ pub(crate) fn amend(
         )));
     }
     let point = event.recorded()?;
-    // The target's own point: the record time its own id carries, as the amendment's does.
+    // When the target was recorded, from its own id, as the amendment's point is from the
+    // amendment's; the target's point on its axis (its writer's time, else that record time) is
+    // `made.point`.
     let written_at = serde_json::from_str::<serde_json::Value>(&written)?
         .get("id")
         .and_then(serde_json::Value::as_str)
@@ -572,14 +583,15 @@ pub(crate) fn amend(
     let latest: Option<i64> = tx
         .prepare_cached(LATEST_AMENDMENT)?
         .query_row(params![seq], |row| row.get(0))?;
-    if let Some(before) = std::iter::once(written_at)
+    if let Some(before) = [written_at, made.point]
+        .into_iter()
         .chain(latest)
         .filter(|at| point < *at)
         .max()
     {
         return Err(Error::Refused(format!(
-            "amendment {id} of {target} is at {point}, before {before}, which the event already \
-             reads as of: an amendment before the event or its latest amendment is refused"
+            "amendment {id} of {target} is at {point}, before {before}: an amendment before the \
+             event's record time, its own point or its latest amendment is refused"
         )));
     }
     let by = event.to_string();
@@ -596,6 +608,7 @@ pub(crate) fn amend(
         if old != new {
             tx.prepare_cached(RENAMED)?
                 .execute(params![entity, old, new, point, by])?;
+            rename_ends(tx, ontology, entity, &old, new)?;
             places.extend(naming(tx, ontology, entity, &old)?);
         }
     }
@@ -726,14 +739,7 @@ fn naming(
     key: &str,
 ) -> Result<Vec<i64>, Error> {
     let mut asks = vec![(entity.to_string(), false)];
-    for relation in ontology.relations.values() {
-        if node_entity(&relation.from) == entity {
-            asks.push((link_entity(&relation.name), false));
-        }
-        if node_entity(&relation.to) == entity {
-            asks.push((link_entity(&relation.name), true));
-        }
-    }
+    asks.extend(link_ends(ontology, entity));
     let mut places = Vec::new();
     for (of, target) in asks {
         let found: Vec<i64> = tx
@@ -743,6 +749,38 @@ fn naming(
         places.extend(found);
     }
     Ok(places)
+}
+
+/// The link entities whose start (`false`) or end (`true`) is a node of `entity`.
+fn link_ends(ontology: &Ontology, entity: &str) -> Vec<(String, bool)> {
+    let mut ends = Vec::new();
+    for relation in ontology.relations.values() {
+        if node_entity(&relation.from) == entity {
+            ends.push((link_entity(&relation.name), false));
+        }
+        if node_entity(&relation.to) == entity {
+            ends.push((link_entity(&relation.name), true));
+        }
+    }
+    ends
+}
+
+/// Copies the endings and conclusions of every link keyed `old` at a node of `entity` onto
+/// `new`; the rows under `old` stay, so the link reads as it was known before the rename.
+fn rename_ends(
+    tx: &Connection,
+    ontology: &Ontology,
+    entity: &str,
+    old: &str,
+    new: &str,
+) -> Result<(), Error> {
+    for (of, target) in link_ends(ontology, entity) {
+        tx.prepare_cached(RENAME_ENDINGS)?
+            .execute(params![of, old, new, target])?;
+        tx.prepare_cached(RENAME_ENDS)?
+            .execute(params![of, old, new, target])?;
+    }
+    Ok(())
 }
 
 /// Hears the event at the place `seq` again from the log: its own hearing stays, known until the
@@ -830,6 +868,7 @@ pub(crate) fn derive(
             made.integer,
             at,
             properties,
+            // A rename can come before the event's own point; an amendment never does.
             at.max(made.point)
         ])?;
         before = tx.last_insert_rowid();

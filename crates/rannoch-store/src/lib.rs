@@ -1295,6 +1295,85 @@ mod tests {
     }
 
     #[test]
+    fn an_ended_link_stays_ended_after_its_end_is_renamed() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (mut g, b1, _) = wrote_b1("rename-ended")?;
+        logged(
+            &mut g,
+            &concluded(&id_at(1_500), "ended", "a1", "b1", 1_500_000),
+        )?;
+        g.commit(&[&amended(2_000, b1.id, r#"{"subject":"b9"}"#)], &[])?;
+        g.fill()?;
+        assert!(g.link_end("wrote", "a1", "b9")?.is_some(), "ended, new key");
+        let after = known_link(&g, "b9", 2_500)?.ok_or("moved by 2,500")?;
+        assert!(after.ended, "ended under the new key");
+        let before = known_link(&g, "b1", 1_700)?.ok_or("known at 1,700")?;
+        assert!(before.ended, "ended under the old key, as known before");
+        Ok(())
+    }
+
+    #[test]
+    fn an_ending_after_a_rename_ends_the_renamed_link() -> Result<(), Box<dyn std::error::Error>> {
+        let (mut g, b1, _) = wrote_b1("rename-then-end")?;
+        g.commit(&[&amended(2_000, b1.id, r#"{"subject":"b9"}"#)], &[])?;
+        g.fill()?;
+        logged(
+            &mut g,
+            &concluded(&id_at(3_000), "ended", "a1", "b1", 3_000_000),
+        )?;
+        g.fill()?;
+        assert!(g.link_end("wrote", "a1", "b9")?.is_some());
+        let now = known_link(&g, "b9", 3_500)?.ok_or("known at 3,500")?;
+        assert!(
+            now.ended,
+            "the ending naming the old key ended the renamed link"
+        );
+        assert!(!known_link(&g, "b9", 2_500)?.ok_or("known at 2,500")?.ended);
+        Ok(())
+    }
+
+    #[test]
+    fn an_amendment_before_the_events_own_time_is_refused() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut g = graph("own-time")?;
+        g.declare(
+            &Declaration::Class(Class {
+                history: crate::HistoryKey::Time,
+                ..Class::new("entry", ["title"])
+            }),
+            r#"{"specversion":"1.0","id":"d-entry","source":"rannoch:shop","type":"rannoch.declared.entry"}"#,
+        )?;
+        g.set_try_limit(1)?;
+        let e1 = logged(
+            &mut g,
+            &format!(
+                r#"{{"specversion":"1.0","id":"{}","source":"rannoch:shop","type":"rannoch.node.entry","subject":"e1","data":{{"properties":{{"title":"one"}},"valid":"unknown","time":5000000}}}}"#,
+                id_at(1_000)
+            ),
+        )?;
+        let early = logged(
+            &mut g,
+            &amended(2_000, e1.id, r#"{"data":{"properties":{"title":"early"}}}"#),
+        )?;
+        logged(
+            &mut g,
+            &amended(6_000, e1.id, r#"{"data":{"properties":{"title":"late"}}}"#),
+        )?;
+        g.fill()?;
+        let stopped: Vec<crate::Cursor> = g.stopped()?.into_iter().map(|(at, _)| at).collect();
+        assert_eq!(
+            stopped,
+            [early.cursor],
+            "the one before the event's time is refused"
+        );
+        let title = g
+            .find("entry", "e1")?
+            .and_then(|node| node.properties.get("title").cloned());
+        assert_eq!(title, Some("late".into()), "the one after it lands");
+        Ok(())
+    }
+
+    #[test]
     fn a_link_arriving_after_a_rename_lands_on_the_new_key()
     -> Result<(), Box<dyn std::error::Error>> {
         let (mut g, b1, _) = wrote_b1("rename-late-link")?;
