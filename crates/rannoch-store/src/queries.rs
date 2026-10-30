@@ -457,6 +457,9 @@ pub(crate) const APPEND_EVENT: &str = "INSERT INTO _events(seq, body, id) VALUES
 pub(crate) const HIGH_WATER: &str =
     "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = '_events'), 0)";
 
+/// Writes a copy of the database into the empty file at `?1`, read in one read transaction.
+pub(crate) const COPY_INTO: &str = "VACUUM INTO ?1";
+
 pub(crate) const EVENT_AT: &str = "SELECT id, body FROM _events WHERE seq = ?1";
 
 pub(crate) const EVENTS_BETWEEN: &str =
