@@ -291,13 +291,13 @@ impl Graph {
             .collect::<Result<_, _>>()?;
         let from = place(&tx, FILL)?;
         let events = Events { conn: &tx }.since(from)?;
+        let tried = |seq: i64, cause: Error| {
+            tx.prepare_cached(TRIED_WORK)?
+                .execute(params![FILL, seq, cause.to_string()])
+        };
         for event in &events {
             if let Err(cause) = attempt(&tx, &ontology, &self.key, event)? {
-                tx.prepare_cached(TRIED_WORK)?.execute(params![
-                    FILL,
-                    event.cursor.0,
-                    cause.to_string()
-                ])?;
+                tried(event.cursor.0, cause)?;
             }
         }
         for seq in again {
@@ -306,10 +306,7 @@ impl Graph {
             };
             match attempt(&tx, &ontology, &self.key, &event)? {
                 Ok(()) => tx.prepare_cached(DONE_RETRY)?.execute(params![FILL, seq])?,
-                Err(cause) => {
-                    tx.prepare_cached(TRIED_WORK)?
-                        .execute(params![FILL, seq, cause.to_string()])?
-                }
+                Err(cause) => tried(seq, cause)?,
             };
         }
         let to = events.last().map_or(from, |event| event.cursor);
