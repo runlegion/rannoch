@@ -111,7 +111,15 @@ pub(crate) const HISTORY_TABLES: &str = "
         arrived INTEGER PRIMARY KEY, line TEXT NOT NULL DEFAULT 'main', identity BLOB NOT NULL,
         entity TEXT NOT NULL, key TEXT NOT NULL, to_key TEXT, event TEXT NOT NULL,
         seq INTEGER NOT NULL, source TEXT NOT NULL, valid TEXT, point INTEGER NOT NULL,
-        integer INTEGER, recorded INTEGER NOT NULL, properties TEXT, UNIQUE(line, identity));
+        integer INTEGER, recorded INTEGER NOT NULL, properties TEXT, known INTEGER,
+        until INTEGER, amended INTEGER, UNIQUE(line, identity));
+    CREATE INDEX IF NOT EXISTS _hearings_seq ON _hearings(seq);
+    CREATE TABLE IF NOT EXISTS _amendments(
+        target INTEGER NOT NULL, point INTEGER NOT NULL, event TEXT NOT NULL,
+        seq INTEGER NOT NULL, PRIMARY KEY(target, point, event)) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS _renames(
+        entity TEXT NOT NULL, old TEXT NOT NULL, new TEXT NOT NULL, point INTEGER NOT NULL,
+        event TEXT NOT NULL, PRIMARY KEY(entity, old, point, event)) WITHOUT ROWID;
     CREATE INDEX IF NOT EXISTS _hearings_at
         ON _hearings(entity, line, key, to_key, integer, point, event);
     CREATE TABLE IF NOT EXISTS _aliases(
@@ -147,6 +155,90 @@ pub(crate) const HEAR: &str = "INSERT INTO _hearings(identity, entity, key, to_k
      source, valid, point, integer, recorded, properties) \
      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)";
 
+/// The event the log holds under the id `?1`: its place and body.
+pub(crate) const EVENT_BY_ID: &str = "SELECT seq, body FROM _events WHERE id = ?1";
+
+/// The hearing the event at the place `?1` made itself: arrived, entity, key, target key, event
+/// it is named by, point and integer key.
+pub(crate) const MADE_BY: &str = "SELECT arrived, entity, key, to_key, event, point, integer \
+     FROM _hearings WHERE line = 'main' AND seq = ?1 AND amended IS NULL";
+
+/// Keeps the amendment `?3` (its point `?2`, its place `?4`) of the event at the place `?1`.
+pub(crate) const AMENDMENT: &str =
+    "INSERT OR IGNORE INTO _amendments(target, point, event, seq) VALUES (?1, ?2, ?3, ?4)";
+
+/// Every amendment of the event at the place `?1` in point order, then event id: its point,
+/// event and body.
+pub(crate) const AMENDMENTS_OF: &str = "SELECT a.point, a.event, e.body FROM _amendments a \
+     JOIN _events e ON e.seq = a.seq WHERE a.target = ?1 ORDER BY a.point, a.event";
+
+/// What the hearings amendments made of the event at the place `?1` are of.
+pub(crate) const AMENDED_OF: &str = "SELECT entity, key, to_key FROM _hearings \
+     WHERE line = 'main' AND amended = ?1";
+
+pub(crate) const DROP_AMENDED: &str = "DELETE FROM _hearings WHERE line = 'main' AND amended = ?1";
+
+/// Makes the hearing `?1` known again with no end, before its amendments are applied again.
+pub(crate) const KNOWN_AGAIN: &str = "UPDATE _hearings SET until = NULL WHERE arrived = ?1";
+
+/// Keeps the rename of the node `?2` of the class entity `?1` to `?3`, known from the point
+/// `?4`, made by the amendment `?5`.
+pub(crate) const RENAMED: &str =
+    "INSERT OR IGNORE INTO _renames(entity, old, new, point, event) VALUES (?1, ?2, ?3, ?4, ?5)";
+
+/// Every rename in the class entity `?1`, in point order and then event id: old key, new key,
+/// point and event.
+pub(crate) const RENAMES_IN: &str =
+    "SELECT old, new, point, event FROM _renames WHERE entity = ?1 ORDER BY point, event";
+
+/// Whether the key `?2` of the class entity `?1` was ever renamed.
+pub(crate) const WAS_RENAMED: &str =
+    "SELECT EXISTS (SELECT 1 FROM _renames WHERE entity = ?1 AND old = ?2)";
+
+/// The places of the events with a hearing of the entity `?1` keyed `?2` (as a link's target
+/// key when `?3` is true).
+pub(crate) const PLACES_NAMING: &str = "SELECT DISTINCT seq FROM _hearings WHERE line = 'main' \
+     AND entity = ?1 AND CASE WHEN ?3 THEN to_key = ?2 ELSE key = ?2 END";
+
+/// How many facts the node or link `?1`, `?2`, `?3` (its target key `''` for a node) has known
+/// now: its hearings and a link's endings.
+pub(crate) const FACTS_KNOWN: &str = "SELECT (SELECT count(*) FROM _hearings WHERE entity = ?1 \
+     AND line = 'main' AND key = ?2 AND to_key IS nullif(?3, '') AND until IS NULL) \
+     + (SELECT count(*) FROM _endings WHERE entity = ?1 AND line = 'main' AND key = ?2 \
+     AND to_key = ?3)";
+
+/// The first hearing this store recorded of `?1`, `?2`, `?3` among those known now, else its
+/// first ending, and the earliest valid time any of its facts was given.
+pub(crate) fn seen_recount() -> String {
+    format!(
+        "SELECT (SELECT min(arrived) FROM _hearings WHERE {h}), \
+         (SELECT min(id) FROM _endings WHERE {e}), \
+         (SELECT valid FROM (SELECT valid FROM _hearings WHERE {h} UNION ALL \
+         SELECT valid FROM _endings WHERE {e}) WHERE valid IS NOT NULL ORDER BY {} LIMIT 1)",
+        valid_day("valid"),
+        h = "entity = ?1 AND line = 'main' AND key = ?2 AND to_key IS nullif(?3, '') \
+             AND until IS NULL",
+        e = "entity = ?1 AND line = 'main' AND key = ?2 AND to_key = ?3",
+    )
+}
+
+/// Puts the seen row of `?1`, `?2`, `?3` whole: first and last facts, first recorded, first
+/// true and count.
+pub(crate) const SEEN_PUT: &str = "INSERT OR REPLACE INTO _seen(entity, line, key, to_key, \
+     first_hearing, first_ending, last_hearing, last_ending, recorded_hearing, recorded_ending, \
+     first_true, count) VALUES (?1, 'main', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)";
+
+/// Sets when the hearing `?1` stopped being known: the point `?2`, or NULL while it is.
+pub(crate) const KNOWN_UNTIL: &str = "UPDATE _hearings SET until = ?2 WHERE arrived = ?1";
+
+/// A hearing made by an amendment of the event at the place `?6`: known from `?13`.
+pub(crate) const HEAR_AMENDED: &str = "INSERT INTO _hearings(identity, entity, key, to_key, \
+     event, seq, source, valid, point, integer, recorded, properties, known, amended) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?6)";
+
+pub(crate) const UNSEEN: &str = "DELETE FROM _seen WHERE entity = ?1 AND line = 'main' \
+     AND key = ?2 AND to_key = ?3";
+
 /// The order versions are chosen by, `DESC` putting the newest first: by integer key (only an
 /// integer-keyed class's rows hold one), then point, then event id.
 pub(crate) fn order(direction: &str) -> String {
@@ -158,8 +250,14 @@ pub(crate) fn order(direction: &str) -> String {
 /// row carries its hearing's columns, `name` the event the hearing is named by, and the
 /// occurrence's `point` and `event`, which [`order`] picks by.
 pub(crate) fn occurrences(filter: &str) -> String {
+    known_occurrences(&format!("{filter} AND h.until IS NULL"))
+}
+
+/// Every occurrence of the hearings `filter` picks, whether known now or only before an
+/// amendment superseded them: each row also carries its hearing's `known` and `until`.
+fn known_occurrences(filter: &str) -> String {
     let hearing = "h.arrived, h.identity, h.event AS name, h.source, h.valid, h.integer, \
-                   h.recorded, h.properties";
+                   h.recorded, h.properties, h.known, h.until";
     format!(
         "(SELECT {hearing}, h.point AS point, h.event AS event FROM _hearings h WHERE {filter} \
          UNION ALL SELECT {hearing}, a.point, a.alias FROM _hearings h \
@@ -167,9 +265,12 @@ pub(crate) fn occurrences(filter: &str) -> String {
     )
 }
 
+/// The node or link `?1`, `?2`, `?3` (entity, key, target key), over its `_hearings` row `h`.
+const OF: &str = "h.entity = ?1 AND h.line = 'main' AND h.key = ?2 AND h.to_key IS ?3";
+
 /// The occurrences of the node or link `?1`, `?2`, `?3` (entity, key, target key).
 pub(crate) fn occurrences_of() -> String {
-    occurrences("h.entity = ?1 AND h.line = 'main' AND h.key = ?2 AND h.to_key IS ?3")
+    occurrences(OF)
 }
 
 /// One version row of the node or link `?1`, `?2`, `?3` among its hearings' occurrences, as
@@ -179,6 +280,27 @@ pub(crate) fn version_row(tail: &str) -> String {
         "SELECT name, source, valid, point, integer, properties, recorded, identity \
          FROM {} WHERE true {tail}",
         occurrences_of()
+    )
+}
+
+/// As [`version_row`], among the hearings known at `?5` on the axis: each is known from its
+/// `known` point (its own place on the axis when no amendment made it) until the `until` point
+/// of the amendment that superseded it.
+pub(crate) fn known_version_row(tail: &str) -> String {
+    format!(
+        "SELECT name, source, valid, point, integer, properties, recorded, identity \
+         FROM {} WHERE true {tail}",
+        known_occurrences(&format!("{OF} AND (h.until IS NULL OR h.until > ?5)"))
+    )
+}
+
+/// One version row of the link `?1`, `?2`, `?3` among its hearings known at the point `?4`,
+/// as `tail` picks it: see [`known_version_row`].
+pub(crate) fn known_link_row(tail: &str) -> String {
+    format!(
+        "SELECT name, source, valid, point, integer, properties, recorded, identity \
+         FROM {} WHERE coalesce(known, point) <= ?4 {tail}",
+        known_occurrences(&format!("{OF} AND (h.until IS NULL OR h.until > ?4)"))
     )
 }
 
@@ -218,7 +340,7 @@ pub(crate) fn seen_kept() -> String {
 /// integer key, point, event and valid time.
 pub(crate) const SEEN_OTHER: &str = "SELECT * FROM (SELECT arrived, NULL, integer, point, event, \
      valid FROM _hearings WHERE entity = ?1 AND line = 'main' AND key = ?2 \
-     AND to_key IS nullif(?3, '') AND arrived IS NOT ?4 UNION ALL SELECT NULL, id, NULL, point, \
+     AND to_key IS nullif(?3, '') AND until IS NULL AND arrived IS NOT ?4 UNION ALL SELECT NULL, id, NULL, point, \
      event, valid FROM _endings WHERE entity = ?1 AND line = 'main' AND key = ?2 \
      AND to_key = ?3 AND id IS NOT ?5) LIMIT 1";
 
@@ -328,7 +450,7 @@ pub(crate) fn seen_sql() -> String {
         one(
             "event, source, valid, point, integer, properties, 0",
             "_hearings",
-            "to_key IS nullif(?3, '')"
+            "to_key IS nullif(?3, '') AND until IS NULL"
         ),
         one(
             "event, source, valid, point, NULL, NULL, 1",
@@ -356,7 +478,9 @@ pub(crate) fn by_integer_key() -> String {
 /// `?5` on it), the greatest by valid time and then by its class's order.
 pub(crate) fn as_of(column: Option<&str>) -> String {
     let valid = valid_day("valid");
-    let known = column.map_or(String::new(), |column| format!(" AND {column} <= ?5"));
+    let known = column.map_or(String::new(), |column| {
+        format!(" AND coalesce(known, {column}) <= ?5")
+    });
     format!(
         "AND {valid} <= ?4{known} ORDER BY {valid} DESC, {} LIMIT 1",
         order("DESC")
@@ -370,7 +494,7 @@ pub(crate) fn link_state() -> String {
         "SELECT event, source, valid, point, integer, properties, ending FROM ( \
          SELECT event, source, valid, point, integer, properties, 0 AS ending FROM _hearings \
          WHERE entity = ?1 AND line = 'main' AND key = ?2 AND to_key = ?3 AND integer IS NULL \
-         AND point <= ?4 UNION ALL SELECT event, source, valid, point, NULL, NULL, 1 \
+         AND until IS NULL AND point <= ?4 UNION ALL SELECT event, source, valid, point, NULL, NULL, 1 \
          FROM _endings WHERE entity = ?1 AND line = 'main' AND key = ?2 AND to_key = ?3 \
          AND point <= ?4) ORDER BY {} LIMIT 1",
         order("DESC")
@@ -447,7 +571,8 @@ pub(crate) fn edge_ending(direction: &str) -> String {
 pub(crate) fn hearings() -> String {
     format!(
         "SELECT identity, event, source, valid, point, integer FROM _hearings \
-         WHERE entity = ?1 AND line = 'main' AND key = ?2 AND to_key IS ?3 ORDER BY {}",
+         WHERE entity = ?1 AND line = 'main' AND key = ?2 AND to_key IS ?3 AND until IS NULL \
+         ORDER BY {}",
         order("ASC")
     )
 }
@@ -572,6 +697,22 @@ pub(crate) fn select_node(class: &str) -> String {
     format!(
         "SELECT source, valid, recorded FROM {} WHERE key = ?1",
         class_table(class)
+    )
+}
+
+/// Removes the node keyed `?1` from its class's table.
+pub(crate) fn delete_node(class: &str) -> String {
+    format!("DELETE FROM {} WHERE key = ?1", class_table(class))
+}
+
+/// Removes the link from the node keyed `?1` to the node keyed `?2` from its relation's table.
+pub(crate) fn delete_link(relation: &str, from: &str, to: &str) -> String {
+    format!(
+        "DELETE FROM {} WHERE src = (SELECT id FROM {} WHERE key = ?1) \
+         AND dst = (SELECT id FROM {} WHERE key = ?2)",
+        relation_table(relation),
+        class_table(from),
+        class_table(to)
     )
 }
 

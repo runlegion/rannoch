@@ -13,15 +13,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rannoch_ontology::{Class, HistoryKey, Ontology, Value};
 use rusqlite::{Connection, OptionalExtension, ToSql, TransactionBehavior, params};
 
-use rannoch_cloudevents::{Conclusion, EventId, LinkFact, NodeFact, NodeRef, ValidTime};
+use rannoch_cloudevents::{Conclusion, EventId, Fact, LinkFact, NodeFact, NodeRef, ValidTime};
 
 use crate::log::Cursor;
 use crate::ontology::{CLASS, RELATION};
 use crate::queries::{
-    ALIAS, ALIASES_OF, CHECK, CONCLUDE, CORRECTED, ENDING, HEAR, HEARING_OF, HELD, RENAME,
-    SEEN_OTHER, SEEN_START, SET_CHECK, as_of, by_integer_key, by_point, edge_ending, edge_hearing,
-    ended_sql, hearings, link_ending, link_state, order, seen_keep, seen_kept, seen_sql,
-    version_row,
+    ALIAS, ALIASES_OF, AMENDED_OF, AMENDMENT, AMENDMENTS_OF, CHECK, CONCLUDE, CORRECTED,
+    DROP_AMENDED, ENDING, EVENT_AT, EVENT_BY_ID, FACTS_KNOWN, HEAR, HEAR_AMENDED, HEARING_OF, HELD,
+    KNOWN_AGAIN, KNOWN_UNTIL, MADE_BY, PLACES_NAMING, RENAME, RENAMED, RENAMES_IN, SEEN_OTHER,
+    SEEN_PUT, SEEN_START, SET_CHECK, UNSEEN, WAS_RENAMED, as_of, by_integer_key, by_point,
+    edge_ending, edge_hearing, ended_sql, hearings, known_link_row, known_version_row, link_ending,
+    link_state, order, seen_keep, seen_kept, seen_recount, seen_sql, version_row,
 };
 use crate::{Error, Graph};
 
@@ -500,6 +502,423 @@ pub(crate) fn conclude(tx: &Connection, conclusion: &Conclusion) -> Result<(), E
     Ok(())
 }
 
+/// What a node or a link is, as its hearings are kept: its entity, key and target key.
+pub(crate) type Subject = (String, String, Option<String>);
+
+/// The hearing an event made itself, as an amendment re-hears it.
+struct Made {
+    arrived: i64,
+    of: Subject,
+    /// The event it is named by.
+    name: String,
+    point: i64,
+    integer: Option<i64>,
+}
+
+/// Folds the amendment `body`, at its place `cursor`: it names the event it amends by its id in
+/// the log (its subject), and its data is a JSON Merge Patch of that event. The amended event
+/// stays in the log as written. An amendment that gives a node event another key renames the
+/// node: its key as known just before is mapped to the new one from the amendment's point, and
+/// every event naming the old key is heard again through the mapping. Returns what the hearings
+/// made and dropped are of, whose current state is to be read again.
+pub(crate) fn amend(
+    tx: &Connection,
+    ontology: &Ontology,
+    key: &Key,
+    body: &str,
+    cursor: Cursor,
+) -> Result<Vec<Subject>, Error> {
+    let amendment: serde_json::Value = serde_json::from_str(body)?;
+    let field = |name: &str| amendment.get(name).and_then(serde_json::Value::as_str);
+    let id = field("id").unwrap_or_default();
+    let event: EventId = id
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .parse()
+        .map_err(|_| Error::Refused(format!("amendment {id} is not <event uuid>:<fact>")))?;
+    let target = field("subject")
+        .ok_or_else(|| Error::Refused(format!("amendment {id} names no event as its subject")))?;
+    let (seq, written): (i64, String) = tx
+        .prepare_cached(EVENT_BY_ID)?
+        .query_row(params![target], |row| Ok((row.get(0)?, row.get(1)?)))
+        .optional()?
+        .ok_or_else(|| Error::Refused(format!("amendment {id} names {target}, not in the log")))?;
+    let made = made_by(tx, seq)?.ok_or_else(|| {
+        Error::Refused(format!(
+            "amendment {id} names {target}, which made no hearing of its own"
+        ))
+    })?;
+    if made.integer.is_some() {
+        return Err(Error::Refused(format!(
+            "amendment {id} names {target}, in a class ordered by an integer key: an amendment \
+             has no integer key to be known at"
+        )));
+    }
+    let point = event.recorded()?;
+    let by = event.to_string();
+    tx.prepare_cached(AMENDMENT)?
+        .execute(params![seq, point, by, cursor.0])?;
+    let mut places = vec![seq];
+    let renamed_to = amendment
+        .get("data")
+        .and_then(|data| data.get("subject"))
+        .and_then(serde_json::Value::as_str);
+    if let (Some(new), None) = (renamed_to, &made.of.2) {
+        let entity = &made.of.0;
+        let old = key_before(tx, (seq, &written), entity, (point, &by))?;
+        if old != new {
+            tx.prepare_cached(RENAMED)?
+                .execute(params![entity, old, new, point, by])?;
+            places.extend(naming(tx, ontology, entity, &old)?);
+        }
+    }
+    places.sort_unstable();
+    places.dedup();
+    let mut touched = Vec::new();
+    for place in places {
+        touched.extend(derive(tx, (ontology, key), place)?);
+    }
+    touched.sort();
+    touched.dedup();
+    Ok(touched)
+}
+
+/// The hearing the event at the place `seq` made itself, if it made one.
+fn made_by(tx: &Connection, seq: i64) -> Result<Option<Made>, Error> {
+    Ok(tx
+        .prepare_cached(MADE_BY)?
+        .query_row(params![seq], |row| {
+            Ok(Made {
+                arrived: row.get(0)?,
+                of: (row.get(1)?, row.get(2)?, row.get(3)?),
+                name: row.get(4)?,
+                point: row.get(5)?,
+                integer: row.get(6)?,
+            })
+        })
+        .optional()?)
+}
+
+/// A rename: old key, new key, point and the amendment that made it.
+type Rename = (String, String, i64, String);
+
+/// Every rename in the class entity `entity`, in point order and then event id.
+fn renames_in(tx: &Connection, entity: &str) -> Result<Vec<Rename>, Error> {
+    Ok(tx
+        .prepare_cached(RENAMES_IN)?
+        .query_map(params![entity], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect::<Result<_, _>>()?)
+}
+
+/// The key `key` resolves to through `renames`, taken in order, as known at `upto` (a point and
+/// event id): each rename made by then that names the key it has reached maps it on.
+fn resolve(renames: &[Rename], key: &str, upto: (i64, &str)) -> String {
+    let mut key = key.to_string();
+    for (old, new, point, event) in renames {
+        if (*point, event.as_str()) <= upto && *old == key {
+            key.clone_from(new);
+        }
+    }
+    key
+}
+
+/// Whether a key `of` names, its node's or a link's ends, was ever renamed.
+pub(crate) fn names_renamed(tx: &Connection, of: &Of) -> Result<bool, Error> {
+    let ends = match of {
+        Of::Node(node) => vec![(&node.class, &node.key)],
+        Of::Link(link) => vec![
+            (&link.from.class, &link.from.key),
+            (&link.to.class, &link.to.key),
+        ],
+    };
+    for (class, key) in ends {
+        let renamed: bool = tx
+            .prepare_cached(WAS_RENAMED)?
+            .query_row(params![node_entity(class), key], |row| row.get(0))?;
+        if renamed {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The key the event at `seq` (`written` as the log holds it) gives its node as known just
+/// before `upto`: its amendments before then applied, then the renames before then.
+fn key_before(
+    tx: &Connection,
+    (seq, written): (i64, &str),
+    entity: &str,
+    upto: (i64, &str),
+) -> Result<String, Error> {
+    let mut body: serde_json::Value = serde_json::from_str(written)?;
+    for (at, by, patch) in amendments_of(tx, seq)? {
+        if (at, by.as_str()) < upto {
+            merge(&mut body, &patch);
+        }
+    }
+    let key = body
+        .get("subject")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let before: Vec<Rename> = renames_in(tx, entity)?
+        .into_iter()
+        .filter(|(_, _, point, event)| (*point, event.as_str()) < upto)
+        .collect();
+    Ok(resolve(&before, key, upto))
+}
+
+/// Every amendment of the event at `seq` in point order and then event id: its point, event and
+/// the merge patch its data holds.
+fn amendments_of(
+    tx: &Connection,
+    seq: i64,
+) -> Result<Vec<(i64, String, serde_json::Value)>, Error> {
+    let rows: Vec<(i64, String, String)> = tx
+        .prepare_cached(AMENDMENTS_OF)?
+        .query_map(params![seq], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<Result<_, _>>()?;
+    rows.into_iter()
+        .map(|(at, by, body)| {
+            let body: serde_json::Value = serde_json::from_str(&body)?;
+            let patch = body.get("data").cloned().unwrap_or(serde_json::Value::Null);
+            Ok((at, by, patch))
+        })
+        .collect()
+}
+
+/// The places of every event with a hearing that names the node keyed `key` of the class entity
+/// `entity`: its own, and every link to or from it.
+fn naming(
+    tx: &Connection,
+    ontology: &Ontology,
+    entity: &str,
+    key: &str,
+) -> Result<Vec<i64>, Error> {
+    let mut asks = vec![(entity.to_string(), false)];
+    for relation in ontology.relations.values() {
+        if node_entity(&relation.from) == entity {
+            asks.push((link_entity(&relation.name), false));
+        }
+        if node_entity(&relation.to) == entity {
+            asks.push((link_entity(&relation.name), true));
+        }
+    }
+    let mut places = Vec::new();
+    for (of, target) in asks {
+        let found: Vec<i64> = tx
+            .prepare_cached(PLACES_NAMING)?
+            .query_map(params![of, key, target], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        places.extend(found);
+    }
+    Ok(places)
+}
+
+/// Hears the event at the place `seq` again from the log: its own hearing stays, known until the
+/// first change, and each amendment of it and each rename of a key it names is a point where it
+/// may read differently. At each such point, in point order and then event id, the event is its
+/// body with every amendment by then applied and its keys resolved through every rename by then;
+/// when that differs from the hearing before, it is heard at the event's own point and integer
+/// key, known from that point (never before the event itself), and the hearing before is known
+/// until it. Returns what the hearings it made and dropped are of.
+pub(crate) fn derive(
+    tx: &Connection,
+    (ontology, key): (&Ontology, &Key),
+    seq: i64,
+) -> Result<Vec<Subject>, Error> {
+    let Some(made) = made_by(tx, seq)? else {
+        return Ok(Vec::new());
+    };
+    let written: String = tx
+        .prepare_cached(EVENT_AT)?
+        .query_row(params![seq], |row| row.get(1))?;
+    let mut touched: Vec<Subject> = tx
+        .prepare_cached(AMENDED_OF)?
+        .query_map(params![seq], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<Result<_, _>>()?;
+    touched.push(made.of.clone());
+    tx.prepare_cached(DROP_AMENDED)?.execute(params![seq])?;
+    tx.prepare_cached(KNOWN_AGAIN)?
+        .execute(params![made.arrived])?;
+    let mut body: serde_json::Value = serde_json::from_str(&written)?;
+    let named: Vec<String> = match crate::fact::check(&written, ontology)? {
+        Fact::Node(node) => vec![node_entity(&node.class)],
+        Fact::Link(link) => vec![node_entity(&link.from.class), node_entity(&link.to.class)],
+        _ => Vec::new(),
+    };
+    let mut renames: BTreeMap<String, Vec<Rename>> = BTreeMap::new();
+    for entity in named {
+        let found = renames_in(tx, &entity)?;
+        renames.insert(entity, found);
+    }
+    // Each point: its point, event, and the patch when an amendment (before a rename at the
+    // same point and event).
+    let mut points: Vec<(i64, String, Option<serde_json::Value>)> = amendments_of(tx, seq)?
+        .into_iter()
+        .map(|(at, by, patch)| (at, by, Some(patch)))
+        .collect();
+    for (_, _, at, by) in renames.values().flatten() {
+        points.push((*at, by.clone(), None));
+    }
+    points.sort_by(|a, b| (a.0, &a.1, a.2.is_none()).cmp(&(b.0, &b.1, b.2.is_none())));
+    let mut before = made.arrived;
+    let mut heard = heard_as(&written, ontology, &renames, None)?.identity(key)?;
+    for (at, by, patch) in points {
+        if let Some(patch) = &patch {
+            merge(&mut body, patch);
+        }
+        let fact = heard_as(&body.to_string(), ontology, &renames, Some((at, &by)))?;
+        let identity = fact.identity(key)?;
+        if identity == heard {
+            continue;
+        }
+        heard = identity;
+        tx.prepare_cached(KNOWN_UNTIL)?
+            .execute(params![before, at])?;
+        let of = fact.of(&by)?;
+        let (entity, of_key, to) = of.entity();
+        let mut named = identity.to_vec();
+        named.extend_from_slice(by.as_bytes());
+        named.extend_from_slice(&seq.to_le_bytes());
+        let properties = match &of {
+            Of::Node(node) => Some(serde_json::to_string(&node.properties)?),
+            Of::Link(_) => None,
+        };
+        tx.prepare_cached(HEAR_AMENDED)?.execute(params![
+            blake3::keyed_hash(&key.bytes, &named).as_bytes(),
+            entity,
+            of_key,
+            to,
+            made.name,
+            seq,
+            of.source(),
+            of.valid().as_text(),
+            made.point,
+            made.integer,
+            at,
+            properties,
+            at.max(made.point)
+        ])?;
+        before = tx.last_insert_rowid();
+        touched.push((entity, of_key.to_string(), to.map(str::to_string)));
+    }
+    Ok(touched)
+}
+
+/// An event's fact as it is heard at a point: a node or a link, its keys resolved through the
+/// renames known by then.
+struct HeardAs(Fact);
+
+impl HeardAs {
+    fn identity(&self, key: &Key) -> Result<[u8; 32], Error> {
+        self.of("")?.identity(key)
+    }
+
+    fn of(&self, by: &str) -> Result<Of<'_>, Error> {
+        match &self.0 {
+            Fact::Node(node) => Ok(Of::Node(node)),
+            Fact::Link(link) => Ok(Of::Link(link)),
+            _ => Err(Error::Refused(format!(
+                "amendment {by} makes an event say no node or link"
+            ))),
+        }
+    }
+}
+
+/// The fact `body` says, with its keys resolved through `renames` as known at `upto`, or as
+/// written when `upto` is `None`.
+fn heard_as(
+    body: &str,
+    ontology: &Ontology,
+    renames: &BTreeMap<String, Vec<Rename>>,
+    upto: Option<(i64, &str)>,
+) -> Result<HeardAs, Error> {
+    let mut fact = crate::fact::check(body, ontology)?;
+    if let Some(upto) = upto {
+        let through = |class: &str, key: &mut String| {
+            if let Some(renames) = renames.get(&node_entity(class)) {
+                *key = resolve(renames, key, upto);
+            }
+        };
+        match &mut fact {
+            Fact::Node(node) => through(&node.class, &mut node.key),
+            Fact::Link(link) => {
+                through(&link.from.class, &mut link.from.key);
+                through(&link.to.class, &mut link.to.key);
+            }
+            _ => {}
+        }
+    }
+    Ok(HeardAs(fact))
+}
+
+/// Applies the JSON Merge Patch `patch` to `target` (RFC 7386): an object's members patch the
+/// target's, `null` removes one, and any other value replaces the target whole.
+fn merge(target: &mut serde_json::Value, patch: &serde_json::Value) {
+    let serde_json::Value::Object(members) = patch else {
+        *target = patch.clone();
+        return;
+    };
+    if !target.is_object() {
+        *target = serde_json::Value::Object(serde_json::Map::new());
+    }
+    if let serde_json::Value::Object(held) = target {
+        for (name, value) in members {
+            if value.is_null() {
+                held.remove(name);
+            } else {
+                merge(
+                    held.entry(name.clone()).or_insert(serde_json::Value::Null),
+                    value,
+                );
+            }
+        }
+    }
+}
+
+/// Keeps what is seen of `of` in step after amendments and renames, counted again from what is
+/// known now: its first and last facts, the first this store recorded, its first true and its
+/// count; or no row once it has one fact or none, as one fact keeps no row.
+pub(crate) fn reseen_of(tx: &Connection, (entity, key, to): &Subject) -> Result<(), Error> {
+    let to = to.as_deref().unwrap_or_default();
+    let count: i64 = tx
+        .prepare_cached(FACTS_KNOWN)?
+        .query_row(params![entity, key, to], |row| row.get(0))?;
+    let edges = edges(tx, (entity, key, (!to.is_empty()).then_some(to)))?;
+    let Some((first, last)) = edges.filter(|_| count > 1) else {
+        tx.prepare_cached(UNSEEN)?
+            .execute(params![entity, key, to])?;
+        return Ok(());
+    };
+    let (hearing, ending, first_true): (Option<i64>, Option<i64>, Option<String>) = tx
+        .prepare_cached(&seen_recount())?
+        .query_row(params![entity, key, to], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+    let ending = if hearing.is_some() { None } else { ending };
+    tx.prepare_cached(SEEN_PUT)?.execute(params![
+        entity,
+        key,
+        to,
+        first.hearing,
+        first.ending,
+        last.hearing,
+        last.ending,
+        hearing,
+        ending,
+        first_true,
+        count
+    ])?;
+    Ok(())
+}
+
 /// Takes `key` as the graph's. A store holding another key's check value refuses it; a store
 /// holding none takes it.
 pub(crate) fn take(conn: &mut Connection, key: &Key) -> Result<(), Error> {
@@ -534,7 +953,12 @@ pub(crate) fn newest(
     conn: &Connection,
     of: (&str, &str, Option<&str>),
 ) -> Result<Option<Versioned>, Error> {
-    read_version(conn, of, &format!("ORDER BY {}", order("DESC")), &[])
+    read_version(
+        conn,
+        of,
+        (version_row, &format!("ORDER BY {}", order("DESC"))),
+        &[],
+    )
 }
 
 /// A version row's properties: a node's, or none for a link, whose row holds null.
@@ -650,7 +1074,7 @@ pub(crate) type Versioned = (Version, i64, [u8; 32]);
 fn read_version(
     conn: &Connection,
     (entity, key, to): (&str, &str, Option<&str>),
-    tail: &str,
+    (rows, tail): (fn(&str) -> String, &str),
     bound: &[&dyn ToSql],
 ) -> Result<Option<Versioned>, Error> {
     /// A version row: event, source, valid, point, integer key, properties, recorded, identity.
@@ -664,7 +1088,7 @@ fn read_version(
         i64,
         [u8; 32],
     );
-    let mut statement = conn.prepare_cached(&version_row(tail))?;
+    let mut statement = conn.prepare_cached(&rows(tail))?;
     let read = |row: &rusqlite::Row| -> rusqlite::Result<Row> {
         Ok((
             row.get(0)?,
@@ -727,7 +1151,12 @@ fn node_at(
     } else {
         by_point()
     };
-    read_version(conn, (&node_entity(&class.name), key, None), &tail, &[&at])
+    read_version(
+        conn,
+        (&node_entity(&class.name), key, None),
+        (version_row, &tail),
+        &[&at],
+    )
 }
 
 /// What a read known at `at` bounds the versions of `class` by, or of a link when `class` is
@@ -758,11 +1187,16 @@ pub(crate) fn node_as_of(
 ) -> Result<Option<Versioned>, Error> {
     let of = (node_entity(&class.name), key, None);
     match known.map(|at| known_bound(Some(class), at)).transpose()? {
-        None => read_version(conn, (&of.0, of.1, of.2), &as_of(None), &[&day]),
+        None => read_version(
+            conn,
+            (&of.0, of.1, of.2),
+            (version_row, &as_of(None)),
+            &[&day],
+        ),
         Some((column, at)) => read_version(
             conn,
             (&of.0, of.1, of.2),
-            &as_of(Some(column)),
+            (known_version_row, &as_of(Some(column))),
             &[&day, &at],
         ),
     }
@@ -968,6 +1402,37 @@ impl Graph {
             return Ok(None);
         };
         let mut version = version_of(columns, ending)?;
+        version.ended = ended(&self.conn, &relation, (from, to), at, None)?;
+        Ok(Some(version))
+    }
+
+    /// The version of the link of `relation` from the node keyed `from` to the node keyed `to`
+    /// as known at the time `known`: the newest by point and then event id among its hearings
+    /// known then, so an amendment or a rename made later is not in it; and whether the link had
+    /// ended by then. `None` when no hearing of it was known then.
+    ///
+    /// # Errors
+    /// [`Error::Refused`] when `known` is an integer key; the relation is not declared, or the
+    /// graph file cannot be read.
+    pub fn link_known_at(
+        &self,
+        relation: &str,
+        from: &str,
+        to: &str,
+        known: At,
+    ) -> Result<Option<Version>, Error> {
+        let (_, at) = known_bound(None, known)?;
+        let relation = self.current_ontology()?.relation(relation)?.name.clone();
+        let tail = format!("ORDER BY {} LIMIT 1", order("DESC"));
+        let Some((mut version, ..)) = read_version(
+            &self.conn,
+            (&link_entity(&relation), from, Some(to)),
+            (known_link_row, &tail),
+            &[&at],
+        )?
+        else {
+            return Ok(None);
+        };
         version.ended = ended(&self.conn, &relation, (from, to), at, None)?;
         Ok(Some(version))
     }
