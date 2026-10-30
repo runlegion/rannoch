@@ -846,11 +846,13 @@ mod tests {
         )?;
         g.fill()?;
         let log = g.events().since(crate::Cursor::START)?;
-        let tables: Vec<String> = g
-            .conn
-            .prepare("SELECT name FROM sqlite_master ORDER BY name")?
-            .query_map([], |row| row.get(0))?
-            .collect::<Result<_, _>>()?;
+        let schema = |g: &crate::Graph| -> rusqlite::Result<Vec<String>> {
+            g.conn
+                .prepare("SELECT name FROM sqlite_master ORDER BY name")?
+                .query_map([], |row| row.get(0))?
+                .collect()
+        };
+        let tables = schema(&g)?;
         let path = temp("copy");
         let at = g.copy_to(&path)?;
         assert_eq!(at, g.events().committed()?);
@@ -859,12 +861,7 @@ mod tests {
             log,
             "the log is unchanged"
         );
-        let after: Vec<String> = g
-            .conn
-            .prepare("SELECT name FROM sqlite_master ORDER BY name")?
-            .query_map([], |row| row.get(0))?
-            .collect::<Result<_, _>>()?;
-        assert_eq!(after, tables, "no table is added for the copy");
+        assert_eq!(schema(&g)?, tables, "no table is added for the copy");
         g.commit(&[&node("book", "b2", "later")], &[])?;
         g.fill()?;
         let copy = open(&path, &KEY)?;
