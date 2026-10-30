@@ -79,6 +79,9 @@ pub struct Graph {
     pub(crate) ontology: Ontology,
     /// What reads use: the ontology and the `PRAGMA schema_version` it was loaded at.
     pub(crate) fresh: RefCell<Fresh>,
+    /// The events this handle has handed out to each worker, so `next` hands back only what an
+    /// earlier run left in progress.
+    pub(crate) handed: std::collections::BTreeSet<(String, i64)>,
 }
 
 /// An ontology and the schema version of the file it was loaded at.
@@ -114,6 +117,7 @@ pub fn open(path: impl AsRef<Path>, key: &[u8; 32]) -> Result<Graph, Error> {
         key,
         ontology,
         fresh,
+        handed: std::collections::BTreeSet::new(),
     })
 }
 
