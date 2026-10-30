@@ -290,20 +290,22 @@ pub(crate) fn version_row(tail: &str) -> String {
 /// `known` point (its own place on the axis when no amendment made it) until the `until` point
 /// of the amendment that superseded it.
 pub(crate) fn known_version_row(tail: &str) -> String {
-    format!(
-        "SELECT name, source, valid, point, integer, properties, recorded, identity \
-         FROM {} WHERE true {tail}",
-        known_occurrences(&format!("{OF} AND (h.until IS NULL OR h.until > ?5)"))
-    )
+    known_row("?5", "true", tail)
 }
 
 /// One version row of the link `?1`, `?2`, `?3` among its hearings known at the point `?4`,
 /// as `tail` picks it: see [`known_version_row`].
 pub(crate) fn known_link_row(tail: &str) -> String {
+    known_row("?4", "coalesce(known, point) <= ?4", tail)
+}
+
+/// One version row among the hearings known at the parameter `at`, kept by `filter`, as `tail`
+/// picks it.
+fn known_row(at: &str, filter: &str, tail: &str) -> String {
     format!(
         "SELECT name, source, valid, point, integer, properties, recorded, identity \
-         FROM {} WHERE coalesce(known, point) <= ?4 {tail}",
-        known_occurrences(&format!("{OF} AND (h.until IS NULL OR h.until > ?4)"))
+         FROM {} WHERE {filter} {tail}",
+        known_occurrences(&format!("{OF} AND (h.until IS NULL OR h.until > {at})"))
     )
 }
 
