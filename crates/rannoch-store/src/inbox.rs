@@ -4,7 +4,7 @@
 
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
-use crate::log::{Cursor, Event};
+use crate::log::{Cursor, Event, decode};
 use crate::queries::{
     DONE_WORK, FAIL_WORK, NEXT_EVENT, PLACE, POSITION, SET_PLACE, START_WORK, WORK,
 };
@@ -56,19 +56,13 @@ impl Graph {
         let Some((seq, id, body)) = row else {
             return Ok(None);
         };
-        let id = id
-            .parse()
-            .map_err(|_| Error::Refused(format!("event at {seq} has an id that is not a UUID")))?;
+        let event = decode(seq, &id, body)?;
         tx.prepare_cached(SET_PLACE)?
             .execute(params![worker, seq])?;
         tx.prepare_cached(START_WORK)?
             .execute(params![worker, seq])?;
         tx.commit()?;
-        Ok(Some(Event {
-            id,
-            cursor: Cursor(seq),
-            body,
-        }))
+        Ok(Some(event))
     }
 
     /// Closes the event at `cursor`, in progress for worker `worker`, as done.

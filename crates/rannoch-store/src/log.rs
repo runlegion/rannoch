@@ -49,25 +49,25 @@ fn high_water(conn: &Connection) -> Result<Cursor, Error> {
     ))
 }
 
+/// An event as a row of the log holds it: its place, its id as text and its body.
+pub(crate) fn decode(seq: i64, id: &str, body: String) -> Result<Event, Error> {
+    Ok(Event {
+        id: id
+            .parse()
+            .map_err(|_| Error::Refused(format!("event at {seq} has an id that is not a UUID")))?,
+        cursor: Cursor(seq),
+        body,
+    })
+}
+
 /// The event at `cursor`, if the log holds one there.
 pub(crate) fn event_at(conn: &Connection, cursor: Cursor) -> Result<Option<Event>, Error> {
     let row: Option<(String, String)> = conn
         .prepare_cached(EVENT_AT)?
         .query_row(params![cursor.0], |row| Ok((row.get(0)?, row.get(1)?)))
         .optional()?;
-    row.map(|(id, body)| {
-        Ok(Event {
-            id: id.parse().map_err(|_| {
-                Error::Refused(format!(
-                    "event at {} has an id that is not a UUID",
-                    cursor.0
-                ))
-            })?,
-            cursor,
-            body,
-        })
-    })
-    .transpose()
+    row.map(|(id, body)| decode(cursor.0, &id, body))
+        .transpose()
 }
 
 /// Appends one event under the id it already has, inside the caller's transaction: at `place`
@@ -142,15 +142,8 @@ impl Events<'_> {
         let mut rows = statement.query(params![cursor.0, until.0])?;
         let mut events = Vec::new();
         while let Some(row) = rows.next()? {
-            let seq: i64 = row.get(0)?;
             let id: String = row.get(1)?;
-            events.push(Event {
-                id: id.parse().map_err(|_| {
-                    Error::Refused(format!("event at {seq} has an id that is not a UUID"))
-                })?,
-                cursor: Cursor(seq),
-                body: row.get(2)?,
-            });
+            events.push(decode(row.get(0)?, &id, row.get(2)?)?);
         }
         Ok(events)
     }

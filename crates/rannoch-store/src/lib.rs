@@ -212,9 +212,14 @@ impl Graph {
     ) -> Result<Vec<Result<Event, Error>>, Error> {
         let mut from: Vec<Option<(&str, &str)>> = vec![None; bodies.len()];
         for &(index, producer, position) in positions {
-            if let Some(slot) = from.get_mut(index) {
-                *slot = Some((producer, position));
-            }
+            let slot = from.get_mut(index).ok_or_else(|| {
+                Error::Refused(format!(
+                    "position {position} of producer {producer} names body {index}, \
+                     but the batch has {} bodies",
+                    bodies.len()
+                ))
+            })?;
+            *slot = Some((producer, position));
         }
         let tx = self
             .conn
