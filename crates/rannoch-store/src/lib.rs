@@ -10,12 +10,15 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
 mod fact;
 mod history;
+mod inbox;
 mod log;
 mod ontology;
 mod queries;
 mod read;
 
+pub use fact::check;
 pub use history::{At, End, Hearing, Seen, Version};
+pub use inbox::State;
 pub use log::{Cursor, Event, Events};
 pub use rannoch_cloudevents::{Date, EventId, NodeRef, ValidTime};
 pub use rannoch_ontology::{Class, Declaration, HistoryKey, Ontology, Relation, Value, ValueType};
@@ -28,7 +31,8 @@ use crate::log::{append, store};
 use crate::ontology::{Bound, build, load};
 use crate::queries::{
     CLOSE_OPEN, FILLED, HISTORY_TABLES, OPEN_LINK, OWN_TABLES, PRAGMAS, RELEASE, ROLLBACK_TO,
-    SAVEPOINT, SCHEMA_VERSION, SET_FILLED, node_id, upsert_link, upsert_node, waiting,
+    SAVEPOINT, SCHEMA_VERSION, SET_FILLED, SET_POSITION, node_id, upsert_link, upsert_node,
+    waiting,
 };
 
 /// Why rannoch did not do what was asked.
@@ -188,28 +192,72 @@ impl Graph {
     }
 
     /// Appends a batch of events, each body a `CloudEvent` as JSON, in one transaction, in the
-    /// order given, with a savepoint per event: an event the ontology does not allow, or that
-    /// fails to append, rolls back alone, and the others land. The answer holds one result per
-    /// body, in the same order: the event as logged, or why it was refused.
+    /// order given, with a savepoint per event: an event that fails to append rolls back alone,
+    /// and the others land. Bodies are not read here: checking them against the ontology is the
+    /// queue's, before they are accepted ([`check`]).
+    ///
+    /// Each entry `(index, producer, position)` in `positions` says the body at `index` took
+    /// `producer` to `position` in its source. Each producer's position lands in the same
+    /// transaction, as of its last body that landed. Once one of a producer's bodies fails, its
+    /// later bodies in the batch are not appended, so its position stops at the failed event and
+    /// a producer that resumes there sends nothing twice and loses nothing. The answer holds one
+    /// result per body, in the same order: the event as logged, or why it did not land.
     ///
     /// # Errors
-    /// The graph file cannot be written; nothing of the batch lands.
-    pub fn commit(&mut self, bodies: &[&str]) -> Result<Vec<Result<Event, Error>>, Error> {
+    /// The graph file cannot be written; nothing of the batch lands, positions included.
+    pub fn commit(
+        &mut self,
+        bodies: &[&str],
+        positions: &[(usize, &str, &str)],
+    ) -> Result<Vec<Result<Event, Error>>, Error> {
+        let mut from: Vec<Option<(&str, &str)>> = vec![None; bodies.len()];
+        for &(index, producer, position) in positions {
+            let slot = from.get_mut(index).ok_or_else(|| {
+                Error::Refused(format!(
+                    "position {position} of producer {producer} names body {index}, \
+                     but the batch has {} bodies",
+                    bodies.len()
+                ))
+            })?;
+            *slot = Some((producer, position));
+        }
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let ontology = load(&tx)?;
         let mut results = Vec::with_capacity(bodies.len());
-        for body in bodies {
-            tx.execute_batch(SAVEPOINT)?;
-            let landed = fact::read(body, &ontology).and_then(|fact| match fact {
-                fact::Fact::Declared => Err(Error::Refused(
-                    "a declaration is made with declare, not committed".to_string(),
-                )),
-                _ => append(&tx, body),
+        // Each producer's position as of its last body that landed, and whether one has failed.
+        let mut reached: BTreeMap<&str, (Option<&str>, bool)> = BTreeMap::new();
+        for (body, from) in bodies.iter().zip(from) {
+            let producer = from.map(|(producer, position)| {
+                (
+                    reached.entry(producer).or_insert((None, false)),
+                    producer,
+                    position,
+                )
             });
+            if let Some(((_, true), producer, _)) = &producer {
+                results.push(Err(Error::Refused(format!(
+                    "an earlier event from producer {producer} failed at commit"
+                ))));
+                continue;
+            }
+            tx.execute_batch(SAVEPOINT)?;
+            let landed = append(&tx, body);
             tx.execute_batch(if landed.is_ok() { RELEASE } else { ROLLBACK_TO })?;
+            if let Some(((held, stopped), _, position)) = producer {
+                if landed.is_ok() {
+                    *held = Some(position);
+                } else {
+                    *stopped = true;
+                }
+            }
             results.push(landed);
+        }
+        for (producer, (position, _)) in reached {
+            if let Some(position) = position {
+                tx.prepare_cached(SET_POSITION)?
+                    .execute([producer, position])?;
+            }
         }
         tx.commit()?;
         Ok(results)
@@ -243,7 +291,7 @@ impl Graph {
                 cursor: event.cursor,
                 recorded,
             };
-            match fact::read(&event.body, &ontology).map_err(failed)? {
+            match fact::check(&event.body, &ontology).map_err(failed)? {
                 fact::Fact::Node(node) => {
                     let (entity, key) = (node_entity(&node.class), node.key.as_str());
                     match heard(&tx, &ontology, &self.key, stamp, &Of::Node(&node))
@@ -505,9 +553,9 @@ mod tests {
     #[test]
     fn a_late_arrival_does_not_change_current_state() -> Result<(), Box<dyn std::error::Error>> {
         let mut g = graph("late")?;
-        g.commit(&[&node_with(&id_at(2_000), "book", "b1", "new")])?;
+        g.commit(&[&node_with(&id_at(2_000), "book", "b1", "new")], &[])?;
         g.fill()?;
-        g.commit(&[&node_with(&id_at(1_000), "book", "b1", "old")])?;
+        g.commit(&[&node_with(&id_at(1_000), "book", "b1", "old")], &[])?;
         g.fill()?;
         assert_eq!(title(&g, "b1")?, Some("new".into()));
         Ok(())
@@ -516,8 +564,8 @@ mod tests {
     #[test]
     fn first_and_last_heard_follow_the_axis() -> Result<(), Box<dyn std::error::Error>> {
         let mut g = graph("seen")?;
-        g.commit(&[&node_with(&id_at(2_000), "book", "b1", "new")])?;
-        g.commit(&[&node_with(&id_at(1_000), "book", "b1", "old")])?;
+        g.commit(&[&node_with(&id_at(2_000), "book", "b1", "new")], &[])?;
+        g.commit(&[&node_with(&id_at(1_000), "book", "b1", "old")], &[])?;
         g.fill()?;
         let seen = g
             .seen(&crate::NodeRef::new("book", "b1"))?
@@ -538,18 +586,21 @@ mod tests {
     #[test]
     fn a_correction_masks_an_ending() -> Result<(), Box<dyn std::error::Error>> {
         let mut g = graph("masks")?;
-        g.commit(&[
-            &node("author", "a1", "ann"),
-            &node("book", "b1", "hi"),
-            &link("a1", "b1"),
-        ])?;
-        g.commit(&[&concluded(&id(), "ended", "a1", "b1", i64::MAX / 2)])?;
+        g.commit(
+            &[
+                &node("author", "a1", "ann"),
+                &node("book", "b1", "hi"),
+                &link("a1", "b1"),
+            ],
+            &[],
+        )?;
+        g.commit(&[&concluded(&id(), "ended", "a1", "b1", i64::MAX / 2)], &[])?;
         g.fill()?;
         assert!(matches!(
             g.link_end("wrote", "a1", "b1")?,
             Some(crate::End::Ended { .. })
         ));
-        g.commit(&[&concluded(&id(), "corrected", "a1", "b1", 0)])?;
+        g.commit(&[&concluded(&id(), "corrected", "a1", "b1", 0)], &[])?;
         g.fill()?;
         assert!(matches!(
             g.link_end("wrote", "a1", "b1")?,
@@ -566,8 +617,8 @@ mod tests {
     fn identical_content_is_one_hearing() -> Result<(), Box<dyn std::error::Error>> {
         let mut g = graph("identical")?;
         let (later, earlier) = (id_at(2_000), id_at(1_000));
-        g.commit(&[&node_with(&later, "book", "b1", "hi")])?;
-        g.commit(&[&node_with(&earlier, "book", "b1", "hi")])?;
+        g.commit(&[&node_with(&later, "book", "b1", "hi")], &[])?;
+        g.commit(&[&node_with(&earlier, "book", "b1", "hi")], &[])?;
         g.fill()?;
         let hearings = g.hearings(&crate::NodeRef::new("book", "b1"))?;
         assert_eq!(hearings.len(), 1);
@@ -596,7 +647,7 @@ mod tests {
         let answers = |name: &str, order: &[&String]| -> Result<_, Box<dyn std::error::Error>> {
             let mut g = graph(name)?;
             for event in order {
-                g.commit(&[event.as_str()])?;
+                g.commit(&[event.as_str()], &[])?;
                 g.fill()?;
             }
             let b1 = crate::NodeRef::new("book", "b1");
@@ -631,24 +682,73 @@ mod tests {
     }
 
     #[test]
-    fn one_refused_event_rolls_back_alone() -> Result<(), Box<dyn std::error::Error>> {
+    fn one_failing_event_rolls_back_alone() -> Result<(), Box<dyn std::error::Error>> {
         let mut g = graph("alone")?;
+        g.conn.execute_batch(
+            "CREATE TRIGGER bad_fails BEFORE INSERT ON _events WHEN NEW.body LIKE '%\"bad\"%' \
+             BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END;",
+        )?;
         let before = g.events().committed()?;
-        let bad = node("tweet", "t1", "x");
-        let results = g.commit(&[&node("book", "b1", "hi"), &bad, &node("book", "b2", "yo")])?;
+        let bad = node("book", "bad", "x");
+        let results = g.commit(
+            &[&node("book", "b1", "hi"), &bad, &node("book", "b2", "yo")],
+            &[],
+        )?;
         assert!(results[0].is_ok() && results[1].is_err() && results[2].is_ok());
         assert_eq!(g.events().since(before)?.len(), 2);
         Ok(())
     }
 
     #[test]
+    fn a_producer_stops_at_its_first_failed_event() -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = graph("stops")?;
+        g.conn.execute_batch(
+            "CREATE TRIGGER bad_fails BEFORE INSERT ON _events WHEN NEW.body LIKE '%\"bad\"%' \
+             BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END;",
+        )?;
+        let before = g.events().committed()?;
+        let (b1, bad, b3, other) = (
+            node("book", "b1", "hi"),
+            node("book", "bad", "x"),
+            node("book", "b3", "yo"),
+            node("book", "b4", "ok"),
+        );
+        let results = g.commit(
+            &[&b1, &bad, &b3, &other],
+            &[
+                (0, "shop", "1"),
+                (1, "shop", "2"),
+                (2, "shop", "3"),
+                (3, "feed", "9"),
+            ],
+        )?;
+        let landed: Vec<bool> = results.iter().map(Result::is_ok).collect();
+        assert_eq!(landed, [true, false, false, true]);
+        assert_eq!(g.events().since(before)?.len(), 2);
+        assert_eq!(g.position("shop")?.as_deref(), Some("1"));
+        assert_eq!(g.position("feed")?.as_deref(), Some("9"));
+        Ok(())
+    }
+
+    #[test]
+    fn commit_does_not_check_the_ontology() -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = graph("unchecked")?;
+        let results = g.commit(&[&node("tweet", "t1", "x")], &[])?;
+        assert!(results[0].is_ok(), "{results:?}");
+        Ok(())
+    }
+
+    #[test]
     fn fill_writes_nodes_and_links_after_the_log() -> Result<(), Box<dyn std::error::Error>> {
         let mut g = graph("fill")?;
-        g.commit(&[
-            &node("author", "a1", "ann"),
-            &node("book", "b1", "hi"),
-            &link("a1", "b1"),
-        ])?;
+        g.commit(
+            &[
+                &node("author", "a1", "ann"),
+                &node("book", "b1", "hi"),
+                &link("a1", "b1"),
+            ],
+            &[],
+        )?;
         let to = g.fill()?;
         assert_eq!(to, g.events().committed()?);
         let title: String = g.conn.query_row(
@@ -676,11 +776,11 @@ mod tests {
                     row.get(0)
                 })
         };
-        g.commit(&[&node("author", "a1", "ann"), &link("a1", "b1")])?;
+        g.commit(&[&node("author", "a1", "ann"), &link("a1", "b1")], &[])?;
         g.fill()?;
         assert_eq!(links(&g)?, 0, "the link waits while its book is missing");
         let before = g.events().committed()?;
-        g.commit(&[&node("book", "b1", "hi")])?;
+        g.commit(&[&node("book", "b1", "hi")], &[])?;
         g.fill()?;
         assert_eq!(links(&g)?, 1, "the link closes when the book arrives");
         let closings = g

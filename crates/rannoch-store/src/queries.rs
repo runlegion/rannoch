@@ -26,7 +26,44 @@ pub(crate) const OWN_TABLES: &str = "
     CREATE INDEX IF NOT EXISTS _open_to ON _open(rel, to_key);
     CREATE TABLE IF NOT EXISTS _filled(one INTEGER PRIMARY KEY CHECK (one = 1),
         cursor INTEGER NOT NULL);
-    INSERT OR IGNORE INTO _filled(one, cursor) VALUES (1, 0);";
+    INSERT OR IGNORE INTO _filled(one, cursor) VALUES (1, 0);
+    CREATE TABLE IF NOT EXISTS _positions(
+        producer TEXT PRIMARY KEY, position TEXT NOT NULL) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS _places(
+        worker TEXT PRIMARY KEY, cursor INTEGER NOT NULL) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS _work(
+        worker TEXT NOT NULL, seq INTEGER NOT NULL, reason TEXT,
+        PRIMARY KEY(worker, seq)) WITHOUT ROWID;";
+
+/// Sets producer `?1`'s position in its source to `?2`.
+pub(crate) const SET_POSITION: &str = "INSERT INTO _positions(producer, position) VALUES (?1, ?2) \
+     ON CONFLICT(producer) DO UPDATE SET position = excluded.position";
+
+pub(crate) const POSITION: &str = "SELECT position FROM _positions WHERE producer = ?1";
+
+/// Worker `?1`'s place: the last cursor handed out to it.
+pub(crate) const PLACE: &str = "SELECT cursor FROM _places WHERE worker = ?1";
+
+pub(crate) const SET_PLACE: &str = "INSERT INTO _places(worker, cursor) VALUES (?1, ?2) \
+     ON CONFLICT(worker) DO UPDATE SET cursor = excluded.cursor";
+
+/// The first event after `?1` and at or below `?2`.
+pub(crate) const NEXT_EVENT: &str =
+    "SELECT seq, id, body FROM _events WHERE seq > ?1 AND seq <= ?2 ORDER BY seq LIMIT 1";
+
+/// Marks event `?2` in progress for worker `?1`.
+pub(crate) const START_WORK: &str = "INSERT INTO _work(worker, seq, reason) VALUES (?1, ?2, NULL)";
+
+/// The row of event `?2` for worker `?1`: present while in progress (reason null) or failed.
+pub(crate) const WORK: &str = "SELECT reason FROM _work WHERE worker = ?1 AND seq = ?2";
+
+/// Closes event `?2` in progress for worker `?1` as done.
+pub(crate) const DONE_WORK: &str =
+    "DELETE FROM _work WHERE worker = ?1 AND seq = ?2 AND reason IS NULL";
+
+/// Closes event `?2` in progress for worker `?1` as failed with reason `?3`.
+pub(crate) const FAIL_WORK: &str =
+    "UPDATE _work SET reason = ?3 WHERE worker = ?1 AND seq = ?2 AND reason IS NULL";
 
 /// rannoch's history tables (oracle history.rs:21-54). The hearings, one version row each, with
 /// no valid-to: `arrived` counts up as this store records them, `integer` is set only in an

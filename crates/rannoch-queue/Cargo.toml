@@ -13,6 +13,11 @@ publish = false
 rannoch-cloudevents = { path = "../rannoch-cloudevents" }
 rannoch-ontology = { path = "../rannoch-ontology" }
 rannoch-store = { path = "../rannoch-store" }
+thiserror = "2"
+
+[dev-dependencies]
+rusqlite = { version = "0.40", features = ["bundled"] }
+tempfile = "3"
 
 [lints]
 workspace = true
