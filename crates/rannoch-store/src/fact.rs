@@ -49,6 +49,16 @@ pub fn check(body: &str, ontology: &Ontology) -> Result<Fact, Error> {
         | Fact::Concluded(Conclusion {
             relation, from, to, ..
         }) => ends(ontology.relation(relation)?, from, to)?,
+        Fact::Replaced(replaced) => {
+            let class = ontology.class(&replaced.class)?;
+            if replaced.old == replaced.new {
+                return Err(Error::Refused(format!(
+                    "replacing {} {} by itself is not a replacement; a new version under the same \
+                     key is a write",
+                    class.name, replaced.old
+                )));
+            }
+        }
         Fact::Declared | Fact::None => {}
     }
     Ok(fact)

@@ -31,6 +31,9 @@ pub(crate) const OWN_TABLES: &str = "
         producer TEXT PRIMARY KEY, position TEXT NOT NULL) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS _places(
         worker TEXT PRIMARY KEY, cursor INTEGER NOT NULL) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS _fates(class TEXT NOT NULL, key TEXT NOT NULL,
+        replaced_by TEXT NOT NULL, point INTEGER NOT NULL, event TEXT NOT NULL,
+        PRIMARY KEY(class, key)) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS _snapshots(path TEXT PRIMARY KEY, cursor INTEGER NOT NULL)
         WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS _work(
@@ -52,6 +55,80 @@ pub(crate) const SET_PLACE: &str = "INSERT INTO _places(worker, cursor) VALUES (
 /// The first event after `?1` and at or below `?2`.
 pub(crate) const NEXT_EVENT: &str =
     "SELECT seq, id, body FROM _events WHERE seq > ?1 AND seq <= ?2 ORDER BY seq LIMIT 1";
+
+/// Records that node `?2` of class `?1` was replaced by `?3` at point `?4` in event `?5`, unless
+/// the fate held is from a replacement later by point and then event id.
+pub(crate) const RECORD_FATE: &str = "INSERT INTO _fates(class, key, replaced_by, point, event) \
+     VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(class, key) DO UPDATE SET \
+     replaced_by = excluded.replaced_by, point = excluded.point, event = excluded.event \
+     WHERE (excluded.point, excluded.event) > (_fates.point, _fates.event)";
+
+/// The key that replaced node `?2` of class `?1`.
+pub(crate) const FATE: &str = "SELECT replaced_by FROM _fates WHERE class = ?1 AND key = ?2";
+
+/// The links of entity `?1` with node `?4` at their source (when `?2`) or target (when `?3`).
+pub(crate) const LINKS_OF: &str = "SELECT DISTINCT key, to_key FROM _hearings \
+     WHERE line = 'main' AND entity = ?1 AND ((?2 AND key = ?4) OR (?3 AND to_key = ?4))";
+
+/// Moves the hearings of link `?1` `?2`->`?3` to `?4`->`?5`.
+pub(crate) const MOVE_LINK_HEARINGS: &str = "UPDATE _hearings SET key = ?4, to_key = ?5 \
+     WHERE line = 'main' AND entity = ?1 AND key = ?2 AND to_key = ?3";
+
+/// Of the conclusions of link `?1` `?2`->`?3` and `?4`->`?5`, the one later by point and then
+/// event id (a correction, with no point, orders last).
+pub(crate) const LATER_END: &str = "SELECT event, source, point, valid FROM _ends \
+     WHERE line = 'main' AND entity = ?1 AND ((key = ?2 AND to_key = ?3) OR (key = ?4 AND to_key = ?5)) \
+     ORDER BY point IS NULL DESC, point DESC, event DESC LIMIT 1";
+
+pub(crate) const PUT_END: &str = "INSERT INTO _ends(entity, key, to_key, event, source, point, valid) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT(entity, line, key, to_key) DO UPDATE SET \
+     event = excluded.event, source = excluded.source, point = excluded.point, valid = excluded.valid";
+
+/// Moves the endings of link `?1` `?2`->`?3` to `?4`->`?5`, but for any it already holds.
+pub(crate) const MOVE_ENDINGS: &str = "UPDATE OR IGNORE _endings SET key = ?4, to_key = ?5 \
+     WHERE line = 'main' AND entity = ?1 AND key = ?2 AND to_key = ?3";
+
+pub(crate) const DROP_ENDS: &str =
+    "DELETE FROM _ends WHERE line = 'main' AND entity = ?1 AND key = ?2 AND to_key = ?3";
+
+pub(crate) const DROP_ENDINGS: &str =
+    "DELETE FROM _endings WHERE line = 'main' AND entity = ?1 AND key = ?2 AND to_key = ?3";
+
+pub(crate) const DROP_SEEN: &str =
+    "DELETE FROM _seen WHERE line = 'main' AND entity = ?1 AND key = ?2 AND to_key = ?3";
+
+pub(crate) const DROP_OPEN: &str =
+    "DELETE FROM _open WHERE rel = ?1 AND from_key = ?2 AND to_key = ?3";
+
+/// Moves the hearings of node `?2` of entity `?1` to key `?3`.
+pub(crate) const MOVE_NODE_HEARINGS: &str = "UPDATE _hearings SET key = ?3 \
+     WHERE line = 'main' AND entity = ?1 AND key = ?2 AND to_key IS NULL";
+
+/// Every fact of `?1`, `?2`, `?3`: its hearings by arrival, then its endings.
+pub(crate) const FACTS_OF: &str = "SELECT * FROM (SELECT arrived AS h, NULL AS e, valid \
+     FROM _hearings WHERE line = 'main' AND entity = ?1 AND key = ?2 AND to_key IS nullif(?3, '') \
+     UNION ALL SELECT NULL, id, valid FROM _endings \
+     WHERE line = 'main' AND entity = ?1 AND key = ?2 AND to_key = ?3) ORDER BY h IS NULL, h, e";
+
+/// Deletes the live row of the link of `relation` from node key `?1` to node key `?2`.
+pub(crate) fn drop_link_row(relation: &str, from: &str, to: &str) -> String {
+    format!(
+        "DELETE FROM {} WHERE src = (SELECT id FROM {} WHERE key = ?1) \
+         AND dst = (SELECT id FROM {} WHERE key = ?2)",
+        relation_table(relation),
+        class_table(from),
+        class_table(to)
+    )
+}
+
+/// Keeps node `?1` of `class` as a row with no properties.
+pub(crate) fn clear_node(class: &str, properties: &[&str]) -> String {
+    let cleared = concat(properties, |p| format!(", {} = NULL", property_column(p)));
+    format!(
+        "UPDATE {} SET source = source{cleared} WHERE key = ?1",
+        class_table(class)
+    )
+}
 
 pub(crate) const ALL_PLACES: &str = "SELECT worker, cursor FROM _places";
 

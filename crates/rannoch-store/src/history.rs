@@ -18,10 +18,11 @@ use rannoch_cloudevents::{Conclusion, EventId, LinkFact, NodeFact, NodeRef, Vali
 use crate::log::Cursor;
 use crate::ontology::{CLASS, RELATION};
 use crate::queries::{
-    ALIAS, ALIASES_OF, CHECK, CONCLUDE, CORRECTED, ENDING, HEAR, HEARING_OF, HELD, RENAME,
-    SEEN_OTHER, SEEN_START, SET_CHECK, as_of, by_integer_key, by_point, edge_ending, edge_hearing,
-    ended_sql, hearings, link_ending, link_state, order, seen_keep, seen_kept, seen_sql,
-    version_row,
+    ALIAS, ALIASES_OF, CHECK, CONCLUDE, CORRECTED, DROP_ENDINGS, DROP_ENDS, DROP_SEEN, ENDING,
+    FACTS_OF, FATE, HEAR, HEARING_OF, HELD, LATER_END, LINKS_OF, MOVE_ENDINGS, MOVE_LINK_HEARINGS,
+    MOVE_NODE_HEARINGS, PUT_END, RENAME, SEEN_OTHER, SEEN_START, SET_CHECK, as_of, by_integer_key,
+    by_point, edge_ending, edge_hearing, ended_sql, hearings, link_ending, link_state, order,
+    seen_keep, seen_kept, seen_sql, version_row,
 };
 use crate::{Error, Graph};
 
@@ -351,14 +352,13 @@ pub(crate) enum Heard {
 /// when its writer supplied its point, which is then part of its identity; else a new hearing,
 /// or a return to an older one, which this event is a new occurrence of. Current state takes
 /// either only when it is now the newest version.
-pub(crate) fn heard(
+pub(crate) fn heard_as(
     tx: &Connection,
     ontology: &Ontology,
-    key: &Key,
+    identity: [u8; 32],
     stamp: Stamp,
     of: &Of,
 ) -> Result<Heard, Error> {
-    let identity = of.identity(key)?;
     let (entity, from, to) = of.entity();
     if let Some(held) = hear(tx, identity, stamp, of, ontology)? {
         if of.time().is_some()
@@ -1036,4 +1036,129 @@ impl Graph {
             ended: ended.map(time),
         }))
     }
+}
+
+/// Moves the history and links of node `old` of `class` to `new`, which replaced it (oracle
+/// `history.rs` `carry`): its hearings, and every link it is an end of with the link's hearings,
+/// endings and conclusion. A moved link that lands on one already held becomes that link,
+/// holding both sets of hearings; of two conclusions the one later by point and then event id is
+/// kept. What is seen of each is read again from its facts. Returns each moved link by relation,
+/// its old ends and its new ends, so the caller puts its live state again.
+pub(crate) fn carry(
+    tx: &Connection,
+    ontology: &Ontology,
+    (class, old, new): (&str, &str, &str),
+) -> Result<Vec<MovedLink>, Error> {
+    let mut moved = Vec::new();
+    for relation in ontology.relations.values() {
+        let (at_from, at_to) = (relation.from == class, relation.to == class);
+        if !at_from && !at_to {
+            continue;
+        }
+        let entity = link_entity(&relation.name);
+        let links: Vec<(String, String)> = tx
+            .prepare_cached(LINKS_OF)?
+            .query_map(params![entity, at_from, at_to, old], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .collect::<Result<_, _>>()?;
+        for (from, to) in links {
+            let end = |at: &String, here: bool| {
+                if here && at == old {
+                    new.to_string()
+                } else {
+                    at.clone()
+                }
+            };
+            let (f, t) = (end(&from, at_from), end(&to, at_to));
+            let keys = params![entity, from, to, f, t];
+            tx.prepare_cached(MOVE_LINK_HEARINGS)?.execute(keys)?;
+            let later: Option<(String, String, Option<i64>, Option<String>)> = tx
+                .prepare_cached(LATER_END)?
+                .query_row(keys, |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })
+                .optional()?;
+            tx.prepare_cached(MOVE_ENDINGS)?.execute(keys)?;
+            for drop in [DROP_ENDS, DROP_ENDINGS, DROP_SEEN] {
+                tx.prepare_cached(drop)?
+                    .execute(params![entity, from, to])?;
+            }
+            if let Some((event, source, point, valid)) = later {
+                tx.prepare_cached(PUT_END)?
+                    .execute(params![entity, f, t, event, source, point, valid])?;
+            }
+            see_again(tx, (&entity, &f, Some(&t)))?;
+            moved.push(MovedLink {
+                relation: relation.name.clone(),
+                old: (from, to),
+                new: (f, t),
+            });
+        }
+    }
+    let node = node_entity(class);
+    tx.prepare_cached(MOVE_NODE_HEARINGS)?
+        .execute(params![node, old, new])?;
+    tx.prepare_cached(DROP_SEEN)?
+        .execute(params![node, old, ""])?;
+    see_again(tx, (&node, new, None))?;
+    Ok(moved)
+}
+
+/// A link [`carry`] moved: its relation, the ends it had and the ends it has now.
+pub(crate) struct MovedLink {
+    pub(crate) relation: String,
+    pub(crate) old: (String, String),
+    pub(crate) new: (String, String),
+}
+
+/// Reads what is seen of `of` (entity, key, target key) again from all its facts: none kept for
+/// one fact, else its first and last by its class's order, its count and its first true.
+fn see_again(tx: &Connection, (entity, key, to): (&str, &str, Option<&str>)) -> Result<(), Error> {
+    let to_key = to.unwrap_or_default();
+    tx.prepare_cached(DROP_SEEN)?
+        .execute(params![entity, key, to_key])?;
+    let facts: Vec<(Option<i64>, Option<i64>, Option<String>)> = tx
+        .prepare_cached(FACTS_OF)?
+        .query_map(params![entity, key, to_key], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<Result<_, _>>()?;
+    let Some(((hearing, ending, valid), rest)) = facts.split_first() else {
+        return Ok(());
+    };
+    if rest.is_empty() {
+        return Ok(());
+    }
+    tx.prepare_cached(SEEN_START)?
+        .execute(params![entity, key, to_key, hearing, ending, valid])?;
+    let Some((first, last)) = edges(tx, (entity, key, to))? else {
+        return Ok(());
+    };
+    for (_, _, valid) in rest {
+        keep(
+            tx,
+            (entity, key, to_key),
+            (&first, &last),
+            (1, valid.as_deref()),
+        )?;
+    }
+    Ok(())
+}
+
+/// The key node `key` of `class` stands under now: the key of the replacement that replaced it,
+/// and of any that replaced that one, or its own.
+pub(crate) fn resolve(tx: &Connection, class: &str, key: &str) -> Result<String, Error> {
+    let mut at = key.to_string();
+    for _ in 0..64 {
+        let next: Option<String> = tx
+            .prepare_cached(FATE)?
+            .query_row(params![class, at], |row| row.get(0))
+            .optional()?;
+        match next {
+            Some(next) if next != at => at = next,
+            _ => break,
+        }
+    }
+    Ok(at)
 }

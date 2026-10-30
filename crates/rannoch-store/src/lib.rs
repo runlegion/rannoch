@@ -27,14 +27,15 @@ pub use read::Node;
 pub use snapshot::Snapshot;
 
 use crate::history::{
-    Heard, Key, Of, Stamp, alias, conclude, heard, link_entity, newest, node_entity, take,
+    Heard, Key, Of, Stamp, alias, carry, conclude, heard_as, link_entity, newest, node_entity,
+    resolve, take,
 };
 use crate::log::{append, store};
 use crate::ontology::{Bound, build, load};
 use crate::queries::{
-    CLOSE_OPEN, FILLED, HISTORY_TABLES, OPEN_LINK, OWN_TABLES, PRAGMAS, RELEASE, ROLLBACK_TO,
-    SAVEPOINT, SCHEMA_VERSION, SET_FILLED, SET_POSITION, node_id, upsert_link, upsert_node,
-    waiting,
+    CLOSE_OPEN, DROP_OPEN, FILLED, HISTORY_TABLES, OPEN_LINK, OWN_TABLES, PRAGMAS, RECORD_FATE,
+    RELEASE, ROLLBACK_TO, SAVEPOINT, SCHEMA_VERSION, SET_FILLED, SET_POSITION, clear_node,
+    drop_link_row, node_id, upsert_link, upsert_node, waiting,
 };
 
 /// Why rannoch did not do what was asked.
@@ -301,85 +302,184 @@ impl Graph {
                 cursor: event.cursor,
                 recorded,
             };
-            match fact::check(&event.body, &ontology).map_err(failed)? {
-                fact::Fact::Node(node) => {
-                    let (entity, key) = (node_entity(&node.class), node.key.as_str());
-                    match heard(&tx, &ontology, &self.key, stamp, &Of::Node(&node))
-                        .map_err(failed)?
-                    {
-                        Heard::Held(held) => {
-                            if alias(&tx, &held, node.event, event.cursor).map_err(failed)?
-                                && let Some((v, recorded, _)) =
-                                    newest(&tx, (&entity, key, None)).map_err(failed)?
-                            {
-                                put_node(
-                                    &tx,
-                                    &node.class,
-                                    key,
-                                    (&v.source, &v.valid, recorded),
-                                    &v.properties,
-                                )
-                                .map_err(failed)?;
-                            }
-                        }
-                        Heard::Newest => {
-                            put_node(
-                                &tx,
-                                &node.class,
-                                key,
-                                (&node.source, &node.valid, recorded),
-                                &node.properties,
-                            )
-                            .map_err(failed)?;
-                            arrived(&tx, &ontology, &node.class, key, recorded).map_err(failed)?;
-                        }
-                        Heard::Older => {}
-                    }
-                }
-                fact::Fact::Link(link) => {
-                    let entity = link_entity(&link.relation);
-                    let ends = (link.from.key.as_str(), link.to.key.as_str());
-                    match heard(&tx, &ontology, &self.key, stamp, &Of::Link(&link))
-                        .map_err(failed)?
-                    {
-                        Heard::Held(held) => {
-                            if alias(&tx, &held, link.event, event.cursor).map_err(failed)?
-                                && let Some((v, ..)) =
-                                    newest(&tx, (&entity, ends.0, Some(ends.1))).map_err(failed)?
-                            {
-                                put_link(
-                                    &tx,
-                                    &ontology,
-                                    &link.relation,
-                                    ends,
-                                    (&v.source, &v.valid, recorded),
-                                )
-                                .map_err(failed)?;
-                            }
-                        }
-                        Heard::Newest => {
-                            put_link(
-                                &tx,
-                                &ontology,
-                                &link.relation,
-                                ends,
-                                (&link.source, &link.valid, recorded),
-                            )
-                            .map_err(failed)?;
-                        }
-                        Heard::Older => {}
-                    }
-                }
-                fact::Fact::Concluded(conclusion) => {
-                    conclude(&tx, &conclusion).map_err(failed)?;
-                }
-                fact::Fact::Declared | fact::Fact::None => {}
-            }
+            fill_one(&tx, &ontology, &self.key, event, stamp).map_err(failed)?;
         }
         tx.execute(SET_FILLED, [to.0])?;
         tx.commit()?;
         Ok(to)
     }
+}
+
+/// Fills one committed event: a node or link heard into its history and current state, a
+/// conclusion, or a replacement. A fact naming a replaced key lands under the key that replaced
+/// it, with the content identity it was written with.
+fn fill_one(
+    tx: &Connection,
+    ontology: &Ontology,
+    key: &Key,
+    event: &Event,
+    stamp: Stamp,
+) -> Result<(), Error> {
+    let recorded = stamp.recorded;
+    let fact = fact::check(&event.body, ontology)?;
+    let identity = match &fact {
+        fact::Fact::Node(node) => Some(Of::Node(node).identity(key)?),
+        fact::Fact::Link(link) => Some(Of::Link(link).identity(key)?),
+        _ => None,
+    };
+    match (redirect(tx, fact)?, identity) {
+        (fact::Fact::Replaced(replaced), _) => replace(tx, ontology, &replaced)?,
+        (fact::Fact::Node(node), Some(identity)) => {
+            let (entity, at) = (node_entity(&node.class), node.key.as_str());
+            match heard_as(tx, ontology, identity, stamp, &Of::Node(&node))? {
+                Heard::Held(held) => {
+                    if alias(tx, &held, node.event, event.cursor)?
+                        && let Some((v, recorded, _)) = newest(tx, (&entity, at, None))?
+                    {
+                        put_node(
+                            tx,
+                            &node.class,
+                            at,
+                            (&v.source, &v.valid, recorded),
+                            &v.properties,
+                        )?;
+                    }
+                }
+                Heard::Newest => {
+                    put_node(
+                        tx,
+                        &node.class,
+                        at,
+                        (&node.source, &node.valid, recorded),
+                        &node.properties,
+                    )?;
+                    arrived(tx, ontology, &node.class, at, recorded)?;
+                }
+                Heard::Older => {}
+            }
+        }
+        (fact::Fact::Link(link), Some(identity)) => {
+            let entity = link_entity(&link.relation);
+            let ends = (link.from.key.as_str(), link.to.key.as_str());
+            match heard_as(tx, ontology, identity, stamp, &Of::Link(&link))? {
+                Heard::Held(held) => {
+                    if alias(tx, &held, link.event, event.cursor)?
+                        && let Some((v, ..)) = newest(tx, (&entity, ends.0, Some(ends.1)))?
+                    {
+                        put_link(
+                            tx,
+                            ontology,
+                            &link.relation,
+                            ends,
+                            (&v.source, &v.valid, recorded),
+                        )?;
+                    }
+                }
+                Heard::Newest => {
+                    put_link(
+                        tx,
+                        ontology,
+                        &link.relation,
+                        ends,
+                        (&link.source, &link.valid, recorded),
+                    )?;
+                }
+                Heard::Older => {}
+            }
+        }
+        (fact::Fact::Concluded(conclusion), _) => conclude(tx, &conclusion)?,
+        _ => {}
+    }
+    Ok(())
+}
+
+/// `fact` with every node key it names standing under the key that replaced it, so a fact that
+/// arrives after a replacement lands where the replacement moved its node.
+fn redirect(tx: &Connection, fact: fact::Fact) -> Result<fact::Fact, Error> {
+    let at = |r: &mut NodeRef| -> Result<(), Error> {
+        r.key = resolve(tx, &r.class, &r.key)?;
+        Ok(())
+    };
+    Ok(match fact {
+        fact::Fact::Node(mut node) => {
+            node.key = resolve(tx, &node.class, &node.key)?;
+            fact::Fact::Node(node)
+        }
+        fact::Fact::Link(mut link) => {
+            at(&mut link.from)?;
+            at(&mut link.to)?;
+            fact::Fact::Link(link)
+        }
+        fact::Fact::Concluded(mut conclusion) => {
+            at(&mut conclusion.from)?;
+            at(&mut conclusion.to)?;
+            fact::Fact::Concluded(conclusion)
+        }
+        other => other,
+    })
+}
+
+/// Applies `replaced`: records the node's fate, moves its history and links to the key it stands
+/// under now, puts the new node's and the moved links' current state, and keeps the old node as a
+/// row with no properties.
+fn replace(
+    tx: &Connection,
+    ontology: &Ontology,
+    replaced: &rannoch_cloudevents::Replacement,
+) -> Result<(), Error> {
+    let class = ontology.class(&replaced.class)?;
+    let recorded = replaced.event.recorded()?;
+    tx.prepare_cached(RECORD_FATE)?.execute(rusqlite::params![
+        class.name,
+        replaced.old,
+        replaced.new,
+        recorded,
+        replaced.event.to_string()
+    ])?;
+    let target = resolve(tx, &class.name, &replaced.old)?;
+    for link in carry(tx, ontology, (&class.name, &replaced.old, &target))? {
+        let relation = ontology.relation(&link.relation)?;
+        tx.prepare_cached(&drop_link_row(&relation.name, &relation.from, &relation.to))?
+            .execute([&link.old.0, &link.old.1])?;
+        tx.prepare_cached(DROP_OPEN)?
+            .execute([&relation.name, &link.old.0, &link.old.1])?;
+        let ends = (link.new.0.as_str(), link.new.1.as_str());
+        if let Some((v, recorded, _)) =
+            newest(tx, (&link_entity(&relation.name), ends.0, Some(ends.1)))?
+        {
+            put_link(
+                tx,
+                ontology,
+                &relation.name,
+                ends,
+                (&v.source, &v.valid, recorded),
+            )?;
+        }
+    }
+    if let Some((v, at, _)) = newest(tx, (&node_entity(&class.name), &target, None))? {
+        put_node(
+            tx,
+            &class.name,
+            &target,
+            (&v.source, &v.valid, at),
+            &v.properties,
+        )?;
+        arrived(tx, ontology, &class.name, &target, at)?;
+    }
+    if present(tx, &class.name, &replaced.old)? {
+        let names: Vec<&str> = class.properties.keys().map(String::as_str).collect();
+        tx.prepare_cached(&clear_node(&class.name, &names))?
+            .execute([&replaced.old])?;
+    } else {
+        put_node(
+            tx,
+            &class.name,
+            &replaced.old,
+            (&replaced.source, &ValidTime::Unknown, recorded),
+            &BTreeMap::new(),
+        )?;
+    }
+    Ok(())
 }
 
 /// Puts a version of the node keyed `key` into its class's table as its current state, with its
@@ -843,6 +943,116 @@ mod tests {
             snapshot.rebuild(&[], temp("snap-key-back"), &[9; 32]),
             Err(crate::Error::KeyDiffers)
         ));
+        Ok(())
+    }
+
+    /// The node `old` of `class` replaced by `new`, in the event `id`.
+    fn replaced(id: &str, class: &str, old: &str, new: &str) -> String {
+        format!(
+            r#"{{"specversion":"1.0","id":"{id}","source":"rannoch:shop","type":"rannoch.replaced.{class}","subject":"{old}","data":{{"new":"{new}"}}}}"#
+        )
+    }
+
+    /// The shop before b1 is replaced by b2, and the replacement, in that order.
+    fn shop_then_replacement() -> Vec<String> {
+        vec![
+            node("author", "a1", "ann"),
+            node_with(&id_at(1_000), "book", "b1", "old"),
+            node_with(&id_at(2_000), "book", "b1", "new"),
+            node_with(&id_at(1_500), "book", "b2", "two"),
+            link("a1", "b1"),
+            link("a1", "b2"),
+            replaced(&id_at(3_000), "book", "b1", "b2"),
+        ]
+    }
+
+    /// What the replacement left: b1's properties and fate, b2's title, and the counts of b2's
+    /// hearings, the merged link's hearings and the old link's.
+    fn after_replacement(g: &crate::Graph) -> Result<String, Box<dyn std::error::Error>> {
+        let b1 = g.find("book", "b1")?.ok_or("b1 keeps its row")?;
+        let b2 = crate::NodeRef::new("book", "b2");
+        Ok(format!(
+            "{:?} {:?} {:?} {} {} {} {:?}",
+            b1.properties,
+            b1.replaced_by,
+            title(g, "b2")?,
+            g.hearings(&b2)?.len(),
+            g.link_hearings("wrote", "a1", "b2")?.len(),
+            g.link_hearings("wrote", "a1", "b1")?.len(),
+            g.seen(&b2)?.map(|seen| seen.count),
+        ))
+    }
+
+    #[test]
+    fn a_replacement_carries_the_node_s_history_and_links_to_its_new_key()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = graph("replace")?;
+        let events = shop_then_replacement();
+        let bodies: Vec<&str> = events.iter().map(String::as_str).collect();
+        g.commit(&bodies, &[])?;
+        g.fill()?;
+        let b1 = g.find("book", "b1")?.ok_or("b1 keeps its row")?;
+        assert!(b1.properties.is_empty());
+        assert_eq!(b1.replaced_by.as_deref(), Some("b2"));
+        assert_eq!(title(&g, "b2")?, Some(crate::Value::from("new")));
+        assert_eq!(g.hearings(&crate::NodeRef::new("book", "b2"))?.len(), 3);
+        assert_eq!(
+            g.link_hearings("wrote", "a1", "b2")?.len(),
+            2,
+            "the moved link merged"
+        );
+        assert!(g.link_hearings("wrote", "a1", "b1")?.is_empty());
+        assert_eq!(
+            g.seen(&crate::NodeRef::new("book", "b2"))?
+                .map(|seen| seen.count),
+            Some(3)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_replacement_gives_the_same_state_in_any_arrival_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let events = shop_then_replacement();
+        let mut in_order = graph("replace-order")?;
+        in_order.commit(&events.iter().map(String::as_str).collect::<Vec<_>>(), &[])?;
+        in_order.fill()?;
+        let mut shuffled = graph("replace-shuffled")?;
+        let order = [6, 3, 4, 2, 0, 5, 1];
+        shuffled.commit(&order.map(|i| events[i].as_str()), &[])?;
+        shuffled.fill()?;
+        assert_eq!(after_replacement(&shuffled)?, after_replacement(&in_order)?);
+        Ok(())
+    }
+
+    #[test]
+    fn a_node_s_fate_is_the_replacement_greatest_by_point() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut g = graph("fate")?;
+        g.commit(
+            &[
+                &node("book", "x", "one"),
+                &node("book", "y", "two"),
+                &node("book", "z", "three"),
+                &replaced(&id_at(5_000), "book", "x", "y"),
+                &replaced(&id_at(4_000), "book", "x", "z"),
+            ],
+            &[],
+        )?;
+        g.fill()?;
+        assert_eq!(
+            g.find("book", "x")?.ok_or("x")?.replaced_by.as_deref(),
+            Some("y")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn replacing_a_node_by_itself_is_refused() -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = graph("self")?;
+        let results = g.commit(&[&replaced(&id(), "book", "b1", "b1")], &[])?;
+        assert!(results[0].is_ok(), "commit appends without checking");
+        assert!(super::check(&replaced(&id(), "book", "b1", "b1"), g.ontology()).is_err());
         Ok(())
     }
 
