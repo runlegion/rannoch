@@ -15,6 +15,7 @@ mod log;
 mod ontology;
 mod queries;
 mod read;
+mod snapshot;
 
 pub use fact::check;
 pub use history::{At, End, Hearing, Seen, Version};
@@ -23,6 +24,7 @@ pub use log::{Cursor, Event, Events};
 pub use rannoch_cloudevents::{Date, EventId, NodeRef, ValidTime};
 pub use rannoch_ontology::{Class, Declaration, HistoryKey, Ontology, Relation, Value, ValueType};
 pub use read::Node;
+pub use snapshot::Snapshot;
 
 use crate::history::{
     Heard, Key, Of, Stamp, alias, conclude, heard, link_entity, newest, node_entity, take,
@@ -98,13 +100,17 @@ pub(crate) struct Fresh {
 /// [`Error::KeyDiffers`] when the graph holds another key's check value; the file cannot be
 /// opened as a graph file.
 pub fn open(path: impl AsRef<Path>, key: &[u8; 32]) -> Result<Graph, Error> {
+    open_with(path, Key::new(key))
+}
+
+/// Opens the graph at `path` under `key`, as [`open`] does.
+pub(crate) fn open_with(path: impl AsRef<Path>, key: Key) -> Result<Graph, Error> {
     let mut conn = Connection::open(path)?;
     conn.busy_handler(Some(retry_lock))?;
     conn.execute_batch(PRAGMAS)?;
     conn.set_prepared_statement_cache_capacity(256);
     conn.execute_batch(OWN_TABLES)?;
     conn.execute_batch(HISTORY_TABLES)?;
-    let key = Key::new(key);
     take(&mut conn, &key)?;
     let schema_version = schema_version(&conn)?;
     let ontology = load(&conn)?;
@@ -739,6 +745,104 @@ mod tests {
         let mut g = graph("unchecked")?;
         let results = g.commit(&[&node("tweet", "t1", "x")], &[])?;
         assert!(results[0].is_ok(), "{results:?}");
+        Ok(())
+    }
+
+    /// What a reader can ask of `g` about the shop: every event's id and place, and the book,
+    /// its hearings and the link's ending.
+    fn answers(g: &crate::Graph) -> Result<String, Box<dyn std::error::Error>> {
+        let b1 = crate::NodeRef::new("book", "b1");
+        let events: Vec<(String, crate::Cursor)> = g
+            .events()
+            .since(crate::Cursor::START)?
+            .into_iter()
+            .map(|e| (e.id.to_string(), e.cursor))
+            .collect();
+        Ok(format!(
+            "{events:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}",
+            g.find("book", "b1")?,
+            g.find("book", "b2")?,
+            g.hearings(&b1)?,
+            g.seen(&b1)?,
+            g.link_end("wrote", "a1", "b1")?,
+        ))
+    }
+
+    #[test]
+    fn a_graph_rebuilt_from_a_snapshot_answers_as_the_graph_it_came_from()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = graph("snap")?;
+        g.commit(
+            &[
+                &node("author", "a1", "ann"),
+                &node_with(&id_at(1_000), "book", "b1", "old"),
+                &node_with(&id_at(2_000), "book", "b1", "new"),
+                &node_with(&id_at(3_000), "book", "b1", "new"),
+                &link("a1", "b1"),
+            ],
+            &[(0, "shop", "5")],
+        )?;
+        g.fill()?;
+        let at = g.events().committed()?;
+        let handed = g.next("w", at)?.ok_or("nothing handed out")?.cursor;
+        g.commit(
+            &[
+                &node("book", "b2", "later"),
+                &concluded(&id(), "ended", "a1", "b1", 9_000),
+            ],
+            &[],
+        )?;
+        g.fill()?;
+        let path = temp("snap-file");
+        let snapshot = g.snapshot(at, &path)?;
+        assert_eq!(snapshot.cursor(), at);
+        let at_snapshot = open(&path, &KEY)?;
+        assert!(
+            at_snapshot.find("book", "b2")?.is_none(),
+            "state as of the cursor"
+        );
+        assert_eq!(at_snapshot.position("shop")?.as_deref(), Some("5"));
+        assert_eq!(at_snapshot.state("w", handed)?, crate::State::InProgress);
+        let later = g.events().since(at)?;
+        let back = snapshot.rebuild(&later, temp("snap-back"), &KEY)?;
+        assert_eq!(answers(&back)?, answers(&g)?);
+        assert!(back.events().committed()? >= at);
+        Ok(())
+    }
+
+    #[test]
+    fn a_snapshot_is_taken_while_another_connection_holds_the_write_lock()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp("snap-locked");
+        let mut g = open(&path, &KEY)?;
+        g.declare(
+            &Declaration::Class(Class::new("book", ["title"])),
+            r#"{"specversion":"1.0","id":"d-book","source":"rannoch:shop","type":"rannoch.declared.book"}"#,
+        )?;
+        g.commit(&[&node("book", "b1", "hi")], &[])?;
+        let at = g.events().committed()?;
+        let holder = rusqlite::Connection::open(&path)?;
+        holder.execute_batch("BEGIN IMMEDIATE")?;
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            holder.execute_batch("COMMIT")
+        });
+        let snapshot = g.snapshot(at, temp("snap-locked-file"))?;
+        release.join().map_err(|_| "the lock holder panicked")??;
+        let back = snapshot.rebuild(&[], temp("snap-locked-back"), &KEY)?;
+        assert!(back.find("book", "b1")?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn a_snapshot_under_another_key_is_refused() -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = graph("snap-key")?;
+        g.commit(&[&node("book", "b1", "hi")], &[])?;
+        let snapshot = g.snapshot(g.events().committed()?, temp("snap-key-file"))?;
+        assert!(matches!(
+            snapshot.rebuild(&[], temp("snap-key-back"), &[9; 32]),
+            Err(crate::Error::KeyDiffers)
+        ));
         Ok(())
     }
 

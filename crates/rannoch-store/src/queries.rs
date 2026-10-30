@@ -31,6 +31,8 @@ pub(crate) const OWN_TABLES: &str = "
         producer TEXT PRIMARY KEY, position TEXT NOT NULL) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS _places(
         worker TEXT PRIMARY KEY, cursor INTEGER NOT NULL) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS _snapshots(path TEXT PRIMARY KEY, cursor INTEGER NOT NULL)
+        WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS _work(
         worker TEXT NOT NULL, seq INTEGER NOT NULL, reason TEXT,
         PRIMARY KEY(worker, seq)) WITHOUT ROWID;";
@@ -50,6 +52,31 @@ pub(crate) const SET_PLACE: &str = "INSERT INTO _places(worker, cursor) VALUES (
 /// The first event after `?1` and at or below `?2`.
 pub(crate) const NEXT_EVENT: &str =
     "SELECT seq, id, body FROM _events WHERE seq > ?1 AND seq <= ?2 ORDER BY seq LIMIT 1";
+
+pub(crate) const ALL_PLACES: &str = "SELECT worker, cursor FROM _places";
+
+pub(crate) const ALL_WORK: &str = "SELECT worker, seq, reason FROM _work";
+
+pub(crate) const ALL_POSITIONS: &str = "SELECT producer, position FROM _positions";
+
+pub(crate) const PUT_WORK: &str = "INSERT INTO _work(worker, seq, reason) VALUES (?1, ?2, ?3)";
+
+/// Lowers every worker's place past `?1` to it.
+pub(crate) const LOWER_PLACES: &str = "UPDATE _places SET cursor = ?1 WHERE cursor > ?1";
+
+/// Raises the log's high-water mark to at least `?1`.
+pub(crate) const RAISE_HIGH_WATER: &str =
+    "UPDATE sqlite_sequence SET seq = ?1 WHERE name = '_events' AND seq < ?1";
+
+pub(crate) const SET_HIGH_WATER: &str =
+    "INSERT INTO sqlite_sequence(name, seq) VALUES ('_events', ?1)";
+
+/// Records a snapshot taken of this graph, so a purge reaches it.
+pub(crate) const RECORD_SNAPSHOT: &str =
+    "INSERT OR REPLACE INTO _snapshots(path, cursor) VALUES (?1, ?2)";
+
+/// Copies the database to the file `?1`.
+pub(crate) const COPY_INTO: &str = "VACUUM INTO ?1";
 
 /// Worker `?1` joins at the start of the log, if it has no place yet.
 pub(crate) const JOIN_WORKER: &str = "INSERT OR IGNORE INTO _places(worker, cursor) VALUES (?1, 0)";
