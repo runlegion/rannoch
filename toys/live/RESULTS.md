@@ -48,3 +48,17 @@ Seed of 2,000 books (6,320 events), script of 4,930 events (640 of them must be 
 1. **Fill does all-or-nothing work behind a crash, so a store crashing faster than it can fill never recovers (livelock).** `Queue::open` fills the whole backlog in one transaction before it returns (rannoch-queue `lib.rs:113`, `graph.fill()?`), and `fill` commits only at its end. A backlog that takes longer to fill than the time between crashes never commits; the producer cannot accept until open returns. Repro: a copy of the stuck run-1 file (10,675 events, fill at 4,781) takes 516 ms to fill (`src/bin/fillprobe.rs`), longer than the 50-300 ms kill window, so every restart starts over. The amendment run's 600-event backlog took 2.3 s. Before #157 the same backlog filled in about a third of the time and the README's 149-kill run finished. The fix is not this toy's to choose: fill could commit in bounded pieces so progress survives a crash, or fill could get faster (2 and 3).
 2. **Fill throughput fell to a third in two merges.** Clean produce of 300,000: 41,576 events/s before #157, 25,351 after #157 (a savepoint and an inbox write per event), 12,814 after #158 (amend: rename checks and refreshes on every node and link fill). Measured with the same harness on detached worktrees of fdc0d29 and 08d651e.
 3. **An amendment's fill cost grows with the store.** About 4 ms per amendment on the 6,000-event seed, 106 ms on the 22,000-event memory store. One cause: `PLACES_NAMING` (queries.rs) filters with `CASE WHEN ?3 THEN to_key = ?2 ELSE key = ?2 END`, so its plan is `SEARCH _hearings USING INDEX _hearings_at (entity=? AND line=?)` and it walks every hearing of the entity (9,782 for `relation:in`) on each call. There is no index that leads with `to_key`.
+
+## main 7fe3df9 (2026-10-31): after #161 (fill in batches, #159; the common path pays nothing for retries and amend, #160)
+
+Same harness, stores on /Volumes/store, run one at a time. The kill loops are now `kp.sh` (producer) and `ka.sh` (amendments): resumable, each call runs at most `CAP` seconds, and they loop until done with no overall cap.
+
+| Run | Result | Verdict |
+|---|---|---|
+| 1. Clean produce of 300,000, three times | 35,960, 34,716 and 36,872 events/s; verify missing 0, doubled 0, unfilled 0 | Held on correctness. Speed is under #160's 37,418 target here; the legion daemon used a full core throughout (load average 3.2). #161's builder measured 43,757-45,493 on a quiet machine. |
+| 2. Produce under kill -9 every 50-300 ms, uncapped | Finished through 1,621 kills in 544 s; a clean open then verify: missing 0, doubled 0, unfilled 0, position 299999 | Held |
+| 3. Worker, 3,001 events under kill -9 | 623 kills in 42 s; 3,002 done, none in progress | Held |
+| 4. Amendments under kill -9 (2,000 books, 4,930-event script, 640 to refuse) | Seed 2 kills, feed 138; 0 mismatches against the oracle; refused 640, stopped 640; no other fill rows; every refused row at 3 tries; `_open` 0; 141 tries snapshots, none went down or past 3 | Held |
+| 5. Legion's memory, 9,682 reflections | 22,619 events in 1.7 s, none refused or stopped; 0 text mismatches, live sets per repo exact, follows 808/808; 200 amendments and 100 renames, 0 mismatches, 53 ms each (was 106 ms on 3f48131) | Held |
+
+The livelock (bug 1 above) is gone: before #161 the amendment kill run sat at fill 6,325 after 25,800 kills; it now finishes in 140.
