@@ -32,10 +32,10 @@ use crate::inbox::place;
 use crate::log::{append, event_at, store};
 use crate::ontology::{Bound, build, load};
 use crate::queries::{
-    CLOSE_OPEN, COPY_INTO, DONE_RETRY, HISTORY_TABLES, OPEN_LINK, OWN_TABLES, PRAGMAS, RELEASE,
-    RESET_TRIES, RETRY_WORK, ROLLBACK_TO, SAVEPOINT, SCHEMA_VERSION, SET_PLACE, SET_POSITION,
-    SET_TRY_LIMIT, STOPPED_WORK, TRIED_WORK, TRY_LIMIT, delete_link, delete_node, node_id,
-    upsert_link, upsert_node, waiting,
+    ANY_RENAME, CLOSE_OPEN, COPY_INTO, DONE_RETRY, HISTORY_TABLES, OPEN_LINK, OWN_TABLES, PRAGMAS,
+    RELEASE, RESET_TRIES, RETRY_WORK, ROLLBACK_TO, SAVEPOINT, SCHEMA_VERSION, SET_PLACE,
+    SET_POSITION, SET_TRY_LIMIT, STOPPED_WORK, TRIED_WORK, TRY_LIMIT, delete_link, delete_node,
+    node_id, upsert_link, upsert_node, waiting,
 };
 
 /// Why rannoch did not do what was asked.
@@ -302,48 +302,101 @@ impl Graph {
         copied
     }
 
-    /// Fills the ontology's tables from the log, as the inbox's worker [`FILL`], in one
-    /// transaction: every committed event after fill's place, in order, then every event an
-    /// earlier fill failed on and has tried fewer times than the store's try limit. A node is
-    /// written into its class's table under its key; a link into its relation's table between its
-    /// two nodes. An event that cannot be filled, such as one of an undeclared class, rolls back
-    /// alone: it is closed as failed with its reason and one more try, and fill carries on.
-    /// Returns the place filled to.
+    /// Fills the ontology's tables from the log, as the inbox's worker [`FILL`]: every committed
+    /// event after fill's place, in order, then every event an earlier fill failed on and has
+    /// tried fewer times than the store's try limit. A node is written into its class's table
+    /// under its key; a link into its relation's table between its two nodes. The new events are
+    /// filled in batches, each committed with fill's place, so a crash loses at most the batch in
+    /// flight: the first takes about [`FILL_BUDGET`] of work, so a process killed soon after it
+    /// starts still commits progress, and each next one four times as long, up to [`FILL_BUDGET_MAX`],
+    /// so a long fill commits, each commit a full sync, only a few times. An event that cannot be filled, such as one of an undeclared
+    /// class, rolls back alone: it is closed as failed with its reason and one more try, and fill
+    /// carries on. Returns the place filled to.
     ///
     /// # Errors
-    /// The graph file cannot be read or written; nothing of this fill lands.
+    /// The graph file cannot be read or written; the batches committed before it stay.
     pub fn fill(&mut self) -> Result<Cursor, Error> {
+        // Read before the new events fill, so an event that fails among them is not tried twice
+        // in one fill; tried after them, so a cause they fix is fixed by then.
+        let limit: i64 = self.conn.query_row(TRY_LIMIT, [], |row| row.get(0))?;
+        let again: Vec<i64> = self
+            .conn
+            .prepare_cached(RETRY_WORK)?
+            .query_map(params![FILL, limit], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        let high = self.events().committed()?;
+        let mut to = place(&self.conn, FILL)?;
+        let mut budget = FILL_BUDGET;
+        while to < high {
+            to = self.fill_batch(to, high, budget)?;
+            budget = (budget * 4).min(FILL_BUDGET_MAX);
+        }
+        if again.is_empty() {
+            return Ok(to);
+        }
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let ontology = load(&tx)?;
-        let limit: i64 = tx.query_row(TRY_LIMIT, [], |row| row.get(0))?;
-        // Tried again after the new events, so a cause they fix is fixed by then.
-        let again: Vec<i64> = tx
-            .prepare_cached(RETRY_WORK)?
-            .query_map(params![FILL, limit], |row| row.get(0))?
-            .collect::<Result<_, _>>()?;
-        let from = place(&tx, FILL)?;
-        let events = Events { conn: &tx }.since(from)?;
-        let tried = |seq: i64, cause: Error| {
-            tx.prepare_cached(TRIED_WORK)?
-                .execute(params![FILL, seq, cause.to_string()])
-        };
-        for event in &events {
-            if let Err(cause) = attempt(&tx, &ontology, &self.key, event)? {
-                tried(event.cursor.0, cause)?;
-            }
-        }
         for seq in again {
             let Some(event) = event_at(&tx, Cursor(seq))? else {
                 continue;
             };
-            match attempt(&tx, &ontology, &self.key, &event)? {
+            match attempt(&tx, &ontology, &self.key, &event, &mut renamed(&tx)?)? {
                 Ok(()) => tx.prepare_cached(DONE_RETRY)?.execute(params![FILL, seq])?,
-                Err(cause) => tried(seq, cause)?,
+                Err(cause) => tried(&tx, seq, &cause)?,
             };
         }
-        let to = events.last().map_or(from, |event| event.cursor);
+        tx.commit()?;
+        Ok(to)
+    }
+
+    /// Fills the events after `from`, up to `high`, in one transaction that also moves fill's place
+    /// to where it stopped: [`FILL_CHUNK`] positions at a time until `budget` has passed or `high`
+    /// is reached. The batch runs under one savepoint; only when an event in it fails is the
+    /// batch rolled back and filled again one event at a time, so the failure stays alone.
+    fn fill_batch(
+        &mut self,
+        from: Cursor,
+        high: Cursor,
+        budget: std::time::Duration,
+    ) -> Result<Cursor, Error> {
+        let started = std::time::Instant::now();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let ontology = load(&tx)?;
+        let log = Events { conn: &tx };
+        let mut renames = renamed(&tx)?;
+        let before = renames;
+        tx.execute_batch(SAVEPOINT)?;
+        let mut to = from;
+        let mut failed = false;
+        // At least one chunk, so a fill always makes progress.
+        while to < high && !failed {
+            let until = Cursor(to.0.saturating_add(FILL_CHUNK).min(high.0));
+            for event in log.since_until(to, until)? {
+                if fill_one(&tx, &ontology, &self.key, &event, &mut renames).is_err() {
+                    failed = true;
+                    break;
+                }
+            }
+            to = until;
+            if started.elapsed() >= budget {
+                break;
+            }
+        }
+        if failed {
+            tx.execute_batch(ROLLBACK_TO)?;
+            renames = before;
+            for event in log.since_until(from, to)? {
+                if let Err(cause) = attempt(&tx, &ontology, &self.key, &event, &mut renames)? {
+                    tried(&tx, event.cursor.0, &cause)?;
+                }
+            }
+        } else {
+            tx.execute_batch(RELEASE)?;
+        }
         tx.prepare_cached(SET_PLACE)?.execute(params![FILL, to.0])?;
         tx.commit()?;
         Ok(to)
@@ -392,6 +445,21 @@ impl Graph {
     }
 }
 
+/// How long fill works before it commits its first batch.
+pub const FILL_BUDGET: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// The longest fill works before it commits a batch.
+pub const FILL_BUDGET_MAX: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How many log positions fill reads at a time within a batch.
+const FILL_CHUNK: i64 = 256;
+
+/// Records one more failed try of the event at `seq`, with its cause.
+fn tried(tx: &Connection, seq: i64, cause: &Error) -> rusqlite::Result<usize> {
+    tx.prepare_cached(TRIED_WORK)?
+        .execute(params![FILL, seq, cause.to_string()])
+}
+
 /// Fills one event under a savepoint: the outer result is the graph file's, the inner one the
 /// event's, and an event that cannot be filled leaves nothing behind.
 fn attempt(
@@ -399,24 +467,31 @@ fn attempt(
     ontology: &Ontology,
     key: &Key,
     event: &Event,
+    renames: &mut bool,
 ) -> Result<Result<(), Error>, Error> {
     tx.execute_batch(SAVEPOINT)?;
-    let filled = fill_one(tx, ontology, key, event).map_err(|cause| {
+    let before = *renames;
+    let filled = fill_one(tx, ontology, key, event, renames).map_err(|cause| {
         Error::Refused(format!(
             "event at {} cannot be filled: {cause}",
             event.cursor.0
         ))
     });
+    if filled.is_err() {
+        *renames = before;
+    }
     tx.execute_batch(if filled.is_ok() { RELEASE } else { ROLLBACK_TO })?;
     Ok(filled)
 }
 
-/// Writes one event into the ontology's tables.
+/// Writes one event into the ontology's tables. `renames` says whether the store holds any
+/// rename; while it holds none, no event is looked up against renames.
 fn fill_one(
     tx: &Connection,
     ontology: &Ontology,
     store_key: &Key,
     event: &Event,
+    renames: &mut bool,
 ) -> Result<(), Error> {
     let recorded = event.id.recorded().map_err(Error::from)?;
     let stamp = Stamp {
@@ -452,13 +527,19 @@ fn fill_one(
                 }
                 Heard::Older => {}
             }
-            follow(tx, ontology, store_key, event.cursor, &Of::Node(&node))?;
+            if *renames {
+                follow(tx, ontology, store_key, event.cursor, &Of::Node(&node))?;
+            }
         }
-        fact::Fact::Link(link) => fill_link(tx, (ontology, store_key), stamp, &link)?,
+        fact::Fact::Link(link) => fill_link(tx, (ontology, store_key), stamp, &link, *renames)?,
         fact::Fact::Concluded(conclusion) => {
-            conclude(tx, &conclusion)?;
+            conclude(tx, &conclusion, *renames)?;
         }
-        fact::Fact::None => amended(tx, ontology, store_key, event)?,
+        fact::Fact::None => {
+            if amended(tx, ontology, store_key, event)? {
+                *renames = renamed(tx)?;
+            }
+        }
         fact::Fact::Declared => {}
     }
     Ok(())
@@ -472,6 +553,7 @@ fn fill_link(
     (ontology, key): (&Ontology, &Key),
     stamp: Stamp,
     link: &rannoch_cloudevents::LinkFact,
+    renames: bool,
 ) -> Result<(), Error> {
     let entity = link_entity(&link.relation);
     let ends = (link.from.key.as_str(), link.to.key.as_str());
@@ -498,7 +580,10 @@ fn fill_link(
         )?,
         Heard::Older => {}
     }
-    follow(tx, ontology, key, stamp.cursor, &Of::Link(link))
+    if renames {
+        follow(tx, ontology, key, stamp.cursor, &Of::Link(link))?;
+    }
+    Ok(())
 }
 
 /// Whether `body` is an amendment: type `rannoch.amended`.
@@ -507,13 +592,19 @@ fn amendment(body: &str) -> bool {
 }
 
 /// Folds `event` when it is an amendment, and puts what it touched into the tables kept for
-/// speed; any other event that says no fact fills nothing.
-fn amended(tx: &Connection, ontology: &Ontology, key: &Key, event: &Event) -> Result<(), Error> {
+/// speed; any other event that says no fact fills nothing. Says whether it was an amendment.
+fn amended(tx: &Connection, ontology: &Ontology, key: &Key, event: &Event) -> Result<bool, Error> {
     if !amendment(&event.body) {
-        return Ok(());
+        return Ok(false);
     }
     let touched = amend(tx, ontology, key, &event.body, event.cursor)?;
-    refresh(tx, ontology, touched)
+    refresh(tx, ontology, touched)?;
+    Ok(true)
+}
+
+/// Whether the store holds any rename.
+fn renamed(tx: &Connection) -> rusqlite::Result<bool> {
+    tx.query_row(ANY_RENAME, [], |row| row.get(0))
 }
 
 /// Hears the event at `cursor`, whose fact is `of`, again through the renames of the keys it
@@ -1786,6 +1877,133 @@ mod tests {
             title(&g, "b1")?,
             Some(last.into()),
             "the higher event id is on top"
+        );
+        Ok(())
+    }
+
+    thread_local! {
+        static TRACED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "rusqlite's trace callback takes the event by value"
+    )]
+    fn traced(event: rusqlite::trace::TraceEvent<'_>) {
+        if let rusqlite::trace::TraceEvent::Stmt(_, sql) = event {
+            TRACED.with(|t| t.borrow_mut().push(sql.to_owned()));
+        }
+    }
+
+    /// The statements `run` makes on `g`'s connection, in order.
+    fn statements(
+        g: &mut crate::Graph,
+        run: impl FnOnce(&mut crate::Graph) -> Result<crate::Cursor, crate::Error>,
+    ) -> Result<Vec<String>, crate::Error> {
+        TRACED.with(|t| t.borrow_mut().clear());
+        g.conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(traced),
+        );
+        let ran = run(g);
+        g.conn
+            .trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
+        ran?;
+        Ok(TRACED.with(std::cell::RefCell::take))
+    }
+
+    fn books(g: &mut crate::Graph, keys: impl Iterator<Item = usize>) -> Result<(), crate::Error> {
+        let bodies: Vec<String> = keys.map(|i| node("book", &format!("b{i}"), "t")).collect();
+        let refs: Vec<&str> = bodies.iter().map(String::as_str).collect();
+        g.commit(&refs, &[])?;
+        Ok(())
+    }
+
+    #[test]
+    fn fill_commits_in_batches() -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp("batches");
+        let mut g = graph_at(&path)?;
+        books(&mut g, 0..600)?;
+        let high = g.events().committed()?;
+        let from = crate::inbox::place(&g.conn, crate::FILL)?;
+        let to = g.fill_batch(from, high, std::time::Duration::ZERO)?;
+        assert_eq!(
+            to,
+            crate::Cursor(from.0 + crate::FILL_CHUNK),
+            "a batch out of time stops after one chunk"
+        );
+        let other = open(&path, &KEY)?;
+        assert_eq!(
+            crate::inbox::place(&other.conn, crate::FILL)?,
+            to,
+            "the batch is committed with fill's place"
+        );
+        assert!(title(&other, "b0")?.is_some(), "its events are filled");
+        assert!(
+            other.find("book", "b599")?.is_none() || title(&other, "b599")?.is_none(),
+            "events past the batch wait for the next"
+        );
+        assert_eq!(g.fill()?, high, "the next fill carries on from the batch");
+        assert!(title(&g, "b599")?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn a_failure_in_a_batch_fails_alone_and_the_rest_commits()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = graph("batch-failure")?;
+        books(&mut g, 0..300)?;
+        let bad = g
+            .commit(&[&node("film", "f1", "x")], &[])?
+            .remove(0)?
+            .cursor;
+        books(&mut g, 300..600)?;
+        let high = g.events().committed()?;
+        assert_eq!(g.fill()?, high);
+        assert!(matches!(
+            g.state(crate::FILL, bad)?,
+            crate::State::Failed(reason) if reason.contains("film")
+        ));
+        assert_eq!(tries(&g, bad)?, 1, "one try, not one per batch pass");
+        for key in ["b0", "b299", "b300", "b599"] {
+            assert!(title(&g, key)?.is_some(), "{key} is filled");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn events_that_fill_pay_no_savepoint_each() -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = graph("one-savepoint")?;
+        books(&mut g, 0..50)?;
+        let ran = statements(&mut g, crate::Graph::fill)?;
+        let savepoints = ran.iter().filter(|s| s.starts_with("SAVEPOINT")).count();
+        assert_eq!(
+            savepoints, 1,
+            "one savepoint for the batch, not one per event"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_store_with_no_rename_fills_without_rename_lookups()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = graph("no-renames")?;
+        logged(&mut g, &node_with(&id_at(1_000), "author", "a1", "ann"))?;
+        logged(&mut g, &book_at(1_000, "b1", "hi"))?;
+        logged(&mut g, &link_with(&id_at(1_000), "a1", "b1"))?;
+        logged(
+            &mut g,
+            &concluded(&id_at(3_000), "ended", "a1", "b1", 3_000_000),
+        )?;
+        let ran = statements(&mut g, crate::Graph::fill)?;
+        let looked: Vec<&String> = ran
+            .iter()
+            .filter(|s| s.contains("_renames WHERE") || s.contains("_amendments"))
+            .collect();
+        assert!(looked.is_empty(), "rename or amendment lookups: {looked:?}");
+        assert!(
+            g.link_end("wrote", "a1", "b1")?.is_some(),
+            "the ending filled"
         );
         Ok(())
     }
