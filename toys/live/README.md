@@ -38,3 +38,11 @@ Worker, the same loop around `$B work $D` on a graph produced first, then `$B st
 | Worker, clean | about 133 events/s: `next` 3.4 ms, `done` 4.1 ms (one full sync each) |
 
 Two defects these runs found, both fixed: tables left behind the log after a kill between commit and fill (opening the queue now fills), and events stranded in progress after a worker crash (#145, a restarted worker gets them back).
+
+## Amendment and memory runs (2026-10-30)
+
+- `target/release/amend seed|script|feed|check|tries|retry <graph> ...`: a seed of books, authors, links and refusal targets; a script of amendments (valid ones and ones fill must refuse) with an oracle computed from the plan; both fed through the queue with positions, resumable after kill -9. `kill-amend.sh` runs them under kills (`WIDE=1` for a 0.5-3.0 s window).
+- `target/release/memory <slice.jsonl> <graph>`: legion's 9,682-reflection slice (local, never committed), live sets, then amends and renames real linked reflections.
+- `target/release/fillprobe <graph>`: times one fill.
+
+Predictions: PREDICTIONS.md. Results and the bugs they found: RESULTS.md.
