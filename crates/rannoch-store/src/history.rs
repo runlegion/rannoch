@@ -458,7 +458,11 @@ fn edges(
 /// valid time) or a correction (with neither). Every ending is kept, and counts as a fact of the
 /// link; the latest conclusion to arrive replaces any before it, so a correction that came last
 /// masks the endings.
-pub(crate) fn conclude(tx: &Connection, conclusion: &Conclusion) -> Result<(), Error> {
+pub(crate) fn conclude(
+    tx: &Connection,
+    conclusion: &Conclusion,
+    renames: bool,
+) -> Result<(), Error> {
     let Conclusion {
         event,
         source,
@@ -471,7 +475,11 @@ pub(crate) fn conclude(tx: &Connection, conclusion: &Conclusion) -> Result<(), E
     let valid = ended.as_ref().and_then(|(_, valid)| valid.as_text());
     let entity = link_entity(relation);
     // The ends as renamed by now: a conclusion naming a renamed key concludes the renamed link.
+    // A store with no rename is not looked up.
     let now = |end: &NodeRef| -> Result<String, Error> {
+        if !renames {
+            return Ok(end.key.clone());
+        }
         Ok(resolve(
             &renames_in(tx, &node_entity(&end.class))?,
             &end.key,

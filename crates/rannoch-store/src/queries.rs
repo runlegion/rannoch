@@ -206,6 +206,9 @@ pub(crate) const RENAMED: &str =
 pub(crate) const RENAMES_IN: &str =
     "SELECT old, new, point, event FROM _renames WHERE entity = ?1 ORDER BY point, event";
 
+/// Whether the store holds any rename.
+pub(crate) const ANY_RENAME: &str = "SELECT EXISTS (SELECT 1 FROM _renames)";
+
 /// Whether the key `?2` of the class entity `?1` was ever renamed.
 pub(crate) const WAS_RENAMED: &str =
     "SELECT EXISTS (SELECT 1 FROM _renames WHERE entity = ?1 AND old = ?2)";
