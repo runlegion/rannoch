@@ -308,10 +308,11 @@ impl Graph {
     /// under its key; a link into its relation's table between its two nodes. The new events are
     /// filled in batches, each committed with fill's place, so a crash loses at most the batch in
     /// flight: the first takes about [`FILL_BUDGET`] of work, so a process killed soon after it
-    /// starts still commits progress, and each next one four times as long, up to [`FILL_BUDGET_MAX`],
-    /// so a long fill commits, each commit a full sync, only a few times. An event that cannot be filled, such as one of an undeclared
-    /// class, rolls back alone: it is closed as failed with its reason and one more try, and fill
-    /// carries on. Returns the place filled to.
+    /// starts still commits progress, and each next one four times as long, up to
+    /// [`FILL_BUDGET_MAX`], so a long fill commits, each commit a full sync, only a few times. An
+    /// event that cannot be filled, such as one of an undeclared class, rolls back alone: it is
+    /// closed as failed with its reason and one more try, and fill carries on. Returns the place
+    /// filled to.
     ///
     /// # Errors
     /// The graph file cannot be read or written; the batches committed before it stay.
@@ -325,12 +326,14 @@ impl Graph {
             .query_map(params![FILL, limit], |row| row.get(0))?
             .collect::<Result<_, _>>()?;
         let high = self.events().committed()?;
-        let mut to = place(&self.conn, FILL)?;
         let mut budget = FILL_BUDGET;
-        while to < high {
-            to = self.fill_batch(to, high, budget)?;
+        let to = loop {
+            let to = self.fill_batch(high, budget)?;
+            if to >= high {
+                break to;
+            }
             budget = (budget * 4).min(FILL_BUDGET_MAX);
-        }
+        };
         if again.is_empty() {
             return Ok(to);
         }
@@ -351,20 +354,22 @@ impl Graph {
         Ok(to)
     }
 
-    /// Fills the events after `from`, up to `high`, in one transaction that also moves fill's place
-    /// to where it stopped: read [`FILL_CHUNK`] positions at a time, and stopped after the first
-    /// event at which `budget` has passed, or at `high`. The batch runs under one savepoint; only when an event in it fails is the
-    /// batch rolled back and filled again one event at a time, so the failure stays alone.
-    fn fill_batch(
-        &mut self,
-        from: Cursor,
-        high: Cursor,
-        budget: std::time::Duration,
-    ) -> Result<Cursor, Error> {
+    /// Fills the events after fill's place, up to `high`, in one transaction that also moves fill's
+    /// place to where it stopped: read [`FILL_CHUNK`] positions at a time, and stopped after the
+    /// first event at which `budget` has passed, or at `high`. The place is read inside the
+    /// transaction, so another handle filling the same file meanwhile is never filled again and
+    /// the place never moves back. The batch runs under one savepoint; only when an event in it
+    /// fails is the batch rolled back and filled again one event at a time, so the failure stays
+    /// alone.
+    fn fill_batch(&mut self, high: Cursor, budget: Duration) -> Result<Cursor, Error> {
         let started = std::time::Instant::now();
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let from = place(&tx, FILL)?;
+        if from >= high {
+            return Ok(from);
+        }
         let ontology = load(&tx)?;
         let log = Events { conn: &tx };
         let mut renames = renamed(&tx)?;
@@ -449,10 +454,10 @@ impl Graph {
 }
 
 /// How long fill works before it commits its first batch.
-pub const FILL_BUDGET: std::time::Duration = std::time::Duration::from_millis(25);
+pub const FILL_BUDGET: Duration = Duration::from_millis(25);
 
 /// The longest fill works before it commits a batch.
-pub const FILL_BUDGET_MAX: std::time::Duration = std::time::Duration::from_secs(1);
+pub const FILL_BUDGET_MAX: Duration = Duration::from_secs(1);
 
 /// How many log positions fill reads at a time within a batch.
 const FILL_CHUNK: i64 = 256;
@@ -1885,7 +1890,8 @@ mod tests {
     }
 
     thread_local! {
-        static TRACED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+        static TRACED: std::cell::RefCell<Vec<String>> =
+            const { std::cell::RefCell::new(Vec::new()) };
     }
 
     #[expect(
@@ -1929,7 +1935,7 @@ mod tests {
         books(&mut g, 0..600)?;
         let high = g.events().committed()?;
         let from = crate::inbox::place(&g.conn, crate::FILL)?;
-        let to = g.fill_batch(from, high, std::time::Duration::ZERO)?;
+        let to = g.fill_batch(high, std::time::Duration::ZERO)?;
         assert_eq!(
             to,
             crate::Cursor(from.0 + 1),
@@ -1968,7 +1974,7 @@ mod tests {
         let high = g.events().committed()?;
         let mut at = crate::inbox::place(&g.conn, crate::FILL)?;
         while at < high {
-            let next = g.fill_batch(at, high, std::time::Duration::ZERO)?;
+            let next = g.fill_batch(high, std::time::Duration::ZERO)?;
             assert_eq!(
                 next,
                 crate::Cursor(at.0 + 1),
@@ -1977,6 +1983,75 @@ mod tests {
             at = next;
         }
         assert_eq!(title(&g, "b1")?, Some("t19".into()));
+        Ok(())
+    }
+
+    #[test]
+    fn a_batch_starts_from_the_place_another_handle_committed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp("two-handles");
+        let mut a = graph_at(&path)?;
+        books(&mut a, 0..10)?;
+        let bad = a
+            .commit(&[&node("film", "f1", "x")], &[])?
+            .remove(0)?
+            .cursor;
+        let high = a.events().committed()?;
+        let mut b = open(&path, &KEY)?;
+        assert_eq!(b.fill()?, high);
+        assert_eq!(tries(&a, bad)?, 1);
+        assert_eq!(
+            a.fill_batch(high, std::time::Duration::ZERO)?,
+            high,
+            "the batch reads the place b committed"
+        );
+        assert_eq!(
+            crate::inbox::place(&a.conn, crate::FILL)?,
+            high,
+            "never moved back"
+        );
+        assert_eq!(tries(&a, bad)?, 1, "no extra try");
+        Ok(())
+    }
+
+    #[test]
+    fn a_rename_mid_fill_puts_later_events_naming_the_old_key_on_the_new_one()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = graph("rename-mid-fill")?;
+        logged(&mut g, &node_with(&id_at(1_000), "author", "a1", "ann"))?;
+        logged(&mut g, &node_with(&id_at(1_000), "author", "a2", "bo"))?;
+        let b1 = logged(&mut g, &book_at(1_000, "b1", "hi"))?;
+        logged(&mut g, &link_with(&id_at(1_000), "a1", "b1"))?;
+        logged(&mut g, &amended(2_000, b1.id, r#"{"subject":"b9"}"#))?;
+        logged(&mut g, &book_at(3_000, "b1", "later"))?;
+        logged(&mut g, &link_with(&id_at(3_000), "a2", "b1"))?;
+        logged(
+            &mut g,
+            &concluded(&id_at(3_000), "ended", "a1", "b1", 3_000_000),
+        )?;
+        let high = g.events().committed()?;
+        let from = crate::inbox::place(&g.conn, crate::FILL)?;
+        assert_eq!(
+            g.fill_batch(high, std::time::Duration::from_secs(60))?,
+            high,
+            "one batch, so the rename flag turns on inside it"
+        );
+        assert!(from < high);
+        assert_eq!(g.stopped()?, vec![]);
+        assert_eq!(
+            title(&g, "b9")?,
+            Some("later".into()),
+            "the node lands on b9"
+        );
+        assert!(
+            g.link_seen("wrote", "a2", "b9")?.is_some(),
+            "the link lands on b9"
+        );
+        assert!(g.link_seen("wrote", "a2", "b1")?.is_none());
+        assert!(
+            known_link(&g, "b9", 3_500)?.ok_or("a1 wrote b9")?.ended,
+            "the ending lands on b9"
+        );
         Ok(())
     }
 
