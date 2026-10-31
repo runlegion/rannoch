@@ -52,6 +52,18 @@ pub(crate) const SET_PLACE: &str = "INSERT INTO _places(worker, cursor) VALUES (
 pub(crate) const NEXT_EVENT: &str =
     "SELECT seq, id, body FROM _events WHERE seq > ?1 AND seq <= ?2 ORDER BY seq LIMIT 1";
 
+/// Worker `?1` joins at the start of the log, if it has no place yet.
+pub(crate) const JOIN_WORKER: &str = "INSERT OR IGNORE INTO _places(worker, cursor) VALUES (?1, 0)";
+
+/// The processed mark: for each worker, the point before its oldest event in progress or else
+/// its place; the lowest of those. Null when there is no worker.
+pub(crate) const PROCESSED: &str = "SELECT MIN(COALESCE((SELECT MIN(w.seq) - 1 FROM _work w \
+     WHERE w.worker = p.worker AND w.reason IS NULL), p.cursor)) FROM _places p";
+
+pub(crate) const REMOVE_PLACE: &str = "DELETE FROM _places WHERE worker = ?1";
+
+pub(crate) const REMOVE_WORK: &str = "DELETE FROM _work WHERE worker = ?1";
+
 /// Worker `?1`'s events still in progress, oldest first.
 pub(crate) const OPEN_WORK: &str =
     "SELECT seq FROM _work WHERE worker = ?1 AND reason IS NULL ORDER BY seq";
@@ -479,6 +491,9 @@ pub(crate) const APPEND_EVENT: &str = "INSERT INTO _events(seq, body, id) VALUES
 
 pub(crate) const HIGH_WATER: &str =
     "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = '_events'), 0)";
+
+/// Writes a copy of the database into the empty file at `?1`, read in one read transaction.
+pub(crate) const COPY_INTO: &str = "VACUUM INTO ?1";
 
 pub(crate) const EVENT_AT: &str = "SELECT id, body FROM _events WHERE seq = ?1";
 
