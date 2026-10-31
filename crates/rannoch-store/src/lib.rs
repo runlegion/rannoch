@@ -352,8 +352,8 @@ impl Graph {
     }
 
     /// Fills the events after `from`, up to `high`, in one transaction that also moves fill's place
-    /// to where it stopped: [`FILL_CHUNK`] positions at a time until `budget` has passed or `high`
-    /// is reached. The batch runs under one savepoint; only when an event in it fails is the
+    /// to where it stopped: read [`FILL_CHUNK`] positions at a time, and stopped after the first
+    /// event at which `budget` has passed, or at `high`. The batch runs under one savepoint; only when an event in it fails is the
     /// batch rolled back and filled again one event at a time, so the failure stays alone.
     fn fill_batch(
         &mut self,
@@ -372,19 +372,22 @@ impl Graph {
         tx.execute_batch(SAVEPOINT)?;
         let mut to = from;
         let mut failed = false;
-        // At least one chunk, so a fill always makes progress.
-        while to < high && !failed {
+        // The budget is checked after each event, so every batch commits at least one event and
+        // progress never depends on how costly the events in a chunk are.
+        'chunks: while to < high && !failed {
             let until = Cursor(to.0.saturating_add(FILL_CHUNK).min(high.0));
             for event in log.since_until(to, until)? {
                 if fill_one(&tx, &ontology, &self.key, &event, &mut renames).is_err() {
+                    to = event.cursor;
                     failed = true;
-                    break;
+                    break 'chunks;
+                }
+                if started.elapsed() >= budget {
+                    to = event.cursor;
+                    break 'chunks;
                 }
             }
             to = until;
-            if started.elapsed() >= budget {
-                break;
-            }
         }
         if failed {
             tx.execute_batch(ROLLBACK_TO)?;
@@ -1929,8 +1932,8 @@ mod tests {
         let to = g.fill_batch(from, high, std::time::Duration::ZERO)?;
         assert_eq!(
             to,
-            crate::Cursor(from.0 + crate::FILL_CHUNK),
-            "a batch out of time stops after one chunk"
+            crate::Cursor(from.0 + 1),
+            "a batch out of time stops after one event"
         );
         let other = open(&path, &KEY)?;
         assert_eq!(
@@ -1938,13 +1941,42 @@ mod tests {
             to,
             "the batch is committed with fill's place"
         );
-        assert!(title(&other, "b0")?.is_some(), "its events are filled");
         assert!(
-            other.find("book", "b599")?.is_none() || title(&other, "b599")?.is_none(),
+            title(&other, "b599")?.is_none(),
             "events past the batch wait for the next"
         );
         assert_eq!(g.fill()?, high, "the next fill carries on from the batch");
         assert!(title(&g, "b599")?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn a_batch_out_of_time_on_amendments_still_commits_one()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut g, b1, _) = wrote_b1("costly-batch")?;
+        let amendments: Vec<String> = (0..20)
+            .map(|i| {
+                amended(
+                    2_000 + i,
+                    b1.id,
+                    &format!(r#"{{"data":{{"properties":{{"title":"t{i}"}}}}}}"#),
+                )
+            })
+            .collect();
+        let refs: Vec<&str> = amendments.iter().map(String::as_str).collect();
+        g.commit(&refs, &[])?;
+        let high = g.events().committed()?;
+        let mut at = crate::inbox::place(&g.conn, crate::FILL)?;
+        while at < high {
+            let next = g.fill_batch(at, high, std::time::Duration::ZERO)?;
+            assert_eq!(
+                next,
+                crate::Cursor(at.0 + 1),
+                "each batch commits one amendment"
+            );
+            at = next;
+        }
+        assert_eq!(title(&g, "b1")?, Some("t19".into()));
         Ok(())
     }
 
