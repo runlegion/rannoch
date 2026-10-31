@@ -30,9 +30,9 @@ use crate::history::{
 use crate::log::{append, store};
 use crate::ontology::{Bound, build, load};
 use crate::queries::{
-    CLOSE_OPEN, FILLED, HISTORY_TABLES, OPEN_LINK, OWN_TABLES, PRAGMAS, RELEASE, ROLLBACK_TO,
-    SAVEPOINT, SCHEMA_VERSION, SET_FILLED, SET_POSITION, node_id, upsert_link, upsert_node,
-    waiting,
+    CLOSE_OPEN, COPY_INTO, FILLED, HISTORY_TABLES, OPEN_LINK, OWN_TABLES, PRAGMAS, RELEASE,
+    ROLLBACK_TO, SAVEPOINT, SCHEMA_VERSION, SET_FILLED, SET_POSITION, node_id, upsert_link,
+    upsert_node, waiting,
 };
 
 /// Why rannoch did not do what was asked.
@@ -265,6 +265,38 @@ impl Graph {
         }
         tx.commit()?;
         Ok(results)
+    }
+
+    /// Writes a copy of the store at one committed point into a new file at `path`, and returns
+    /// the cursor that copy holds. The copy is read in one read transaction, so it takes no write
+    /// lock and a writer on another connection commits meanwhile; nothing after the returned
+    /// cursor is in it. Nothing is recorded in the store: the copy is outside it, like a backup.
+    ///
+    /// # Errors
+    /// [`Error::Refused`] when `path` already exists or cannot be created; the copy cannot be
+    /// written. A copy that fails leaves no file at `path`.
+    pub fn copy_to(&self, path: impl AsRef<Path>) -> Result<Cursor, Error> {
+        let path = path.as_ref();
+        let shown = path.display();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|e| Error::Refused(format!("cannot make a copy at {shown}: {e}")))?;
+        let copied = (|| {
+            let into = path
+                .to_str()
+                .ok_or_else(|| Error::Refused(format!("the copy's path {shown} is not UTF-8")))?;
+            self.conn.execute(COPY_INTO, [into])?;
+            Events {
+                conn: &Connection::open(path)?,
+            }
+            .committed()
+        })();
+        if copied.is_err() {
+            let _ = std::fs::remove_file(path);
+        }
+        copied
     }
 
     /// Fills the ontology's tables from the log: every committed event after the last one
@@ -533,7 +565,11 @@ mod tests {
     }
 
     fn graph(name: &str) -> Result<crate::Graph, crate::Error> {
-        let mut g = open(temp(name), &KEY)?;
+        graph_at(&temp(name))
+    }
+
+    fn graph_at(path: &std::path::Path) -> Result<crate::Graph, crate::Error> {
+        let mut g = open(path, &KEY)?;
         let declared = |name: &str| {
             format!(
                 r#"{{"specversion":"1.0","id":"d-{name}","source":"rannoch:shop","type":"rannoch.declared.{name}"}}"#
@@ -794,6 +830,105 @@ mod tests {
             .filter(|e| e.body.contains("rannoch.closed.wrote"))
             .count();
         assert_eq!(closings, 1, "its closing is logged once");
+        Ok(())
+    }
+
+    #[test]
+    fn a_copy_answers_as_the_store_at_its_cursor() -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = graph("copied")?;
+        g.commit(
+            &[
+                &node("author", "a1", "ann"),
+                &node("book", "b1", "hi"),
+                &link("a1", "b1"),
+            ],
+            &[],
+        )?;
+        g.fill()?;
+        let log = g.events().since(crate::Cursor::START)?;
+        let schema = |g: &crate::Graph| -> rusqlite::Result<Vec<String>> {
+            g.conn
+                .prepare("SELECT name FROM sqlite_master ORDER BY name")?
+                .query_map([], |row| row.get(0))?
+                .collect()
+        };
+        let tables = schema(&g)?;
+        let path = temp("copy");
+        let at = g.copy_to(&path)?;
+        assert_eq!(at, g.events().committed()?);
+        assert_eq!(
+            g.events().since(crate::Cursor::START)?,
+            log,
+            "the log is unchanged"
+        );
+        assert_eq!(schema(&g)?, tables, "no table is added for the copy");
+        g.commit(&[&node("book", "b2", "later")], &[])?;
+        g.fill()?;
+        let copy = open(&path, &KEY)?;
+        assert_eq!(copy.events().committed()?, at);
+        assert_eq!(copy.events().since(crate::Cursor::START)?, log);
+        assert_eq!(title(&copy, "b1")?, title(&g, "b1")?);
+        assert_eq!(
+            copy.link_seen("wrote", "a1", "b1")?,
+            g.link_seen("wrote", "a1", "b1")?
+        );
+        let b1 = crate::NodeRef::new("book", "b1");
+        assert_eq!(copy.hearings(&b1)?, g.hearings(&b1)?);
+        assert!(
+            copy.find("book", "b2")?.is_none(),
+            "nothing after the cursor"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_copy_is_made_while_another_connection_writes() -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp("busy");
+        let mut g = graph_at(&path)?;
+        g.commit(&[&node("book", "b1", "hi")], &[])?;
+        let before = g.events().committed()?;
+        let writer = open(&path, &KEY)?;
+        writer.conn.execute_batch("BEGIN IMMEDIATE")?;
+        crate::log::append(&writer.conn, &node("book", "b2", "yo"))?;
+        let started = std::time::Instant::now();
+        let at = g.copy_to(temp("busy-copy"))?;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "the copy did not wait"
+        );
+        writer.conn.execute_batch("COMMIT")?;
+        assert_eq!(
+            at, before,
+            "the copy holds the point committed when it was made"
+        );
+        assert!(g.events().committed()? > at, "the writer committed");
+        Ok(())
+    }
+
+    #[test]
+    fn a_copy_refuses_a_path_that_exists() -> Result<(), Box<dyn std::error::Error>> {
+        let g = graph("exists")?;
+        let path = temp("taken");
+        std::fs::write(&path, "")?;
+        assert!(matches!(g.copy_to(&path), Err(crate::Error::Refused(_))));
+        assert_eq!(
+            std::fs::metadata(&path)?.len(),
+            0,
+            "the file is left as it was"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_copy_leaves_no_file() -> Result<(), Box<dyn std::error::Error>> {
+        let g = graph("fails")?;
+        g.conn.execute_batch("BEGIN")?;
+        let path = temp("failed");
+        assert!(
+            g.copy_to(&path).is_err(),
+            "a copy cannot be made inside a transaction"
+        );
+        assert!(!path.exists());
         Ok(())
     }
 }
