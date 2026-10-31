@@ -11,6 +11,10 @@ use crate::queries::{
 };
 use crate::{Error, Graph};
 
+/// The inbox worker that fill runs as: its place is the last event filled, and its failed rows
+/// are the events fill could not fill. A worker of an app must not take this name.
+pub const FILL: &str = "rannoch.fill";
+
 /// Where a committed event stands for one worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum State {
@@ -177,7 +181,7 @@ fn in_progress(closed: usize, worker: &str, cursor: Cursor) -> Result<(), Error>
 }
 
 /// Worker `worker`'s place, or [`Cursor::START`] before its first event.
-fn place(conn: &rusqlite::Connection, worker: &str) -> Result<Cursor, Error> {
+pub(crate) fn place(conn: &rusqlite::Connection, worker: &str) -> Result<Cursor, Error> {
     Ok(Cursor(
         conn.prepare_cached(PLACE)?
             .query_row([worker], |row| row.get(0))

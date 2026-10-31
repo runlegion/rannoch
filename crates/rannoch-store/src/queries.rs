@@ -24,15 +24,16 @@ pub(crate) const OWN_TABLES: &str = "
         source TEXT NOT NULL, valid TEXT,
         PRIMARY KEY(rel, from_key, to_key)) WITHOUT ROWID;
     CREATE INDEX IF NOT EXISTS _open_to ON _open(rel, to_key);
-    CREATE TABLE IF NOT EXISTS _filled(one INTEGER PRIMARY KEY CHECK (one = 1),
-        cursor INTEGER NOT NULL);
-    INSERT OR IGNORE INTO _filled(one, cursor) VALUES (1, 0);
+    CREATE TABLE IF NOT EXISTS _fill(one INTEGER PRIMARY KEY CHECK (one = 1),
+        try_limit INTEGER NOT NULL);
+    INSERT OR IGNORE INTO _fill(one, try_limit) VALUES (1, 3);
     CREATE TABLE IF NOT EXISTS _positions(
         producer TEXT PRIMARY KEY, position TEXT NOT NULL) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS _places(
         worker TEXT PRIMARY KEY, cursor INTEGER NOT NULL) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS _work(
         worker TEXT NOT NULL, seq INTEGER NOT NULL, reason TEXT,
+        tries INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY(worker, seq)) WITHOUT ROWID;";
 
 /// Sets producer `?1`'s position in its source to `?2`.
@@ -80,6 +81,32 @@ pub(crate) const DONE_WORK: &str =
 /// Closes event `?2` in progress for worker `?1` as failed with reason `?3`.
 pub(crate) const FAIL_WORK: &str =
     "UPDATE _work SET reason = ?3 WHERE worker = ?1 AND seq = ?2 AND reason IS NULL";
+
+/// The store's try limit: how many times fill tries an event before it stops.
+pub(crate) const TRY_LIMIT: &str = "SELECT try_limit FROM _fill WHERE one = 1";
+
+pub(crate) const SET_TRY_LIMIT: &str = "UPDATE _fill SET try_limit = ?1 WHERE one = 1";
+
+/// Worker `?1`'s failed events tried fewer than `?2` times, oldest first.
+pub(crate) const RETRY_WORK: &str = "SELECT seq FROM _work \
+     WHERE worker = ?1 AND reason IS NOT NULL AND tries < ?2 ORDER BY seq";
+
+/// Worker `?1`'s failed events tried `?2` times or more, oldest first, with their last reason.
+pub(crate) const STOPPED_WORK: &str = "SELECT seq, reason FROM _work \
+     WHERE worker = ?1 AND reason IS NOT NULL AND tries >= ?2 ORDER BY seq";
+
+/// Event `?2` failed for worker `?1` with reason `?3`: its first try, or one more.
+pub(crate) const TRIED_WORK: &str = "INSERT INTO _work(worker, seq, reason, tries) \
+     VALUES (?1, ?2, ?3, 1) \
+     ON CONFLICT(worker, seq) DO UPDATE SET reason = excluded.reason, tries = tries + 1";
+
+/// Closes event `?2`, failed for worker `?1`, as done.
+pub(crate) const DONE_RETRY: &str =
+    "DELETE FROM _work WHERE worker = ?1 AND seq = ?2 AND reason IS NOT NULL";
+
+/// Sets the tries of event `?2`, failed for worker `?1`, back to none.
+pub(crate) const RESET_TRIES: &str =
+    "UPDATE _work SET tries = 0 WHERE worker = ?1 AND seq = ?2 AND reason IS NOT NULL";
 
 /// rannoch's history tables (oracle history.rs:21-54). The hearings, one version row each, with
 /// no valid-to: `arrived` counts up as this store records them, `integer` is set only in an
@@ -436,10 +463,6 @@ pub(crate) fn hearings() -> String {
         order("ASC")
     )
 }
-
-pub(crate) const FILLED: &str = "SELECT cursor FROM _filled WHERE one = 1";
-
-pub(crate) const SET_FILLED: &str = "UPDATE _filled SET cursor = ?1 WHERE one = 1";
 
 /// Puts a link that waits for an end into `_open`, or updates the one already waiting.
 pub(crate) const OPEN_LINK: &str = "INSERT INTO _open(rel, from_key, to_key, source, valid) \

@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 mod fact;
 mod history;
@@ -18,7 +18,7 @@ mod read;
 
 pub use fact::check;
 pub use history::{At, End, Hearing, Seen, Version};
-pub use inbox::State;
+pub use inbox::{FILL, State};
 pub use log::{Cursor, Event, Events};
 pub use rannoch_cloudevents::{Date, EventId, NodeRef, ValidTime};
 pub use rannoch_ontology::{Class, Declaration, HistoryKey, Ontology, Relation, Value, ValueType};
@@ -27,12 +27,13 @@ pub use read::Node;
 use crate::history::{
     Heard, Key, Of, Stamp, alias, conclude, heard, link_entity, newest, node_entity, take,
 };
-use crate::log::{append, store};
+use crate::inbox::place;
+use crate::log::{append, event_at, store};
 use crate::ontology::{Bound, build, load};
 use crate::queries::{
-    CLOSE_OPEN, COPY_INTO, FILLED, HISTORY_TABLES, OPEN_LINK, OWN_TABLES, PRAGMAS, RELEASE,
-    ROLLBACK_TO, SAVEPOINT, SCHEMA_VERSION, SET_FILLED, SET_POSITION, node_id, upsert_link,
-    upsert_node, waiting,
+    CLOSE_OPEN, COPY_INTO, DONE_RETRY, HISTORY_TABLES, OPEN_LINK, OWN_TABLES, PRAGMAS, RELEASE,
+    RESET_TRIES, RETRY_WORK, ROLLBACK_TO, SAVEPOINT, SCHEMA_VERSION, SET_PLACE, SET_POSITION,
+    SET_TRY_LIMIT, STOPPED_WORK, TRIED_WORK, TRY_LIMIT, node_id, upsert_link, upsert_node, waiting,
 };
 
 /// Why rannoch did not do what was asked.
@@ -299,113 +300,192 @@ impl Graph {
         copied
     }
 
-    /// Fills the ontology's tables from the log: every committed event after the last one
-    /// filled, in order, in one transaction. A node is written into its class's table under its
-    /// key; a link into its relation's table between its two nodes. Returns the place filled to.
+    /// Fills the ontology's tables from the log, as the inbox's worker [`FILL`], in one
+    /// transaction: every committed event after fill's place, in order, then every event an
+    /// earlier fill failed on and has tried fewer times than the store's try limit. A node is
+    /// written into its class's table under its key; a link into its relation's table between its
+    /// two nodes. An event that cannot be filled, such as one of an undeclared class, rolls back
+    /// alone: it is closed as failed with its reason and one more try, and fill carries on.
+    /// Returns the place filled to.
     ///
     /// # Errors
-    /// An event cannot be filled, such as a link whose end is not in its class's table: nothing
-    /// of this fill lands, and the error names the event's place.
+    /// The graph file cannot be read or written; nothing of this fill lands.
     pub fn fill(&mut self) -> Result<Cursor, Error> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let ontology = load(&tx)?;
-        let from = Cursor(tx.prepare_cached(FILLED)?.query_row([], |row| row.get(0))?);
+        let limit: i64 = tx.query_row(TRY_LIMIT, [], |row| row.get(0))?;
+        // Tried again after the new events, so a cause they fix is fixed by then.
+        let again: Vec<i64> = tx
+            .prepare_cached(RETRY_WORK)?
+            .query_map(params![FILL, limit], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        let from = place(&tx, FILL)?;
         let events = Events { conn: &tx }.since(from)?;
-        let mut to = from;
+        let tried = |seq: i64, cause: Error| {
+            tx.prepare_cached(TRIED_WORK)?
+                .execute(params![FILL, seq, cause.to_string()])
+        };
         for event in &events {
-            let failed = |cause: Error| {
-                Error::Refused(format!(
-                    "event at {} cannot be filled: {cause}",
-                    event.cursor.0
-                ))
-            };
-            to = event.cursor;
-            let recorded = event.id.recorded().map_err(Error::from).map_err(failed)?;
-            let stamp = Stamp {
-                cursor: event.cursor,
-                recorded,
-            };
-            match fact::check(&event.body, &ontology).map_err(failed)? {
-                fact::Fact::Node(node) => {
-                    let (entity, key) = (node_entity(&node.class), node.key.as_str());
-                    match heard(&tx, &ontology, &self.key, stamp, &Of::Node(&node))
-                        .map_err(failed)?
-                    {
-                        Heard::Held(held) => {
-                            if alias(&tx, &held, node.event, event.cursor).map_err(failed)?
-                                && let Some((v, recorded, _)) =
-                                    newest(&tx, (&entity, key, None)).map_err(failed)?
-                            {
-                                put_node(
-                                    &tx,
-                                    &node.class,
-                                    key,
-                                    (&v.source, &v.valid, recorded),
-                                    &v.properties,
-                                )
-                                .map_err(failed)?;
-                            }
-                        }
-                        Heard::Newest => {
-                            put_node(
-                                &tx,
-                                &node.class,
-                                key,
-                                (&node.source, &node.valid, recorded),
-                                &node.properties,
-                            )
-                            .map_err(failed)?;
-                            arrived(&tx, &ontology, &node.class, key, recorded).map_err(failed)?;
-                        }
-                        Heard::Older => {}
-                    }
-                }
-                fact::Fact::Link(link) => {
-                    let entity = link_entity(&link.relation);
-                    let ends = (link.from.key.as_str(), link.to.key.as_str());
-                    match heard(&tx, &ontology, &self.key, stamp, &Of::Link(&link))
-                        .map_err(failed)?
-                    {
-                        Heard::Held(held) => {
-                            if alias(&tx, &held, link.event, event.cursor).map_err(failed)?
-                                && let Some((v, ..)) =
-                                    newest(&tx, (&entity, ends.0, Some(ends.1))).map_err(failed)?
-                            {
-                                put_link(
-                                    &tx,
-                                    &ontology,
-                                    &link.relation,
-                                    ends,
-                                    (&v.source, &v.valid, recorded),
-                                )
-                                .map_err(failed)?;
-                            }
-                        }
-                        Heard::Newest => {
-                            put_link(
-                                &tx,
-                                &ontology,
-                                &link.relation,
-                                ends,
-                                (&link.source, &link.valid, recorded),
-                            )
-                            .map_err(failed)?;
-                        }
-                        Heard::Older => {}
-                    }
-                }
-                fact::Fact::Concluded(conclusion) => {
-                    conclude(&tx, &conclusion).map_err(failed)?;
-                }
-                fact::Fact::Declared | fact::Fact::None => {}
+            if let Err(cause) = attempt(&tx, &ontology, &self.key, event)? {
+                tried(event.cursor.0, cause)?;
             }
         }
-        tx.execute(SET_FILLED, [to.0])?;
+        for seq in again {
+            let Some(event) = event_at(&tx, Cursor(seq))? else {
+                continue;
+            };
+            match attempt(&tx, &ontology, &self.key, &event)? {
+                Ok(()) => tx.prepare_cached(DONE_RETRY)?.execute(params![FILL, seq])?,
+                Err(cause) => tried(seq, cause)?,
+            };
+        }
+        let to = events.last().map_or(from, |event| event.cursor);
+        tx.prepare_cached(SET_PLACE)?.execute(params![FILL, to.0])?;
         tx.commit()?;
         Ok(to)
     }
+
+    /// Sets the store's try limit: how many times fill tries an event before it stops (3 until
+    /// set).
+    ///
+    /// # Errors
+    /// The graph file cannot be written.
+    pub fn set_try_limit(&mut self, limit: u32) -> Result<(), Error> {
+        self.conn.execute(SET_TRY_LIMIT, [limit])?;
+        Ok(())
+    }
+
+    /// The events fill has stopped trying, oldest first, each with the reason its last try
+    /// failed.
+    ///
+    /// # Errors
+    /// The graph file cannot be read.
+    pub fn stopped(&self) -> Result<Vec<(Cursor, String)>, Error> {
+        let limit: i64 = self.conn.query_row(TRY_LIMIT, [], |row| row.get(0))?;
+        Ok(self
+            .conn
+            .prepare_cached(STOPPED_WORK)?
+            .query_map(params![FILL, limit], |row| {
+                Ok((Cursor(row.get(0)?), row.get(1)?))
+            })?
+            .collect::<Result<_, _>>()?)
+    }
+
+    /// Sets the tries of the event at `cursor`, which fill failed on, back to none, so the next
+    /// fill tries it again.
+    ///
+    /// # Errors
+    /// [`Error::Refused`] when fill has not failed on that event; the graph file cannot be
+    /// written.
+    pub fn retry(&mut self, cursor: Cursor) -> Result<(), Error> {
+        if self.conn.execute(RESET_TRIES, params![FILL, cursor.0])? == 0 {
+            return Err(Error::Refused(format!(
+                "fill has not failed on the event at {}",
+                cursor.0
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Fills one event under a savepoint: the outer result is the graph file's, the inner one the
+/// event's, and an event that cannot be filled leaves nothing behind.
+fn attempt(
+    tx: &Connection,
+    ontology: &Ontology,
+    key: &Key,
+    event: &Event,
+) -> Result<Result<(), Error>, Error> {
+    tx.execute_batch(SAVEPOINT)?;
+    let filled = fill_one(tx, ontology, key, event).map_err(|cause| {
+        Error::Refused(format!(
+            "event at {} cannot be filled: {cause}",
+            event.cursor.0
+        ))
+    });
+    tx.execute_batch(if filled.is_ok() { RELEASE } else { ROLLBACK_TO })?;
+    Ok(filled)
+}
+
+/// Writes one event into the ontology's tables.
+fn fill_one(
+    tx: &Connection,
+    ontology: &Ontology,
+    store_key: &Key,
+    event: &Event,
+) -> Result<(), Error> {
+    let recorded = event.id.recorded().map_err(Error::from)?;
+    let stamp = Stamp {
+        cursor: event.cursor,
+        recorded,
+    };
+    match fact::check(&event.body, ontology)? {
+        fact::Fact::Node(node) => {
+            let (entity, key) = (node_entity(&node.class), node.key.as_str());
+            match heard(tx, ontology, store_key, stamp, &Of::Node(&node))? {
+                Heard::Held(held) => {
+                    if alias(tx, &held, node.event, event.cursor)?
+                        && let Some((v, recorded, _)) = newest(tx, (&entity, key, None))?
+                    {
+                        put_node(
+                            tx,
+                            &node.class,
+                            key,
+                            (&v.source, &v.valid, recorded),
+                            &v.properties,
+                        )?;
+                    }
+                }
+                Heard::Newest => {
+                    put_node(
+                        tx,
+                        &node.class,
+                        key,
+                        (&node.source, &node.valid, recorded),
+                        &node.properties,
+                    )?;
+                    arrived(tx, ontology, &node.class, key, recorded)?;
+                }
+                Heard::Older => {}
+            }
+        }
+        fact::Fact::Link(link) => {
+            let entity = link_entity(&link.relation);
+            let ends = (link.from.key.as_str(), link.to.key.as_str());
+            match heard(tx, ontology, store_key, stamp, &Of::Link(&link))? {
+                Heard::Held(held) => {
+                    if alias(tx, &held, link.event, event.cursor)?
+                        && let Some((v, ..)) = newest(tx, (&entity, ends.0, Some(ends.1)))?
+                    {
+                        put_link(
+                            tx,
+                            ontology,
+                            &link.relation,
+                            ends,
+                            (&v.source, &v.valid, recorded),
+                        )?;
+                    }
+                }
+                Heard::Newest => {
+                    put_link(
+                        tx,
+                        ontology,
+                        &link.relation,
+                        ends,
+                        (&link.source, &link.valid, recorded),
+                    )?;
+                }
+                Heard::Older => {}
+            }
+        }
+        fact::Fact::Concluded(conclusion) => {
+            conclude(tx, &conclusion)?;
+        }
+        fact::Fact::Declared | fact::Fact::None => {}
+    }
+    Ok(())
 }
 
 /// Puts a version of the node keyed `key` into its class's table as its current state, with its
@@ -929,6 +1009,146 @@ mod tests {
             "a copy cannot be made inside a transaction"
         );
         assert!(!path.exists());
+        Ok(())
+    }
+
+    fn declare_film(g: &mut crate::Graph) -> Result<(), crate::Error> {
+        g.declare(
+            &Declaration::Class(Class::new("film", ["title"])),
+            r#"{"specversion":"1.0","id":"d-film","source":"rannoch:shop","type":"rannoch.declared.film"}"#,
+        )?;
+        Ok(())
+    }
+
+    fn tries(g: &crate::Graph, cursor: crate::Cursor) -> rusqlite::Result<i64> {
+        g.conn.query_row(
+            "SELECT tries FROM _work WHERE worker = ?1 AND seq = ?2",
+            rusqlite::params![crate::FILL, cursor.0],
+            |row| row.get(0),
+        )
+    }
+
+    fn film(g: &crate::Graph, key: &str) -> Result<Option<crate::Value>, crate::Error> {
+        Ok(g.find("film", key)?
+            .and_then(|node| node.properties.get("title").cloned()))
+    }
+
+    #[test]
+    fn fill_takes_events_through_the_inbox() -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = graph("inbox-fill")?;
+        g.commit(&[&node("book", "b1", "hi")], &[])?;
+        let to = g.fill()?;
+        g.commit(&[&node("book", "b2", "yo")], &[])?;
+        assert_eq!(g.state(crate::FILL, to)?, crate::State::Done);
+        assert_eq!(
+            g.state(crate::FILL, g.events().committed()?)?,
+            crate::State::Waiting
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_event_fill_cannot_apply_fails_alone() -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = graph("fails-alone")?;
+        let landed = g.commit(&[&node("film", "f1", "x"), &node("book", "b1", "hi")], &[])?;
+        let f1 = landed[0].as_ref().map_err(ToString::to_string)?.cursor;
+        g.fill()?;
+        assert!(
+            matches!(g.state(crate::FILL, f1)?, crate::State::Failed(reason) if reason.contains("film"))
+        );
+        assert_eq!(tries(&g, f1)?, 1);
+        assert_eq!(title(&g, "b1")?, Some("hi".into()), "fill carried on");
+        g.commit(&[&node("book", "b2", "yo")], &[])?;
+        g.fill()?;
+        assert_eq!(tries(&g, f1)?, 2, "one more try");
+        assert_eq!(title(&g, "b2")?, Some("yo".into()));
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_event_filled_later_reads_as_if_filled_first_time()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let body = node("film", "f1", "x");
+        let mut late = graph("late-film")?;
+        let landed = late.commit(&[&body], &[])?;
+        let f1 = landed[0].as_ref().map_err(ToString::to_string)?.cursor;
+        late.fill()?;
+        declare_film(&mut late)?;
+        late.fill()?;
+        assert_eq!(late.state(crate::FILL, f1)?, crate::State::Done);
+        let mut first = graph("first-film")?;
+        declare_film(&mut first)?;
+        first.commit(&[&body], &[])?;
+        first.fill()?;
+        let f = crate::NodeRef::new("film", "f1");
+        assert_eq!(film(&late, "f1")?, Some("x".into()));
+        assert_eq!(film(&late, "f1")?, film(&first, "f1")?);
+        assert_eq!(late.hearings(&f)?.len(), first.hearings(&f)?.len());
+        assert_eq!(
+            late.seen(&f)?.map(|s| s.count),
+            first.seen(&f)?.map(|s| s.count)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fill_stops_at_the_try_limit() -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = graph("stops")?;
+        let limit: i64 = g
+            .conn
+            .query_row(crate::queries::TRY_LIMIT, [], |row| row.get(0))?;
+        assert_eq!(limit, 3, "3 unless set");
+        g.set_try_limit(2)?;
+        let landed = g.commit(&[&node("film", "f1", "x")], &[])?;
+        let f1 = landed[0].as_ref().map_err(ToString::to_string)?.cursor;
+        g.fill()?;
+        assert!(g.stopped()?.is_empty(), "one try is under the limit");
+        g.fill()?;
+        g.fill()?;
+        assert_eq!(tries(&g, f1)?, 2, "not tried past the limit");
+        let stopped = g.stopped()?;
+        assert_eq!(stopped.len(), 1);
+        assert_eq!(stopped[0].0, f1);
+        assert!(stopped[0].1.contains("film"), "with its last reason");
+        assert!(matches!(g.state(crate::FILL, f1)?, crate::State::Failed(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn a_reset_event_is_tried_again() -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = graph("reset")?;
+        g.set_try_limit(1)?;
+        let landed = g.commit(&[&node("film", "f1", "x")], &[])?;
+        let f1 = landed[0].as_ref().map_err(ToString::to_string)?.cursor;
+        g.fill()?;
+        declare_film(&mut g)?;
+        g.fill()?;
+        assert_eq!(film(&g, "f1")?, None, "stopped, so not tried");
+        g.retry(f1)?;
+        g.fill()?;
+        assert_eq!(g.state(crate::FILL, f1)?, crate::State::Done);
+        assert_eq!(film(&g, "f1")?, Some("x".into()));
+        assert!(g.retry(f1).is_err(), "nothing failed to reset");
+        Ok(())
+    }
+
+    #[test]
+    fn the_try_count_lives_on_the_inbox_row() -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = graph("row")?;
+        let body = node("film", "f1", "x");
+        let landed = g.commit(&[&body], &[])?;
+        let f1 = landed[0].as_ref().map_err(ToString::to_string)?.cursor;
+        g.fill()?;
+        g.fill()?;
+        assert_eq!(tries(&g, f1)?, 2);
+        let logged = g.events().since(crate::Cursor::START)?;
+        let event = logged
+            .iter()
+            .find(|e| e.cursor == f1)
+            .ok_or("f1 is logged")?;
+        let written: serde_json::Value = serde_json::from_str(&body)?;
+        let held: serde_json::Value = serde_json::from_str(&event.body)?;
+        assert_eq!(held, written, "the event is never changed");
         Ok(())
     }
 }
