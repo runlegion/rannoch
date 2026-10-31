@@ -6,9 +6,14 @@ use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 use crate::log::{Cursor, Event, decode, event_at};
 use crate::queries::{
-    DONE_WORK, FAIL_WORK, NEXT_EVENT, OPEN_WORK, PLACE, POSITION, SET_PLACE, START_WORK, WORK,
+    DONE_WORK, FAIL_WORK, JOIN_WORKER, NEXT_EVENT, OPEN_WORK, PLACE, POSITION, PROCESSED,
+    REMOVE_PLACE, REMOVE_WORK, SET_PLACE, START_WORK, WORK,
 };
 use crate::{Error, Graph};
+
+/// The inbox worker that fill runs as: its place is the last event filled, and its failed rows
+/// are the events fill could not fill. A worker of an app must not take this name.
+pub const FILL: &str = "rannoch.fill";
 
 /// Where a committed event stands for one worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,7 +45,8 @@ impl Graph {
     /// Hands out to worker `worker` its oldest event an earlier run left in progress (one this
     /// handle has not handed out), so a worker that restarts gets back what it had not closed;
     /// otherwise the first event after its place and at or below `until`, marking it in progress
-    /// and moving the worker's place to it; `None` when there is neither.
+    /// and moving the worker's place to it; `None` when there is neither. A worker exists from its
+    /// first call, holding the processed mark at the start until it finishes something.
     ///
     /// # Errors
     /// The graph file cannot be read or written, or the event's id cannot be decoded.
@@ -61,6 +67,7 @@ impl Graph {
             self.handed.insert((worker.to_string(), seq));
             return Ok(event);
         }
+        tx.prepare_cached(JOIN_WORKER)?.execute([worker])?;
         let place = place(&tx, worker)?;
         let row: Option<(i64, String, String)> = tx
             .prepare_cached(NEXT_EVENT)?
@@ -69,6 +76,7 @@ impl Graph {
             })
             .optional()?;
         let Some((seq, id, body)) = row else {
+            tx.commit()?;
             return Ok(None);
         };
         let event = decode(seq, &id, body)?;
@@ -128,6 +136,39 @@ impl Graph {
     }
 }
 
+impl Graph {
+    /// The processed mark: the lowest point every worker has finished, so no event at or before
+    /// it is waiting or in progress for any worker. A failed event counts as finished. With no
+    /// worker it is the committed watermark, and it never passes it. It deletes nothing.
+    ///
+    /// # Errors
+    /// The graph file cannot be read.
+    pub fn processed(&self) -> Result<Cursor, Error> {
+        let committed = self.events().committed()?;
+        let mark: Option<i64> = self
+            .conn
+            .prepare_cached(PROCESSED)?
+            .query_row([], |row| row.get(0))?;
+        Ok(mark.map_or(committed, |mark| Cursor(mark.min(committed.0))))
+    }
+
+    /// Removes worker `worker`, its place and its open and failed events, releasing the mark it
+    /// held.
+    ///
+    /// # Errors
+    /// The graph file cannot be written.
+    pub fn remove_worker(&mut self, worker: &str) -> Result<(), Error> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.prepare_cached(REMOVE_PLACE)?.execute([worker])?;
+        tx.prepare_cached(REMOVE_WORK)?.execute([worker])?;
+        tx.commit()?;
+        self.handed.retain(|(w, _)| w != worker);
+        Ok(())
+    }
+}
+
 /// Refuses a close that closed no row: the event was not in progress for the worker.
 fn in_progress(closed: usize, worker: &str, cursor: Cursor) -> Result<(), Error> {
     if closed == 0 {
@@ -140,7 +181,7 @@ fn in_progress(closed: usize, worker: &str, cursor: Cursor) -> Result<(), Error>
 }
 
 /// Worker `worker`'s place, or [`Cursor::START`] before its first event.
-fn place(conn: &rusqlite::Connection, worker: &str) -> Result<Cursor, Error> {
+pub(crate) fn place(conn: &rusqlite::Connection, worker: &str) -> Result<Cursor, Error> {
     Ok(Cursor(
         conn.prepare_cached(PLACE)?
             .query_row([worker], |row| row.get(0))
@@ -206,6 +247,43 @@ mod tests {
         );
         g.done("w", Cursor(1))?;
         assert_eq!(g.next("w", until)?.map(|e| e.cursor), Some(Cursor(2)));
+        Ok(())
+    }
+
+    #[test]
+    fn the_processed_mark_is_the_lowest_point_every_worker_has_finished()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = std::env::temp_dir().join(format!("rannoch-inbox-{}.db", uuid::Uuid::now_v7()));
+        let mut g = open(&path, &[7; 32])?;
+        let body = r#"{"specversion":"1.0","id":"x","source":"s","type":"t"}"#;
+        assert_eq!(g.next("late", Cursor(0))?, None);
+        g.commit(&[body, body, body, body], &[])?;
+        let until = g.events().committed()?;
+        assert_eq!(
+            g.processed()?,
+            Cursor(0),
+            "a worker with nothing handed out holds the start"
+        );
+        g.remove_worker("late")?;
+        assert_eq!(g.processed()?, until, "no worker: the committed watermark");
+        let first = g.next("w", until)?.ok_or("first")?.cursor;
+        assert_eq!(g.processed()?, Cursor(0));
+        g.done("w", first)?;
+        assert_eq!(g.processed()?, first);
+        let (second, third) = (
+            g.next("w", until)?.ok_or("second")?.cursor,
+            g.next("w", until)?.ok_or("third")?.cursor,
+        );
+        g.done("w", third)?;
+        assert_eq!(g.processed()?, first, "the second is still in progress");
+        g.failed("w", second, "bad")?;
+        assert_eq!(g.processed()?, third, "a failed event counts as finished");
+        let other = open(&path, &[7; 32])?;
+        assert_eq!(other.processed()?, third, "readable from another handle");
+        g.next("v", until)?;
+        assert_eq!(g.processed()?, Cursor(0));
+        g.remove_worker("v")?;
+        assert_eq!(g.processed()?, third, "removing a worker releases the mark");
         Ok(())
     }
 
