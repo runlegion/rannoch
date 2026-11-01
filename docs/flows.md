@@ -48,7 +48,7 @@ Each row names a step: the processor that runs it.
 
 A worker passes work on by emitting a CloudEvent. The next worker's guard matches that event's type.
 
-**rannoch is at-least-once.** A step retried after a crash can emit again, and that is fine. The store does not dedupe by CloudEvent id: the log mints a fresh log id for every event, and the queue accepts a body it has accepted before. A repeated `rannoch.node` or `rannoch.link` event changes nothing in the graph, because an identical hearing adds nothing (the repeat is held as an alias). An app's own event types can reach a worker twice, so every worker and every host action must be idempotent: doing the same work twice leaves the same result.
+**rannoch is at-least-once.** A step retried after a crash can emit again, and that is fine. The store does not dedupe by CloudEvent id: the log mints a fresh log id for every event, and the queue accepts a body it has accepted before. A repeated `rannoch.node` or `rannoch.link` event under the same CloudEvent id records nothing in the graph. Under a new id it is an alias of the same hearing at its own point, and if that point is newer than the current version, the repeated content becomes current. An app's own event types can reach a worker twice, so every worker and every host action must be idempotent: doing the same work twice leaves the same result.
 
 `next` can also name another worker directly; whether that is needed beside emit is an open question below.
 

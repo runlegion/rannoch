@@ -67,7 +67,7 @@ Something that goes wrong after an event was accepted is a `Failure`, reported o
 
 ## Write a worker
 
-A worker is a name and a loop. Each worker has its own place in the log and sees every committed event, in order: declarations, nodes, links, amendments and the app's own event types. The worker decides what it cares about and closes everything else as done.
+A worker is a name and a loop. Each worker has its own place in the log and sees every committed event, in order: declarations, nodes, links, endings, amendments, the `rannoch.closed.<relation>` events fill appends when an arriving node closes a waiting link, and the app's own event types. The worker decides what it cares about and closes everything else as done.
 
 ```rust
 fn drain(queue: &Queue, worker: &str) -> Result<usize, rannoch_store::Error> {
