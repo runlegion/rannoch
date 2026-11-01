@@ -4,7 +4,7 @@
 
 ## The idea
 
-A flow is a set of workers, each a file of JSON lines in a folder. The harness loads the folder, runs each worker against the inbox, and commits what each step did together with the worker's place, so a crash never runs a step's effect twice or skips one.
+A flow is a set of workers, each a file of JSON lines in a folder. The harness loads the folder, runs each worker against the inbox, and commits what each step did together with the worker's place. The goal is that a crash never skips a step's effect; how that commit works is not designed yet, and delivery is at least once (below).
 
 The parts, from the scaffolds' own descriptions:
 

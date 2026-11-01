@@ -71,7 +71,7 @@ All in one file. rannoch's own tables start with `_`.
 | `_fill` | Fill's try limit (3 unless set). |
 | `_check` | The check value of the app's key. |
 
-The tables kept for speed are `class:<name>`, `relation:<name>` and `_seen`; fill keeps them current. Reads answer from `_hearings`, `_aliases`, `_ends`, `_endings` and `_seen`. The class and relation tables serve the app's own SQL; rannoch reads them in one case: `find` for a key with no version known now (a node renamed away) falls back to the class row and returns it with no properties. A link of the wrong classes cannot exist in a relation table, since both ends are foreign keys.
+The tables kept for speed are `class:<name>`, `relation:<name>` and `_seen`; fill keeps them current. Reads answer from `_hearings`, `_aliases`, `_ends`, `_endings` and `_seen`. The class and relation tables serve the app's own SQL. `find` returns `None` for a key renamed away. A link of the wrong classes cannot exist in a relation table, since both ends are foreign keys.
 
 ## The bitemporal model
 
@@ -101,7 +101,7 @@ When fill reaches an amendment, it records it in `_amendments`, then derives the
 
 **A rename is an amendment that patches the subject.** Fill records it in `_renames` as a mapping from the old key to the new key, known from the amendment's point. Every event that names the old key is heard again through the mapping: the node's own events and every link to or from it. Link endings and corrections are copied onto the new key; their old-key rows stay, so reads as known before the rename are unchanged. A link, ending or node event arriving after the rename that names the old key lands on the new key. A second rename maps on from the new key.
 
-Fill refuses an amendment whose id is not `<uuid>:<fact>`; that has no subject; that names an event not in the log; that names an event which made no hearing of its own (a declaration, an app's own event, a link ending or correction, content identical to an earlier hearing, or any event that states no fact); that amends an event of an integer-keyed class; or whose point is before the target's record time, the target's own point, or the latest amendment already applied to it. A refused amendment is a failed try (below); it never stops fill.
+Fill refuses an amendment whose id is not `<uuid>:<fact>`; that has no subject; that names an event not in the log; that names an event which made no hearing of its own (a declaration, an app's own event, a link ending or correction, content identical to an earlier hearing, or any event that states no fact); that amends an event of an integer-keyed class; or whose point is before the target's record time, the target's own point, or the latest amendment already applied to it. Fill also refuses an amendment whose patch leaves the event invalid against the ontology or stating no node or link. A refused amendment is a failed try (below); it never stops fill.
 
 While the store holds no rename, fill does no rename lookup for nodes, links or endings. It checks once per batch, and again after each amendment lands.
 
@@ -152,7 +152,7 @@ None of the following exists in code. Each crate is an empty scaffold with one d
 
 ### Flows
 
-Worker files (`rannoch-worker`), the harness (`rannoch-harness`) and the steps (`rannoch-processor`, `rannoch-processor-*`). The design: each worker is a file of JSON lines in a folder; the harness runs each as an inbox worker, reads guards, hands each row to its processor, follows `next` and `else`, and commits what a step did together with the worker's place. How a step's effect commits together with the worker's place is not designed, and no public call does it today ([flows.md](flows.md), open questions 1 and 7). [flows.md](flows.md) is the design for mark-up, with its open questions.
+Worker files (`rannoch-worker`), the harness (`rannoch-harness`) and the steps (`rannoch-processor`, `rannoch-processor-*`). The design: each worker is a file of JSON lines in a folder; the harness runs each as an inbox worker, reads guards, hands each row to its processor, follows `next` and `else`, and commits what a step did together with the worker's place. How a step's effect commits together with the worker's place is not designed, and no public call does it today. [flows.md](flows.md) is the design for mark-up, with its open questions.
 
 ### Purge (#148)
 
