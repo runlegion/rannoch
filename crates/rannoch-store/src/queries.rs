@@ -34,7 +34,9 @@ pub(crate) const OWN_TABLES: &str = "
     CREATE TABLE IF NOT EXISTS _work(
         worker TEXT NOT NULL, seq INTEGER NOT NULL, reason TEXT,
         tries INTEGER NOT NULL DEFAULT 0,
-        PRIMARY KEY(worker, seq)) WITHOUT ROWID;";
+        PRIMARY KEY(worker, seq)) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS _kept(
+        worker TEXT PRIMARY KEY, state TEXT NOT NULL) WITHOUT ROWID;";
 
 /// Sets producer `?1`'s position in its source to `?2`.
 pub(crate) const SET_POSITION: &str = "INSERT INTO _positions(producer, position) VALUES (?1, ?2) \
@@ -63,6 +65,26 @@ pub(crate) const PROCESSED: &str = "SELECT MIN(COALESCE((SELECT MIN(w.seq) - 1 F
 pub(crate) const REMOVE_PLACE: &str = "DELETE FROM _places WHERE worker = ?1";
 
 pub(crate) const REMOVE_WORK: &str = "DELETE FROM _work WHERE worker = ?1";
+
+pub(crate) const REMOVE_KEPT: &str = "DELETE FROM _kept WHERE worker = ?1";
+
+/// Every worker but `?1`: where it resumes (the point before its oldest event in progress, or else
+/// its place), the state it keeps, and its last event closed as failed.
+pub(crate) const PLACES: &str = "SELECT p.worker, COALESCE((SELECT MIN(w.seq) - 1 FROM _work w \
+     WHERE w.worker = p.worker AND w.reason IS NULL), p.cursor), k.state, \
+     (SELECT MAX(w.seq) FROM _work w WHERE w.worker = p.worker AND w.reason IS NOT NULL) \
+     FROM _places p LEFT JOIN _kept k ON k.worker = p.worker WHERE p.worker <> ?1";
+
+/// Sets the state worker `?1` keeps with its place to `?2`.
+pub(crate) const SET_KEPT: &str = "INSERT INTO _kept(worker, state) VALUES (?1, ?2) \
+     ON CONFLICT(worker) DO UPDATE SET state = excluded.state";
+
+/// Drops worker `?1`'s events in progress: a place saved by the queue already stands before them.
+pub(crate) const DROP_OPEN_WORK: &str = "DELETE FROM _work WHERE worker = ?1 AND reason IS NULL";
+
+/// Records event `?2` as failed for worker `?1` with reason `?3`, over any earlier reason.
+pub(crate) const FAILED_WORK: &str = "INSERT INTO _work(worker, seq, reason) VALUES (?1, ?2, ?3) \
+     ON CONFLICT(worker, seq) DO UPDATE SET reason = excluded.reason";
 
 /// Worker `?1`'s events still in progress, oldest first.
 pub(crate) const OPEN_WORK: &str =
@@ -646,6 +668,12 @@ pub(crate) const EVENT_AT: &str = "SELECT id, body FROM _events WHERE seq = ?1";
 
 pub(crate) const EVENTS_BETWEEN: &str =
     "SELECT seq, id, body FROM _events WHERE seq > ?1 AND seq <= ?2 ORDER BY seq";
+
+/// At most `?3` of the events after `?1` and up to `?2`.
+pub(crate) const EVENTS_CHUNK: &str =
+    "SELECT seq, id, body FROM _events WHERE seq > ?1 AND seq <= ?2 ORDER BY seq LIMIT ?3";
+
+pub(crate) const COUNT_BETWEEN: &str = "SELECT COUNT(*) FROM _events WHERE seq > ?1 AND seq <= ?2";
 
 /// A quoted SQL identifier.
 fn ident(name: &str) -> String {

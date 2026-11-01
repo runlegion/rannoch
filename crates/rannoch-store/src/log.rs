@@ -6,7 +6,9 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::Error;
-use crate::queries::{APPEND_EVENT, EVENT_AT, EVENTS_BETWEEN, HIGH_WATER};
+use crate::queries::{
+    APPEND_EVENT, COUNT_BETWEEN, EVENT_AT, EVENTS_BETWEEN, EVENTS_CHUNK, HIGH_WATER,
+};
 
 /// A place in a graph's event log. Reading since a cursor returns the events after it. An app
 /// stores a cursor by serializing it, and a graph rebuilt from the log keeps each event's place,
@@ -139,12 +141,41 @@ impl Events<'_> {
     /// The graph file cannot be read, or an event's id in it cannot be decoded.
     pub fn since_until(&self, cursor: Cursor, until: Cursor) -> Result<Vec<Event>, Error> {
         let mut statement = self.conn.prepare_cached(EVENTS_BETWEEN)?;
-        let mut rows = statement.query(params![cursor.0, until.0])?;
-        let mut events = Vec::new();
-        while let Some(row) = rows.next()? {
-            let id: String = row.get(1)?;
-            events.push(decode(row.get(0)?, &id, row.get(2)?)?);
-        }
-        Ok(events)
+        let rows = statement.query(params![cursor.0, until.0])?;
+        decode_rows(rows)
     }
+
+    /// At most `limit` of the events after `cursor` and up to `until`, in the order they were
+    /// written: [`Events::since_until`] a chunk at a time.
+    ///
+    /// # Errors
+    /// The graph file cannot be read, or an event's id in it cannot be decoded.
+    pub fn chunk(&self, cursor: Cursor, until: Cursor, limit: usize) -> Result<Vec<Event>, Error> {
+        let mut statement = self.conn.prepare_cached(EVENTS_CHUNK)?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = statement.query(params![cursor.0, until.0, limit])?;
+        decode_rows(rows)
+    }
+
+    /// How many events the log holds after `cursor` and up to `until`.
+    ///
+    /// # Errors
+    /// The graph file cannot be read.
+    pub fn count(&self, cursor: Cursor, until: Cursor) -> Result<u64, Error> {
+        let count: i64 = self
+            .conn
+            .prepare_cached(COUNT_BETWEEN)?
+            .query_row(params![cursor.0, until.0], |row| row.get(0))?;
+        Ok(u64::try_from(count).unwrap_or(0))
+    }
+}
+
+/// Every event in `rows` of seq, id and body, in order.
+fn decode_rows(mut rows: rusqlite::Rows<'_>) -> Result<Vec<Event>, Error> {
+    let mut events = Vec::new();
+    while let Some(row) = rows.next()? {
+        let id: String = row.get(1)?;
+        events.push(decode(row.get(0)?, &id, row.get(2)?)?);
+    }
+    Ok(events)
 }
