@@ -1,6 +1,6 @@
 # rannoch architecture
 
-This page describes the second edition of rannoch as the code at this commit builds it. Every part is labelled **built** or **designed, not built**. A built part does what this page says; a designed part does nothing yet and has its own section at the end. The first edition is the tag `v0.4.0` (`v0.4.0.a` holds the same content); it is a reference for working code only, never for what rannoch is.
+This page describes the second edition of rannoch as the code at this commit builds it. Every part is labelled **built** or **designed, not built**. A built part does what this page says; a designed part does nothing yet and has its own section at the end. The first edition lives at the tag `v0.4.0.a`, not on main; it is a reference for working code only, never for what rannoch is.
 
 How to use what is built: [store.md](store.md) and [inbox.md](inbox.md). The design for flows: [flows.md](flows.md).
 
@@ -24,7 +24,7 @@ It keeps every change as an event in an append-only log and never changes an eve
 | `rannoch-processor` | The contract every step meets. | Designed, not built |
 | `rannoch-processor-*` (after, approve, bin, branch, count, emit, host, lookup, onnx, store, wait) | One kind of step each. | Designed, not built |
 
-The root package `rannoch` (`src/`) is the first edition, kept as a reference. Apps depend on `rannoch-store` and `rannoch-queue`.
+The root `Cargo.toml` is a workspace with no package of its own. Apps depend on `rannoch-store` and `rannoch-queue`.
 
 ## How an event moves
 

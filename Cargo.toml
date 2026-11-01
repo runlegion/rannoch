@@ -1,34 +1,5 @@
-[package]
-name = "rannoch"
-version = "0.4.0"
-edition = "2024"
-rust-version = "1.98"
-license = "MIT"
-repository = "https://github.com/runlegion/rannoch"
-authors = ["Sean Silvius"]
-description = "One graph for the Rust projects in our ecosystem: the core of the events, presented as an ontology."
-publish = false
-
-[dependencies]
-blake3 = "1.8"
-rusqlite = { version = "0.40", features = ["bundled"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-thiserror = "2"
-uuid = { version = "1", features = ["v7", "serde"] }
-
-[dev-dependencies]
-dirs = "6"
-fastrand = "2"
-rstest = "0.26"
-rstest-bdd = "0.6"
-rstest-bdd-macros = "0.6"
-tempfile = "3"
-
-[lints]
-workspace = true
-
 [workspace]
+resolver = "3"
 members = [
     "crates/rannoch-probe",
     "crates/rannoch-store",
@@ -51,6 +22,10 @@ members = [
     "crates/rannoch-processor-onnx",
 ]
 
+# The version of record: release.toml points here, and each tag `v{version}` names it.
+[workspace.package]
+version = "0.4.0"
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 unreachable_pub = "warn"
@@ -63,13 +38,7 @@ expect_used = "warn"
 dbg_macro = "warn"
 todo = "warn"
 
-# The scenarios build graphs at the toys' sizes (T4: 100,000 voices); an unoptimized bundled
-# SQLite makes those fixtures several times slower.
+# An unoptimized bundled SQLite makes the store's tests several times slower.
 [profile.dev.package."*"]
 opt-level = 3
 
-[target.'cfg(target_os = "macos")'.dev-dependencies]
-nix = { version = "0.30", features = ["resource"] }
-
-[target.'cfg(windows)'.dev-dependencies]
-memory-stats = "1.2"
