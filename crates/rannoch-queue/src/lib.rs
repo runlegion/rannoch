@@ -306,9 +306,7 @@ impl Queue {
     ) -> Result<(), Error> {
         match lock(&self.shared.workers).get_mut(worker) {
             Some(held) => held.close(worker, cursor, reason, kept),
-            None => Err(Error::Refused(format!(
-                "event at {cursor:?} is not in progress for worker {worker}"
-            ))),
+            None => Err(workers::not_in_progress(worker, cursor)),
         }
     }
 

@@ -121,9 +121,7 @@ impl Worker {
             .iter_mut()
             .find(|taken| taken.cursor == cursor && taken.state == State::InProgress)
         else {
-            return Err(Error::Refused(format!(
-                "event at {cursor:?} is not in progress for worker {name}"
-            )));
+            return Err(not_in_progress(name, cursor));
         };
         taken.kept = kept;
         if let Some(reason) = failed {
@@ -210,4 +208,11 @@ impl Worker {
     pub(crate) fn unsaved(&mut self) {
         self.dirty = true;
     }
+}
+
+/// The refusal of a close for an event not in progress for worker `name`.
+pub(crate) fn not_in_progress(name: &str, cursor: Cursor) -> Error {
+    Error::Refused(format!(
+        "event at {cursor:?} is not in progress for worker {name}"
+    ))
 }
