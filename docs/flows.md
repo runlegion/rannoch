@@ -1,6 +1,6 @@
 # Writing flows
 
-> **This is a design. None of it is built.** `rannoch-worker`, `rannoch-harness`, `rannoch-processor` and every `rannoch-processor-*` crate are empty scaffolds. This page is for the operator and the residents to mark up; once agreed, it becomes the spec they are built from. The syntax below is a sketch of the shape, not a format to write against. To process events today, write a worker in your own code ([inbox.md](inbox.md)).
+> **This is a design. None of it is built.** `rannoch-worker`, `rannoch-harness`, `rannoch-processor` and every `rannoch-processor-*` crate are empty scaffolds. This page is for mark-up; once agreed, it becomes the spec they are built from. The syntax below is a sketch of the shape, not a format to write against. To process events today, write a worker in your own code ([inbox.md](inbox.md)).
 
 ## The idea
 
@@ -14,7 +14,7 @@ The parts, from the scaffolds' own descriptions:
 
 ## How a worker works
 
-Take the operator's example: a line arrives; one worker parses it and writes a report, then passes it on to worker x, which writes its own report; meanwhile workers x, y and z all run.
+An example: a line arrives; one worker parses it and writes a report, then passes it on to worker x, which writes its own report; meanwhile workers x, y and z all run.
 
 ### It sees every event
 
@@ -68,21 +68,17 @@ A worker passes work on by emitting a CloudEvent. The next worker's guard matche
 
 `parse_line`, `write_report` and `x_report` are the app's host actions. A line that fails to parse takes `else` to the worker's bin with the reason.
 
-## Kessel's first flow
+## Example: a long import pipeline
 
-From kessel (bullpen, 2026-11-01), agreed in shape by the operator on 2026-10-27. One game build, from patch to sealed.
+One import run, from raw input to sealed.
 
-1. **Arrives.** `kessel-import`, a host action, runs once a Steam patch is installed. It walks the `.tor` archives and emits one CloudEvent per piece: a GOM object, a string table, an area file, a room file, or a media file. Type `dev.huttspawn.kessel.raw.<kind>`; source `kessel/<branch>/<steam build id>`; subject the FQN or derived path; data the raw bytes and a content hash. A piece the walker cannot split arrives whole as `raw.unsplit`, with a report event. One build is about 1-2 million events.
-2. **Recognise.** Guards match by type alone (`raw.gom`, `raw.stringtable`, `raw.area`, `raw.room`, `raw.media`, `raw.unsplit`), with `source` scoping a guard to one build.
-3. **Decode, in parallel.** Each raw kind goes to its reader, a host action: `raw.gom` to the field reader (typed in: the raw bytes and a reference to the build's prototype registry; typed out: decoded fields, or a decode failure with byte offsets). Each output is keyed to the raw event and the parser version, and emits `object.added`, `object.changed` or `object.removed` against the same FQN in the previous build. A failure emits `decode.failed` and goes to recovery; only if recovery fails does it go to a judge (Haiku, then Sonnet when Haiku is unsure).
-4. **Hand off.** `object.*` fans out in parallel to domain workers (items, abilities, quests, conversations, maps), each emitting domain facts. A link (quest to reward item, NPC to conversation) is made once both ends exist and emits `link.found` with the source event ids. Beside them, an `onnx` step judges test-or-real on `object.added`.
-5. **Join, then seal.** Once every raw event of the build has a decode or a judged failure, three checks run: 100% decode, nothing lost between archive and store, and coverage against the oracle. If all pass, the flow emits `build.sealed` and drops the build's `raw.*` events. A failed check holds the seal and emits the gap.
+1. **Arrives.** An importer, a host action, walks the input and emits one CloudEvent per piece: type `example.raw.<kind>`, source `importer/<run>`, subject the piece's path, data the raw bytes and a content hash. A piece the importer cannot split arrives whole as `raw.unsplit`, with a report event. One run is about 1-2 million events.
+2. **Recognise.** Guards match by type alone (`raw.<kind>`, `raw.unsplit`), with `source` scoping a guard to one run.
+3. **Decode, in parallel.** Each raw kind goes to its reader, a host action: typed in, the raw bytes and a reference to shared reference data; typed out, decoded fields or a decode failure with byte offsets. Each output is keyed to the raw event and the parser version, and emits `object.added`, `object.changed` or `object.removed` against the same key in the previous run. A failure emits `decode.failed` and goes to a recovery worker.
+4. **Hand off.** `object.*` fans out in parallel to domain workers, each emitting domain facts. A link is made once both ends exist and emits `link.found` with the source event ids. Beside them, an `onnx` step classifies `object.added`.
+5. **Join, then seal.** Once every raw event of the run has a decode or a judged failure, checks run: everything decoded, nothing lost between input and store, and coverage against a reference. If all pass, the flow emits `run.sealed` and drops the run's `raw.*` events. A failed check holds the seal and emits the gap.
 
-Open, the operator's call on cost: whether `raw.media` is kept after seal. Media is most of each build's 30 GB and more.
-
-## Warden's first flow
-
-**Pending.** To be filled from warden's answer.
+Open: which raw kinds are kept after seal. Large media can be most of a run's size.
 
 ## Open questions
 
@@ -92,10 +88,10 @@ Open, the operator's call on cost: whether `raw.media` is kept after seal. Media
 4. **Host actions.** How an app registers one, declares its input and output shapes, and how the harness remembers an answer.
 5. **Bins.** Where a worker's bin lives, how a binned event is read and fixed, and how it is sent back through.
 6. **Going live.** The earlier design had a program saved into the folder only staged, then made live by a signed request after a trial against history. Is that kept?
-7. **Where flows live.** The workflow crates sit in rannoch's workspace today. The 0.3 scope RFC said workflows would be their own crate, with rannoch one backend. Do they stay?
-8. **Kessel's asks:**
+7. **Where flows live.** The workflow crates sit in rannoch's workspace today. An earlier plan had workflows as their own crate, with rannoch one backend. Do they stay?
+8. **Asks from a long pipeline:**
    - **A join:** wait until every event from source X has reached outcome Y.
    - **Replay:** rerun a step with a new parser version over the stored raw events, before seal.
    - **Purge scoped by source,** allowed only after seal. (Purge is #148; a retention rule per class, trim, has no issue yet.)
-   - **Large inputs by reference:** host actions that take the prototype registry, hundreds of MB, by reference rather than inline.
-9. **Scale.** Kessel's builds are millions of events and terabytes of import log across builds. What the store keeps after a build is sealed decides its size.
+   - **Large inputs by reference:** host actions that take shared reference data, hundreds of MB, by reference rather than inline.
+9. **Scale.** A long pipeline is millions of events per run and terabytes of import log across runs. What the store keeps after a run is sealed decides its size.
