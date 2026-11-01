@@ -528,3 +528,17 @@ fn a_worker_costs_under_ten_microseconds_an_event() -> Result<(), Box<dyn std::e
     );
     Ok(())
 }
+
+#[test]
+fn a_saved_failure_ahead_of_the_cursor_still_reads_as_failed()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let queue = committed(&dir, 1)?;
+    let open_one = queue.next("w")?.ok_or("first")?.cursor;
+    let failing = queue.next("w")?.ok_or("second")?.cursor;
+    queue.failed("w", failing, "bad")?;
+    let _ = queue.flush();
+    queue.done("w", open_one)?;
+    assert_eq!(queue.state("w", failing)?, State::Failed("bad".to_string()));
+    Ok(())
+}

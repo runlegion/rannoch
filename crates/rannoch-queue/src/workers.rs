@@ -194,7 +194,10 @@ impl Worker {
         self.saved = place.cursor;
         for (cursor, reason) in closes {
             match reason {
-                Some(reason) if self.failed.get(cursor) == Some(reason) => {
+                // A failure ahead of the cursor stays: memory still answers for it.
+                Some(reason)
+                    if *cursor <= place.cursor && self.failed.get(cursor) == Some(reason) =>
+                {
                     self.failed.remove(cursor);
                 }
                 Some(_) => {}

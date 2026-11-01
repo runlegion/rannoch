@@ -330,9 +330,8 @@ impl Queue {
             .get(worker)
             .map(|held| held.state(cursor));
         match known {
-            None => Ok(State::Waiting),
             Some(Some(state)) => Ok(state),
-            Some(None) => lock(&self.shared.graph).state(worker, cursor),
+            _ => lock(&self.shared.graph).state(worker, cursor),
         }
     }
 
