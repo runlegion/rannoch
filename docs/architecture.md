@@ -1,60 +1,168 @@
 # rannoch architecture
 
-The requirements are the authority: FR-RANNOCH-031..049, 051..054 and NFR-RANNOCH-011..014, 016 in legion. Where this page and a requirement differ, the requirement wins.
+This page describes the second edition of rannoch as the code at this commit builds it. Every part is labelled **built** or **designed, not built**. A built part does what this page says; a designed part does nothing yet and has its own section at the end. The first edition (v0.4.0, tagged `v0.4.0.a`) is a reference for working code only, never for what rannoch is.
 
-## What it is
+How to use what is built: [store.md](store.md) and [inbox.md](inbox.md). The design for flows: [flows.md](flows.md).
 
-rannoch is one graph for the Rust projects in our ecosystem that need a graph. It is a library and nothing else: no executable, no network, no person or agent uses it directly. An app links it and keeps its own graphs in it.
+## What rannoch is
 
-It is also the core of the events. Every change to a graph is an event, and the tables are state built from the events. A graph's shape is published the same way: classes, relations and properties are declared as events, and judgments are events. rannoch presents everything as an ontology.
+rannoch is one app's graph store, in one SQLite file, linked into the app's own process as a Rust library. It has no executable, no CLI, no server and no network. Nothing it does reaches another machine; sync and transport belong to the app.
 
-The name: Rannoch, the geth home world in Mass Effect; it means walled garden.
+It keeps every change as an event in an append-only log and never changes an event once written. The tables are built from the log. Every fact carries two points in time: when it happened, and when the store came to know it. Any read can be asked as of either.
 
-## What it refuses
+## The crates
 
-- It knows no domain. Each app declares its own classes and relations.
-- It syncs nothing and opens no connection. Sync, sockets, publishing and subscribing across processes or machines belong to the apps.
-- It depends on no other crate or app of ours. Owning the code makes them no different from any other dependency: they stay outside.
-- It computes and stores no embeddings, and ranks nothing. Any weighting is an app's visible policy.
-- Existing data comes in by hand; a graph starts from an empty file.
+| Crate | Owns | State |
+|---|---|---|
+| `rannoch-ontology` | Classes, relations, properties, value types and history keys; checking a declaration against what is declared and a value against its type. No I/O. | Built |
+| `rannoch-cloudevents` | Reading a CloudEvents 1.0 body into the fact it states: a node, a link, a link's ending or correction, a declaration, or no fact. Event ids and dates. No I/O. | Built |
+| `rannoch-store` | The graph file: the log, the ontology tables, fill, hearings, amendments and renames, the tables kept for speed, reads, the inbox's places and work rows, fill retries, `copy_to`. | Built |
+| `rannoch-queue` | The inbox in memory: accepting events, the heartbeat that commits them, producers' positions, handing events to workers, failures, subscribers. | Built |
+| `rannoch-probe` | Measuring a host's memory and how fast a directory takes durable writes. | Built |
+| `rannoch-worker` | Reading a worker file and checking it against the ontology. | Designed, not built |
+| `rannoch-harness` | Running worker files. | Designed, not built |
+| `rannoch-processor` | The contract every step meets. | Designed, not built |
+| `rannoch-processor-*` (after, approve, bin, branch, count, emit, host, lookup, onnx, store, wait) | One kind of step each. | Designed, not built |
 
-## The parts
+The root package `rannoch` (`src/`) is the first edition, kept as a reference. Apps depend on `rannoch-store` and `rannoch-queue`.
 
-1. **Events are the record.** Every change is an event in one order. An app reads the events after a cursor it holds. Each event names what it added and removed, by kind and endpoint. State rebuilt from the events alone equals live state, and replay to a cursor then on equals one replay.
-2. **Writes are whole units, in pieces.** A unit is one node and its own links, never split across pieces. A write commits in pieces small enough that no read or hook waits on it; each piece is one transaction that writes one event for what it added and one closing event per open link it closed, and its events land only if it lands. A write is checked before any piece commits, so a refused write lands nothing and leaves no event. A write that fails at a piece (a full disk, a busy file) keeps the pieces before it, and the error returns their events so the app can resume. Each class has one natural key: writing under an existing key adds a version, and writing a node exactly as it already is adds nothing and writes no event.
-3. **The ontology is declared on the stream.** Declaring a class, a relation or a property is one event; rannoch projects it straight into a table, as a fact becomes a row. Each class is its own table, with an id, a unique natural key and a valid time. Each relation is its own table whose two ends reference their classes, so the database refuses a link between the wrong kinds. A relation may be declared as containment (its source is part of its target). An identical declaration is a no-op; a conflicting one is refused in ontology terms. Replaying the events into an empty file rebuilds the schema and the data. A property added later reads as absent on older instances, never default-filled.
-4. **Facts carry their source and two times.** Every node and link keeps when it was true (its valid time, which may be stated as unknown) apart from when rannoch recorded it. Reads can be asked as of a valid time; an unknown valid time is never read as now.
-5. **Links can wait.** A link to a key that has not arrived waits as an open link, recording the kind it waits for. When a node of that kind arrives, the link moves into its relation's table, and that move is one closing event. A node of another kind under that key leaves the link open and is reported. The graph always says what is missing.
-6. **Reads are capped walks and exact counts.** A walk follows named relations in either direction, to a number of hops, under a cap, and says when it stopped at the cap. A count is exact and uncapped: distinct, total and grouped in one pass, over many roots, ending on a class. A judgment is a step on the path, not a special case.
-7. **Forgetting strips content.** Forgetting follows the app's rule. The forgotten node and its links leave live state; earlier events keep their ids, kinds and endpoints and lose their content, so numbers an app derived can subtract exactly what was removed. What was forgotten stays gone through every replay.
-8. **References cross files.** An app mounts another graph file by name, and a graph can refer to a node in it by class and key. Replacing a node by another under a different key is its own event naming both keys; a new version under the same key is not a replacement. The reference resolves from the target file's own facts: live, forgotten (with its rule) or replaced (with what replaced it). The referring file never changes.
-9. **Relays are the app's.** rannoch keeps no relay and runs no fold. What a relay needs from rannoch is events whose ids name the relation and both ends of every link, so an app can filter before its own fold.
-10. **The store keeps every event; a snapshot deletes nothing.** An app may take a snapshot of a graph's state at a cursor it picks, into a file of its own, carrying the ontology. A new reader or a rebuild starts from the snapshot and takes only the events after its cursor; the snapshot plus those events gives the same state as live. No call deletes an event.
+## How an event moves
 
-## How a node reads
+```
+app ──accept──▶ Queue (memory) ──heartbeat, every 20 ms──▶ _events (the log)
+                                                              │
+                                              fill (worker rannoch.fill)
+                                                              ▼
+                              _hearings, _aliases, _ends, _endings, _amendments, _renames
+                                                              │
+                                           tables kept for speed: class:<name>, relation:<name>,
+                                           _open, _seen
+                                                              │
+                              reads ◀────────────────────────┘     workers ◀── next/done/failed
+```
 
-Every read and every refusal answers in ontology terms. Asked about a node, rannoch answers: its class, its properties, its relations by name in both directions with counts, and what it is part of, through the relations an app declared as part-of. The answer names no table or column.
+1. **Accept.** `Queue::accept` or `accept_from` reads the body as CloudEvents 1.0 and checks the fact against the ontology the queue took when it opened. A refused body is refused at once with its reason and is not held. An accepted body is held in memory with a ticket. Declarations are refused here; they go through `Graph::declare`.
+2. **Commit.** The heartbeat (every `Queue::INTERVAL`, 20 ms, or on `flush`, `close` or drop) commits everything held in one transaction, with a savepoint per event. An event that fails at commit rolls back alone and is reported as a `Failure::Event`. A producer's position commits in the same transaction as its events; after a producer's event fails, its later events in the batch are not committed. The log gives each event a place (`Cursor`) that is never reused, and a log id (`Event.id`, a fresh `UUIDv7`).
+3. **Fill.** After each commit, the queue's heartbeat runs `Graph::fill`, which folds the new events into the history tables and the tables kept for speed (details below). The queue then moves its committed watermark and tells its subscribers.
+4. **Hand out.** `Queue::next(worker)` hands each worker the next committed event at or below the watermark. Every worker sees every event.
+5. **Read.** Reads go through any handle on the file. They read the history tables and `_seen`, never the queue's memory.
 
-## Modules
+What a crash loses: events accepted since the last heartbeat, and the batch whose commit was in flight. Nothing committed is lost. Every commit is durable: the file runs in WAL mode with `synchronous=FULL` and `fullfsync=ON`, so on macOS each commit is flushed to the device.
 
-One crate:
+## The tables
 
-- `open`: opens a graph file and knows its classes and relations.
-- `write`: units, pieces, refusals; owns typed refusals.
-- `read`: walks, counts, describing a node in ontology terms, reading as of a valid time.
-- `events`: the log, cursors, replay, forgetting, snapshots; owns rannoch's own tables (events, the ontology, fates, open links, `_followers`).
-- `history`: hearings, each write's point on the time axis, content identity under the app's key, aliases, and how a link ended or was found wrong; owns `_hearings`, `_aliases`, `_ends` and the key's check value.
-- `refs`: references into other graph files.
+All in one file. rannoch's own tables start with `_`.
 
-rannoch's own tables start with `_`; every other table is a class or a relation an app declared.
+| Table | Holds |
+|---|---|
+| `_events` | The log: place, log id, body. |
+| `_ontology` | Every declared class and relation. |
+| `_hearings` | Every hearing of a node or link: its identity, entity, key (and a link's target key), event, place, source, valid time, point, integer key, record time, properties, and its known window (`known`, `until`) and the place of the event it amends (`amended`). |
+| `_aliases` | Other events that arrived with a hearing's identical content. |
+| `_ends`, `_endings` | A link's latest conclusion (ended or found wrong), and every ending at its point. |
+| `_amendments` | Each amendment by target place, point and event. |
+| `_renames` | Each rename: entity, old key, new key, point, event. |
+| `_open` | Links waiting for a node that has not arrived. |
+| `_seen` | Per node and link: first and last heard, first recorded, first true, count. |
+| `class:<name>` | One row per node of the class, one column per property. |
+| `relation:<name>` | One row per link with a version known now (endings are read from `_endings`, not from this table), with foreign keys to both classes' tables. |
+| `_places`, `_work` | The inbox: each worker's place, and a row for each event in progress or failed, with its reason and try count. |
+| `_positions` | Each producer's position in its source. |
+| `_fill` | Fill's try limit (3 unless set). |
+| `_check` | The check value of the app's key. |
 
-## What was measured
+`class:<name>` and `relation:<name>` are kept for speed and for the app's own SQL. rannoch's reads do not use them: `find` and the other reads answer from `_hearings`, `_aliases`, `_endings` and `_seen`. Fill keeps the class and relation tables current: a link of the wrong classes cannot exist there, since both ends are foreign keys.
 
-These numbers come from toys run on real data on a laptop, each rerun by a second agent.
+## The bitemporal model
 
-- A fresh lookup (find by key, two-hop walk capped at 200) on a 27,000-node graph: p99 under 7 ms. Reads never wait on a writer.
-- A small write while another writer commits 1,000-change pieces: under 70 ms. Pieces of 10,000 lost a race at over a second.
-- An exact count at 100,000 voices: 8 MB peak for one count, 8.5 MB for all 1,000 findings, against 353 MB for loading the whole graph. On a cold disk one count took 3-6 s (0.3 s warm); rannoch sets no cold-disk target.
-- An app's relay (outside rannoch) at a 13,198-voice finding reshapes per judgment in 14-123 us, about 1,000 times faster than recounting; on a 6,446-node relay, 145-241 us.
-- Per-class tables count about 30% faster than one generic table; per-relation tables faster again.
-- 200 references resolved across files in 0.63 ms.
+Every hearing has two points:
+
+- **Its point on the axis**: when the fact happened. It is the time the writer supplied (`data.time`), or, without one, the record time of the store that first recorded the event, carried in the millisecond of its CloudEvent id. A class can order its history by an integer the writer supplies instead.
+- **Its known window**: from when the store knew it (`known`) until an amendment superseded it (`until`). A hearing written directly is known from its own point and has no `until`. A hearing made by an amendment is known from the amendment's point; the hearing it supersedes gets `until` set to that point.
+
+Reads use them like this:
+
+- **Now** (`find`, `hearings`, `seen`, `link_seen`, `link_end`): hearings with no `until`, the newest on the class's axis. A version that arrives late answers at its own point and becomes current only if it is the newest on the axis.
+- **As known at a point** (`find_as_of` with `known_at`, `link_known_at`): hearings known at that point (`known` at or before it, `until` after it or absent). An amendment or rename made later is not in the answer.
+- **On the axis** (`state_at`, `link_state_at`): the version that held at a point on the axis.
+
+**Identity.** A hearing's identity is its content hashed with BLAKE3 under the app's 32-byte key. Identical content is one hearing: the same content arriving under another event id becomes an alias. The key is held in memory only; the file keeps a check value, and opening it under another key returns `Error::KeyDiffers`.
+
+**Links.** A link's endings sit beside its hearings at their own points. A live hearing at a later point reopens a link that ended. A correction records that the link was wrong, which is not an ending. A link that names a node that has not arrived waits in `_open` and moves into its relation's table when the node arrives.
+
+## Amend and rename
+
+**Amend is rare.** It corrects a mistake: an event that was written wrong. It is not how an app records change. A value that changes is a new event, a new hearing at its own point, and the store's history keeps both. An app that amends routinely is modelling change the wrong way.
+
+An amendment is an event of type `rannoch.amended`. Its subject is the log id (`Event.id`) of the event it amends; its data is a JSON Merge Patch (RFC 7386) of that event. Its point is the record time in its own CloudEvent id.
+
+When fill reaches an amendment, it records it in `_amendments`, then derives the target's hearings again: it applies every amendment of the target in point order, then event id, and wherever the event reads differently, it writes a new hearing known from that amendment's point and closes the hearing before it at that point. The amended event in the log is never changed. Read as known before the amendment, the event reads as written.
+
+**A rename is an amendment that patches the subject.** Fill records it in `_renames` as a mapping from the old key to the new key, known from the amendment's point. Every event that names the old key is heard again through the mapping: the node's own events and every link to or from it. Link endings and corrections are copied onto the new key; their old-key rows stay, so reads as known before the rename are unchanged. A link, ending or node event arriving after the rename that names the old key lands on the new key. A second rename maps on from the new key.
+
+Fill refuses an amendment that names an event not in the log; whose point is before the target's own point or before the latest amendment already applied to it; that amends an event of an integer-keyed class; or that amends an event with no hearing of its own (a declaration, an app's own event, or content identical to an earlier hearing). A refused amendment is a failed try (below); it never stops fill.
+
+While the store holds no rename, fill does no rename lookup for nodes, links or endings. It checks once per batch, and again after each amendment lands.
+
+## Fill
+
+Fill is a worker on the inbox, named `rannoch.fill` (`FILL`), with its place in `_places`.
+
+- **Batches.** Each batch takes its own write transaction, reads fill's place inside it, fills events until its time budget is spent, and commits its events together with fill's new place. The first batch's budget is 25 ms (`FILL_BUDGET`); each next batch runs four times longer, up to 1 s (`FILL_BUDGET_MAX`). The budget is checked after each event, so every batch commits at least one event, and a crash loses at most the batch in flight.
+- **One savepoint per batch.** When an event in a batch fails, the batch rolls back to its savepoint and is filled again one event at a time, so the failed event fails alone and the rest commits.
+- **Retries.** A failed event gets a `_work` row for `rannoch.fill` with its reason and its try count, raised by one. Each later fill tries again the failed events still under the try limit, besides filling the new events; a fill reads its list of retries before it fills new events, so an event that fails in one fill is not tried twice in it. An event that succeeds on retry reads exactly as if it had filled the first time.
+- **Stopping.** At the try limit (3, set with `set_try_limit`) an event is no longer tried. `stopped()` lists those events with their last reasons; `retry(cursor)` resets one's tries. The event in the log never changes.
+
+Every error inside one event's fill counts as that event's try, a storage fault included. Only a failure of the savepoint statements aborts a fill.
+
+## The inbox
+
+A worker is a name with a place in `_places`: the last event handed out to it. Events after the place are waiting. Of the events at or before it, only those in progress or failed have a `_work` row.
+
+- `next(worker)` takes the worker's oldest event an earlier run left in progress, if any; otherwise the first event after its place, at or below the committed watermark, marking it in progress. A worker joins at the start of the log on its first `next`.
+- `done` deletes the event's row; `failed` keeps it with the reason. The inbox retries only fill's failures, never an app worker's.
+- Each worker sees every committed event, in log order, independent of every other worker.
+
+## The processed mark
+
+`processed()` is the lowest point every worker has finished: no event at or before it is waiting or in progress for any worker. A failed event counts as finished. Fill is a worker, so the mark never passes what fill has not reached. With no workers it equals the committed watermark, and it never passes it. It deletes nothing. `remove_worker` deletes a worker's place and rows and releases the mark it held.
+
+## copy_to
+
+`copy_to(path)` runs SQLite's `VACUUM INTO` inside one read transaction and returns the cursor the copy holds, read from the copy itself. It takes no write lock and records nothing in the store. It refuses a path that exists and removes its file if the copy fails. The copy is not flushed durably; the snapshot tool that does that is designed in #154 and not built.
+
+## Limits
+
+- **No lookup from a CloudEvent id to a log id.** Issue #164 adds one that returns the first log id an event's source and id arrived under; it is not built, and it is for tracking down the event a mistake came from, and nothing else. An app that will amend an event keeps its log id from `commit`'s result, from `events().since(...)`, or from the `Event` a worker takes.
+- **At-least-once, no dedupe by CloudEvent id.** The log mints a fresh log id for every event, and the queue accepts a body it has accepted before. A repeated node or link event changes nothing in the graph: identical content is one hearing, the repeat an alias. The log holds both events and every worker is handed both, so workers must be idempotent.
+- **The queue owns its graph.** `Queue::open` takes the `Graph` by value. An app with a queue open reads, and calls `stopped`, `retry`, `set_try_limit` and `copy_to`, through a second handle (`rannoch_store::open`).
+- **An event a worker takes and never closes stays in progress** until the process restarts, and holds the processed mark below it until it is closed.
+- **Sources.** A source that starts with `rannoch:` is read back percent-decoded without the prefix; any other source is stored exactly as given.
+- **The queue takes the ontology once.** Declarations made after `Queue::open` are not seen by that queue; close it, declare, and open it again.
+- **A removed property stays in its class table column.** `find` reads from `_hearings` and answers correctly; the `class:<name>` row keeps the old value until the node is written again.
+- **One history line.** Every history table has a `line` column, and every read and write uses the line `main`.
+- **Copies are not durable on return.** See `copy_to`.
+
+## Designed, not built
+
+None of the following exists in code. Each crate is an empty scaffold with one doc comment.
+
+### Flows
+
+Worker files (`rannoch-worker`), the harness (`rannoch-harness`) and the steps (`rannoch-processor`, `rannoch-processor-*`). The design: each worker is a file of JSON lines in a folder; the harness runs each as an inbox worker, reads guards, hands each row to its processor, follows `next` and `else`, and commits what a step did together with the worker's place. Flows will sit on top of the queue and the store and use only their public API: `next`, `done`, `failed` and the store's reads and commits. [flows.md](flows.md) is the design for mark-up, with its open questions.
+
+### Purge (#148)
+
+Erasing a fact from the store and its WAL, with a standing rule that refuses it coming back.
+
+### Trim
+
+Retention declared per class, such as dropping raw events once processed. No issue is filed.
+
+### Relay (#151)
+
+Neighbourhoods kept warm outside the store.
+
+### Snapshot tool (#154)
+
+A durable copy of the store, built on `copy_to`, outside the engine.

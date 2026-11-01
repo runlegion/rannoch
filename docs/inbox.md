@@ -26,7 +26,7 @@ let queue = Queue::open(graph(&path)?, Queue::INTERVAL)?;
 
 - Declare the ontology first. The queue checks events against the ontology it took when it opened; to declare more, close the queue, declare, and open it again.
 - `Queue::open` takes the graph, fills whatever the log holds past the tables (a process that stopped between a commit and its fill leaves some behind), and starts the heartbeat.
-- The queue owns the graph's connection. Read through another handle on the same file: `rannoch_store::open(&path, &KEY)?.find(...)`.
+- The queue owns the graph: `Queue::open` takes the `Graph` by value. Reads, and the store calls the queue does not expose (`stopped`, `retry`, `set_try_limit`, `copy_to`), go through a second handle on the same file: `rannoch_store::open(&path, &KEY)?`. The queue does all commits and fills; the second handle only reads and calls those.
 
 ## Accept events
 
@@ -91,6 +91,8 @@ fn drain(queue: &Queue, worker: &str) -> Result<usize, rannoch_store::Error> {
 
 A failed event stays failed for that worker; the inbox does not retry an app's worker. Retry it in your own code if your work can succeed later.
 
+Close every event you take. A worker that returns or errors without calling `done` or `failed` leaves the event in progress: no other `next` hands it out until the process restarts, and the processed mark stays below it until it is closed.
+
 ### After a crash
 
 A worker's place and every event's state are in the file. When the process restarts, `next` first hands the worker back any event an earlier run left in progress, then carries on after its place. Nothing it closed is handed out again.
@@ -111,8 +113,8 @@ queue.remove_worker("index")?;
 
 ## What was measured
 
-From `toys/live/RESULTS.md` on the `chore/live-test` branch, main 7fe3df9, stores on an external USB drive:
+From `toys/live/RESULTS.md` on the `chore/live-test` branch, main 7fe3df9:
 
 - 300,000 events produced under `kill -9` every 50-300 ms (1,621 kills): none missing, doubled or unfilled.
 - A worker over 3,001 events under 623 kills: every event done, none left in progress.
-- Clean fill throughput: about 44,000-45,000 events a second on a quiet machine (35,000-37,000 with another process holding a core).
+- A clean produce of 300,000 events: 34,716-36,872 events a second, with another process holding a core. On a quiet machine, PR #161 measured about 44,000-45,000.

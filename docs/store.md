@@ -8,6 +8,10 @@ cargo run -p rannoch-store --example store
 
 Most apps write through the queue ([inbox.md](inbox.md)), not `Graph::commit`. This page uses `commit` and `fill` directly to show what the store does with each event.
 
+The snippets call four helpers that build event bodies, `declared`, `node`, `wrote` and `amended`, plus `id`; they are defined at the top of `crates/rannoch-store/examples/store.rs`. `node` is shown below.
+
+**With a queue open,** the queue owns the `Graph` it was opened with (`Queue::open` takes it by value). Everything on this page that is not a write, `find` and the other reads, `stopped`, `retry`, `set_try_limit` and `copy_to`, is reached through a second handle: `rannoch_store::open(&path, &key)`. Do not call `commit` or `fill` on the second handle while the queue runs; the queue does both.
+
 ## Open
 
 ```rust
@@ -52,7 +56,7 @@ Every event is a CloudEvents 1.0 JSON object. rannoch reads the `rannoch.*` type
 | `rannoch.declared.<name>` | (any) | none; made with `declare`, never accepted |
 
 - `id` is `<uuid>:<fact>`: a `UUIDv7` for the origin's event, then which fact within it. The millisecond in the uuid is when the origin recorded the event, and it is that event's point unless the writer supplies `time`. `format!("{}:0", EventId::now())` makes one.
-- `source` is `rannoch:<who wrote it>`.
+- `source` names who wrote it. A source that starts with `rannoch:` is read back percent-decoded without the prefix; any other source (such as `kessel/<branch>/<build>`) is stored exactly as given.
 - `valid` is when the fact was true: `"unknown"`, or `{"on": "2026-10"}` or `{"on": "2026-10-31"}`. Unknown is never read as now.
 - Property values: text is a bare string; other types are tagged: `{"integer": 5}`, `{"decimal": "1.20"}`, `{"float": 1.5}`, `{"float_vector": [0.1, 0.2]}`.
 
@@ -109,6 +113,8 @@ assert_eq!(g.hearings(&NodeRef::new("book", "b1"))?.len(), 1);
 
 ## Amend
 
+**Amend is rare.** It corrects a mistake: an event that was written wrong. It is not how an app records change. A value that changes is a new event, a new hearing at its own point, and the store's history keeps both. An app that amends routinely is modelling change the wrong way.
+
 An amendment corrects what an event says without changing the event. It is an event of type `rannoch.amended` whose subject is the log id (`Event.id`) of the event it amends, not that event's CloudEvent id, and whose data is a JSON Merge Patch (RFC 7386) of the event: a value replaces, `null` removes, an omitted field stays.
 
 ```rust
@@ -120,16 +126,16 @@ g.fill()?;
 - The amended event stays in the log as written. Read as known before the amendment, it reads as written; from the amendment's point on, it reads patched.
 - An amendment's point is the record time in its own CloudEvent id. Amendments stack in point order; at the same point, by event id.
 - **A rename is a patch of the subject.** It maps the old key to the new one from the amendment's point. The node and its links (live or ended) answer under the new key; a link or ending that arrives later naming the old key lands on the new one; a second rename maps on from the new key. Read as known before the rename, everything answers under the old key.
-- An app finds a log id in `commit`'s result, in `events().since(...)`, or in the `Event` a worker takes. There is no lookup from a CloudEvent id to a log id yet.
+- An app finds a log id in `commit`'s result, in `events().since(...)`, or in the `Event` a worker takes. There is no lookup from a CloudEvent id to a log id; issue #164 adds one, not built, that returns the first log id an event arrived under. It is for tracking down the event a mistake came from, and nothing else.
 
-Amendments are meant to be rare, and they are the slow path: about 53 ms each on a 22,619-event store (legion's memory), measured on main 7fe3df9. Events that are not amendments pay nothing for them while a store has no renames.
+Amendments are the slow path: about 53 ms each on a 22,619-event store (legion's memory), measured on main 7fe3df9. Events that are not amendments pay nothing for them while a store has no renames.
 
 ### Refused amendments
 
 Fill refuses an amendment that:
 
 - names an event that is not in the log;
-- has a point before the event's own point (its writer's `time`, else its record time), or before the latest amendment already applied to it;
+- has a point before the event's record time, its own point (its writer's `time`, else its record time), or its latest amendment already applied;
 - amends an event of an integer-keyed class;
 - amends an event with no hearing of its own: a declaration, an app's own event, or content identical to an earlier hearing.
 

@@ -31,7 +31,7 @@ rannoch-store = { git = "https://github.com/runlegion/rannoch", tag = "v0.5.0" }
 rannoch-queue = { git = "https://github.com/runlegion/rannoch", tag = "v0.5.0" }
 ```
 
-`rannoch-store` re-exports what an app needs from `rannoch-ontology` and `rannoch-cloudevents` (`Class`, `Relation`, `Declaration`, `Value`, `EventId`, `NodeRef` and the rest).
+`rannoch-store` re-exports from `rannoch-ontology`: `Class`, `Declaration`, `HistoryKey`, `Ontology`, `Relation`, `Value`, `ValueType`; and from `rannoch-cloudevents`: `Date`, `EventId`, `NodeRef`, `ValidTime`. A worker that parses event bodies itself also depends on `rannoch-cloudevents` (its `read` and `attributes`) or on `serde_json`.
 
 Rust 1.98, edition 2024.
 
@@ -41,6 +41,6 @@ Rust 1.98, edition 2024.
 2. [docs/inbox.md](docs/inbox.md): the queue, producers, and workers in your own code. Runnable: `cargo run -p rannoch-queue --example worker`.
 3. [docs/flows.md](docs/flows.md): the flow-writing guide. A design, not yet built.
 
-`docs/architecture.md` describes the first edition (v0.4.0) and is kept for its measurements. Where it and these pages differ, these pages describe the code.
+4. [docs/architecture.md](docs/architecture.md): how the second edition is built, every part labelled built or not built, and its limits.
 
 The name: Rannoch, the geth home world in Mass Effect.

@@ -18,7 +18,7 @@ Take the operator's example: a line arrives; one worker parses it and writes a r
 
 ### It sees every event
 
-Every worker has its own place in the inbox and is handed every committed event, in log order. Workers x, y and z read the same stream at their own pace, each with its own retries and its own state. One falling behind holds no other back. Within one worker, events go one at a time, in order. This part is built: it is the inbox.
+Every worker has its own place in the inbox and is handed every committed event, in log order. Workers x, y and z read the same stream at their own pace, each with its own state. One falling behind holds no other back. Within one worker, events go one at a time, in order. This part is built: it is the inbox. The inbox does not retry an app's worker (only fill's own failures are retried); retrying a worker's failed step belongs to the harness design.
 
 ### It recognises a kind with a guard
 
@@ -33,7 +33,7 @@ Each row names a step: the processor that runs it.
 | `host` | Calls an action the app registered, under a declared key, checking its input and its answer, and remembering the answer |
 | `store` | Writes a node with its properties and links in one unit; writing it again unchanged writes nothing |
 | `lookup` | Reads a node by class and key, or nothing |
-| `emit` | Sends a CloudEvent to the inbox or to a named sink, exactly once; its id is a hash of its content, its time the event's time |
+| `emit` | Sends a CloudEvent to the inbox or to a named sink, its time the event's time; a retried step emits again (see below) |
 | `branch` | Continues at the first case whose guard holds, else at the default, else ends |
 | `bin` | Puts the input in the worker's bin, with a reason |
 | `wait` | Parks a keyed instance until a matching event arrives or its time passes, on event time |
@@ -46,7 +46,9 @@ Each row names a step: the processor that runs it.
 
 ### It hands off with an emit
 
-A worker passes work on by emitting a CloudEvent. The next worker's guard matches that event's type. Because an emitted event's id is a hash of its content, a step retried after a crash emits the same id, and the store holds it once.
+A worker passes work on by emitting a CloudEvent. The next worker's guard matches that event's type.
+
+**rannoch is at-least-once.** A step retried after a crash can emit again, and that is fine. The store does not dedupe by CloudEvent id: the log mints a fresh log id for every event, and the queue accepts a body it has accepted before. A repeated `rannoch.node` or `rannoch.link` event changes nothing in the graph, because an identical hearing adds nothing (the repeat is held as an alias). An app's own event types can reach a worker twice, so every worker and every host action must be idempotent: doing the same work twice leaves the same result.
 
 `next` can also name another worker directly; whether that is needed beside emit is an open question below.
 
