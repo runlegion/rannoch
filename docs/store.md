@@ -56,7 +56,7 @@ Every event is a CloudEvents 1.0 JSON object. rannoch reads the `rannoch.*` type
 | `rannoch.declared.<name>` | (any) | none; made with `declare`, never accepted |
 
 - `id` is `<uuid>:<fact>`: a `UUIDv7` for the origin's event, then which fact within it. The millisecond in the uuid is when the origin recorded the event, and it is that event's point unless the writer supplies `time`. `format!("{}:0", EventId::now())` makes one.
-- `source` names who wrote it. A source that starts with `rannoch:` is read back percent-decoded without the prefix; any other source (such as `kessel/<branch>/<build>`) is stored exactly as given.
+- `source` names who wrote it. A source that starts with `rannoch:` is read back percent-decoded without the prefix; any other source (such as `importer/<run>`) is stored exactly as given.
 - `valid` is when the fact was true: `"unknown"`, or `{"on": "2026-10"}` or `{"on": "2026-10-31"}`. Unknown is never read as now.
 - Property values: text is a bare string; other types are tagged: `{"integer": 5}`, `{"decimal": "1.20"}`, `{"float": 1.5}`, `{"float_vector": [0.1, 0.2]}`.
 
@@ -128,7 +128,7 @@ g.fill()?;
 - **A rename is a patch of the subject.** It maps the old key to the new one from the amendment's point. The node and its links (live or ended) answer under the new key; a link or ending that arrives later naming the old key lands on the new one; a second rename maps on from the new key. Read as known before the rename, everything answers under the old key.
 - An app finds a log id in `commit`'s result, in `events().since(...)`, or in the `Event` a worker takes. There is no lookup from a CloudEvent id to a log id; issue #164 adds one, not built, that returns the first log id an event arrived under. It is for tracking down the event a mistake came from, and nothing else.
 
-Amendments are the slow path: about 53 ms each on a 22,619-event store (legion's memory), measured on main 7fe3df9. Events that are not amendments pay nothing for them while a store has no renames.
+Amendments are the slow path: about 53 ms each on a 22,619-event store, measured on main 7fe3df9. Events that are not amendments pay nothing for them while a store has no renames.
 
 ### Refused amendments
 
