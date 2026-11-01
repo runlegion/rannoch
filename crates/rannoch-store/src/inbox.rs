@@ -6,8 +6,9 @@ use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 use crate::log::{Cursor, Event, decode, event_at};
 use crate::queries::{
-    DONE_WORK, FAIL_WORK, JOIN_WORKER, NEXT_EVENT, OPEN_WORK, PLACE, POSITION, PROCESSED,
-    REMOVE_PLACE, REMOVE_WORK, SET_PLACE, START_WORK, WORK,
+    DONE_RETRY, DONE_WORK, DROP_OPEN_WORK, FAIL_WORK, FAILED_WORK, JOIN_WORKER, NEXT_EVENT,
+    OPEN_WORK, PLACE, PLACES, POSITION, PROCESSED, REMOVE_KEPT, REMOVE_PLACE, REMOVE_WORK,
+    SET_KEPT, SET_PLACE, START_WORK, WORK,
 };
 use crate::{Error, Graph};
 
@@ -28,7 +29,77 @@ pub enum State {
     Failed(String),
 }
 
+/// A worker's place as the queue saves it: the cursor through which it has closed every event,
+/// and the state it keeps with that cursor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Place {
+    pub worker: String,
+    pub cursor: Cursor,
+    pub kept: Option<String>,
+}
+
 impl Graph {
+    /// Every worker's place but fill's, as it resumes after a restart: the point before its
+    /// oldest event an earlier run left in progress, or else its place, with the state it keeps.
+    /// Beside each, its last event closed as failed, or [`Cursor::START`] when none.
+    ///
+    /// # Errors
+    /// The graph file cannot be read.
+    pub fn places(&self) -> Result<Vec<(Place, Cursor)>, Error> {
+        Ok(self
+            .conn
+            .prepare_cached(PLACES)?
+            .query_map([FILL], |row| {
+                let place = Place {
+                    worker: row.get(0)?,
+                    cursor: Cursor(row.get(1)?),
+                    kept: row.get(2)?,
+                };
+                Ok((place, Cursor(row.get::<_, Option<i64>>(3)?.unwrap_or(0))))
+            })?
+            .collect::<Result<_, _>>()?)
+    }
+
+    /// Saves many workers in one transaction, one group commit: each place with the state it
+    /// keeps, dropping the worker's events in progress (its place stands before them); then each
+    /// close, `(worker, cursor, Some(reason))` recording the event as failed and
+    /// `(worker, cursor, None)` clearing a failure an earlier run recorded for it. Fill's place is
+    /// never touched.
+    ///
+    /// # Errors
+    /// The graph file cannot be written; nothing is saved.
+    pub fn save_places(
+        &mut self,
+        places: &[Place],
+        closes: &[(&str, Cursor, Option<&str>)],
+    ) -> Result<(), Error> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for place in places {
+            tx.prepare_cached(SET_PLACE)?
+                .execute(params![place.worker, place.cursor.0])?;
+            tx.prepare_cached(DROP_OPEN_WORK)?
+                .execute([&place.worker])?;
+            if let Some(kept) = &place.kept {
+                tx.prepare_cached(SET_KEPT)?
+                    .execute(params![place.worker, kept])?;
+            }
+        }
+        for (worker, cursor, reason) in closes {
+            match reason {
+                Some(reason) => tx
+                    .prepare_cached(FAILED_WORK)?
+                    .execute(params![worker, cursor.0, reason])?,
+                None => tx
+                    .prepare_cached(DONE_RETRY)?
+                    .execute(params![worker, cursor.0])?,
+            };
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Producer `producer`'s position in its source, as last committed, or `None` before its
     /// first.
     ///
@@ -152,8 +223,8 @@ impl Graph {
         Ok(mark.map_or(committed, |mark| Cursor(mark.min(committed.0))))
     }
 
-    /// Removes worker `worker`, its place and its open and failed events, releasing the mark it
-    /// held.
+    /// Removes worker `worker`, its place, the state it keeps and its open and failed events,
+    /// releasing the mark it held.
     ///
     /// # Errors
     /// The graph file cannot be written.
@@ -163,6 +234,7 @@ impl Graph {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.prepare_cached(REMOVE_PLACE)?.execute([worker])?;
         tx.prepare_cached(REMOVE_WORK)?.execute([worker])?;
+        tx.prepare_cached(REMOVE_KEPT)?.execute([worker])?;
         tx.commit()?;
         self.handed.retain(|(w, _)| w != worker);
         Ok(())

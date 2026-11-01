@@ -199,7 +199,7 @@ fn a_drop_hands_untaken_failures_to_the_handler() -> Result<(), Box<dyn std::err
 }
 
 #[test]
-fn every_committed_event_has_a_state_for_each_worker_that_survives_reopening()
+fn every_closed_event_has_a_state_for_each_worker_that_survives_reopening()
 -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let queue = Queue::open(graph(&path(&dir))?, HOUR)?;
@@ -220,7 +220,11 @@ fn every_committed_event_has_a_state_for_each_worker_that_survives_reopening()
         queue.state("w", handed[1])?,
         State::Failed("no such book".to_string())
     );
-    assert_eq!(queue.state("w", handed[2])?, State::InProgress);
+    assert_eq!(
+        queue.state("w", handed[2])?,
+        State::Waiting,
+        "what the earlier run left open is after its cursor"
+    );
     let back = queue.next("w")?.ok_or("the third comes back")?.cursor;
     assert_eq!(
         back, handed[2],
@@ -337,5 +341,204 @@ fn opening_the_queue_fills_what_the_log_holds_past_the_tables()
     let queue = Queue::open(g, HOUR)?;
     drop(queue);
     assert!(open(path(&dir), &KEY)?.find("item", "i1")?.is_some());
+    Ok(())
+}
+
+/// A queue holding `count` committed items after the declaration, and the graph's path.
+fn committed(dir: &tempfile::TempDir, count: usize) -> Result<Queue, Box<dyn std::error::Error>> {
+    let queue = Queue::open(graph(&path(dir))?, HOUR)?;
+    for n in 0..count {
+        queue.accept(item(&format!("i{n}")))?;
+    }
+    let (_, failed) = queue.flush();
+    assert!(failed.is_empty(), "{failed:?}");
+    Ok(queue)
+}
+
+#[test]
+fn taking_and_closing_write_nothing_until_a_group_commit() -> Result<(), Box<dyn std::error::Error>>
+{
+    let dir = tempfile::tempdir()?;
+    let queue = committed(&dir, 2)?;
+    let first = queue.next("w")?.ok_or("first")?.cursor;
+    let second = queue.next("w")?.ok_or("second")?.cursor;
+    queue.done("w", first)?;
+    queue.failed("w", second, "no such book")?;
+    let reader = open(path(&dir), &KEY)?;
+    assert_eq!(
+        reader.state("w", first)?,
+        State::Waiting,
+        "a close reached disk"
+    );
+    assert_eq!(reader.state("w", second)?, State::Waiting);
+    assert_eq!(queue.state("w", first)?, State::Done, "memory knows");
+    assert_eq!(
+        queue.state("w", second)?,
+        State::Failed("no such book".to_string())
+    );
+    let _ = queue.flush();
+    assert_eq!(reader.state("w", first)?, State::Done);
+    assert_eq!(
+        reader.state("w", second)?,
+        State::Failed("no such book".to_string()),
+        "the failure is recorded with its reason"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_heartbeat_with_only_worker_changes_commits_them() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    drop(committed(&dir, 1)?);
+    let queue = Queue::open(open(path(&dir), &KEY)?, Queue::INTERVAL)?;
+    let reader = open(path(&dir), &KEY)?;
+    let mut last = None;
+    while let Some(event) = queue.next("a")? {
+        queue.done("a", event.cursor)?;
+        last = Some(event.cursor);
+    }
+    let last = last.ok_or("nothing handed out")?;
+    let other = queue.next("b")?.ok_or("b's first")?.cursor;
+    queue.done("b", other)?;
+    wait_for(|| {
+        reader.state("a", last).ok() == Some(State::Done)
+            && reader.state("b", other).ok() == Some(State::Done)
+    });
+    Ok(())
+}
+
+#[test]
+fn after_a_crash_a_worker_is_handed_again_what_came_after_its_saved_cursor()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let queue = committed(&dir, 4)?;
+    let first = queue.next("w")?.ok_or("first")?.cursor;
+    queue.done("w", first)?;
+    let _ = queue.flush();
+    let second = queue.next("w")?.ok_or("second")?.cursor;
+    queue.done("w", second)?;
+    // A crash: nothing runs after this, no drop, no group commit.
+    std::mem::forget(queue);
+    let queue = Queue::open(open(path(&dir), &KEY)?, HOUR)?;
+    assert_eq!(
+        queue.next("w")?.map(|e| e.cursor),
+        Some(second),
+        "the close after the last group commit is handed again"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_worker_keeps_state_with_its_cursor_across_a_restart() -> Result<(), Box<dyn std::error::Error>>
+{
+    let dir = tempfile::tempdir()?;
+    let queue = committed(&dir, 1)?;
+    let first = queue.next("w")?.ok_or("first")?.cursor;
+    let second = queue.next("w")?.ok_or("second")?.cursor;
+    queue.done_keeping("w", second, "count=2")?;
+    assert_eq!(
+        queue.kept("w"),
+        None,
+        "the cursor has not reached the second while the first is open"
+    );
+    queue.done_keeping("w", first, "count=1")?;
+    assert_eq!(queue.kept("w").as_deref(), Some("count=2"));
+    drop(queue);
+    let queue = Queue::open(open(path(&dir), &KEY)?, HOUR)?;
+    assert_eq!(queue.kept("w").as_deref(), Some("count=2"));
+    assert_eq!(queue.next("w")?, None, "the cursor came back with it");
+    Ok(())
+}
+
+#[test]
+fn a_failure_saved_ahead_of_the_cursor_clears_when_handed_again_and_done()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let queue = committed(&dir, 2)?;
+    let open_one = queue.next("w")?.ok_or("first")?.cursor;
+    let failing = queue.next("w")?.ok_or("second")?.cursor;
+    queue.failed("w", failing, "not yet")?;
+    let _ = queue.flush();
+    std::mem::forget(queue);
+    let queue = Queue::open(open(path(&dir), &KEY)?, HOUR)?;
+    assert_eq!(queue.next("w")?.map(|e| e.cursor), Some(open_one));
+    assert_eq!(queue.next("w")?.map(|e| e.cursor), Some(failing));
+    queue.done("w", open_one)?;
+    queue.done("w", failing)?;
+    drop(queue);
+    assert_eq!(open(path(&dir), &KEY)?.state("w", failing)?, State::Done);
+    Ok(())
+}
+
+#[test]
+fn every_worker_s_lag_and_the_slowest_cursor_can_be_read() -> Result<(), Box<dyn std::error::Error>>
+{
+    let dir = tempfile::tempdir()?;
+    let queue = committed(&dir, 3)?;
+    assert_eq!(queue.slowest(), None, "no worker yet");
+    let total = queue.lag("fast")?;
+    assert_eq!(
+        total, 4,
+        "the declaration and three items are ahead of a new worker"
+    );
+    while let Some(event) = queue.next("fast")? {
+        queue.done("fast", event.cursor)?;
+    }
+    let slow = queue.next("slow")?.ok_or("slow's first")?.cursor;
+    queue.done("slow", slow)?;
+    assert_eq!(queue.lag("fast")?, 0);
+    assert_eq!(queue.lag("slow")?, 3);
+    assert_eq!(queue.slowest(), Some(slow));
+    assert_eq!(queue.processed()?, slow);
+    queue.accept(item("i9"))?;
+    assert_eq!(
+        queue.lag("fast")?,
+        0,
+        "accept is not refused, and lag counts committed events"
+    );
+    let _ = queue.flush();
+    assert_eq!(queue.lag("fast")?, 1);
+    Ok(())
+}
+
+/// The issue's bound on a worker's own cost per event, with no work in the worker.
+const MAX_PER_EVENT: Duration = Duration::from_micros(10);
+
+#[test]
+fn a_worker_costs_under_ten_microseconds_an_event() -> Result<(), Box<dyn std::error::Error>> {
+    const EVENTS: usize = 20_000;
+    let dir = tempfile::tempdir()?;
+    let queue = committed(&dir, EVENTS)?;
+    let started = Instant::now();
+    let mut closed = 0u32;
+    while let Some(event) = queue.next("bench")? {
+        queue.done("bench", event.cursor)?;
+        closed += 1;
+    }
+    let per_event = started.elapsed() / closed;
+    eprintln!("worker overhead: {per_event:?} per event over {closed} events");
+    assert_eq!(
+        closed as usize,
+        EVENTS + 1,
+        "every event and the declaration"
+    );
+    assert!(
+        per_event <= MAX_PER_EVENT,
+        "a worker took {per_event:?} per event, over {MAX_PER_EVENT:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_saved_failure_ahead_of_the_cursor_still_reads_as_failed()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let queue = committed(&dir, 1)?;
+    let open_one = queue.next("w")?.ok_or("first")?.cursor;
+    let failing = queue.next("w")?.ok_or("second")?.cursor;
+    queue.failed("w", failing, "bad")?;
+    let _ = queue.flush();
+    queue.done("w", open_one)?;
+    assert_eq!(queue.state("w", failing)?, State::Failed("bad".to_string()));
     Ok(())
 }

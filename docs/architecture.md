@@ -17,7 +17,7 @@ It keeps every change as an event in an append-only log and never changes an eve
 | `rannoch-ontology` | Classes, relations, properties, value types and history keys; checking a declaration against what is declared and a value against its type. No I/O. | Built |
 | `rannoch-cloudevents` | Reading a CloudEvents 1.0 body into the fact it states: a node, a link, a link's ending or correction, a declaration, or no fact. Event ids and dates. No I/O. | Built |
 | `rannoch-store` | The graph file: the log, the ontology tables, fill, hearings, amendments and renames, the tables kept for speed, reads, the inbox's places and work rows, fill retries, `copy_to`. | Built |
-| `rannoch-queue` | The inbox in memory: accepting events, the heartbeat that commits them, producers' positions, handing events to workers, failures, subscribers. | Built |
+| `rannoch-queue` | The inbox in memory: accepting events, the heartbeat that commits them, producers' positions, each worker's cursor and the group commit that saves them, lag, failures, subscribers. | Built |
 | `rannoch-probe` | Measuring a host's memory and how fast a directory takes durable writes. | Built |
 | `rannoch-worker` | Reading a worker file and checking it against the ontology. | Designed, not built |
 | `rannoch-harness` | Running worker files. | Designed, not built |
@@ -44,7 +44,7 @@ app ──accept──▶ Queue (memory) ──heartbeat, every 20 ms──▶ _
 1. **Accept.** `Queue::accept` or `accept_from` reads the body as CloudEvents 1.0 and checks the fact against the ontology the queue took when it opened. A refused body is refused at once with its reason and is not held. An accepted body is held in memory with a ticket. Declarations are refused here; they go through `Graph::declare`.
 2. **Commit.** The heartbeat (at the interval passed to `Queue::open`, `Queue::INTERVAL` = 20 ms by default, or on `flush`, `close` or drop) commits everything held in one transaction, with a savepoint per event. An event that fails at commit rolls back alone and is reported as a `Failure::Event`. A producer's position commits in the same transaction as its events; after a producer's event fails, its later events in the batch are not committed. The log gives each event a place (`Cursor`) that is never reused, and a log id (`Event.id`, a fresh `UUIDv7`).
 3. **Fill.** After each commit, the queue's heartbeat runs `Graph::fill`, which folds the new events into the history tables and the tables kept for speed (details below). The queue then moves its committed watermark and tells its subscribers.
-4. **Hand out.** `Queue::next(worker)` hands each worker the next committed event at or below the watermark. Every worker sees every event, including the `rannoch.closed.<relation>` events fill appends (see Links).
+4. **Hand out.** `Queue::next(worker)` hands each worker the next committed event after its cursor, at or below the watermark, from memory. Every worker sees every event, including the `rannoch.closed.<relation>` events fill appends (see Links).
 5. **Read.** Reads go through any handle on the file. They read the history tables and `_seen`, never the queue's memory.
 
 What a crash loses: events accepted since the last heartbeat, and the batch whose commit was in flight. Nothing committed is lost. Every commit is durable: the file runs in WAL mode with `synchronous=FULL` and `fullfsync=ON`, so on macOS each commit is flushed to the device.
@@ -120,15 +120,22 @@ Every error inside one event's fill counts as that event's try, a storage fault 
 
 ## The inbox
 
-A worker is a name with a place in `_places`: the last event handed out to it. Events after the place are waiting. Of the events at or before it, only those in progress or failed have a `_work` row.
+Each worker reads with its own cursor, held in the queue's memory: every event at or before it is closed. Taking an event and closing it change only memory; neither writes to disk.
 
-- `next(worker)` takes the worker's oldest event an earlier run left in progress, if any; otherwise the first event after its place, at or below the committed watermark, marking it in progress. A worker joins at the start of the log on its first `next`.
-- `done` deletes the event's row; `failed` keeps it with the reason. The inbox retries only fill's failures, never an app worker's.
+- `next(worker)` hands out the first event after the last one handed out, at or below the committed watermark, and marks it in progress. The worker reads ahead from the log 1,024 events at a time (`Events::chunk`). A worker joins at the start of the log on its first `next`.
+- `done` and `failed` close an event. The cursor moves past every closed event at its front, so a worker that holds several events and closes them out of order keeps its cursor before the oldest one still open.
+- `done_keeping(worker, cursor, state)` closes as `done` does and keeps an opaque string with the cursor once the cursor reaches that event; `kept(worker)` reads it back.
+- **The group commit.** The heartbeat, `flush` and `close` save every worker that changed in one transaction (`Graph::save_places`), also when no event was accepted: each worker's cursor in `_places`, its kept state in `_kept`, and each event it closed as failed as a `_work` row with its reason. A save that fails is reported as `Failure::Workers` and tried again by the next group commit.
+- **After a crash** a worker resumes from its last saved cursor and is handed again everything after it, closed or not: delivery is at least once. An event saved as failed ahead of the cursor and done when handed again has its failure cleared.
+- The inbox retries only fill's failures, never an app worker's. Fill keeps its own place and `_work` rows, written in its own transactions, and the group commit never touches them.
 - Each worker sees every committed event, in log order, independent of every other worker.
+- `lag(worker)` is how many committed events are after the worker's cursor; `slowest()` is the lowest cursor of all workers. A producer or a ring reads them to apply back-pressure; the queue never blocks or refuses `accept`.
+
+`Graph::next`, `done` and `failed` still exist on the store, one durable write each; the queue no longer calls them.
 
 ## The processed mark
 
-`processed()` is the lowest point every worker has finished: no event at or before it is waiting or in progress for any worker. A failed event counts as finished. Fill is a worker, so the mark never passes what fill has not reached. With no workers it equals the committed watermark, and it never passes it. It deletes nothing. `remove_worker` deletes a worker's place and rows and releases the mark it held.
+`processed()` is the lowest point every worker has finished: no event at or before it is waiting or in progress for any worker. A failed event counts as finished. Fill is a worker, so the mark never passes what fill has not reached. With no workers it equals the committed watermark, and it never passes it. It deletes nothing. `Queue::processed` reads the workers' cursors from memory; `Graph::processed` reads what the last group commit saved. `remove_worker` deletes a worker's place, kept state and rows at once and releases the mark it held.
 
 ## copy_to
 
@@ -139,7 +146,8 @@ A worker is a name with a place in `_places`: the last event handed out to it. E
 - **No lookup from a CloudEvent id to a log id.** Issue #164 adds one that returns the first log id an event's source and id arrived under; it is not built, and it is for tracking down the event a mistake came from, and nothing else. An app that will amend an event keeps its log id from `commit`'s result, from `events().since(...)`, or from the `Event` a worker takes. A queue app gets a `Ticket` from `accept`, not an `Event`, so it has the last two.
 - **At-least-once, no dedupe by CloudEvent id.** The log mints a fresh log id for every event, and the queue accepts a body it has accepted before. A repeat under the same CloudEvent id records nothing in the graph. A repeat under a new id is an alias of its hearing at the repeat's own point; if that point is newer than the current version, the repeated (older) content becomes current through it. The log holds both events and every worker is handed both, so workers must be idempotent.
 - **The queue owns its graph.** `Queue::open` takes the `Graph` by value. An app with a queue open reads, and calls `stopped`, `retry`, `set_try_limit` and `copy_to`, through a second handle (`rannoch_store::open`).
-- **An event a worker takes and never closes stays in progress** until the process restarts, and holds the processed mark below it until it is closed.
+- **An event a worker takes and never closes stays in progress** until the process restarts, and holds the worker's cursor and the processed mark below it until it is closed.
+- **A crash hands a worker again what it closed since the last group commit**, about 20 ms of work at the default interval.
 - **Sources.** A source that starts with `rannoch:` is read back percent-decoded without the prefix; any other source is stored exactly as given.
 - **The queue takes the ontology once.** Declarations made after `Queue::open` are not seen by that queue; close it, declare, and open it again.
 - **A removed property stays in its class table column** for as long as the row exists. A later write that omits the property leaves the old value; only deleting the row clears it. `find` reads from `_hearings` and answers correctly.

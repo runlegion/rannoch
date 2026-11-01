@@ -18,7 +18,7 @@ mod read;
 
 pub use fact::check;
 pub use history::{At, End, Hearing, Seen, Version};
-pub use inbox::{FILL, State};
+pub use inbox::{FILL, Place, State};
 pub use log::{Cursor, Event, Events};
 pub use rannoch_cloudevents::{Date, EventId, NodeRef, ValidTime};
 pub use rannoch_ontology::{Class, Declaration, HistoryKey, Ontology, Relation, Value, ValueType};

@@ -62,6 +62,7 @@ Something that goes wrong after an event was accepted is a `Failure`, reported o
 - `Failure::Fill`: a commit landed but its tables were not filled.
 - `Failure::Heartbeat`: the heartbeat panicked; what is queued commits only through a flush, a close or a drop.
 - `Failure::Subscriber`: a subscriber panicked.
+- `Failure::Workers`: the workers' cursors could not be saved; the next group commit tries again.
 
 `subscribe(|cursor| ...)` calls back after each commit with the cursor of the last committed event. A subscriber may call `next` from inside; it must not subscribe, flush or close there.
 
@@ -83,19 +84,42 @@ fn drain(queue: &Queue, worker: &str) -> Result<usize, rannoch_store::Error> {
 }
 ```
 
-- `next(worker)` hands out the worker's next committed event and marks it in progress; `None` when there is nothing past its place. It never hands out an event past the committed watermark.
-- `done(worker, cursor)` and `failed(worker, cursor, reason)` close it. Closing an event that is not in progress for that worker is refused.
-- `state(worker, cursor)` says where an event stands for a worker: `Waiting`, `InProgress`, `Done` or `Failed(reason)`.
+- Each worker reads with its own cursor, held in memory. Taking an event and closing it write nothing to disk.
+- `next(worker)` hands out the worker's next committed event and marks it in progress; `None` when there is nothing past it. It never hands out an event past the committed watermark. The worker reads ahead from the log a chunk at a time.
+- `done(worker, cursor)` and `failed(worker, cursor, reason)` close it. Closing an event that is not in progress for that worker is refused. The cursor moves past every closed event at its front, so an event still open holds it back.
+- `state(worker, cursor)` says where an event stands for a worker: `Waiting`, `InProgress`, `Done` or `Failed(reason)`, closes not yet saved included.
 - Workers are independent. Two workers on one queue each get every event; one falling behind holds no other back.
 - A worker name is any string except `rannoch.fill`, which fill uses for itself.
 
-A failed event stays failed for that worker; the inbox does not retry an app's worker. Retry it in your own code if your work can succeed later.
+A failed event is recorded with its reason and stays failed for that worker; the inbox does not retry an app's worker. Retry it in your own code if your work can succeed later.
 
-Close every event you take. A worker that returns or errors without calling `done` or `failed` leaves the event in progress: no other `next` hands it out until the process restarts, and the processed mark stays below it until it is closed.
+Close every event you take. A worker that returns or errors without calling `done` or `failed` leaves the event in progress: no other `next` hands it out until the process restarts, and the worker's cursor and the processed mark stay below it until it is closed.
+
+### Keeping state with the cursor
+
+```rust
+queue.done_keeping(worker, event.cursor, total.to_string())?;
+let total = queue.kept(worker);
+```
+
+`done_keeping` closes the event as `done` does and keeps an opaque string with the worker's cursor once the cursor reaches that event. It is saved in the same group commit as the cursor, as a producer's position is with its events, and `kept` reads it back, after a restart too.
+
+### The group commit
+
+A worker's cursor, its kept state and its failures reach disk only in a group commit: the heartbeat, `flush` or `close`. One transaction saves every worker that changed, and a heartbeat with only worker changes still commits them. A save that fails is reported as `Failure::Workers` and tried again by the next group commit.
 
 ### After a crash
 
-A worker's place and every event's state are in the file. When the process restarts, `next` first hands the worker back any event an earlier run left in progress, then carries on after its place. Nothing it closed is handed out again.
+A worker resumes from its last saved cursor and is handed again everything after it, including what it closed since the last group commit. Delivery is at least once, so workers must be idempotent, as they already are for repeated events. An event saved as failed and done when handed again reads as done.
+
+### Lag and back-pressure
+
+```rust
+let behind = queue.lag("reports")?;
+let slowest = queue.slowest();
+```
+
+`lag(worker)` is how many committed events are after the worker's cursor. `slowest()` is the lowest cursor of all workers, `None` with none. A producer or a ring reads them to apply back-pressure; the queue itself never blocks or refuses `accept`.
 
 ## The processed mark
 
@@ -103,7 +127,7 @@ A worker's place and every event's state are in the file. When the process resta
 let last = queue.processed()?;
 ```
 
-The processed mark is the lowest point every worker has finished: everything at or before it has been closed, done or failed, by every worker, fill included. It never passes what fill has not reached. Use it to know what is safe to act on everywhere, or to report progress.
+The processed mark is the lowest point every worker has finished: everything at or before it has been closed, done or failed, by every worker, fill included, closes not yet saved included. It never passes what fill has not reached. Use it to know what is safe to act on everywhere, or to report progress.
 
 A worker that leaves for good holds the mark back until it is removed:
 
@@ -118,3 +142,5 @@ From `toys/live/RESULTS.md` on the `chore/live-test` branch, main 7fe3df9:
 - 300,000 events produced under `kill -9` every 50-300 ms (1,621 kills): none missing, doubled or unfilled.
 - A worker over 3,001 events under 623 kills: every event done, none left in progress.
 - A clean produce of 300,000 events: 34,716-36,872 events a second, with another process holding a core. On a quiet machine, PR #161 measured about 44,000-45,000.
+
+Worker costs, from the `a_worker_costs_under_ten_microseconds_an_event` test in `crates/rannoch-queue/src/tests.rs`, which CI runs and which fails above 10 µs: one worker takes and closes 20,001 events on a clean store, with no work in the worker. On an Apple-silicon laptop with an SSD it measured 0.86 µs per event in the debug build CI runs, and 0.20 µs in a release build. Before the worker contract, each `next` and each `done` was a durable commit: 5.4 ms per event, measured by an app on v0.5.0.
