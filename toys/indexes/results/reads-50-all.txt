@@ -1,0 +1,56 @@
+| read (50% aliases) | ms | rows |
+| links out 1 now | 0.010 | 1 |
+| links out 1 known | 0.009 | 1 |
+| links in 1 now | 0.011 | 1 |
+| page out 1 | 0.130 | 1 |
+| page in 1 | 0.125 | 1 |
+| describe out-hub 1 | 0.008 | 1 |
+| describe in-hub 1 | 0.008 | 1 |
+| links out 10 now | 0.029 | 10 |
+| links out 10 known | 0.029 | 10 |
+| links in 10 now | 0.034 | 10 |
+| page out 10 | 0.146 | 10 |
+| page in 10 | 0.358 | 10 |
+| describe out-hub 10 | 0.008 | 1 |
+| describe in-hub 10 | 0.007 | 1 |
+| links out 100 now | 0.230 | 100 |
+| links out 100 known | 0.231 | 100 |
+| links in 100 now | 0.266 | 100 |
+| page out 100 | 0.359 | 100 |
+| page in 100 | 0.584 | 100 |
+| describe out-hub 100 | 0.008 | 1 |
+| describe in-hub 100 | 0.008 | 1 |
+| links out 1000 now | 2.863 | 1000 |
+| links out 1000 known | 2.871 | 1000 |
+| links in 1000 now | 3.907 | 1000 |
+| page out 1000 | 0.366 | 100 |
+| page in 1000 | 0.455 | 100 |
+| describe out-hub 1000 | 0.008 | 1 |
+| describe in-hub 1000 | 0.007 | 1 |
+| links out 10000 now | 39.912 | 10000 |
+| links out 10000 known | 38.794 | 10000 |
+| links in 10000 now | 42.263 | 10000 |
+| page out 10000 | 0.368 | 100 |
+| page in 10000 | 0.378 | 100 |
+| describe out-hub 10000 | 0.008 | 1 |
+| describe in-hub 10000 | 0.008 | 1 |
+| links out 120000 now | 487.146 | 120000 |
+| links out 120000 known | 480.451 | 120000 |
+| links in 120000 now | 514.884 | 120000 |
+| page out 120000 | 0.368 | 100 |
+| page in 120000 | 0.362 | 100 |
+| describe out-hub 120000 | 0.008 | 1 |
+| describe in-hub 120000 | 0.008 | 1 |
+| state_at now | 0.006 | 1 |
+| state_at known | 0.006 | 1 |
+| link_state_at now | 0.015 | 1 |
+| link_state_at known | 0.014 | 1 |
+| find | 0.005 | 1 |
+| nodes book title=g7 now (4k rows) | 33.950 | 4000 |
+| nodes book title=g7 known | 33.465 | 4000 |
+| nodes book title=hub (6 rows) | 0.030 | 6 |
+| counts now | 251.087 | 1 |
+| counts known | 257.929 | 1 |
+| toy stats read | 21.614 | 310013 |
+| answer counts, default known-at | 258.209 | 266 |
+| answer links f10, default known-at | 0.052 | 2001 |

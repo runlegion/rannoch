@@ -41,6 +41,9 @@ use crate::queries::{
 
 /// TOY ONLY: statements captured by [`Graph::toy_capture`].
 static TOY_CAPTURED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+/// TOY ONLY: statement times gathered by [`Graph::toy_profile`].
+static TOY_PROFILE: std::sync::Mutex<std::collections::BTreeMap<String, (f64, u64)>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// Why rannoch did not do what was asked.
 #[derive(Debug, thiserror::Error)]
@@ -108,9 +111,20 @@ pub fn open(path: impl AsRef<Path>, key: &[u8; 32]) -> Result<Graph, Error> {
     let mut conn = Connection::open(path)?;
     conn.busy_handler(Some(retry_lock))?;
     conn.execute_batch(PRAGMAS)?;
+    // TOY ONLY: extra pragmas for the index toy (for example a larger page cache).
+    if let Ok(extra) = std::env::var("RANNOCH_TOY_PRAGMAS") {
+        conn.execute_batch(&extra)?;
+    }
+    if let Some(n) = std::env::var("RANNOCH_TOY_STMT_CACHE").ok().and_then(|v| v.parse().ok()) {
+        conn.set_prepared_statement_cache_capacity(n);
+    }
     conn.set_prepared_statement_cache_capacity(256);
     conn.execute_batch(OWN_TABLES)?;
     conn.execute_batch(HISTORY_TABLES)?;
+    // TOY ONLY: schema changes for the index toy, run after the history tables exist.
+    if let Ok(extra) = std::env::var("RANNOCH_TOY_SCHEMA") {
+        conn.execute_batch(&extra)?;
+    }
     let key = Key::new(key);
     take(&mut conn, &key)?;
     let schema_version = schema_version(&conn)?;
@@ -442,6 +456,36 @@ impl Graph {
         }
     }
 
+    /// TOY ONLY: starts (`on`) or stops timing every statement this connection runs; stopping
+    /// returns each statement's total milliseconds and run count, slowest first.
+    pub fn toy_profile(&self, on: bool) -> Vec<(String, f64, u64)> {
+        fn profiled(event: rusqlite::trace::TraceEvent<'_>) {
+            if let rusqlite::trace::TraceEvent::Profile(stmt, took) = event
+                && let Ok(mut map) = TOY_PROFILE.lock()
+            {
+                let e = map.entry(stmt.sql().to_string()).or_insert((0.0, 0));
+                e.0 += took.as_secs_f64() * 1000.0;
+                e.1 += 1;
+            }
+        }
+        if on {
+            if let Ok(mut map) = TOY_PROFILE.lock() {
+                map.clear();
+            }
+            self.conn
+                .trace_v2(rusqlite::trace::TraceEventCodes::SQLITE_TRACE_PROFILE, Some(profiled));
+            return Vec::new();
+        }
+        self.conn
+            .trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
+        let mut rows: Vec<(String, f64, u64)> = TOY_PROFILE
+            .lock()
+            .map(|m| m.iter().map(|(k, (t, n))| (k.clone(), *t, *n)).collect())
+            .unwrap_or_default();
+        rows.sort_by(|a, b| b.1.total_cmp(&a.1));
+        rows
+    }
+
     /// TOY ONLY: the stats fill keeps, per class and relation, now.
     ///
     /// # Errors
@@ -580,6 +624,14 @@ fn fill_one(
         fact::Fact::Concluded(conclusion) => Some(conclusion.event),
         fact::Fact::Declared | fact::Fact::None => None,
     };
+    if let Some(origin) = origin {
+        toy_stats::note_known(origin.recorded()?);
+    } else if let Ok(a) = rannoch_cloudevents::attributes(&event.body) {
+        let uuid = a.id.split(':').next().unwrap_or_default().to_string();
+        if let Ok(id) = serde_json::from_value::<rannoch_cloudevents::EventId>(serde_json::Value::String(uuid)) {
+            toy_stats::note_known(id.recorded().unwrap_or(i64::MIN));
+        }
+    }
     let renames = &mut flags.renames;
     match fact {
         fact::Fact::Node(node) => {
@@ -619,7 +671,7 @@ fn fill_one(
             if toy_stats::enabled() && toy_stats::ever_ended(tx, rel, from, to)? {
                 let before = toy_stats::holding(tx, rel, from, to)?;
                 fill_link(tx, (ontology, store_key), stamp, &link, *renames)?;
-                toy_stats::moved(tx, rel, before, toy_stats::holding(tx, rel, from, to)?)?;
+                toy_stats::moved(tx, (rel, from, to), before, toy_stats::holding(tx, rel, from, to)?)?;
             } else {
                 fill_link(tx, (ontology, store_key), stamp, &link, *renames)?;
             }
@@ -629,7 +681,7 @@ fn fill_one(
             let before = toy_stats::enabled() && toy_stats::holding(tx, rel, from, to)?;
             conclude(tx, ontology, &conclusion, *renames)?;
             if toy_stats::enabled() {
-                toy_stats::moved(tx, rel, before, toy_stats::holding(tx, rel, from, to)?)?;
+                toy_stats::moved(tx, (rel, from, to), before, toy_stats::holding(tx, rel, from, to)?)?;
             }
         }
         fact::Fact::None => {
@@ -852,7 +904,7 @@ fn current(tx: &Connection, ontology: &Ontology, subject: &Subject) -> Result<()
             if tx.prepare_cached(&delete_link(relation, &declared.from, &declared.to))?
                 .execute([key, to])? > 0
             {
-                toy_stats::tally(format!("link:{relation}"), -1);
+                toy_stats::tally_link(relation, key, to, -1);
             }
             tx.prepare_cached(CLOSE_OPEN)?
                 .execute(rusqlite::params![relation, key, to])?;
@@ -901,7 +953,7 @@ fn put_link(
     let declared = ontology.relation(relation)?;
     let valid = valid.as_text();
     if present(tx, &declared.from, from)? && present(tx, &declared.to, to)? {
-        toy_stats::put_link(tx, relation, &declared.from, &declared.to, rusqlite::params![from, to, source, valid, recorded])?;
+        toy_stats::put_link(tx, relation, &declared.from, &declared.to, (from, to), rusqlite::params![from, to, source, valid, recorded])?;
     } else {
         tx.prepare_cached(OPEN_LINK)?
             .execute(rusqlite::params![relation, from, to, source, valid])?;
@@ -944,7 +996,7 @@ fn arrived(
                 {
                     continue;
                 }
-                toy_stats::put_link(tx, &relation.name, &relation.from, &relation.to, rusqlite::params![from_key, to_key, source, valid, recorded])?;
+                toy_stats::put_link(tx, &relation.name, &relation.from, &relation.to, (&from_key, &to_key), rusqlite::params![from_key, to_key, source, valid, recorded])?;
                 tx.prepare_cached(CLOSE_OPEN)?.execute(rusqlite::params![
                     relation.name,
                     from_key,

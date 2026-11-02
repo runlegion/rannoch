@@ -905,6 +905,15 @@ fn property_value(property: &str) -> String {
 /// Indexes the hearings of `class`'s nodes by the value of `property`. Only that class's hearings
 /// are in it, so a write of any other pays nothing for it.
 pub(crate) fn create_property_index(class: &str, property: &str) -> String {
+    // TOY ONLY: `RANNOCH_TOY_PROPIDX=entity` leads the index with the entity column instead of a
+    // partial `WHERE entity = ...`, whose bound-parameter match re-prepares statements.
+    if std::env::var("RANNOCH_TOY_PROPIDX").as_deref() == Ok("entity") {
+        return format!(
+            "CREATE INDEX IF NOT EXISTS {} ON _hearings(entity, {}, key);",
+            ident(&format!("_by:{}:{class}:{property}", class.len())),
+            property_value(property)
+        );
+    }
     format!(
         "CREATE INDEX IF NOT EXISTS {} ON _hearings({}, key) WHERE entity = {} AND line = 'main';",
         ident(&format!("_by:{}:{class}:{property}", class.len())),

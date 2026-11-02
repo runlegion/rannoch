@@ -244,6 +244,14 @@ impl Graph {
                 }
                 let (axis, known) =
                     bounds(&relation.axis, view, &format!("relation {}", relation.name))?;
+                if view.axis.is_none() && view.known.is_none()
+                    && let Some(n) = crate::toy_stats::link_count_now(&self.conn, &relation.name, direction == Direction::Out, &node.key)?
+                {
+                    if n > 0 {
+                        links.insert((relation.name.clone(), direction), u64::try_from(n).unwrap_or(0));
+                    }
+                    continue;
+                }
                 let count = counted(
                     &self.conn,
                     &format!(
@@ -281,7 +289,10 @@ impl Graph {
         let Envelope { data: asked } = serde_json::from_str(query)?;
         let known = match asked.view.known {
             Some(known) => Some(known),
-            None => self.conn.query_row(KNOWN_NOW, [], |row| row.get(0))?,
+            None => match crate::toy_stats::known_now(&self.conn)? {
+                Some(kept) => Some(kept),
+                None => self.conn.query_row(KNOWN_NOW, [], |row| row.get(0))?,
+            },
         };
         let view = View {
             axis: asked.view.axis,

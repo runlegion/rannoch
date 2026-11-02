@@ -1,0 +1,4 @@
+fill 306000 events in 22.807 s: 13417 events/s
+fill 306000 events in 22.826 s: 13406 events/s
+fill 306000 events in 22.830 s: 13403 events/s
+fill 306000 events in 22.991 s: 13309 events/s

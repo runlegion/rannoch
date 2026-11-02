@@ -9,6 +9,62 @@ use std::sync::OnceLock;
 
 thread_local! {
     static TALLY: RefCell<HashMap<String, i64>> = RefCell::new(HashMap::new());
+    static KNOWN: std::cell::Cell<i64> = const { std::cell::Cell::new(i64::MIN) };
+}
+
+fn cc() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RANNOCH_TOY_CC").is_ok())
+}
+
+fn kept_known() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RANNOCH_TOY_KNOWN").is_ok())
+}
+
+/// counter_cache: tallies a change in whether the link from `from` to `to` of `relation` holds,
+/// for the relation and, with `RANNOCH_TOY_CC`, for each of its two ends.
+pub(crate) fn tally_link(relation: &str, from: &str, to: &str, d: i64) {
+    tally(format!("link:{relation}"), d);
+    if cc() {
+        tally(format!("o:{relation}:{from}"), d);
+        tally(format!("i:{relation}:{to}"), d);
+    }
+}
+
+/// Notes a fact's known-at, so each batch keeps the newest the store holds.
+pub(crate) fn note_known(known: i64) {
+    if kept_known() {
+        KNOWN.with(|k| {
+            if known > k.get() {
+                k.set(known);
+            }
+        });
+    }
+}
+
+/// The newest known-at the store holds, as fill keeps it (with `RANNOCH_TOY_KNOWN`).
+pub(crate) fn known_now(conn: &Connection) -> Result<Option<i64>, Error> {
+    if !kept_known() {
+        return Ok(None);
+    }
+    Ok(conn
+        .prepare_cached("SELECT n FROM _stats WHERE entity = 'known_now'")?
+        .query_row([], |row| row.get(0))
+        .ok())
+}
+
+/// counter_cache: how many links of `relation` from (`out`) or to the node keyed `key` hold now.
+pub(crate) fn link_count_now(conn: &Connection, relation: &str, out: bool, key: &str) -> Result<Option<i64>, Error> {
+    if !cc() {
+        return Ok(None);
+    }
+    let entity = format!("{}:{relation}:{key}", if out { "o" } else { "i" });
+    Ok(Some(
+        conn.prepare_cached("SELECT n FROM _stats WHERE entity = ?1")?
+            .query_row([entity], |row| row.get(0))
+            .unwrap_or(0),
+    ))
 }
 
 /// Tallies a row a fill added to (1) or removed from (-1) a class or relation table, in memory.
@@ -45,11 +101,19 @@ pub(crate) fn prepare(tx: &Connection, ontology: &Ontology) -> Result<(), Error>
     for (i, relation) in ontology.relations.keys().enumerate() {
         let entity = quote(&format!("link:{relation}"));
         let rel = quote(relation);
+        let (o, i_) = if cc() {
+            (
+                format!(", ('o:' || new.rel || ':' || new.from_key, 1), ('i:' || new.rel || ':' || new.to_key, 1)"),
+                format!(", ('o:' || old.rel || ':' || old.from_key, -1), ('i:' || old.rel || ':' || old.to_key, -1)"),
+            )
+        } else {
+            (String::new(), String::new())
+        };
         sql.push_str(&format!(
             "CREATE TEMP TRIGGER IF NOT EXISTS stats_o{i}_i AFTER INSERT ON main._open \
-             WHEN new.rel = {rel} BEGIN INSERT INTO stats_delta VALUES ({entity}, 1); END;\
+             WHEN new.rel = {rel} BEGIN INSERT INTO stats_delta VALUES ({entity}, 1){o}; END;\
              CREATE TEMP TRIGGER IF NOT EXISTS stats_o{i}_d AFTER DELETE ON main._open \
-             WHEN old.rel = {rel} BEGIN INSERT INTO stats_delta VALUES ({entity}, -1); END;"
+             WHEN old.rel = {rel} BEGIN INSERT INTO stats_delta VALUES ({entity}, -1){i_}; END;"
         ));
     }
     tx.execute_batch(&sql)?;
@@ -71,6 +135,14 @@ pub(crate) fn flush(tx: &Connection) -> Result<(), Error> {
          GROUP BY entity ON CONFLICT(entity) DO UPDATE SET n = n + excluded.n;\
          DELETE FROM stats_delta;",
     )?;
+    let known = KNOWN.with(|k| k.replace(i64::MIN));
+    if known > i64::MIN {
+        tx.prepare_cached(
+            "INSERT INTO _stats(entity, n) VALUES ('known_now', ?1) \
+             ON CONFLICT(entity) DO UPDATE SET n = max(n, excluded.n)",
+        )?
+        .execute([known])?;
+    }
     Ok(())
 }
 
@@ -108,12 +180,12 @@ pub(crate) fn ever_ended(tx: &Connection, relation: &str, from: &str, to: &str) 
 }
 
 /// Tallies a change in whether a link of `relation` holds.
-pub(crate) fn moved(tx: &Connection, relation: &str, before: bool, after: bool) -> Result<(), Error> {
+pub(crate) fn moved(tx: &Connection, (relation, from, to): (&str, &str, &str), before: bool, after: bool) -> Result<(), Error> {
     if !on() || before == after {
         return Ok(());
     }
     let _ = tx;
-    tally(format!("link:{relation}"), if after { 1 } else { -1 });
+    tally_link(relation, from, to, if after { 1 } else { -1 });
     Ok(())
 }
 
@@ -164,7 +236,7 @@ fn node_split_build(class: &str, names: &[&str]) -> (String, String) {
 }
 
 /// Puts a link into its relation's table, tallying it when the row is new.
-pub(crate) fn put_link(tx: &Connection, relation: &str, from: &str, to: &str, params: impl rusqlite::Params + Clone) -> Result<(), Error> {
+pub(crate) fn put_link(tx: &Connection, relation: &str, from: &str, to: &str, keys: (&str, &str), params: impl rusqlite::Params + Clone) -> Result<(), Error> {
     thread_local! {
         static SQL: RefCell<HashMap<String, (String, String, String)>> = RefCell::new(HashMap::new());
     }
@@ -190,7 +262,7 @@ pub(crate) fn put_link(tx: &Connection, relation: &str, from: &str, to: &str, pa
         return Ok(());
     }
     if tx.prepare_cached(&insert)?.execute(params.clone())? == 1 {
-        tally(format!("link:{relation}"), 1);
+        tally_link(relation, keys.0, keys.1, 1);
     } else {
         tx.prepare_cached(&update)?.execute(params)?;
     }

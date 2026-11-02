@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS _hearings_to; CREATE INDEX IF NOT EXISTS _hearings_to ON _hearings(entity, line, to_key, key); DROP INDEX IF EXISTS "_by:4:book:title"; CREATE INDEX IF NOT EXISTS "_by:4:book:title" ON _hearings(entity, json_extract(properties, '$."title"'), key);

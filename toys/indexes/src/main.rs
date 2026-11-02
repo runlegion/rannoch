@@ -58,7 +58,9 @@ fn id_of(body: &str) -> String {
 
 fn book_class() -> Class {
     let mut c = Class::new("book", ["title"]);
-    c.indexed.insert("title".into());
+    if std::env::var("RANNOCH_TOY_NOINDEX").is_err() {
+        c.indexed.insert("title".into());
+    }
     c
 }
 
@@ -277,13 +279,66 @@ fn fill_bench(dir: &str, events: usize) -> Result<(), Box<dyn std::error::Error>
         bodies.push(wrote(&format!("a{}", i % (half / 10)), &format!("b{}", (i * 7919) % (half - half / 10))));
     }
     // A realistic share of re-sent content: 2% of events.
-    let resend: Vec<String> = bodies.iter().step_by(50).map(|b| b.replacen(&id_of(b), &id(), 1)).collect();
-    bodies.extend(resend);
+    if std::env::var("RANNOCH_TOY_NORESEND").is_err() {
+        let resend: Vec<String> = bodies.iter().step_by(50).map(|b| b.replacen(&id_of(b), &id(), 1)).collect();
+        bodies.extend(resend);
+    }
+    if std::env::var("RANNOCH_TOY_PHASES").is_ok() {
+        let n_nodes = half / 10 + (half - half / 10);
+        let n_links = events - half;
+        let phases = [("nodes", 0, n_nodes), ("links", n_nodes, n_nodes + n_links), ("resend", n_nodes + n_links, bodies.len())];
+        let mut g = store(dir, "fill-phases.rannoch")?;
+        for (name, a, b) in phases {
+            if a >= b { continue; }
+            commit_all(&mut g, &bodies[a..b])?;
+            let t = Instant::now();
+            g.fill()?;
+            let s = t.elapsed().as_secs_f64();
+            println!("  phase {name}: {} events in {s:.3} s: {:.0}/s", b - a, (b - a) as f64 / s);
+        }
+        return Ok(());
+    }
     commit_all(&mut g, &bodies)?;
+    let profile = std::env::var("RANNOCH_TOY_PROFILE").is_ok();
+    if profile {
+        g.toy_profile(true);
+    }
     let started = Instant::now();
     g.fill()?;
     let secs = started.elapsed().as_secs_f64();
     println!("fill {} events in {secs:.3} s: {:.0} events/s", bodies.len(), bodies.len() as f64 / secs);
+    eprintln!("stopped {}", g.stopped().map(|v| v.len()).unwrap_or(0));
+    if profile {
+        for (sql, ms, n) in g.toy_profile(false).into_iter().take(25) {
+            println!("  {ms:9.0} ms {n:8} x  {}", sql.replace('\n', " ").chars().take(160).collect::<String>());
+        }
+    }
+    Ok(())
+}
+
+fn verify(dir: &str, alias_percent: usize) -> Result<(), Box<dyn std::error::Error>> {
+    let g = reopen(dir, alias_percent)?;
+    let mut nodes: Vec<NodeRef> = FANS.iter().flat_map(|f| [NodeRef::new("author", format!("f{f}")), NodeRef::new("book", format!("in{f}"))]).collect();
+    for i in (0..130_000).step_by(997) {
+        nodes.push(NodeRef::new("author", format!("a{i}")));
+    }
+    for i in (0..200_000).step_by(1499) {
+        nodes.push(NodeRef::new("book", format!("b{i}")));
+    }
+    let mut bad = 0;
+    for n in &nodes {
+        let Some(d) = g.describe(n, &now())? else { continue };
+        for (dir, out) in [(Direction::Out, true), (Direction::In, false)] {
+            if (n.class == "author") != out { continue; }
+            let want = g.links(n, "wrote", dir, &now())?.len() as u64;
+            let got = d.links.get(&("wrote".to_string(), dir)).copied().unwrap_or(0);
+            if want != got {
+                bad += 1;
+                println!("  differ: {}:{} {:?} counter {got}, links {want}", n.class, n.key, dir);
+            }
+        }
+    }
+    println!("verify describe counts on {} nodes: {bad} differ", nodes.len());
     Ok(())
 }
 
@@ -294,6 +349,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("capture") => capture(&args[2], args[3].parse()?),
         Some("reads") => time_reads(&args[2], args[3].parse()?),
         Some("fill") => fill_bench(&args[2], args[3].parse()?),
+        Some("verify") => verify(&args[2], args[3].parse()?),
         _ => {
             eprintln!("usage: build|capture|reads <dir> <alias-percent> | fill <dir> <events>");
             Ok(())

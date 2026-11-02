@@ -1,0 +1,3 @@
+store with 0% re-sent: 747234 events filled in 28.6 s
+store with 10% re-sent: 821458 events filled in 39.7 s
+store with 50% re-sent: 1118351 events filled in 98.8 s

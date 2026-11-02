@@ -1,0 +1,14 @@
+== 0% aliases
+| 100 | window | 0.124 ms | 100 rows |
+| 100 | per-key seek | 0.169 ms | 100 rows |
+| 1000 | window | 1.152 ms | 1000 rows |
+| 1000 | per-key seek | 1.686 ms | 1000 rows |
+| 10000 | window | 12.044 ms | 10000 rows |
+| 10000 | per-key seek | 17.635 ms | 10000 rows |
+== 50% aliases
+| 100 | window | 0.212 ms | 100 rows |
+| 100 | per-key seek | 0.228 ms | 100 rows |
+| 1000 | window | 2.107 ms | 1000 rows |
+| 1000 | per-key seek | 2.327 ms | 1000 rows |
+| 10000 | window | 30.842 ms | 10000 rows |
+| 10000 | per-key seek | 32.819 ms | 10000 rows |

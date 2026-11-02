@@ -1,0 +1,20 @@
+== 0% aliases
+built _now in 4.7 s, 742234 rows
+| 100 | window | 0.164 ms | 100 rows |
+| 100 | A: _now lookup | 0.061 ms | 100 rows |
+| 1000 | window | 1.566 ms | 1000 rows |
+| 1000 | A: _now lookup | 0.407 ms | 1000 rows |
+| 10000 | window | 14.858 ms | 10000 rows |
+| 10000 | A: _now lookup | 4.654 ms | 10000 rows |
+| 120000 | window | 208.347 ms | 120000 rows |
+| 120000 | A: _now lookup | 63.525 ms | 120000 rows |
+== 50% aliases
+built _now in 7.8 s, 742234 rows
+| 100 | window | 0.246 ms | 100 rows |
+| 100 | A: _now lookup | 0.047 ms | 100 rows |
+| 1000 | window | 2.475 ms | 1000 rows |
+| 1000 | A: _now lookup | 0.419 ms | 1000 rows |
+| 10000 | window | 34.713 ms | 10000 rows |
+| 10000 | A: _now lookup | 4.745 ms | 10000 rows |
+| 120000 | window | 418.198 ms | 120000 rows |
+| 120000 | A: _now lookup | 64.309 ms | 120000 rows |
