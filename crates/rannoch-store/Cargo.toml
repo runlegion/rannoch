@@ -13,7 +13,7 @@ publish = false
 rannoch-cloudevents = { path = "../rannoch-cloudevents" }
 rannoch-ontology = { path = "../rannoch-ontology" }
 blake3 = "1.8"
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled", "trace"] } # TOY ONLY: trace for the index toy
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

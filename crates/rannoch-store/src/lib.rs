@@ -39,6 +39,9 @@ use crate::queries::{
     WAITING_FOR, delete_link, delete_node, node_id, upsert_link, upsert_node, waiting,
 };
 
+/// TOY ONLY: statements captured by [`Graph::toy_capture`].
+static TOY_CAPTURED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
 /// Why rannoch did not do what was asked.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -413,6 +416,30 @@ impl Graph {
         tx.prepare_cached(SET_PLACE)?.execute(params![FILL, to.0])?;
         tx.commit()?;
         Ok(to)
+    }
+
+    /// TOY ONLY: starts (`on`) or stops capturing the statements this connection runs, and
+    /// returns what was captured since the last start.
+    pub fn toy_capture(&self, on: bool) -> Vec<String> {
+        fn traced(event: rusqlite::trace::TraceEvent<'_>) {
+            if let rusqlite::trace::TraceEvent::Stmt(_, sql) = event
+                && let Ok(mut seen) = TOY_CAPTURED.lock()
+            {
+                seen.push(sql.to_owned());
+            }
+        }
+        if on {
+            if let Ok(mut seen) = TOY_CAPTURED.lock() {
+                seen.clear();
+            }
+            self.conn
+                .trace_v2(rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT, Some(traced));
+            Vec::new()
+        } else {
+            self.conn
+                .trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
+            TOY_CAPTURED.lock().map(|mut s| std::mem::take(&mut *s)).unwrap_or_default()
+        }
     }
 
     /// TOY ONLY: the stats fill keeps, per class and relation, now.
