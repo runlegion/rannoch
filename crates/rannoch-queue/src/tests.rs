@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use rannoch_store::{Class, Declaration, Error, Graph, open};
+use rannoch_store::{Class, Declaration, Error, Graph, Relation, open};
 
 use super::{Failure, Queue, State, Ticket, lock};
 
@@ -341,6 +341,47 @@ fn opening_the_queue_fills_what_the_log_holds_past_the_tables()
     let queue = Queue::open(g, HOUR)?;
     drop(queue);
     assert!(open(path(&dir), &KEY)?.find("item", "i1")?.is_some());
+    Ok(())
+}
+
+#[test]
+fn a_closed_link_event_is_handed_out_by_the_commit_that_filled_it()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let mut g = graph(&path(&dir))?;
+    g.declare(
+        &Declaration::Class(Class::new("box", ["v"])),
+        r#"{"specversion":"1.0","id":"d-box","source":"rannoch:app","type":"rannoch.declared.box"}"#,
+    )?;
+    g.declare(
+        &Declaration::Relation(Relation::new("holds", "box", "item", false)),
+        r#"{"specversion":"1.0","id":"d-holds","source":"rannoch:app","type":"rannoch.declared.holds"}"#,
+    )?;
+    let queue = Queue::open(g, HOUR)?;
+    queue.accept(node("box", "b1"))?;
+    queue.accept(format!(
+        r#"{{"specversion":"1.0","id":"{}:0","source":"rannoch:app","type":"rannoch.link.holds","subject":"b1","data":{{"from":{{"class":"box","key":"b1"}},"to":{{"class":"item","key":"i1"}},"valid":"unknown"}}}}"#,
+        rannoch_cloudevents::EventId::now()
+    ))?;
+    let (_, failed) = queue.flush();
+    assert!(failed.is_empty(), "{failed:?}");
+    while let Some(event) = queue.next("w")? {
+        queue.done("w", event.cursor)?;
+    }
+    queue.accept(item("i1"))?;
+    let (_, failed) = queue.flush();
+    assert!(failed.is_empty(), "{failed:?}");
+    let mut handed = Vec::new();
+    while let Some(event) = queue.next("w")? {
+        queue.done("w", event.cursor)?;
+        handed.push(event.body);
+    }
+    assert!(
+        handed
+            .iter()
+            .any(|body| body.contains("rannoch.closed.holds")),
+        "the closed event is handed out with no later commit: {handed:?}"
+    );
     Ok(())
 }
 
