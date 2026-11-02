@@ -14,7 +14,7 @@ use crate::history::{
     node_entity, node_in_view, time, version_of,
 };
 use crate::queries::{
-    KNOWN_NOW, keys_by_property, link_count, links_in_view, node_count, nodes_in_view, select_node,
+    Catalogue, KNOWN_NOW, all_nodes_in_view, link_count, links_counted, links_in_view, node_count,
 };
 use crate::{Class, Date, Error, EventId, Graph, NodeRef, Ontology, ValidTime, Value};
 
@@ -37,8 +37,8 @@ impl Graph {
     /// # Errors
     /// The class is not declared, or the graph file cannot be read.
     pub fn find(&self, class: &str, key: &str) -> Result<Option<Node>, Error> {
-        let ontology = self.current_ontology()?;
-        find_in(&self.conn, &ontology, class, key)
+        let (ontology, sql) = self.current()?;
+        find_in(&self.conn, (&ontology, &sql), class, key)
     }
 
     /// The node of `class` with natural key `key` as of the valid time `as_of`, in `view`: among
@@ -120,7 +120,7 @@ impl Graph {
         let (axis, known) = bounds(&declared.axis, view, &format!("relation {relation}"))?;
         keyed_versions(
             &self.conn,
-            &links_in_view(out),
+            links_in_view(out),
             params![link_entity(relation), axis, known, node.key],
         )
     }
@@ -139,7 +139,7 @@ impl Graph {
         filter: &BTreeMap<String, Value>,
         view: &View,
     ) -> Result<Vec<(String, Version)>, Error> {
-        let ontology = self.current_ontology()?;
+        let (ontology, sql) = self.current()?;
         let class = ontology.class(class)?;
         if let Some(property) = filter.keys().find(|p| !class.indexed.contains(*p)) {
             return Err(Error::Refused(format!(
@@ -150,10 +150,14 @@ impl Graph {
         let (axis, known) = bounds(&class.axis, view, &format!("class {}", class.name))?;
         let entity = node_entity(&class.name);
         let mut nodes = match filter.iter().next() {
-            None => keyed_versions(&self.conn, &nodes_in_view(""), params![entity, axis, known])?,
+            None => keyed_versions(
+                &self.conn,
+                all_nodes_in_view(),
+                params![entity, axis, known],
+            )?,
             Some((property, value)) => keyed_versions(
                 &self.conn,
-                &nodes_in_view(&keys_by_property(&class.name, property)),
+                &sql.class(&class.name)?.by[property],
                 params![entity, axis, known, serde_json::to_string(value)?],
             )?,
         };
@@ -178,7 +182,7 @@ impl Graph {
             let (axis, known) = bounds(&class.axis, view, &format!("class {}", class.name))?;
             let count = counted(
                 &self.conn,
-                &node_count(),
+                node_count(),
                 params![node_entity(&class.name), axis, known],
             )?;
             counts.nodes.insert(class.name.clone(), count);
@@ -188,7 +192,7 @@ impl Graph {
                 bounds(&relation.axis, view, &format!("relation {}", relation.name))?;
             let count = counted(
                 &self.conn,
-                &link_count(),
+                link_count(),
                 params![link_entity(&relation.name), axis, known],
             )?;
             counts.links.insert(relation.name.clone(), count);
@@ -221,10 +225,7 @@ impl Graph {
                     bounds(&relation.axis, view, &format!("relation {}", relation.name))?;
                 let count = counted(
                     &self.conn,
-                    &format!(
-                        "SELECT count(*) FROM ({})",
-                        links_in_view(direction == Direction::Out)
-                    ),
+                    links_counted(direction == Direction::Out),
                     params![link_entity(&relation.name), axis, known, node.key],
                 )?;
                 if count > 0 {
@@ -392,7 +393,7 @@ fn day_text((year, month, day): (u16, u8, u8)) -> String {
 
 fn find_in(
     conn: &Connection,
-    ontology: &Ontology,
+    (ontology, sql): (&Ontology, &Catalogue),
     class: &str,
     key: &str,
 ) -> Result<Option<Node>, Error> {
@@ -403,7 +404,7 @@ fn find_in(
     }
     // A replaced node keeps its row and nothing else: its history is the new key's now.
     Ok(conn
-        .prepare_cached(&select_node(&class.name))?
+        .prepare_cached(&sql.class(&class.name)?.row)?
         .query_row(params![key], |row| {
             Ok(Node {
                 class: class.name.clone(),
@@ -632,7 +633,7 @@ mod tests {
             .conn
             .prepare(&format!(
                 "EXPLAIN QUERY PLAN {}",
-                crate::queries::nodes_in_view(&crate::queries::keys_by_property("book", "genre"))
+                g.current()?.1.class("book")?.by["genre"]
             ))?
             .query_map(
                 rusqlite::params!["class:book", None::<Vec<u8>>, None::<i64>, "\"fiction\""],

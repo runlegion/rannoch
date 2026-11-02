@@ -6,9 +6,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, TransactionBehavior, params};
 
 mod fact;
+mod handles;
 mod history;
 mod inbox;
 mod log;
@@ -24,6 +25,7 @@ pub use rannoch_cloudevents::{Date, EventId, NodeRef, ValidTime};
 pub use rannoch_ontology::{Class, Declaration, Ontology, Relation, Value, ValueType};
 pub use read::{Counts, Description, Direction, Node};
 
+use crate::handles::{Handles, Run};
 use crate::history::{
     Heard, Key, Of, Stamp, Subject, alias, amend, conclude, derive, heard, link_entity,
     names_renamed, newest, node_entity, reseen_of, take,
@@ -32,10 +34,9 @@ use crate::inbox::place;
 use crate::log::{append, event_at, store};
 use crate::ontology::{Bound, build, load};
 use crate::queries::{
-    ANY_RENAME, CACHE, CLOSE_OPEN, COPY_INTO, DONE_RETRY, HISTORY_TABLES, OPEN_LINK, OWN_TABLES,
-    PRAGMAS, RELEASE, RESET_TRIES, RETRY_WORK, ROLLBACK_TO, SAVEPOINT, SCHEMA_VERSION, SET_PLACE,
-    SET_POSITION, SET_TRY_LIMIT, STOP_WAITING, STOPPED_WORK, TRIED_WORK, TRY_LIMIT, WAITED,
-    WAITING_FOR, delete_link, delete_node, node_id, upsert_link, upsert_node, waiting,
+    CACHE, COPY_INTO, Catalogue, HISTORY_TABLES, OWN_TABLES, PRAGMAS, RELEASE, RESET_TRIES,
+    RETRY_WORK, ROLLBACK_TO, SAVEPOINT, SCHEMA_VERSION, SET_PLACE, SET_POSITION, SET_TRY_LIMIT,
+    STOPPED_WORK, Sql, TRY_LIMIT,
 };
 
 /// Why rannoch did not do what was asked.
@@ -92,6 +93,8 @@ pub struct Graph {
 pub(crate) struct Fresh {
     pub(crate) schema_version: i64,
     pub(crate) ontology: Arc<Ontology>,
+    /// The statements of its classes, built when it loaded.
+    pub(crate) sql: Arc<Catalogue>,
 }
 
 /// Opens the graph at `path` under the app's content-identity key `key`, which is held in memory
@@ -114,6 +117,7 @@ pub fn open(path: impl AsRef<Path>, key: &[u8; 32]) -> Result<Graph, Error> {
     let ontology = load(&conn)?;
     let fresh = RefCell::new(Fresh {
         schema_version,
+        sql: Arc::new(Catalogue::new(&ontology)),
         ontology: Arc::new(ontology.clone()),
     });
     Ok(Graph {
@@ -147,9 +151,17 @@ impl Graph {
         let ontology = Arc::new(load(&self.conn)?);
         *self.fresh.borrow_mut() = Fresh {
             schema_version: version,
+            sql: Arc::new(Catalogue::new(&ontology)),
             ontology: Arc::clone(&ontology),
         };
         Ok(ontology)
+    }
+
+    /// The ontology the file holds now, as [`Graph::current_ontology`] reads it, with the
+    /// statements of its classes.
+    pub(crate) fn current(&self) -> Result<(Arc<Ontology>, Arc<Catalogue>), Error> {
+        let ontology = self.current_ontology()?;
+        Ok((ontology, Arc::clone(&self.fresh.borrow().sql)))
     }
 
     /// Takes `ontology`, loaded at `schema_version`, as both what `ontology()` returns and what
@@ -157,6 +169,7 @@ impl Graph {
     pub(crate) fn loaded(&mut self, schema_version: i64, ontology: Ontology) {
         *self.fresh.get_mut() = Fresh {
             schema_version,
+            sql: Arc::new(Catalogue::new(&ontology)),
             ontology: Arc::new(ontology.clone()),
         };
         self.ontology = ontology;
@@ -341,17 +354,20 @@ impl Graph {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let ontology = load(&tx)?;
+        let sql = Catalogue::new(&ontology);
+        let run = Handles::new(&tx, &sql);
         history::take_noted();
         for seq in again {
-            let Some(event) = event_at(&tx, Cursor(seq))? else {
+            let Some(event) = event_at(&run, Cursor(seq))? else {
                 continue;
             };
-            match attempt(&tx, &ontology, &self.key, &event, &mut Flags::read(&tx)?)? {
-                Ok(()) => tx.prepare_cached(DONE_RETRY)?.execute(params![FILL, seq])?,
-                Err(cause) => tried(&tx, seq, &cause)?,
+            match attempt(&run, &ontology, &self.key, &event, &mut Flags::read(&run)?)? {
+                Ok(()) => run.with(Sql::DoneRetry, |s| s.execute(params![FILL, seq]))?,
+                Err(cause) => tried(&run, seq, &cause)?,
             };
         }
-        history::keep_noted(&tx)?;
+        history::keep_noted(&run)?;
+        drop(run);
         tx.commit()?;
         Ok(to)
     }
@@ -368,13 +384,15 @@ impl Graph {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let from = place(&tx, FILL)?;
+        let from = place(&*tx, FILL)?;
         if from >= high {
             return Ok(from);
         }
         let ontology = load(&tx)?;
+        let sql = Catalogue::new(&ontology);
+        let run = Handles::new(&tx, &sql);
         let log = Events { conn: &tx };
-        let mut flags = Flags::read(&tx)?;
+        let mut flags = Flags::read(&run)?;
         let before = flags.clone();
         history::take_noted();
         tx.execute_batch(SAVEPOINT)?;
@@ -385,7 +403,7 @@ impl Graph {
         'chunks: while to < high && !failed {
             let until = Cursor(to.0.saturating_add(FILL_CHUNK).min(high.0));
             for event in log.since_until(to, until)? {
-                if fill_one(&tx, &ontology, &self.key, &event, &mut flags).is_err() {
+                if fill_one(&run, &ontology, &self.key, &event, &mut flags).is_err() {
                     to = event.cursor;
                     failed = true;
                     break 'chunks;
@@ -402,14 +420,15 @@ impl Graph {
             flags = before;
             history::take_noted();
             for event in log.since_until(from, to)? {
-                if let Err(cause) = attempt(&tx, &ontology, &self.key, &event, &mut flags)? {
-                    tried(&tx, event.cursor.0, &cause)?;
+                if let Err(cause) = attempt(&run, &ontology, &self.key, &event, &mut flags)? {
+                    tried(&run, event.cursor.0, &cause)?;
                 }
             }
         } else {
             tx.execute_batch(RELEASE)?;
         }
-        history::keep_noted(&tx)?;
+        history::keep_noted(&run)?;
+        drop(run);
         tx.prepare_cached(SET_PLACE)?.execute(params![FILL, to.0])?;
         tx.commit()?;
         Ok(to)
@@ -468,21 +487,22 @@ pub const FILL_BUDGET_MAX: Duration = Duration::from_secs(1);
 const FILL_CHUNK: i64 = 256;
 
 /// Records one more failed try of the event at `seq`, with its cause.
-fn tried(tx: &Connection, seq: i64, cause: &Error) -> rusqlite::Result<usize> {
-    tx.prepare_cached(TRIED_WORK)?
-        .execute(params![FILL, seq, cause.to_string()])
+fn tried(tx: &impl Run, seq: i64, cause: &Error) -> rusqlite::Result<usize> {
+    tx.with(Sql::TriedWork, |s| {
+        s.execute(params![FILL, seq, cause.to_string()])
+    })
 }
 
 /// Fills one event under a savepoint: the outer result is the graph file's, the inner one the
 /// event's, and an event that cannot be filled leaves nothing behind.
 fn attempt(
-    tx: &Connection,
+    tx: &Handles<'_>,
     ontology: &Ontology,
     key: &Key,
     event: &Event,
     flags: &mut Flags,
 ) -> Result<Result<(), Error>, Error> {
-    tx.execute_batch(SAVEPOINT)?;
+    tx.conn().execute_batch(SAVEPOINT)?;
     let before = flags.clone();
     let noted = history::take_noted();
     let filled = fill_one(tx, ontology, key, event, flags).map_err(|cause| {
@@ -496,7 +516,8 @@ fn attempt(
         history::take_noted();
     }
     history::note(noted);
-    tx.execute_batch(if filled.is_ok() { RELEASE } else { ROLLBACK_TO })?;
+    tx.conn()
+        .execute_batch(if filled.is_ok() { RELEASE } else { ROLLBACK_TO })?;
     Ok(filled)
 }
 
@@ -510,11 +531,10 @@ struct Flags {
 }
 
 impl Flags {
-    fn read(tx: &Connection) -> rusqlite::Result<Flags> {
-        let waited: Vec<String> = tx
-            .prepare_cached(WAITED)?
-            .query_map([], |row| row.get(0))?
-            .collect::<Result<_, _>>()?;
+    fn read(tx: &Handles<'_>) -> rusqlite::Result<Flags> {
+        let waited: Vec<String> = tx.with(Sql::Waited, |s| {
+            s.query_map([], |row| row.get(0))?.collect()
+        })?;
         Ok(Flags {
             renames: renamed(tx)?,
             waiting: waited
@@ -529,7 +549,7 @@ impl Flags {
 /// While the store holds no rename, no event is looked up against renames; while no amendment
 /// waits, none is looked up for its target.
 fn fill_one(
-    tx: &Connection,
+    tx: &Handles<'_>,
     ontology: &Ontology,
     store_key: &Key,
     event: &Event,
@@ -602,7 +622,7 @@ fn fill_one(
 /// Applies the amendments waiting for `event`, now filled, by known-at and then event id. One
 /// that is refused is a failed try of the amendment, as fill retries count it, never of `event`.
 fn awaited(
-    tx: &Connection,
+    tx: &Handles<'_>,
     ontology: &Ontology,
     key: &Key,
     event: &Event,
@@ -612,21 +632,20 @@ fn awaited(
         return Ok(());
     };
     let named = params![attributes.source, attributes.id];
-    let waiting: Vec<i64> = tx
-        .prepare_cached(WAITING_FOR)?
-        .query_map(named, |row| row.get(0))?
-        .collect::<Result<_, _>>()?;
+    let waiting: Vec<i64> = tx.with(Sql::WaitingFor, |s| {
+        s.query_map(named, |row| row.get(0))?.collect()
+    })?;
     if waiting.is_empty() {
         return Ok(());
     }
-    tx.prepare_cached(STOP_WAITING)?.execute(named)?;
+    tx.with(Sql::StopWaiting, |s| s.execute(named))?;
     for seq in waiting {
         let Some(amendment) = event_at(tx, Cursor(seq))? else {
             continue;
         };
-        tx.execute_batch(SAVEPOINT)?;
+        tx.conn().execute_batch(SAVEPOINT)?;
         let applied = amended(tx, ontology, key, &amendment, true);
-        tx.execute_batch(if applied.is_ok() {
+        tx.conn().execute_batch(if applied.is_ok() {
             RELEASE
         } else {
             ROLLBACK_TO
@@ -644,7 +663,7 @@ fn awaited(
 /// into its relation's table (or open while an end is missing), then through any rename of its
 /// ends.
 fn fill_link(
-    tx: &Connection,
+    tx: &Handles<'_>,
     (ontology, key): (&Ontology, &Key),
     stamp: Stamp,
     link: &rannoch_cloudevents::LinkFact,
@@ -659,7 +678,6 @@ fn fill_link(
             {
                 put_link(
                     tx,
-                    ontology,
                     &link.relation,
                     ends,
                     (&v.source, &v.valid, stamp.recorded),
@@ -668,7 +686,6 @@ fn fill_link(
         }
         Heard::Newest => put_link(
             tx,
-            ontology,
             &link.relation,
             ends,
             (&link.source, &link.valid, stamp.recorded),
@@ -691,7 +708,7 @@ fn amendment(body: &str) -> bool {
 /// no fact fills nothing. `target_filled` says the amendment's target has just filled, so it
 /// never waits again. Says whether it was an amendment.
 fn amended(
-    tx: &Connection,
+    tx: &Handles<'_>,
     ontology: &Ontology,
     key: &Key,
     event: &Event,
@@ -713,15 +730,15 @@ fn amended(
 }
 
 /// Whether the store holds any rename.
-fn renamed(tx: &Connection) -> rusqlite::Result<bool> {
-    tx.query_row(ANY_RENAME, [], |row| row.get(0))
+fn renamed(tx: &Handles<'_>) -> rusqlite::Result<bool> {
+    tx.with(Sql::AnyRename, |s| s.query_row([], |row| row.get(0)))
 }
 
 /// Hears the event at `cursor`, whose fact is `of`, again through the renames of the keys it
 /// names when any was renamed, so it lands on the new key, and puts what that touched into the
 /// tables kept for speed.
 fn follow(
-    tx: &Connection,
+    tx: &Handles<'_>,
     ontology: &Ontology,
     key: &Key,
     cursor: Cursor,
@@ -737,7 +754,7 @@ fn follow(
 /// Puts the current state of every subject in `touched` into the tables kept for speed: first the
 /// links that have no version known now let go of their nodes, then the nodes, then the links that
 /// have one, so a renamed node's links follow it.
-fn refresh(tx: &Connection, ontology: &Ontology, touched: Vec<Subject>) -> Result<(), Error> {
+fn refresh(tx: &Handles<'_>, ontology: &Ontology, touched: Vec<Subject>) -> Result<(), Error> {
     let (links, nodes): (Vec<Subject>, Vec<Subject>) =
         touched.into_iter().partition(|(.., to)| to.is_some());
     let mut live = Vec::new();
@@ -758,52 +775,42 @@ fn refresh(tx: &Connection, ontology: &Ontology, touched: Vec<Subject>) -> Resul
 /// Puts the current state of `subject` into the tables kept for speed after an amendment: its
 /// newest version known now, or no row once it has none (a node with links still in its
 /// relations' tables is refused); and keeps what is seen of it in step.
-fn current(tx: &Connection, ontology: &Ontology, subject: &Subject) -> Result<(), Error> {
+fn current(tx: &Handles<'_>, ontology: &Ontology, subject: &Subject) -> Result<(), Error> {
     let (entity, key, to) = subject;
     reseen_of(tx, subject)?;
     let version = newest(tx, (entity, key, to.as_deref()))?;
     match to {
         None => {
             let class = entity.trim_start_matches(&node_entity(""));
-            match version {
-                Some((v, recorded, _)) => {
-                    put_node(
-                        tx,
-                        class,
-                        key,
-                        (&v.source, &v.valid, recorded),
-                        &v.properties,
-                    )?;
-                    arrived(tx, ontology, class, key, recorded)?;
-                }
-                None => {
-                    tx.prepare_cached(&delete_node(class))?
-                        .execute([key])
-                        .map_err(|e| {
-                            Error::Refused(format!(
-                                "node {key} of {class} has no version known now, and links \
-                                 still name it: {e}"
-                            ))
-                        })?;
-                }
+            if let Some((v, recorded, _)) = version {
+                put_node(
+                    tx,
+                    class,
+                    key,
+                    (&v.source, &v.valid, recorded),
+                    &v.properties,
+                )?;
+                arrived(tx, ontology, class, key, recorded)?;
+            } else {
+                let remove = tx.sql.class(class)?.remove.stmt();
+                tx.with(remove, |s| s.execute([key])).map_err(|e| {
+                    Error::Refused(format!(
+                        "node {key} of {class} has no version known now, and links still name \
+                         it: {e}"
+                    ))
+                })?;
             }
         }
         Some(to) => {
             let relation = entity.trim_start_matches(&link_entity(""));
             if let Some((v, recorded, _)) = version {
-                return put_link(
-                    tx,
-                    ontology,
-                    relation,
-                    (key, to),
-                    (&v.source, &v.valid, recorded),
-                );
+                return put_link(tx, relation, (key, to), (&v.source, &v.valid, recorded));
             }
-            let declared = ontology.relation(relation)?;
-            tx.prepare_cached(&delete_link(relation, &declared.from, &declared.to))?
-                .execute([key, to])?;
-            tx.prepare_cached(CLOSE_OPEN)?
-                .execute(rusqlite::params![relation, key, to])?;
+            let remove = tx.sql.relation(relation)?.remove.stmt();
+            tx.with(remove, |s| s.execute([key, to]))?;
+            tx.with(Sql::CloseOpen, |s| {
+                s.execute(rusqlite::params![relation, key, to])
+            })?;
         }
     }
     Ok(())
@@ -812,85 +819,108 @@ fn current(tx: &Connection, ontology: &Ontology, subject: &Subject) -> Result<()
 /// Puts a version of the node keyed `key` into its class's table as its current state, with its
 /// source, valid time and record time.
 fn put_node(
-    tx: &Connection,
+    tx: &Handles<'_>,
     class: &str,
     key: &str,
     (source, valid, recorded): (&str, &ValidTime, i64),
     properties: &BTreeMap<String, Value>,
 ) -> Result<(), Error> {
-    let names: Vec<&str> = properties.keys().map(String::as_str).collect();
+    let sql = tx.sql.class(class)?;
     let valid = valid.as_text();
+    // Each declared property's value and whether the version carries it, in declared order.
+    let carried: Vec<(Option<Bound<'_>>, bool)> = sql
+        .properties
+        .iter()
+        .map(|name| {
+            let value = properties.get(name);
+            (value.map(Bound), value.is_some())
+        })
+        .collect();
     let mut values: Vec<&dyn rusqlite::ToSql> = vec![&key, &source, &valid, &recorded];
-    let bound: Vec<Bound<'_>> = properties.values().map(Bound).collect();
-    values.extend(bound.iter().map(|v| v as &dyn rusqlite::ToSql));
-    tx.prepare_cached(&upsert_node(class, &names))?
-        .execute(values.as_slice())?;
+    for (value, carries) in &carried {
+        values.push(value);
+        values.push(carries);
+    }
+    tx.with(sql.put.stmt(), |s| s.execute(values.as_slice()))?;
     Ok(())
 }
 
 /// Puts a link's current state, with its source, valid time and record time: into its relation
 /// when both its ends are present, else open.
 fn put_link(
-    tx: &Connection,
-    ontology: &Ontology,
+    tx: &Handles<'_>,
     relation: &str,
     (from, to): (&str, &str),
     (source, valid, recorded): (&str, &ValidTime, i64),
 ) -> Result<(), Error> {
-    let declared = ontology.relation(relation)?;
     let valid = valid.as_text();
-    if present(tx, &declared.from, from)? && present(tx, &declared.to, to)? {
-        tx.prepare_cached(&upsert_link(relation, &declared.from, &declared.to))?
-            .execute(rusqlite::params![from, to, source, valid, recorded])?;
-    } else {
-        tx.prepare_cached(OPEN_LINK)?
-            .execute(rusqlite::params![relation, from, to, source, valid])?;
+    if !put_into(tx, relation, (from, to), (source, valid, recorded))? {
+        tx.with(Sql::OpenLink, |s| {
+            s.execute(rusqlite::params![relation, from, to, source, valid])
+        })?;
     }
     Ok(())
 }
 
-/// Whether the node keyed `key` of `class` is in its class's table.
-fn present(tx: &Connection, class: &str, key: &str) -> Result<bool, Error> {
-    Ok(tx
-        .prepare_cached(&node_id(class))?
-        .query_row([key], |row| row.get::<_, i64>(0))
-        .optional()?
-        .is_some())
+/// Writes the link into its relation's table, and says whether it could: false, writing
+/// nothing, while an end is not in its class's table.
+fn put_into(
+    tx: &Handles<'_>,
+    relation: &str,
+    (from, to): (&str, &str),
+    (source, valid, recorded): (&str, Option<&str>, i64),
+) -> Result<bool, Error> {
+    let put = tx.sql.relation(relation)?.put.stmt();
+    match tx.with(put, |s| {
+        s.execute(rusqlite::params![from, to, source, valid, recorded])
+    }) {
+        Ok(_) => Ok(true),
+        Err(rusqlite::Error::SqliteFailure(failure, _))
+            if failure.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_NOTNULL =>
+        {
+            Ok(false)
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Closes every open link that was waiting for the node `key` of `class`, now present, whose
 /// other end is present too: the link moves into its relation with the source it was opened with,
 /// and its closing is logged as one event.
 fn arrived(
-    tx: &Connection,
+    tx: &Handles<'_>,
     ontology: &Ontology,
     class: &str,
     key: &str,
     recorded: i64,
 ) -> Result<(), Error> {
     for relation in ontology.relations.values() {
-        for (waits_on, column) in [(&relation.to, "to_key"), (&relation.from, "from_key")] {
+        for (waits_on, waiting) in [
+            (&relation.to, Sql::WaitingOnTarget),
+            (&relation.from, Sql::WaitingOnSource),
+        ] {
             if waits_on != class {
                 continue;
             }
-            let open: Vec<(String, String, String, Option<String>)> = tx
-                .prepare_cached(&waiting(column))?
-                .query_map(rusqlite::params![relation.name, key], |row| {
+            let open: Vec<(String, String, String, Option<String>)> = tx.with(waiting, |s| {
+                s.query_map(rusqlite::params![relation.name, key], |row| {
                     Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
                 })?
-                .collect::<Result<_, _>>()?;
+                .collect()
+            })?;
             for (from_key, to_key, source, valid) in open {
-                if !(present(tx, &relation.from, &from_key)? && present(tx, &relation.to, &to_key)?)
-                {
+                let ends = (from_key.as_str(), to_key.as_str());
+                if !put_into(
+                    tx,
+                    &relation.name,
+                    ends,
+                    (&source, valid.as_deref(), recorded),
+                )? {
                     continue;
                 }
-                tx.prepare_cached(&upsert_link(&relation.name, &relation.from, &relation.to))?
-                    .execute(rusqlite::params![from_key, to_key, source, valid, recorded])?;
-                tx.prepare_cached(CLOSE_OPEN)?.execute(rusqlite::params![
-                    relation.name,
-                    from_key,
-                    to_key
-                ])?;
+                tx.with(Sql::CloseOpen, |s| {
+                    s.execute(rusqlite::params![relation.name, from_key, to_key])
+                })?;
                 let id = EventId::now();
                 let body = serde_json::json!({
                     "specversion": "1.0",
@@ -1967,6 +1997,81 @@ mod tests {
         let bodies: Vec<String> = keys.map(|i| node("book", &format!("b{i}"), "t")).collect();
         let refs: Vec<&str> = bodies.iter().map(String::as_str).collect();
         g.commit(&refs, &[])?;
+        Ok(())
+    }
+
+    /// How many statements fill runs for `more - few` events of one kind: the statements of
+    /// filling `more` events of it less those of filling `few`, so what a fill runs once cancels
+    /// out.
+    fn extra_statements(
+        g: &mut crate::Graph,
+        bodies: impl Fn(std::ops::Range<usize>) -> Vec<String>,
+        (few, more): (usize, usize),
+    ) -> Result<usize, crate::Error> {
+        let mut ran = Vec::new();
+        for range in [0..few, few..few + more] {
+            let bodies = bodies(range);
+            let refs: Vec<&str> = bodies.iter().map(String::as_str).collect();
+            g.commit(&refs, &[])?;
+            ran.push(statements(g, crate::Graph::fill)?.len());
+        }
+        Ok(ran[1] - ran[0])
+    }
+
+    #[test]
+    fn fill_runs_fewer_statements_per_node_and_link() -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = graph("per-event")?;
+        let authors = |keys: std::ops::Range<usize>| -> Vec<String> {
+            keys.map(|i| node("author", &format!("a{i}"), "t"))
+                .collect()
+        };
+        let books = |keys: std::ops::Range<usize>| -> Vec<String> {
+            keys.map(|i| node("book", &format!("b{i}"), "t")).collect()
+        };
+        let links = |keys: std::ops::Range<usize>| -> Vec<String> {
+            keys.map(|i| link(&format!("a{i}"), &format!("b{i}")))
+                .collect()
+        };
+        // Ten events more each time: any statement more per event, on any of them, fails.
+        let nodes = extra_statements(&mut g, authors, (10, 20))?;
+        extra_statements(&mut g, books, (10, 20))?;
+        let links = extra_statements(&mut g, links, (10, 20))?;
+        assert!(
+            nodes <= 6 * 10,
+            "ten nodes cost {nodes} statements, were 70"
+        );
+        assert!(
+            links <= 5 * 10,
+            "ten links cost {links} statements, were 80"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_version_without_a_property_keeps_its_column() -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = graph("keeps-column")?;
+        g.declare(
+            &Declaration::Class(Class::new("item", ["a", "b"])),
+            r#"{"specversion":"1.0","id":"d-item","source":"rannoch:shop","type":"rannoch.declared.item"}"#,
+        )?;
+        let item = |id: &str, properties: &str| {
+            format!(
+                r#"{{"specversion":"1.0","id":"{id}","source":"rannoch:shop","type":"rannoch.node.item","subject":"i1","data":{{"properties":{properties},"valid":"unknown"}}}}"#
+            )
+        };
+        g.commit(&[&item(&id_at(1_000), r#"{"a":"1","b":"2"}"#)], &[])?;
+        g.commit(&[&item(&id_at(2_000), r#"{"a":"3"}"#)], &[])?;
+        g.fill()?;
+        let row: (String, String) = g.conn.query_row(
+            r#"SELECT "p:a", "p:b" FROM "class:item" WHERE key = 'i1'"#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(
+            row,
+            ("3".into(), "2".into()),
+            "the later version leaves b as it was"
+        );
         Ok(())
     }
 
