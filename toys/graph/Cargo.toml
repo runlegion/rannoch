@@ -1,0 +1,15 @@
+[package]
+name = "rannoch-toy-graph"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+rannoch-store = { path = "../../crates/rannoch-store" }
+serde_json = "1"
+uuid = { version = "1", features = ["v7"] }
+
+[profile.release]
+debug = false

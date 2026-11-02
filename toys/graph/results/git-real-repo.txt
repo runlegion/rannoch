@@ -1,0 +1,38 @@
+truth from git: 3435 commits, 6878 files, 4121 parent links, 29837 touched links
+filled 44271 events in 4.50s
+now:
+  ok    commit nodes: 3435
+  file nodes listed: 6878
+  ok    parent, read out: 4121 edges
+  ok    parent, read in: 4121 edges
+  ok    touched, read out: 29837 edges
+  ok    touched, read in: 29837 edges
+  ok    counts: {"commit": 3435, "file": 6878} {"parent": 4121, "touched": 29837}
+  ok    describe: 3435 nodes
+  ok    nodes year=2025: 612
+  ok    nodes year=2026: 2823
+  whole-graph check took 429.63ms (about 13749 link and node reads, plus describes)
+at the median commit time (1782195666):
+  ok    commit nodes: 1718
+  file nodes listed: 6878
+  ok    parent, read out: 1736 edges
+  ok    parent, read in: 1736 edges
+  ok    touched, read out: 18558 edges
+  ok    touched, read in: 18558 edges
+  ok    counts: {"commit": 1718, "file": 6878} {"parent": 1736, "touched": 18558}
+  ok    describe: 1718 nodes
+  ok    nodes year=2025: 612
+  ok    nodes year=2026: 1106
+a second store, another arrival order:
+  ok    commit nodes: 3435
+  file nodes listed: 6878
+  ok    parent, read out: 4121 edges
+  ok    parent, read in: 4121 edges
+  ok    touched, read out: 29837 edges
+  ok    touched, read in: 29837 edges
+  ok    counts: {"commit": 3435, "file": 6878} {"parent": 4121, "touched": 29837}
+  ok    describe: 3435 nodes
+  ok    nodes year=2025: 612
+  ok    nodes year=2026: 2823
+
+differences: 0

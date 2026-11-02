@@ -48,3 +48,11 @@ both. Three arrival orders, fill in chunks, every axis and known-at pair on a gr
 
 Any difference from P1 or P2 is a defect or a docs gap to report, not to explain away. No code in
 rannoch changes in this toy.
+
+## Added after the first P1 run, before this case ran
+
+u>v heard, then ended, then corrected (PR #179's notes say a correction masks a link's endings).
+From the docs, the link was wrong and has also ended, so it does not hold. Prediction: it does not
+hold; PR #179's note suggests it may come back. Also, one re-sent link in each kind of relation is
+asked for its hearings: an axis re-send at the same build should be 1 hearing; a no-axis re-send has
+a new known-at, and the docs do not say whether that is an alias. Prediction: 1 hearing for both.

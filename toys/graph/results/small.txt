@@ -1,0 +1,23 @@
+the graph as read now:
+  a>b b>c c>a d>d g>k h>h1 h>h2 h>h3 h>h4 h>h5 m>n s>t u>v x>ghost
+  DIFF  follows out, now
+        got : a>b b>c c>a d>d g>k h>h1 h>h2 h>h3 h>h4 h>h5 m>n s>t u>v x>ghost
+        want: a>b b>c c>a d>d g>k h>h1 h>h2 h>h3 h>h4 h>h5 s>t x>ghost
+  DIFF  follows in, now
+        got : a>b b>c c>a d>d g>k h>h1 h>h2 h>h3 h>h4 h>h5 m>n s>t u>v x>ghost
+        want: a>b b>c c>a d>d g>k h>h1 h>h2 h>h3 h>h4 h>h5 s>t x>ghost
+  ok    nodes, now: {"a", "b", "c", "d", "e", "f", "g", "h", "h1", "h2", "h3", "h4", "h5", "i", "k", "m", "n", "s", "t", "u", "v", "x"}
+  counts now: {"follows": 14, "ships": 1}
+  DIFF  counts follows want 12
+  ok    follows out, known-at 15 (g>k ended, e>f and m>n there): a>b b>c c>a d>d e>f h>h1 h>h2 h>h3 h>h4 h>h5 m>n r>t x>ghost
+  DIFF  follows out, known-at 25 (before the rename)
+        got : a>b b>c c>a d>d g>k h>h1 h>h2 h>h3 h>h4 h>h5 m>n r>t u>v x>ghost
+        want: a>b b>c c>a d>d g>k h>h1 h>h2 h>h3 h>h4 h>h5 r>t x>ghost
+  ok    nodes at 25 list r, not s
+  ok    ships out, build 1: p>q
+  ok    ships out, build 2: 
+  ok    ships out, build 3: p>q
+  describe h: {("follows", Out): 5}
+  re-sent link, no axis: 1 hearing(s); axis, same build: 2 hearing(s)
+
+differences: 4

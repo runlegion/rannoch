@@ -1,0 +1,8 @@
+no re-sends:
+  13440 read comparisons, 0 differences
+  coverage: 2808 links ended in a view, 1458 reopened, 822 live and ended at the same point, 0 re-sends after an ending
+with re-sends:
+  13440 read comparisons, 0 differences
+  coverage: 2457 links ended in a view, 1833 reopened, 831 live and ended at the same point, 212 re-sends after an ending
+
+differences: 0
