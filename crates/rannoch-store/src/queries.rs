@@ -563,11 +563,11 @@ pub(crate) fn seen_sql() -> String {
     )
 }
 
-/// The hearings of the entity `?1` in the view of the axis bound `?2` and the known-at `?3` (each
-/// NULL for now), as columns of `_hearings` unqualified. A node or link is in the view exactly when
-/// one of its hearings' own rows is: a hearing is named by its smallest id, so no alias of it is
-/// known before it.
-const HEARD_IN_VIEW: &str = "entity = ?1 AND line = 'main' AND (?2 IS NULL OR axis <= ?2) \
+/// The hearings in the view of the axis bound `?2` and the known-at `?3` (each NULL for now), as
+/// columns of `_hearings` unqualified. A node or link is in the view exactly when one of its
+/// hearings' own rows is: a hearing is named by its smallest id, so no alias of it is known
+/// before it.
+const IN_VIEW: &str = "line = 'main' AND (?2 IS NULL OR axis <= ?2) \
      AND (?3 IS NULL OR known <= ?3) \
      AND (until IS NULL OR until > coalesce(?3, 9223372036854775807))";
 
@@ -608,10 +608,9 @@ pub(crate) fn nodes_in_view(keys: &str) -> String {
 pub(crate) fn keys_by_property(class: &str, property: &str) -> String {
     format!(
         "SELECT key FROM _hearings WHERE entity = {} AND {} = json_extract(?4, '$') \
-         AND {}",
+         AND {IN_VIEW}",
         literal(&format!("{CLASS}:{class}")),
-        property_value(property),
-        HEARD_IN_VIEW.replacen("entity = ?1 AND ", "", 1)
+        property_value(property)
     )
 }
 
@@ -642,7 +641,7 @@ pub(crate) fn link_count() -> String {
          AND (?2 IS NULL OR axis <= ?2) AND (?3 IS NULL OR known <= ?3))";
     format!(
         "SELECT (SELECT count(*) FROM (SELECT DISTINCT key, to_key FROM _hearings \
-         WHERE {HEARD_IN_VIEW})) - (SELECT count(*) FROM ({}) f WHERE ending = 1 AND NOT {} AND {})",
+         WHERE entity = ?1 AND {IN_VIEW})) - (SELECT count(*) FROM ({}) f WHERE ending = 1 AND NOT {} AND {})",
         newest_each(
             &link_facts(
                 &format!("(h.key, h.to_key) {ended}"),
@@ -665,7 +664,7 @@ const CORRECTED_IN_VIEW: &str = "EXISTS (SELECT 1 FROM _ends c WHERE c.entity = 
 /// Whether the link of `?1` named by the row `f` has a hearing in the view `?2`, `?3`.
 fn heard_in_view() -> String {
     format!(
-        "EXISTS (SELECT 1 FROM _hearings WHERE {HEARD_IN_VIEW} AND key = f.key \
+        "EXISTS (SELECT 1 FROM _hearings WHERE entity = ?1 AND {IN_VIEW} AND key = f.key \
          AND to_key = f.to_key)"
     )
 }
@@ -705,7 +704,7 @@ fn holding(heard: &str, other: &str, ends: &str) -> String {
 
 /// How many keys of the class entity `?1` have a version in the view `?2`, `?3`.
 pub(crate) fn node_count() -> String {
-    format!("SELECT count(DISTINCT key) FROM _hearings WHERE {HEARD_IN_VIEW}")
+    format!("SELECT count(DISTINCT key) FROM _hearings WHERE entity = ?1 AND {IN_VIEW}")
 }
 
 /// The greatest known-at the store holds: of a hearing, the amendment that superseded one, an
