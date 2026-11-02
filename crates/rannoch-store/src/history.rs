@@ -523,52 +523,57 @@ pub(crate) fn conclude(
         .transpose()?;
     let valid = ended.as_ref().and_then(|(_, valid)| valid.as_text());
     let entity = link_entity(relation);
-    // The ends as renamed by now: a conclusion naming a renamed key concludes the renamed link.
-    // A store with no rename is not looked up.
-    let now = |end: &NodeRef| -> Result<String, Error> {
+    // Each end as renamed by the conclusion's own known-at, then every key it was renamed to
+    // after: the conclusion is kept under each, as a rename copies the endings it finds, so the
+    // order a conclusion and a rename arrive in never changes where it is kept. A store with no
+    // rename is not looked up.
+    let by = event.to_string();
+    let keys = |end: &NodeRef| -> Result<Vec<String>, Error> {
         if !renames {
-            return Ok(end.key.clone());
+            return Ok(vec![end.key.clone()]);
         }
-        Ok(resolve(
+        Ok(renamed_from(
             &renames_in(tx, &node_entity(&end.class))?,
             &end.key,
-            (i64::MAX, "\u{10ffff}"),
+            (known, &by),
         ))
     };
-    let (from, to) = (&now(from)?, &now(to)?);
-    tx.prepare_cached(CONCLUDE)?.execute(params![
-        entity,
-        from,
-        to,
-        event.to_string(),
-        source,
-        at,
-        valid,
-        known
-    ])?;
-    if let Some(at) = at {
-        let new = tx.prepare_cached(ENDING)?.execute(params![
-            entity,
-            from,
-            to,
-            at,
-            event.to_string(),
-            source,
-            valid,
-            known
-        ])?;
-        if new == 1 {
-            let mark = Mark {
-                hearing: None,
-                ending: Some(tx.last_insert_rowid()),
-                axis: at,
-                known,
-                event: event.to_string(),
+    let (froms, tos) = (keys(from)?, keys(to)?);
+    for from in &froms {
+        for to in &tos {
+            tx.prepare_cached(CONCLUDE)?
+                .execute(params![entity, from, to, by, source, at, valid, known])?;
+            let Some(at) = &at else {
+                continue;
             };
-            saw(tx, (&entity, from, Some(to)), &mark, valid)?;
+            let new = tx
+                .prepare_cached(ENDING)?
+                .execute(params![entity, from, to, at, by, source, valid, known])?;
+            if new == 1 {
+                let mark = Mark {
+                    hearing: None,
+                    ending: Some(tx.last_insert_rowid()),
+                    axis: at.clone(),
+                    known,
+                    event: by.clone(),
+                };
+                saw(tx, (&entity, from, Some(to)), &mark, valid)?;
+            }
         }
     }
     Ok(())
+}
+
+/// The key `key` resolves to through `renames` as known at `upto`, then each key it was renamed
+/// to after `upto`, in order.
+fn renamed_from(renames: &[Rename], key: &str, upto: (i64, &str)) -> Vec<String> {
+    let mut keys = vec![resolve(renames, key, upto)];
+    for (old, new, point, event) in renames {
+        if (*point, event.as_str()) > upto && keys.last() == Some(old) {
+            keys.push(new.clone());
+        }
+    }
+    keys
 }
 
 /// What a node or a link is, as its hearings are kept: its entity, key and target key.
@@ -642,11 +647,8 @@ pub(crate) fn amend(
         Some((seq, _)) => made_by(tx, *seq)?,
         None => None,
     };
-    // A target that has filled, or that the log holds before the amendment, and made no hearing
-    // never will.
-    let Some((seq, written)) =
-        found.filter(|(seq, _)| made.is_some() || target_filled || *seq <= cursor.0)
-    else {
+    let filled = target_filled || (made.is_none() && filled_before(tx, found.as_ref(), cursor)?);
+    let Some((seq, written)) = found.filter(|_| made.is_some() || filled) else {
         tx.prepare_cached(WAIT)?.execute(params![
             source,
             target,
@@ -697,6 +699,21 @@ pub(crate) fn amend(
     touched.sort();
     touched.dedup();
     Ok(Some(touched))
+}
+
+/// Whether the target `found` (its place and body) has already filled: the log holds it before
+/// the amendment at `cursor`, or at or below fill's committed place, as on fill's retry of the
+/// amendment. A target that filled with no hearing never makes one. Fill's place is read only
+/// for a target with no hearing, which is rare.
+fn filled_before(
+    tx: &Connection,
+    found: Option<&(i64, String)>,
+    cursor: Cursor,
+) -> Result<bool, Error> {
+    let Some((seq, _)) = found else {
+        return Ok(false);
+    };
+    Ok(*seq <= cursor.0 || Cursor(*seq) <= crate::inbox::place(tx, crate::FILL)?)
 }
 
 /// The hearing the event at the place `seq` made itself, if it made one.
@@ -1592,5 +1609,34 @@ impl Graph {
             count: u64::try_from(count).unwrap_or(0),
             ended: ended.as_deref().map(decode_axis),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_axis, encode};
+
+    #[test]
+    fn encoded_points_order_as_their_parts() {
+        let points: [&[i64]; 7] = [
+            &[i64::MIN],
+            &[-256, 0],
+            &[-1, 300],
+            &[0, -5],
+            &[0, 255],
+            &[0, 256],
+            &[1, i64::MIN],
+        ];
+        for pair in points.windows(2) {
+            assert!(
+                encode(pair[0]) < encode(pair[1]),
+                "{:?} orders before {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+        for point in points {
+            assert_eq!(decode_axis(&encode(point)), point);
+        }
     }
 }

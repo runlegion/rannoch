@@ -2654,4 +2654,81 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn a_waiting_amendment_refused_after_its_target_fills_stops_at_the_default_limit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = graph("waits-default-limit")?;
+        let order = format!(
+            r#"{{"specversion":"1.0","id":"{}","source":"shop","type":"shop.order"}}"#,
+            id_at(1_000)
+        );
+        let named: serde_json::Value = serde_json::from_str(&order)?;
+        let fix = logged(
+            &mut g,
+            &amending(
+                2_000,
+                ("shop", named["id"].as_str().unwrap_or_default()),
+                r#"{"data":{"x":1}}"#,
+            ),
+        )?;
+        g.fill()?;
+        logged(&mut g, &order)?;
+        for _ in 0..5 {
+            g.fill()?;
+        }
+        let stopped: Vec<crate::Cursor> = g.stopped()?.into_iter().map(|(at, _)| at).collect();
+        assert_eq!(
+            stopped,
+            [fix.cursor],
+            "its retries are refused, never a new wait"
+        );
+        let waiting: i64 = g
+            .conn
+            .query_row("SELECT count(*) FROM _waiting", [], |row| row.get(0))?;
+        assert_eq!(waiting, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn an_ending_reads_the_same_whether_it_arrives_before_or_after_a_rename()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let answers = |name: &str, ending_first: bool| -> Result<_, Box<dyn std::error::Error>> {
+            let (mut g, b1, _) = wrote_b1(name)?;
+            let ending = concluded(&id_at(1_500), "ended", "a1", "b1");
+            let rename = amended(2_000, &b1, r#"{"subject":"b9"}"#);
+            let order = if ending_first {
+                [&ending, &rename]
+            } else {
+                [&rename, &ending]
+            };
+            feed(&mut g, &order)?;
+            let at = |to: &str, known: Option<u64>| -> Result<_, crate::Error> {
+                Ok(g.link_state_at("wrote", "a1", to, &view(None, known))?
+                    .map(|v| v.ended))
+            };
+            Ok((
+                at("b1", Some(1_700))?,
+                at("b9", Some(1_700))?,
+                at("b9", None)?,
+                at("b1", None)?,
+                // Each run mints its own ids, so the ending is compared by its point.
+                match g.link_end("wrote", "a1", "b9")? {
+                    Some(crate::End::Ended { axis, known, .. }) => Some((axis, known)),
+                    _ => None,
+                },
+                g.link_seen("wrote", "a1", "b9")?
+                    .map(|s| (s.count, s.ended)),
+            ))
+        };
+        let before = answers("ending-before-rename", true)?;
+        assert_eq!(
+            before.0,
+            Some(true),
+            "known at 1,700, the link under b1 had ended"
+        );
+        assert_eq!(before.2, Some(true), "now, the link under b9 has ended");
+        assert_eq!(answers("ending-after-rename", false)?, before);
+        Ok(())
+    }
 }
