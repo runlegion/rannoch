@@ -21,6 +21,8 @@ let mut g = rannoch_store::open(dir.join("shop.rannoch"), &key)?;
 
 A path with no graph starts an empty one. The 32-byte key hashes every hearing's content identity; rannoch holds it in memory only. Keep it with the app: opening the file under another key returns `Error::KeyDiffers`.
 
+Each open handle keeps up to 64 MB of the file's pages in memory as its cache, and a copy made with `copy_to` holds one more while it reads the copy back. A queue and a second handle for reads are two handles: up to 128 MB.
+
 ## Declare the ontology
 
 An app declares its own classes and relations; rannoch knows no domain. Each declaration is one event, with its own CloudEvent as the body.
