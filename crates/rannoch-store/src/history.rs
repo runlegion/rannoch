@@ -21,11 +21,10 @@ use crate::ontology::{CLASS, RELATION};
 use crate::queries::{
     ALIAS, ALIASES_OF, AMENDED_OF, AMENDMENT, AMENDMENTS_OF, CHECK, CONCLUDE, CORRECTED,
     DROP_AMENDED, ENDING, EVENT_AT, EVENT_BY_CLOUDEVENT, FACTS_KNOWN, HEAR, HEAR_AMENDED,
-    HEARING_OF, HELD, KNOWN_AGAIN, KNOWN_UNTIL, LATEST_AMENDMENT, MADE_BY, PLACES_NAMING, RENAME,
-    RENAME_ENDINGS, RENAME_ENDS, RENAMED, RENAMES_IN, SEEN_OTHER, SEEN_PUT, SEEN_START, SET_CHECK,
-    UNSEEN, WAIT, WAS_RENAMED, as_of, edge_ending, edge_hearing, ended_sql, hearings, link_ending,
-    link_state, newest_in_view, order, seen_keep, seen_kept, seen_recount, seen_sql, version_row,
-    view_row,
+    HEARING_OF, HELD, KNOWN_AGAIN, KNOWN_UNTIL, MADE_BY, PLACES_NAMING, RENAME, RENAME_ENDINGS,
+    RENAME_ENDS, RENAMED, RENAMES_IN, SEEN_OTHER, SEEN_PUT, SEEN_START, SET_CHECK, UNSEEN, WAIT,
+    WAS_RENAMED, as_of, edge_ending, edge_hearing, ended_sql, hearings, link_ending, link_state,
+    newest_in_view, order, seen_keep, seen_kept, seen_recount, seen_sql, version_row, view_row,
 };
 use crate::{Error, Graph};
 
@@ -624,19 +623,6 @@ pub(crate) fn amend(
         return Err(Error::Refused(format!("amendment {id} has no patch")));
     }
     let known = event.recorded()?;
-    let target_known = uuid(target)
-        .ok_or_else(|| {
-            Error::Refused(format!(
-                "amendment {id} names {target}, which is not <event uuid>:<fact>"
-            ))
-        })?
-        .recorded()?;
-    if known < target_known {
-        return Err(Error::Refused(format!(
-            "amendment {id} of {target} is known at {known}, before {target_known}: an \
-             amendment known before its target is refused"
-        )));
-    }
     let found: Option<(i64, String)> = tx
         .prepare_cached(EVENT_BY_CLOUDEVENT)?
         .query_row(params![source, target], |row| {
@@ -663,15 +649,6 @@ pub(crate) fn amend(
             "amendment {id} names {target}, which made no hearing of its own"
         ))
     })?;
-    let latest: Option<i64> = tx
-        .prepare_cached(LATEST_AMENDMENT)?
-        .query_row(params![seq], |row| row.get(0))?;
-    if let Some(latest) = latest.filter(|latest| known < *latest) {
-        return Err(Error::Refused(format!(
-            "amendment {id} of {target} is known at {known}, before {latest}: an amendment \
-             known before the target's latest amendment is refused"
-        )));
-    }
     let by = event.to_string();
     tx.prepare_cached(AMENDMENT)?
         .execute(params![seq, known, by, cursor.0])?;

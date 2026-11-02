@@ -126,21 +126,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert!(g.link_state_at("wrote", "a1", "b9", &before)?.is_none());
 
     // An amendment fill cannot apply never stops fill: it is tried up to the try limit (3) and
-    // then stops, with its reason. This one is known before the event it names, minted an hour
-    // from now.
-    let hour =
-        SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)? + Duration::from_secs(3_600);
-    let later = uuid::Uuid::new_v7(uuid::Timestamp::from_unix(
-        uuid::NoContext,
-        hour.as_secs(),
-        0,
-    ));
-    let early = amended(
-        ("rannoch:shop", &format!("{later}:0")),
-        r#"{"subject":"x"}"#,
+    // then stops, with its reason. This one names an app's own event, which makes no hearing, so
+    // there is nothing to amend.
+    let order = format!(
+        r#"{{"specversion":"1.0","id":"{}","source":"shop","type":"shop.order"}}"#,
+        id()
     );
-    let bad = g.commit(&[&early], &[])?;
-    let bad = bad[0].as_ref().map_err(ToString::to_string)?.cursor;
+    let order_id: serde_json::Value = serde_json::from_str(&order)?;
+    let bad = amended(
+        ("shop", order_id["id"].as_str().unwrap_or_default()),
+        r#"{"data":{"x":1}}"#,
+    );
+    let bad = g.commit(&[&order, &bad], &[])?;
+    let bad = bad[1].as_ref().map_err(ToString::to_string)?.cursor;
     for _ in 0..3 {
         g.fill()?;
     }

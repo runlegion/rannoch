@@ -1572,34 +1572,6 @@ mod tests {
     }
 
     #[test]
-    fn an_amendment_known_before_its_target_is_refused() -> Result<(), Box<dyn std::error::Error>> {
-        let mut g = graph("own-time")?;
-        g.set_try_limit(1)?;
-        let b1 = logged(&mut g, &book_at(3_000, "b1", "one"))?;
-        let early = logged(
-            &mut g,
-            &amended(2_000, &b1, r#"{"data":{"properties":{"title":"early"}}}"#),
-        )?;
-        logged(
-            &mut g,
-            &amended(6_000, &b1, r#"{"data":{"properties":{"title":"late"}}}"#),
-        )?;
-        g.fill()?;
-        let stopped: Vec<crate::Cursor> = g.stopped()?.into_iter().map(|(at, _)| at).collect();
-        assert_eq!(
-            stopped,
-            [early.cursor],
-            "the one known before its target is refused"
-        );
-        assert_eq!(
-            title(&g, "b1")?,
-            Some("late".into()),
-            "the one after it lands"
-        );
-        Ok(())
-    }
-
-    #[test]
     fn a_link_arriving_after_a_rename_lands_on_the_new_key()
     -> Result<(), Box<dyn std::error::Error>> {
         let (mut g, b1, _) = wrote_b1("rename-late-link")?;
@@ -1926,36 +1898,6 @@ mod tests {
         let stopped = g.stopped()?;
         assert_eq!(stopped.len(), 1, "the amendment stops at the limit");
         assert_eq!(stopped[0].0, bad.cursor);
-        Ok(())
-    }
-
-    #[test]
-    fn an_amendment_before_the_latest_one_is_refused() -> Result<(), Box<dyn std::error::Error>> {
-        let mut g = graph("before")?;
-        g.set_try_limit(1)?;
-        let b1 = logged(&mut g, &book_at(1_000, "b1", "one"))?;
-        logged(
-            &mut g,
-            &amended(2_000, &b1, r#"{"data":{"properties":{"title":"two"}}}"#),
-        )?;
-        g.fill()?;
-        let late = logged(
-            &mut g,
-            &amended(1_500, &b1, r#"{"data":{"properties":{"title":"x"}}}"#),
-        )?;
-        let before = logged(
-            &mut g,
-            &amended(500, &b1, r#"{"data":{"properties":{"title":"y"}}}"#),
-        )?;
-        g.fill()?;
-        assert_eq!(
-            title(&g, "b1")?,
-            Some("two".into()),
-            "it reads as amended at 2000"
-        );
-        assert_eq!(title_known(&g, "b1", 1_700)?, Some("one".into()));
-        let stopped: Vec<crate::Cursor> = g.stopped()?.into_iter().map(|(at, _)| at).collect();
-        assert_eq!(stopped, [late.cursor, before.cursor], "both are refused");
         Ok(())
     }
 
@@ -2729,6 +2671,75 @@ mod tests {
         );
         assert_eq!(before.2, Some(true), "now, the link under b9 has ended");
         assert_eq!(answers("ending-after-rename", false)?, before);
+        Ok(())
+    }
+
+    /// Every order of `items`.
+    fn orders<T: Clone>(items: &[T]) -> Vec<Vec<T>> {
+        if items.len() <= 1 {
+            return vec![items.to_vec()];
+        }
+        let mut all = Vec::new();
+        for (i, first) in items.iter().enumerate() {
+            let mut rest = items.to_vec();
+            rest.remove(i);
+            for mut order in orders(&rest) {
+                order.insert(0, first.clone());
+                all.push(order);
+            }
+        }
+        all
+    }
+
+    #[test]
+    fn amendments_stack_by_known_at_in_every_arrival_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let target = book_at(1_000, "b1", "one");
+        let named: serde_json::Value = serde_json::from_str(&target)?;
+        let named = ("rannoch:shop", named["id"].as_str().unwrap_or_default());
+        let events = [
+            target.clone(),
+            // Known before its target: it is not refused, and stacks first.
+            amending(
+                500,
+                named,
+                r#"{"source":"rannoch:editor","data":{"properties":{"title":"zero"}}}"#,
+            ),
+            amending(
+                2_000,
+                named,
+                r#"{"subject":"b9","data":{"properties":{"title":"two"}}}"#,
+            ),
+            amending(2_500, named, r#"{"subject":"b10"}"#),
+        ];
+        let mut first = None;
+        for (n, order) in orders(&events).into_iter().enumerate() {
+            let mut g = graph(&format!("every-order-{n}"))?;
+            // One commit in this order, then one fill: fill reads the log in arrival order.
+            g.commit(&order.iter().map(String::as_str).collect::<Vec<_>>(), &[])?;
+            g.fill()?;
+            let mut answers = vec![format!("{:?}", g.stopped()?)];
+            for key in ["b1", "b9", "b10"] {
+                answers.push(format!(
+                    "{:?}",
+                    g.find("book", key)?.map(|b| (b.properties, b.source))
+                ));
+                for known in [1_200, 1_700, 2_200, 2_700] {
+                    answers.push(format!("{:?}", title_known(&g, key, known)?));
+                }
+            }
+            match &first {
+                None => first = Some(answers),
+                Some(first) => assert_eq!(&answers, first, "order {n}: {order:?}"),
+            }
+        }
+        let first = first.ok_or("an order ran")?;
+        assert_eq!(first[0], "[]", "no amendment is refused for its timing");
+        assert_eq!(first[2], r#"Some(Text("zero"))"#, "b1 known at 1,200 s");
+        assert!(
+            first[11].contains("two") && first[11].contains("editor"),
+            "{first:?}"
+        );
         Ok(())
     }
 }

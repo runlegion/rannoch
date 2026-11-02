@@ -120,7 +120,7 @@ Reads take a `View { axis, known }`: an optional axis point and an optional know
 | `link_hearings`, `link_seen`, `link_end` | as for nodes; `link_end` says whether it ended or was found wrong |
 | `events().since(cursor)`, `at(cursor)`, `committed()` | the log itself |
 
-A version that arrives late answers at its own point; it does not change what is current unless it is newer on the axis. A link's latest conclusion (ending or correction) is chosen by known-at, then event id, never by arrival. Reading the same log in any order, or after a rebuild, gives the same answers; only `Node.recorded` and `Seen.first_recorded`, which name this store's own receipt, may differ. One exception is the refusal below of an amendment known before the target's latest amendment: which amendment is latest when it fills depends on arrival.
+A version that arrives late answers at its own point; it does not change what is current unless it is newer on the axis. A link's latest conclusion (ending or correction) is chosen by known-at, then event id, never by arrival. Reading the same log in any order, or after a rebuild, gives the same answers; only `Node.recorded` and `Seen.first_recorded`, which name this store's own receipt, may differ.
 
 ```rust
 let book = g.find("book", "b1")?.ok_or("b1 is there")?;
@@ -144,19 +144,20 @@ g.fill()?;
 ```
 
 - Each store resolves the target when it fills the amendment, so a store replaying another's log applies the same amendment. An amendment that arrives before its target waits and applies when the target fills, so the target's arrival order does not change the answer.
+- The store refuses no amendment for its timing. Amendments of one event stack by known-at, then event id, whatever order they arrive in; one known before its target counts from the target's own known-at.
 - Amendments are allowed in every class. A patch of `data.axis` moves the version to the patched point.
 - The amended event stays in the log as written. Read as known before the amendment, it reads as written; from the amendment's known-at on, it reads patched.
-- An amendment is known at the clock in its own CloudEvent id. Amendments stack by known-at; at the same known-at, by event id.
+- An amendment is known at the clock in its own CloudEvent id.
 - **A rename is a patch of the subject.** It maps the old key to the new one from the amendment's known-at. The node and its links (live or ended) answer under the new key; a link or ending that arrives later naming the old key lands on the new one; a second rename maps on from the new key. Read as known before the rename, everything answers under the old key.
+
 Amendments are the slow path: finding the target reads the whole log. One amendment's fill took about 23 ms on a 22,619-event store (release build, this machine's SSD). Events that are not amendments pay nothing for them while a store has no renames and no amendment waits.
 
 ### Refused amendments
 
-Fill refuses an amendment that:
+Fill refuses only an amendment that cannot be stored at all, one that:
 
-- names no target or has no patch;
-- is known before its target's known-at, or before its latest amendment already applied (which one is latest when it fills depends on the order amendments arrive in);
-- amends an event logged before it with no hearing of its own: a declaration, an app's own event, or content identical to an earlier hearing.
+- is malformed: it names no target or has no patch, or its patch leaves the event invalid against the ontology;
+- amends an event with no hearing of its own: a declaration, an app's own event, or content identical to an earlier hearing.
 
 An amendment whose target is not in the log is not refused: it waits.
 
