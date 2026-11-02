@@ -586,8 +586,16 @@ impl Shared {
         }
         let mut filled = None;
         if landed.is_some() {
-            match graph.fill() {
-                Ok(to) => filled = Some(to),
+            // Fill logs a closed event for each link it closes, after the batch; the watermark
+            // takes them in, so they are handed out without waiting for a later commit.
+            match graph
+                .fill()
+                .and_then(|to| Ok((to, graph.events().committed()?)))
+            {
+                Ok((to, high)) => {
+                    filled = Some(to);
+                    landed = Some(high);
+                }
                 Err(error) => failed.push(Failure::Fill {
                     ticket: last,
                     error,
