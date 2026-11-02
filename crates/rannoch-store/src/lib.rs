@@ -17,11 +17,11 @@ mod queries;
 mod read;
 
 pub use fact::check;
-pub use history::{At, End, Hearing, Seen, Version};
+pub use history::{End, Hearing, Seen, Version, View};
 pub use inbox::{FILL, Place, State};
 pub use log::{Cursor, Event, Events};
 pub use rannoch_cloudevents::{Date, EventId, NodeRef, ValidTime};
-pub use rannoch_ontology::{Class, Declaration, HistoryKey, Ontology, Relation, Value, ValueType};
+pub use rannoch_ontology::{Class, Declaration, Ontology, Relation, Value, ValueType};
 pub use read::Node;
 
 use crate::history::{
@@ -34,8 +34,8 @@ use crate::ontology::{Bound, build, load};
 use crate::queries::{
     ANY_RENAME, CLOSE_OPEN, COPY_INTO, DONE_RETRY, HISTORY_TABLES, OPEN_LINK, OWN_TABLES, PRAGMAS,
     RELEASE, RESET_TRIES, RETRY_WORK, ROLLBACK_TO, SAVEPOINT, SCHEMA_VERSION, SET_PLACE,
-    SET_POSITION, SET_TRY_LIMIT, STOPPED_WORK, TRIED_WORK, TRY_LIMIT, delete_link, delete_node,
-    node_id, upsert_link, upsert_node, waiting,
+    SET_POSITION, SET_TRY_LIMIT, STOP_WAITING, STOPPED_WORK, TRIED_WORK, TRY_LIMIT, WAITED,
+    WAITING_FOR, delete_link, delete_node, node_id, upsert_link, upsert_node, waiting,
 };
 
 /// Why rannoch did not do what was asked.
@@ -345,7 +345,7 @@ impl Graph {
             let Some(event) = event_at(&tx, Cursor(seq))? else {
                 continue;
             };
-            match attempt(&tx, &ontology, &self.key, &event, &mut renamed(&tx)?)? {
+            match attempt(&tx, &ontology, &self.key, &event, &mut Flags::read(&tx)?)? {
                 Ok(()) => tx.prepare_cached(DONE_RETRY)?.execute(params![FILL, seq])?,
                 Err(cause) => tried(&tx, seq, &cause)?,
             };
@@ -372,8 +372,8 @@ impl Graph {
         }
         let ontology = load(&tx)?;
         let log = Events { conn: &tx };
-        let mut renames = renamed(&tx)?;
-        let before = renames;
+        let mut flags = Flags::read(&tx)?;
+        let before = flags.clone();
         tx.execute_batch(SAVEPOINT)?;
         let mut to = from;
         let mut failed = false;
@@ -382,7 +382,7 @@ impl Graph {
         'chunks: while to < high && !failed {
             let until = Cursor(to.0.saturating_add(FILL_CHUNK).min(high.0));
             for event in log.since_until(to, until)? {
-                if fill_one(&tx, &ontology, &self.key, &event, &mut renames).is_err() {
+                if fill_one(&tx, &ontology, &self.key, &event, &mut flags).is_err() {
                     to = event.cursor;
                     failed = true;
                     break 'chunks;
@@ -396,9 +396,9 @@ impl Graph {
         }
         if failed {
             tx.execute_batch(ROLLBACK_TO)?;
-            renames = before;
+            flags = before;
             for event in log.since_until(from, to)? {
-                if let Err(cause) = attempt(&tx, &ontology, &self.key, &event, &mut renames)? {
+                if let Err(cause) = attempt(&tx, &ontology, &self.key, &event, &mut flags)? {
                     tried(&tx, event.cursor.0, &cause)?;
                 }
             }
@@ -475,38 +475,73 @@ fn attempt(
     ontology: &Ontology,
     key: &Key,
     event: &Event,
-    renames: &mut bool,
+    flags: &mut Flags,
 ) -> Result<Result<(), Error>, Error> {
     tx.execute_batch(SAVEPOINT)?;
-    let before = *renames;
-    let filled = fill_one(tx, ontology, key, event, renames).map_err(|cause| {
+    let before = flags.clone();
+    let filled = fill_one(tx, ontology, key, event, flags).map_err(|cause| {
         Error::Refused(format!(
             "event at {} cannot be filled: {cause}",
             event.cursor.0
         ))
     });
     if filled.is_err() {
-        *renames = before;
+        *flags = before;
     }
     tx.execute_batch(if filled.is_ok() { RELEASE } else { ROLLBACK_TO })?;
     Ok(filled)
 }
 
-/// Writes one event into the ontology's tables. `renames` says whether the store holds any
-/// rename; while it holds none, no event is looked up against renames.
+/// What fill looks up for each event only while the store holds any: renames, and the origin
+/// events amendments wait for. Read once per batch, and again after each amendment lands, so an
+/// event is looked up against the waiting amendments only when its own origin is waited for.
+#[derive(Debug, Clone)]
+struct Flags {
+    renames: bool,
+    waiting: std::collections::BTreeSet<EventId>,
+}
+
+impl Flags {
+    fn read(tx: &Connection) -> rusqlite::Result<Flags> {
+        let waited: Vec<String> = tx
+            .prepare_cached(WAITED)?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        Ok(Flags {
+            renames: renamed(tx)?,
+            waiting: waited
+                .iter()
+                .filter_map(|id| id.split(':').next()?.parse().ok())
+                .collect(),
+        })
+    }
+}
+
+/// Writes one event into the ontology's tables, then applies the amendments waiting for it.
+/// While the store holds no rename, no event is looked up against renames; while no amendment
+/// waits, none is looked up for its target.
 fn fill_one(
     tx: &Connection,
     ontology: &Ontology,
     store_key: &Key,
     event: &Event,
-    renames: &mut bool,
+    flags: &mut Flags,
 ) -> Result<(), Error> {
     let recorded = event.id.recorded().map_err(Error::from)?;
     let stamp = Stamp {
         cursor: event.cursor,
         recorded,
     };
-    match fact::check(&event.body, ontology)? {
+    let fact = fact::check(&event.body, ontology)?;
+    // The origin event a fact names; `None` for an event that names none parsed here.
+    let origin = match &fact {
+        fact::Fact::Node(node) => Some(node.event),
+        fact::Fact::Link(link) => Some(link.event),
+        fact::Fact::Concluded(conclusion) => Some(conclusion.event),
+        fact::Fact::Declared | fact::Fact::None => None,
+    };
+    let renames = &mut flags.renames;
+    match fact {
         fact::Fact::Node(node) => {
             let (entity, key) = (node_entity(&node.class), node.key.as_str());
             match heard(tx, ontology, store_key, stamp, &Of::Node(&node))? {
@@ -541,15 +576,59 @@ fn fill_one(
         }
         fact::Fact::Link(link) => fill_link(tx, (ontology, store_key), stamp, &link, *renames)?,
         fact::Fact::Concluded(conclusion) => {
-            conclude(tx, &conclusion, *renames)?;
+            conclude(tx, ontology, &conclusion, *renames)?;
         }
         fact::Fact::None => {
-            if amended(tx, ontology, store_key, event)? {
-                *renames = renamed(tx)?;
+            if amended(tx, ontology, store_key, event, false)? {
+                *flags = Flags::read(tx)?;
             }
         }
         fact::Fact::Declared => {}
     }
+    if !flags.waiting.is_empty() && origin.is_none_or(|origin| flags.waiting.contains(&origin)) {
+        awaited(tx, ontology, store_key, event, flags)?;
+    }
+    Ok(())
+}
+
+/// Applies the amendments waiting for `event`, now filled, by known-at and then event id. One
+/// that is refused is a failed try of the amendment, as fill retries count it, never of `event`.
+fn awaited(
+    tx: &Connection,
+    ontology: &Ontology,
+    key: &Key,
+    event: &Event,
+    flags: &mut Flags,
+) -> Result<(), Error> {
+    let Ok(attributes) = rannoch_cloudevents::attributes(&event.body) else {
+        return Ok(());
+    };
+    let named = params![attributes.source, attributes.id];
+    let waiting: Vec<i64> = tx
+        .prepare_cached(WAITING_FOR)?
+        .query_map(named, |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    if waiting.is_empty() {
+        return Ok(());
+    }
+    tx.prepare_cached(STOP_WAITING)?.execute(named)?;
+    for seq in waiting {
+        let Some(amendment) = event_at(tx, Cursor(seq))? else {
+            continue;
+        };
+        tx.execute_batch(SAVEPOINT)?;
+        let applied = amended(tx, ontology, key, &amendment, true);
+        tx.execute_batch(if applied.is_ok() {
+            RELEASE
+        } else {
+            ROLLBACK_TO
+        })?;
+        if let Err(cause) = applied {
+            let cause = Error::Refused(format!("event at {seq} cannot be filled: {cause}"));
+            tried(tx, seq, &cause)?;
+        }
+    }
+    *flags = Flags::read(tx)?;
     Ok(())
 }
 
@@ -600,13 +679,28 @@ fn amendment(body: &str) -> bool {
 }
 
 /// Folds `event` when it is an amendment, and puts what it touched into the tables kept for
-/// speed; any other event that says no fact fills nothing. Says whether it was an amendment.
-fn amended(tx: &Connection, ontology: &Ontology, key: &Key, event: &Event) -> Result<bool, Error> {
+/// speed; an amendment whose target is not filled yet waits for it. Any other event that says
+/// no fact fills nothing. `target_filled` says the amendment's target has just filled, so it
+/// never waits again. Says whether it was an amendment.
+fn amended(
+    tx: &Connection,
+    ontology: &Ontology,
+    key: &Key,
+    event: &Event,
+    target_filled: bool,
+) -> Result<bool, Error> {
     if !amendment(&event.body) {
         return Ok(false);
     }
-    let touched = amend(tx, ontology, key, &event.body, event.cursor)?;
-    refresh(tx, ontology, touched)?;
+    if let Some(touched) = amend(
+        tx,
+        ontology,
+        key,
+        (&event.body, event.cursor),
+        target_filled,
+    )? {
+        refresh(tx, ontology, touched)?;
+    }
     Ok(true)
 }
 
@@ -850,11 +944,11 @@ mod tests {
         link_with(&id(), from, to)
     }
 
-    /// The link from `from` to `to` ended at `at` milliseconds (`kind` `ended`), or was found
-    /// wrong (`kind` `corrected`).
-    fn concluded(id: &str, kind: &str, from: &str, to: &str, at: i64) -> String {
+    /// The link from `from` to `to` ended (`kind` `ended`), at its known-at on the undeclared
+    /// axis, or was found wrong (`kind` `corrected`).
+    fn concluded(id: &str, kind: &str, from: &str, to: &str) -> String {
         format!(
-            r#"{{"specversion":"1.0","id":"{id}","source":"rannoch:shop","type":"rannoch.{kind}.wrote","subject":"{from}","data":{{"from":{{"class":"author","key":"{from}"}},"to":{{"class":"book","key":"{to}"}},"at":{at},"valid":"unknown"}}}}"#
+            r#"{{"specversion":"1.0","id":"{id}","source":"rannoch:shop","type":"rannoch.{kind}.wrote","subject":"{from}","data":{{"from":{{"class":"author","key":"{from}"}},"to":{{"class":"book","key":"{to}"}}}}}}"#
         )
     }
 
@@ -933,13 +1027,13 @@ mod tests {
             ],
             &[],
         )?;
-        g.commit(&[&concluded(&id(), "ended", "a1", "b1", i64::MAX / 2)], &[])?;
+        g.commit(&[&concluded(&id(), "ended", "a1", "b1")], &[])?;
         g.fill()?;
         assert!(matches!(
             g.link_end("wrote", "a1", "b1")?,
             Some(crate::End::Ended { .. })
         ));
-        g.commit(&[&concluded(&id(), "corrected", "a1", "b1", 0)], &[])?;
+        g.commit(&[&concluded(&id(), "corrected", "a1", "b1")], &[])?;
         g.fill()?;
         assert!(matches!(
             g.link_end("wrote", "a1", "b1")?,
@@ -981,7 +1075,7 @@ mod tests {
             node_with(&id_at(1_500), "book", "b1", "one"),
             node_with(&id_at(3_000), "book", "b1", "two"),
             link_with(&id_at(500), "a1", "b1"),
-            concluded(&id_at(4_000), "ended", "a1", "b1", 2_000_000),
+            concluded(&id_at(4_000), "ended", "a1", "b1"),
         ];
         let answers = |name: &str, order: &[&String]| -> Result<_, Box<dyn std::error::Error>> {
             let mut g = graph(name)?;
@@ -991,14 +1085,17 @@ mod tests {
             }
             let b1 = crate::NodeRef::new("book", "b1");
             let now = g.find("book", "b1")?.ok_or("b1 was heard")?;
-            let at = crate::At::Time(std::time::UNIX_EPOCH + std::time::Duration::from_secs(2_000));
+            let at = crate::View {
+                axis: Some(vec![2_000_000]),
+                known: None,
+            };
             let seen = g.seen(&b1)?.ok_or("b1 was heard")?;
             let link = g
                 .link_seen("wrote", "a1", "b1")?
                 .ok_or("the link was heard")?;
             Ok((
                 (now.properties, now.source, now.valid),
-                g.state_at(&b1, at)?,
+                g.state_at(&b1, &at)?,
                 (
                     seen.first_heard,
                     seen.last_heard,
@@ -1140,10 +1237,20 @@ mod tests {
         )
     }
 
-    /// An amendment recorded at `seconds` of the logged event `target`, its data `patch`.
-    fn amended(seconds: u64, target: crate::EventId, patch: &str) -> String {
+    /// An amendment known at `seconds` of the event `target`, named by its `CloudEvent` source
+    /// and id, its patch `patch`.
+    fn amended(seconds: u64, target: &crate::Event, patch: &str) -> String {
+        let named = rannoch_cloudevents::attributes(&target.body).ok();
+        let named = named
+            .as_ref()
+            .map_or(("", ""), |n| (n.source.as_str(), n.id.as_str()));
+        amending(seconds, named, patch)
+    }
+
+    /// An amendment known at `seconds` of the event whose source and id are `target`.
+    fn amending(seconds: u64, (source, id): (&str, &str), patch: &str) -> String {
         format!(
-            r#"{{"specversion":"1.0","id":"{}","source":"rannoch:fixer","type":"rannoch.amended","subject":"{target}","data":{patch}}}"#,
+            r#"{{"specversion":"1.0","id":"{}","source":"rannoch:fixer","type":"rannoch.amended","data":{{"target":{{"source":"{source}","id":"{id}"}},"patch":{patch}}}}}"#,
             id_at(seconds)
         )
     }
@@ -1156,8 +1263,11 @@ mod tests {
         Ok(g.commit(&[body], &[])?.remove(0)?)
     }
 
-    fn known_at(seconds: u64) -> crate::At {
-        crate::At::Time(std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds))
+    fn known_at(seconds: u64) -> crate::View {
+        crate::View {
+            axis: None,
+            known: Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds)),
+        }
     }
 
     fn title_known(
@@ -1166,7 +1276,7 @@ mod tests {
         seconds: u64,
     ) -> Result<Option<crate::Value>, crate::Error> {
         let day = crate::Date::day(2024, 1, 1);
-        Ok(g.find_as_of("book", key, &day, Some(known_at(seconds)))?
+        Ok(g.find_as_of("book", key, &day, &known_at(seconds))?
             .and_then(|node| node.properties.get("title").cloned()))
     }
 
@@ -1177,8 +1287,8 @@ mod tests {
         let b2 = logged(&mut g, &book_at(1_000, "b2", "gone"))?;
         g.commit(
             &[
-                &amended(2_000, b1.id, r#"{"data":{"properties":{"title":"typo"}}}"#),
-                &amended(2_000, b2.id, r#"{"data":{"properties":{"title":null}}}"#),
+                &amended(2_000, &b1, r#"{"data":{"properties":{"title":"typo"}}}"#),
+                &amended(2_000, &b2, r#"{"data":{"properties":{"title":null}}}"#),
             ],
             &[],
         )?;
@@ -1201,7 +1311,7 @@ mod tests {
         let b1 = logged(&mut g, &book_at(1_000, "b1", "tpyo"))?;
         let fix = logged(
             &mut g,
-            &amended(2_000, b1.id, r#"{"data":{"properties":{"title":"typo"}}}"#),
+            &amended(2_000, &b1, r#"{"data":{"properties":{"title":"typo"}}}"#),
         )?;
         g.fill()?;
         assert_eq!(
@@ -1230,7 +1340,7 @@ mod tests {
         g.commit(
             &[&amended(
                 2_000,
-                b1.id,
+                &b1,
                 r#"{"data":{"properties":{"title":"typo"}}}"#,
             )],
             &[],
@@ -1247,8 +1357,8 @@ mod tests {
         let b1 = logged(&mut g, &book_at(1_000, "b1", "one"))?;
         g.commit(
             &[
-                &amended(2_000, b1.id, r#"{"data":{"properties":{"title":"two"}}}"#),
-                &amended(3_000, b1.id, r#"{"source":"rannoch:editor"}"#),
+                &amended(2_000, &b1, r#"{"data":{"properties":{"title":"two"}}}"#),
+                &amended(3_000, &b1, r#"{"source":"rannoch:editor"}"#),
             ],
             &[],
         )?;
@@ -1268,7 +1378,7 @@ mod tests {
     fn renaming_a_node_amends_its_events_subject() -> Result<(), Box<dyn std::error::Error>> {
         let mut g = graph("rename")?;
         let b1 = logged(&mut g, &book_at(1_000, "b1", "hi"))?;
-        g.commit(&[&amended(2_000, b1.id, r#"{"subject":"b9"}"#)], &[])?;
+        g.commit(&[&amended(2_000, &b1, r#"{"subject":"b9"}"#)], &[])?;
         g.fill()?;
         assert_eq!(
             title(&g, "b9")?,
@@ -1291,8 +1401,8 @@ mod tests {
         g.fill()?;
         g.commit(
             &[
-                &amended(2_000, b1.id, r#"{"data":{"properties":{"title":"typo"}}}"#),
-                &amended(2_000, b2.id, r#"{"subject":"b3"}"#),
+                &amended(2_000, &b1, r#"{"data":{"properties":{"title":"typo"}}}"#),
+                &amended(2_000, &b2, r#"{"subject":"b3"}"#),
             ],
             &[],
         )?;
@@ -1359,13 +1469,13 @@ mod tests {
         to: &str,
         seconds: u64,
     ) -> Result<Option<crate::Version>, crate::Error> {
-        g.link_known_at("wrote", "a1", to, known_at(seconds))
+        g.link_state_at("wrote", "a1", to, &known_at(seconds))
     }
 
     #[test]
     fn a_renamed_nodes_links_answer_under_its_new_key() -> Result<(), Box<dyn std::error::Error>> {
         let (mut g, b1, _) = wrote_b1("rename-links")?;
-        g.commit(&[&amended(2_000, b1.id, r#"{"subject":"b9"}"#)], &[])?;
+        g.commit(&[&amended(2_000, &b1, r#"{"subject":"b9"}"#)], &[])?;
         g.fill()?;
         assert!(
             g.link_seen("wrote", "a1", "b9")?.is_some(),
@@ -1388,8 +1498,8 @@ mod tests {
         let (mut g, b1, _) = wrote_b1("rename-twice")?;
         g.commit(
             &[
-                &amended(2_000, b1.id, r#"{"subject":"b9"}"#),
-                &amended(3_000, b1.id, r#"{"subject":"b10"}"#),
+                &amended(2_000, &b1, r#"{"subject":"b9"}"#),
+                &amended(3_000, &b1, r#"{"subject":"b10"}"#),
             ],
             &[],
         )?;
@@ -1413,8 +1523,8 @@ mod tests {
         // The link's amendment arrives before the rename it comes after on the axis.
         g.commit(
             &[
-                &amended(3_000, wrote.id, r#"{"source":"rannoch:editor"}"#),
-                &amended(2_000, b1.id, r#"{"subject":"b9"}"#),
+                &amended(3_000, &wrote, r#"{"source":"rannoch:editor"}"#),
+                &amended(2_000, &b1, r#"{"subject":"b9"}"#),
             ],
             &[],
         )?;
@@ -1433,11 +1543,8 @@ mod tests {
     fn an_ended_link_stays_ended_after_its_end_is_renamed() -> Result<(), Box<dyn std::error::Error>>
     {
         let (mut g, b1, _) = wrote_b1("rename-ended")?;
-        logged(
-            &mut g,
-            &concluded(&id_at(1_500), "ended", "a1", "b1", 1_500_000),
-        )?;
-        g.commit(&[&amended(2_000, b1.id, r#"{"subject":"b9"}"#)], &[])?;
+        logged(&mut g, &concluded(&id_at(1_500), "ended", "a1", "b1"))?;
+        g.commit(&[&amended(2_000, &b1, r#"{"subject":"b9"}"#)], &[])?;
         g.fill()?;
         assert!(g.link_end("wrote", "a1", "b9")?.is_some(), "ended, new key");
         let after = known_link(&g, "b9", 2_500)?.ok_or("moved by 2,500")?;
@@ -1450,12 +1557,9 @@ mod tests {
     #[test]
     fn an_ending_after_a_rename_ends_the_renamed_link() -> Result<(), Box<dyn std::error::Error>> {
         let (mut g, b1, _) = wrote_b1("rename-then-end")?;
-        g.commit(&[&amended(2_000, b1.id, r#"{"subject":"b9"}"#)], &[])?;
+        g.commit(&[&amended(2_000, &b1, r#"{"subject":"b9"}"#)], &[])?;
         g.fill()?;
-        logged(
-            &mut g,
-            &concluded(&id_at(3_000), "ended", "a1", "b1", 3_000_000),
-        )?;
+        logged(&mut g, &concluded(&id_at(3_000), "ended", "a1", "b1"))?;
         g.fill()?;
         assert!(g.link_end("wrote", "a1", "b9")?.is_some());
         let now = known_link(&g, "b9", 3_500)?.ok_or("known at 3,500")?;
@@ -1468,59 +1572,18 @@ mod tests {
     }
 
     #[test]
-    fn an_amendment_before_the_events_own_time_is_refused() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let mut g = graph("own-time")?;
-        g.declare(
-            &Declaration::Class(Class {
-                history: crate::HistoryKey::Time,
-                ..Class::new("entry", ["title"])
-            }),
-            r#"{"specversion":"1.0","id":"d-entry","source":"rannoch:shop","type":"rannoch.declared.entry"}"#,
-        )?;
-        g.set_try_limit(1)?;
-        let e1 = logged(
-            &mut g,
-            &format!(
-                r#"{{"specversion":"1.0","id":"{}","source":"rannoch:shop","type":"rannoch.node.entry","subject":"e1","data":{{"properties":{{"title":"one"}},"valid":"unknown","time":5000000}}}}"#,
-                id_at(1_000)
-            ),
-        )?;
-        let early = logged(
-            &mut g,
-            &amended(2_000, e1.id, r#"{"data":{"properties":{"title":"early"}}}"#),
-        )?;
-        logged(
-            &mut g,
-            &amended(6_000, e1.id, r#"{"data":{"properties":{"title":"late"}}}"#),
-        )?;
-        g.fill()?;
-        let stopped: Vec<crate::Cursor> = g.stopped()?.into_iter().map(|(at, _)| at).collect();
-        assert_eq!(
-            stopped,
-            [early.cursor],
-            "the one before the event's time is refused"
-        );
-        let title = g
-            .find("entry", "e1")?
-            .and_then(|node| node.properties.get("title").cloned());
-        assert_eq!(title, Some("late".into()), "the one after it lands");
-        Ok(())
-    }
-
-    #[test]
     fn a_link_arriving_after_a_rename_lands_on_the_new_key()
     -> Result<(), Box<dyn std::error::Error>> {
         let (mut g, b1, _) = wrote_b1("rename-late-link")?;
         logged(&mut g, &node_with(&id_at(1_000), "author", "a2", "bob"))?;
-        g.commit(&[&amended(2_000, b1.id, r#"{"subject":"b9"}"#)], &[])?;
+        g.commit(&[&amended(2_000, &b1, r#"{"subject":"b9"}"#)], &[])?;
         g.fill()?;
         g.commit(&[&link_with(&id_at(3_000), "a2", "b1")], &[])?;
         g.fill()?;
         assert!(g.link_seen("wrote", "a2", "b9")?.is_some());
         assert!(g.link_seen("wrote", "a2", "b1")?.is_none());
         assert!(
-            g.link_known_at("wrote", "a2", "b9", known_at(2_500))?
+            g.link_state_at("wrote", "a2", "b9", &known_at(2_500))?
                 .is_none(),
             "not known before it arrived"
         );
@@ -1536,7 +1599,7 @@ mod tests {
     fn a_link_reads_as_written_before_its_amendment() -> Result<(), Box<dyn std::error::Error>> {
         let (mut g, _, wrote) = wrote_b1("link-known")?;
         g.commit(
-            &[&amended(2_000, wrote.id, r#"{"source":"rannoch:editor"}"#)],
+            &[&amended(2_000, &wrote, r#"{"source":"rannoch:editor"}"#)],
             &[],
         )?;
         g.fill()?;
@@ -1552,7 +1615,7 @@ mod tests {
         let mut g = graph("rename-merge")?;
         let b2 = logged(&mut g, &book_at(1_000, "b2", "two"))?;
         logged(&mut g, &book_at(1_500, "b3", "three"))?;
-        g.commit(&[&amended(2_000, b2.id, r#"{"subject":"b3"}"#)], &[])?;
+        g.commit(&[&amended(2_000, &b2, r#"{"subject":"b3"}"#)], &[])?;
         g.fill()?;
         let seen = g
             .seen(&crate::NodeRef::new("book", "b3"))?
@@ -1812,17 +1875,18 @@ mod tests {
 
     #[test]
     fn an_amendment_fill_cannot_apply_never_stops_fill() -> Result<(), Box<dyn std::error::Error>> {
-        let mut elsewhere = graph("elsewhere")?;
-        let stranger = logged(&mut elsewhere, &book_at(1_000, "b0", "not here"))?;
         let mut g = graph("unappliable")?;
         g.set_try_limit(1)?;
+        let stranger = logged(
+            &mut g,
+            &format!(
+                r#"{{"specversion":"1.0","id":"{}","source":"shop","type":"shop.order"}}"#,
+                id_at(1_000)
+            ),
+        )?;
         let bad = logged(
             &mut g,
-            &amended(
-                2_000,
-                stranger.id,
-                r#"{"data":{"properties":{"title":"x"}}}"#,
-            ),
+            &amended(2_000, &stranger, r#"{"data":{"properties":{"title":"x"}}}"#),
         )?;
         logged(&mut g, &book_at(3_000, "b2", "after"))?;
         g.fill()?;
@@ -1838,41 +1902,11 @@ mod tests {
     }
 
     #[test]
-    fn an_amendment_before_the_latest_one_is_refused() -> Result<(), Box<dyn std::error::Error>> {
-        let mut g = graph("before")?;
-        g.set_try_limit(1)?;
-        let b1 = logged(&mut g, &book_at(1_000, "b1", "one"))?;
-        logged(
-            &mut g,
-            &amended(2_000, b1.id, r#"{"data":{"properties":{"title":"two"}}}"#),
-        )?;
-        g.fill()?;
-        let late = logged(
-            &mut g,
-            &amended(1_500, b1.id, r#"{"data":{"properties":{"title":"x"}}}"#),
-        )?;
-        let before = logged(
-            &mut g,
-            &amended(500, b1.id, r#"{"data":{"properties":{"title":"y"}}}"#),
-        )?;
-        g.fill()?;
-        assert_eq!(
-            title(&g, "b1")?,
-            Some("two".into()),
-            "it reads as amended at 2000"
-        );
-        assert_eq!(title_known(&g, "b1", 1_700)?, Some("one".into()));
-        let stopped: Vec<crate::Cursor> = g.stopped()?.into_iter().map(|(at, _)| at).collect();
-        assert_eq!(stopped, [late.cursor, before.cursor], "both are refused");
-        Ok(())
-    }
-
-    #[test]
     fn amendments_at_one_point_stack_by_event_id() -> Result<(), Box<dyn std::error::Error>> {
         let mut g = graph("same-point")?;
         let b1 = logged(&mut g, &book_at(1_000, "b1", "one"))?;
-        let first = amended(2_000, b1.id, r#"{"data":{"properties":{"title":"a"}}}"#);
-        let second = amended(2_000, b1.id, r#"{"data":{"properties":{"title":"b"}}}"#);
+        let first = amended(2_000, &b1, r#"{"data":{"properties":{"title":"a"}}}"#);
+        let second = amended(2_000, &b1, r#"{"data":{"properties":{"title":"b"}}}"#);
         let id = |body: &str| -> Result<String, serde_json::Error> {
             let v: serde_json::Value = serde_json::from_str(body)?;
             Ok(v["id"].as_str().unwrap_or_default().to_owned())
@@ -1964,7 +1998,7 @@ mod tests {
             .map(|i| {
                 amended(
                     2_000 + i,
-                    b1.id,
+                    &b1,
                     &format!(r#"{{"data":{{"properties":{{"title":"t{i}"}}}}}}"#),
                 )
             })
@@ -2022,13 +2056,10 @@ mod tests {
         logged(&mut g, &node_with(&id_at(1_000), "author", "a2", "bo"))?;
         let b1 = logged(&mut g, &book_at(1_000, "b1", "hi"))?;
         logged(&mut g, &link_with(&id_at(1_000), "a1", "b1"))?;
-        logged(&mut g, &amended(2_000, b1.id, r#"{"subject":"b9"}"#))?;
+        logged(&mut g, &amended(2_000, &b1, r#"{"subject":"b9"}"#))?;
         logged(&mut g, &book_at(3_000, "b1", "later"))?;
         logged(&mut g, &link_with(&id_at(3_000), "a2", "b1"))?;
-        logged(
-            &mut g,
-            &concluded(&id_at(3_000), "ended", "a1", "b1", 3_000_000),
-        )?;
+        logged(&mut g, &concluded(&id_at(3_000), "ended", "a1", "b1"))?;
         let high = g.events().committed()?;
         let from = crate::inbox::place(&g.conn, crate::FILL)?;
         assert_eq!(
@@ -2098,19 +2129,616 @@ mod tests {
         logged(&mut g, &node_with(&id_at(1_000), "author", "a1", "ann"))?;
         logged(&mut g, &book_at(1_000, "b1", "hi"))?;
         logged(&mut g, &link_with(&id_at(1_000), "a1", "b1"))?;
-        logged(
-            &mut g,
-            &concluded(&id_at(3_000), "ended", "a1", "b1", 3_000_000),
-        )?;
+        logged(&mut g, &concluded(&id_at(3_000), "ended", "a1", "b1"))?;
         let ran = statements(&mut g, crate::Graph::fill)?;
         let looked: Vec<&String> = ran
             .iter()
-            .filter(|s| s.contains("_renames WHERE") || s.contains("_amendments"))
+            .filter(|s| {
+                s.contains("_renames WHERE")
+                    || s.contains("_amendments")
+                    || s.contains("_waiting WHERE")
+                    || s.contains("json_extract")
+            })
             .collect();
-        assert!(looked.is_empty(), "rename or amendment lookups: {looked:?}");
+        assert!(
+            looked.is_empty(),
+            "rename, amendment or waiting lookups: {looked:?}"
+        );
         assert!(
             g.link_end("wrote", "a1", "b1")?.is_some(),
             "the ending filled"
+        );
+        Ok(())
+    }
+
+    /// A graph whose class `release` declares the axis (build), `run` declares (build, step),
+    /// and `book` declares none; the relation `ships` from run to release declares (build).
+    fn graph_on_axes(name: &str) -> Result<crate::Graph, crate::Error> {
+        let mut g = open(temp(name), &KEY)?;
+        let declared = |name: &str| {
+            format!(
+                r#"{{"specversion":"1.0","id":"d-{name}","source":"rannoch:shop","type":"rannoch.declared.{name}"}}"#
+            )
+        };
+        let axis = |parts: &[&str]| parts.iter().map(ToString::to_string).collect();
+        for (class, parts) in [
+            ("release", &["build"][..]),
+            ("run", &["build", "step"][..]),
+            ("book", &[][..]),
+        ] {
+            g.declare(
+                &Declaration::Class(Class {
+                    axis: axis(parts),
+                    ..Class::new(class, ["title"])
+                }),
+                &declared(class),
+            )?;
+        }
+        g.declare(
+            &Declaration::Relation(Relation {
+                axis: axis(&["build"]),
+                ..Relation::new("ships", "run", "release", false)
+            }),
+            &declared("ships"),
+        )?;
+        Ok(g)
+    }
+
+    /// A node of `class` keyed `key` known at `seconds`, at the point `axis` (JSON, or empty
+    /// for none), titled `title`, with no valid time.
+    fn on_axis(seconds: u64, class: &str, key: &str, axis: &str, title: &str) -> String {
+        let axis = if axis.is_empty() {
+            String::new()
+        } else {
+            format!(r#","axis":{axis}"#)
+        };
+        format!(
+            r#"{{"specversion":"1.0","id":"{}","source":"rannoch:shop","type":"rannoch.node.{class}","subject":"{key}","data":{{"properties":{{"title":"{title}"}}{axis}}}}}"#,
+            id_at(seconds)
+        )
+    }
+
+    /// A `ships` link (`kind` `link`) or its ending (`kind` `ended`) from the run `from` to the
+    /// release `to`, known at `seconds`, at the point `axis` (JSON).
+    fn ships(seconds: u64, kind: &str, (from, to): (&str, &str), axis: &str) -> String {
+        format!(
+            r#"{{"specversion":"1.0","id":"{}","source":"rannoch:shop","type":"rannoch.{kind}.ships","data":{{"from":{{"class":"run","key":"{from}"}},"to":{{"class":"release","key":"{to}"}},"axis":{axis}}}}}"#,
+            id_at(seconds)
+        )
+    }
+
+    /// A view of the axis point `axis` as known at `seconds`, each `None` for now.
+    fn view(axis: Option<&[i64]>, seconds: Option<u64>) -> crate::View {
+        crate::View {
+            axis: axis.map(<[i64]>::to_vec),
+            known: seconds.map(|s| std::time::UNIX_EPOCH + std::time::Duration::from_secs(s)),
+        }
+    }
+
+    /// The title of the node `class` `key` in `view`.
+    fn title_in(
+        g: &crate::Graph,
+        (class, key): (&str, &str),
+        view: &crate::View,
+    ) -> Result<Option<crate::Value>, crate::Error> {
+        Ok(g.state_at(&crate::NodeRef::new(class, key), view)?
+            .and_then(|v| v.properties.get("title").cloned()))
+    }
+
+    /// Commits each body and fills after each, in the order given.
+    fn feed(g: &mut crate::Graph, bodies: &[&String]) -> Result<(), crate::Error> {
+        for body in bodies {
+            g.commit(&[body.as_str()], &[])?;
+            g.fill()?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_correction_at_the_same_point_reads_by_known_at_in_every_kind_of_class()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let r_wrong = on_axis(1_000, "release", "r1", r#"{"build":12}"#, "tpyo");
+        let r_fixed = on_axis(2_000, "release", "r1", r#"{"build":12}"#, "typo");
+        let k_wrong = on_axis(1_000, "run", "k1", r#"{"build":12,"step":3}"#, "tpyo");
+        let k_fixed = on_axis(2_000, "run", "k1", r#"{"build":12,"step":3}"#, "typo");
+        let b_wrong = on_axis(1_000, "book", "b1", "", "tpyo");
+        for (name, order) in [
+            ("same-point", [&r_wrong, &r_fixed, &k_wrong, &k_fixed]),
+            (
+                "same-point-reversed",
+                [&k_fixed, &r_fixed, &k_wrong, &r_wrong],
+            ),
+        ] {
+            let mut g = graph_on_axes(name)?;
+            feed(&mut g, &order)?;
+            let book = logged(&mut g, &b_wrong)?;
+            logged(
+                &mut g,
+                &amended(2_000, &book, r#"{"data":{"properties":{"title":"typo"}}}"#),
+            )?;
+            g.fill()?;
+            // The log's own receipt stamps are all now: reads known at 1,500 s and 2,500 s
+            // can only tell the two apart by each event's own clock.
+            for (of, point) in [
+                (("release", "r1"), Some(&[12][..])),
+                (("run", "k1"), Some(&[12, 3][..])),
+                (("book", "b1"), None),
+            ] {
+                assert_eq!(
+                    title_in(&g, of, &view(point, Some(1_500)))?,
+                    Some("tpyo".into()),
+                    "{name} {of:?}: known before the correction, read as the original"
+                );
+                assert_eq!(
+                    title_in(&g, of, &view(point, Some(2_500)))?,
+                    Some("typo".into()),
+                    "{name} {of:?}: known after it, read as the correction"
+                );
+                assert_eq!(
+                    title_in(&g, of, &view(None, None))?,
+                    Some("typo".into()),
+                    "{name} {of:?}: now"
+                );
+                assert_eq!(title_in(&g, of, &view(point, Some(500)))?, None);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_partial_point_reads_the_top_of_its_prefix() -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = graph_on_axes("prefix")?;
+        let events = [
+            on_axis(1_000, "run", "k1", r#"{"build":12,"step":1}"#, "a"),
+            on_axis(1_001, "run", "k1", r#"{"build":12,"step":5}"#, "b"),
+            on_axis(1_002, "run", "k1", r#"{"build":13,"step":0}"#, "c"),
+        ];
+        feed(&mut g, &events.iter().collect::<Vec<_>>())?;
+        let k1 = ("run", "k1");
+        assert_eq!(
+            title_in(&g, k1, &view(Some(&[12]), None))?,
+            Some("b".into())
+        );
+        assert_eq!(
+            title_in(&g, k1, &view(Some(&[12, 1]), None))?,
+            Some("a".into())
+        );
+        assert_eq!(
+            title_in(&g, k1, &view(Some(&[13]), None))?,
+            Some("c".into())
+        );
+        assert_eq!(title_in(&g, k1, &view(Some(&[11]), None))?, None);
+        assert_eq!(title_in(&g, k1, &view(Some(&[]), None))?, Some("c".into()));
+        assert!(
+            matches!(
+                title_in(&g, k1, &view(Some(&[12, 1, 0]), None)),
+                Err(crate::Error::Refused(_))
+            ),
+            "a point longer than the axis is refused"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_axis_part_left_out_or_not_declared_is_refused() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let g = graph_on_axes("refused-parts")?;
+        let ontology = g.ontology();
+        for (body, names) in [
+            (on_axis(1, "release", "r1", "", "x"), "leaves out build"),
+            (
+                on_axis(1, "run", "k1", r#"{"build":1}"#, "x"),
+                "leaves out step",
+            ),
+            (
+                on_axis(1, "release", "r1", r#"{"build":1,"step":2}"#, "x"),
+                "part step",
+            ),
+            (
+                on_axis(1, "book", "b1", r#"{"build":1}"#, "x"),
+                "part build",
+            ),
+            (ships(1, "link", ("k1", "r1"), "{}"), "leaves out build"),
+            (ships(1, "ended", ("k1", "r1"), "{}"), "leaves out build"),
+        ] {
+            let Err(crate::Error::Refused(why)) = crate::check(&body, ontology) else {
+                panic!("{body} must be refused");
+            };
+            assert!(why.contains(names), "{why}");
+        }
+        assert!(
+            crate::check(
+                &on_axis(1, "release", "r1", r#"{"build":1}"#, "x"),
+                ontology
+            )
+            .is_ok()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_link_heard_at_two_builds_is_two_hearings_and_ends_at_its_own()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = graph_on_axes("link-builds")?;
+        let events = [
+            on_axis(1_000, "run", "k1", r#"{"build":12,"step":0}"#, "k"),
+            on_axis(1_000, "release", "r1", r#"{"build":12}"#, "r"),
+            ships(1_001, "link", ("k1", "r1"), r#"{"build":12}"#),
+            ships(1_002, "link", ("k1", "r1"), r#"{"build":13}"#),
+            ships(1_003, "ended", ("k1", "r1"), r#"{"build":14}"#),
+        ];
+        feed(&mut g, &events.iter().collect::<Vec<_>>())?;
+        let axes: Vec<Vec<i64>> = g
+            .link_hearings("ships", "k1", "r1")?
+            .into_iter()
+            .map(|h| h.axis)
+            .collect();
+        assert_eq!(
+            axes,
+            [vec![12], vec![13]],
+            "two hearings, each at its build"
+        );
+        let at = |build: i64| g.link_state_at("ships", "k1", "r1", &view(Some(&[build]), None));
+        assert!(!at(13)?.ok_or("held at 13")?.ended);
+        assert!(at(14)?.ok_or("ended at 14")?.ended);
+        assert!(at(11)?.is_none());
+        assert!(matches!(
+            g.link_end("ships", "k1", "r1")?,
+            Some(crate::End::Ended { ref axis, .. }) if axis == &[14]
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn a_links_latest_conclusion_is_chosen_by_known_at_not_arrival()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let link = link_with(&id_at(1_000), "a1", "b1");
+        let (ended, corrected) = (
+            concluded(&id_at(2_000), "ended", "a1", "b1"),
+            concluded(&id_at(3_000), "corrected", "a1", "b1"),
+        );
+        let early_fix = concluded(&id_at(1_500), "corrected", "a1", "b1");
+        for (name, order, corrected_last) in [
+            ("ends-1", [&link, &ended, &corrected], true),
+            ("ends-2", [&link, &corrected, &ended], true),
+            ("ends-3", [&link, &early_fix, &ended], false),
+            ("ends-4", [&link, &ended, &early_fix], false),
+        ] {
+            let mut g = graph(name)?;
+            feed(&mut g, &order)?;
+            let end = g.link_end("wrote", "a1", "b1")?;
+            assert_eq!(
+                matches!(end, Some(crate::End::Corrected { .. })),
+                corrected_last,
+                "{name}: {end:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn an_amendment_before_its_target_waits_and_reads_as_in_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let target = on_axis(1_000, "release", "r1", r#"{"build":12}"#, "tpyo");
+        let named: serde_json::Value = serde_json::from_str(&target)?;
+        let fix = amending(
+            2_000,
+            ("rannoch:shop", named["id"].as_str().unwrap_or_default()),
+            r#"{"data":{"properties":{"title":"typo"}}}"#,
+        );
+        let answers = |name: &str, order: [&String; 2]| -> Result<_, Box<dyn std::error::Error>> {
+            let mut g = graph_on_axes(name)?;
+            g.set_try_limit(1)?;
+            g.commit(&[order[0].as_str()], &[])?;
+            for _ in 0..3 {
+                g.fill()?;
+            }
+            feed(&mut g, &[order[1]])?;
+            let r1 = ("release", "r1");
+            Ok((
+                g.stopped()?,
+                title_in(&g, r1, &view(None, None))?,
+                title_in(&g, r1, &view(None, Some(1_500)))?,
+                title_in(&g, r1, &view(None, Some(2_500)))?,
+            ))
+        };
+        let forward = answers("waits-forward", [&target, &fix])?;
+        assert_eq!(
+            forward,
+            (
+                Vec::new(),
+                Some("typo".into()),
+                Some("tpyo".into()),
+                Some("typo".into())
+            ),
+            "an amendment in a class with a declared axis lands"
+        );
+        assert_eq!(answers("waits-backward", [&fix, &target])?, forward);
+        Ok(())
+    }
+
+    #[test]
+    fn a_store_replaying_anothers_log_gives_the_same_answers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = graph_on_axes("replay-origin")?;
+        let events = [
+            on_axis(1_000, "run", "k1", r#"{"build":12,"step":0}"#, "k"),
+            on_axis(1_000, "release", "r1", r#"{"build":12}"#, "tpyo"),
+            on_axis(1_100, "release", "r1", r#"{"build":13}"#, "next"),
+            on_axis(1_200, "release", "r1", r#"{"build":12}"#, "typo"),
+            ships(1_300, "link", ("k1", "r1"), r#"{"build":12}"#),
+            ships(1_400, "ended", ("k1", "r1"), r#"{"build":13}"#),
+            on_axis(1_000, "book", "b1", "", "one"),
+        ];
+        feed(&mut g, &events.iter().collect::<Vec<_>>())?;
+        let book = g
+            .events()
+            .since(crate::Cursor::START)?
+            .into_iter()
+            .find(|e| e.body.contains("rannoch.node.book"))
+            .ok_or("the book is logged")?;
+        feed(
+            &mut g,
+            &[
+                &amended(1_500, &book, r#"{"data":{"properties":{"title":"two"}}}"#),
+                &amended(1_600, &book, r#"{"subject":"b9"}"#),
+            ],
+        )?;
+        let answers = |g: &crate::Graph| -> Result<_, Box<dyn std::error::Error>> {
+            let mut titles = Vec::new();
+            for of in [
+                ("release", "r1"),
+                ("run", "k1"),
+                ("book", "b1"),
+                ("book", "b9"),
+            ] {
+                for point in [None, Some(&[12][..]), Some(&[13][..])] {
+                    for known in [None, Some(1_150), Some(1_250), Some(1_550), Some(1_650)] {
+                        let point = if of.0 == "book" { None } else { point };
+                        titles.push(title_in(g, of, &view(point, known))?);
+                    }
+                }
+            }
+            let seen = g
+                .seen(&crate::NodeRef::new("release", "r1"))?
+                .ok_or("seen")?;
+            Ok((
+                titles,
+                g.hearings(&crate::NodeRef::new("release", "r1"))?,
+                g.hearings(&crate::NodeRef::new("book", "b9"))?,
+                g.link_hearings("ships", "k1", "r1")?,
+                g.link_end("ships", "k1", "r1")?,
+                g.link_state_at("ships", "k1", "r1", &view(Some(&[12]), None))?,
+                // First recorded is this store's own receipt order, so it is left out.
+                (seen.first_heard, seen.last_heard, seen.count),
+                g.stopped()?,
+            ))
+        };
+        let origin = answers(&g)?;
+        let log: Vec<String> = g
+            .events()
+            .since(crate::Cursor::START)?
+            .into_iter()
+            .map(|e| e.body)
+            .filter(|body| !body.contains("rannoch.declared") && !body.contains("rannoch.closed"))
+            .collect();
+        for (name, reversed) in [("replay-in-order", false), ("replay-reversed", true)] {
+            let mut copy = graph_on_axes(name)?;
+            let mut order: Vec<&String> = log.iter().collect();
+            if reversed {
+                order.reverse();
+            }
+            feed(&mut copy, &order)?;
+            assert_eq!(answers(&copy)?, origin, "{name}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_waiting_amendment_whose_target_makes_no_hearing_is_refused_when_it_fills()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = graph("waits-no-hearing")?;
+        g.set_try_limit(1)?;
+        let order = format!(
+            r#"{{"specversion":"1.0","id":"{}","source":"shop","type":"shop.order"}}"#,
+            id_at(1_000)
+        );
+        let named: serde_json::Value = serde_json::from_str(&order)?;
+        let fix = logged(
+            &mut g,
+            &amending(
+                2_000,
+                ("shop", named["id"].as_str().unwrap_or_default()),
+                r#"{"data":{"x":1}}"#,
+            ),
+        )?;
+        g.fill()?;
+        assert!(
+            g.stopped()?.is_empty(),
+            "it waits while its target is missing"
+        );
+        logged(&mut g, &order)?;
+        for _ in 0..3 {
+            g.fill()?;
+        }
+        let stopped: Vec<crate::Cursor> = g.stopped()?.into_iter().map(|(at, _)| at).collect();
+        assert_eq!(stopped, [fix.cursor], "refused once its target filled");
+        let waiting: i64 = g
+            .conn
+            .query_row("SELECT count(*) FROM _waiting", [], |row| row.get(0))?;
+        assert_eq!(waiting, 0, "nothing is left waiting");
+        Ok(())
+    }
+
+    #[test]
+    fn an_amendment_of_the_axis_moves_the_version_to_the_patched_point()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = graph_on_axes("patched-axis")?;
+        let r1 = logged(
+            &mut g,
+            &on_axis(1_000, "release", "r1", r#"{"build":12}"#, "wrong build"),
+        )?;
+        logged(
+            &mut g,
+            &amended(2_000, &r1, r#"{"data":{"axis":{"build":13}}}"#),
+        )?;
+        g.fill()?;
+        let r1 = ("release", "r1");
+        assert_eq!(title_in(&g, r1, &view(Some(&[12]), None))?, None);
+        assert_eq!(
+            title_in(&g, r1, &view(Some(&[13]), None))?,
+            Some("wrong build".into())
+        );
+        assert_eq!(
+            title_in(&g, r1, &view(Some(&[12]), Some(1_500)))?,
+            Some("wrong build".into()),
+            "known before the amendment, it is at build 12"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_waiting_amendment_refused_after_its_target_fills_stops_at_the_default_limit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = graph("waits-default-limit")?;
+        let order = format!(
+            r#"{{"specversion":"1.0","id":"{}","source":"shop","type":"shop.order"}}"#,
+            id_at(1_000)
+        );
+        let named: serde_json::Value = serde_json::from_str(&order)?;
+        let fix = logged(
+            &mut g,
+            &amending(
+                2_000,
+                ("shop", named["id"].as_str().unwrap_or_default()),
+                r#"{"data":{"x":1}}"#,
+            ),
+        )?;
+        g.fill()?;
+        logged(&mut g, &order)?;
+        for _ in 0..5 {
+            g.fill()?;
+        }
+        let stopped: Vec<crate::Cursor> = g.stopped()?.into_iter().map(|(at, _)| at).collect();
+        assert_eq!(
+            stopped,
+            [fix.cursor],
+            "its retries are refused, never a new wait"
+        );
+        let waiting: i64 = g
+            .conn
+            .query_row("SELECT count(*) FROM _waiting", [], |row| row.get(0))?;
+        assert_eq!(waiting, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn an_ending_reads_the_same_whether_it_arrives_before_or_after_a_rename()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let answers = |name: &str, ending_first: bool| -> Result<_, Box<dyn std::error::Error>> {
+            let (mut g, b1, _) = wrote_b1(name)?;
+            let ending = concluded(&id_at(1_500), "ended", "a1", "b1");
+            let rename = amended(2_000, &b1, r#"{"subject":"b9"}"#);
+            let order = if ending_first {
+                [&ending, &rename]
+            } else {
+                [&rename, &ending]
+            };
+            feed(&mut g, &order)?;
+            let at = |to: &str, known: Option<u64>| -> Result<_, crate::Error> {
+                Ok(g.link_state_at("wrote", "a1", to, &view(None, known))?
+                    .map(|v| v.ended))
+            };
+            Ok((
+                at("b1", Some(1_700))?,
+                at("b9", Some(1_700))?,
+                at("b9", None)?,
+                at("b1", None)?,
+                // Each run mints its own ids, so the ending is compared by its point.
+                match g.link_end("wrote", "a1", "b9")? {
+                    Some(crate::End::Ended { axis, known, .. }) => Some((axis, known)),
+                    _ => None,
+                },
+                g.link_seen("wrote", "a1", "b9")?
+                    .map(|s| (s.count, s.ended)),
+            ))
+        };
+        let before = answers("ending-before-rename", true)?;
+        assert_eq!(
+            before.0,
+            Some(true),
+            "known at 1,700, the link under b1 had ended"
+        );
+        assert_eq!(before.2, Some(true), "now, the link under b9 has ended");
+        assert_eq!(answers("ending-after-rename", false)?, before);
+        Ok(())
+    }
+
+    /// Every order of `items`.
+    fn orders<T: Clone>(items: &[T]) -> Vec<Vec<T>> {
+        if items.len() <= 1 {
+            return vec![items.to_vec()];
+        }
+        let mut all = Vec::new();
+        for (i, first) in items.iter().enumerate() {
+            let mut rest = items.to_vec();
+            rest.remove(i);
+            for mut order in orders(&rest) {
+                order.insert(0, first.clone());
+                all.push(order);
+            }
+        }
+        all
+    }
+
+    #[test]
+    fn amendments_stack_by_known_at_in_every_arrival_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let target = book_at(1_000, "b1", "one");
+        let named: serde_json::Value = serde_json::from_str(&target)?;
+        let named = ("rannoch:shop", named["id"].as_str().unwrap_or_default());
+        let events = [
+            target.clone(),
+            // Known before its target: it is not refused, and stacks first.
+            amending(
+                500,
+                named,
+                r#"{"source":"rannoch:editor","data":{"properties":{"title":"zero"}}}"#,
+            ),
+            amending(
+                2_000,
+                named,
+                r#"{"subject":"b9","data":{"properties":{"title":"two"}}}"#,
+            ),
+            amending(2_500, named, r#"{"subject":"b10"}"#),
+        ];
+        let mut first = None;
+        for (n, order) in orders(&events).into_iter().enumerate() {
+            let mut g = graph(&format!("every-order-{n}"))?;
+            // One commit in this order, then one fill: fill reads the log in arrival order.
+            g.commit(&order.iter().map(String::as_str).collect::<Vec<_>>(), &[])?;
+            g.fill()?;
+            let mut answers = vec![format!("{:?}", g.stopped()?)];
+            for key in ["b1", "b9", "b10"] {
+                answers.push(format!(
+                    "{:?}",
+                    g.find("book", key)?.map(|b| (b.properties, b.source))
+                ));
+                for known in [1_200, 1_700, 2_200, 2_700] {
+                    answers.push(format!("{:?}", title_known(&g, key, known)?));
+                }
+            }
+            match &first {
+                None => first = Some(answers),
+                Some(first) => assert_eq!(&answers, first, "order {n}: {order:?}"),
+            }
+        }
+        let first = first.ok_or("an order ran")?;
+        assert_eq!(first[0], "[]", "no amendment is refused for its timing");
+        assert_eq!(first[2], r#"Some(Text("zero"))"#, "b1 known at 1,200 s");
+        assert!(
+            first[11].contains("two") && first[11].contains("editor"),
+            "{first:?}"
         );
         Ok(())
     }

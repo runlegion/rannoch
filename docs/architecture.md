@@ -8,7 +8,7 @@ How to use what is built: [store.md](store.md) and [inbox.md](inbox.md). The des
 
 rannoch is one app's graph store, in one SQLite file, linked into the app's own process as a Rust library. It has no executable, no CLI, no server and no network. Nothing it does reaches another machine; sync and transport belong to the app.
 
-It keeps every change as an event in an append-only log and never changes an event once written. The tables are built from the log. Every fact carries its point in time (when it happened), the window in which the store knew it, and a valid time (when it was true in the world). Reads can be asked as of each.
+It keeps every change as an event in an append-only log and never changes an event once written. The tables are built from the log. Every fact carries three times: when it became known (the clock in its CloudEvent id), its point on the axis its class or relation declares, and a valid time (when it was true in the world). Reads can be asked as of each.
 
 ## The crates
 
@@ -57,11 +57,12 @@ All in one file. rannoch's own tables start with `_`.
 |---|---|
 | `_events` | The log: place, log id, body. |
 | `_ontology` | Every declared class and relation. |
-| `_hearings` | Every hearing of a node or link: its identity, entity, key (and a link's target key), event, place, source, valid time, point, integer key, record time, properties, and its known window (`known`, `until`) and the place of the event it amends (`amended`). |
+| `_hearings` | Every hearing of a node or link: its identity, entity, key (and a link's target key), event, place, source, valid time, axis point, receipt stamp (`recorded`), properties, and its known window (`known`, `until`) and the place of the event it amends (`amended`). |
 | `_aliases` | Other events that arrived with a hearing's identical content. |
-| `_ends`, `_endings` | A link's latest conclusion (ended or found wrong), and every ending at its point. |
-| `_amendments` | Each amendment by target place, point and event. |
-| `_renames` | Each rename: entity, old key, new key, point, event. |
+| `_ends`, `_endings` | A link's latest conclusion by known-at (ended or found wrong), and every ending at its axis point and known-at. |
+| `_amendments` | Each amendment by target place, known-at and event. |
+| `_renames` | Each rename: entity, old key, new key, known-at, event. |
+| `_waiting` | Each amendment waiting for its target: the target's source and id, the amendment's known-at, event and place. |
 | `_open` | Links waiting for a node that has not arrived. |
 | `_seen` | Per node and link: first and last heard, first recorded, first true, count. |
 | `class:<name>` | One row per node of the class, one column per property. |
@@ -73,35 +74,39 @@ All in one file. rannoch's own tables start with `_`.
 
 The tables kept for speed are `class:<name>`, `relation:<name>` and `_seen`; fill keeps them current. Reads answer from `_hearings`, `_aliases`, `_ends`, `_endings` and `_seen`. The class and relation tables serve the app's own SQL. `find` returns `None` for a key renamed away. A link of the wrong classes cannot exist in a relation table, since both ends are foreign keys.
 
-## The bitemporal model
+## Three times
 
-Three times are kept, and they are different things:
+Every fact has three times, each with one job:
 
-- **Its valid time**: when the fact was true in the world, as the writer states it (`ValidTime`): unknown, a month, or a day. Unknown is never read as now.
-- **Its point on the axis**: when the fact happened. It is the time the writer supplied (`data.time`), or, without one, the record time of the store that first recorded the event, carried in the millisecond of its CloudEvent id. A class can order its history by an integer the writer supplies instead.
-- **Its known window**: from when the store knew it (`known`) until an amendment superseded it (`until`). A hearing written directly is known from its own point and has no `until`. A hearing made by an amendment is known from the later of the amendment's point and the event's own point; the hearing it supersedes gets `until` set to that point.
+- **Known-at**: when the fact became known. It is the millisecond in its CloudEvent id (a `UUIDv7`), so it trusts the clock of the host that minted the event. A store's own receipt stamp (the log id it mints, and `recorded`) orders its log and is never read as known-at.
+- **Its axis point**: where the fact sits on the axis its class or relation declares, as named integer parts compared in order, such as `(build)` or `(build, step)`; a time is a part in milliseconds. The event carries it as `data.axis`. A class or relation that declares no axis is ordered by known-at.
+- **Its valid time**: what it claims about the world (`ValidTime`): unknown, a month or a day. It is optional, and unknown is never read as now.
 
-Reads use them like this:
+A hearing written directly is known from its known-at and has no `until`. A hearing made by an amendment is known from the later of the amendment's known-at and the target's; the hearing it supersedes gets `until` set to then. Versions order by axis point, then known-at, then event id, so a correction at the same point follows what it corrects.
 
-- **Now** (`find`, `hearings`, `seen`, `link_seen`, `link_end`): hearings with no `until`, the newest on the class's axis. A version that arrives late answers at its own point and becomes current only if it is the newest on the axis.
-- **As of a valid date, as known at a point** (`find_as_of(class, key, date, known_at)`): the version valid on that date, among hearings known now or, given `known_at`, known at that point (`known` at or before it, `until` after it or absent). `link_known_at` reads a link as known at a point. An amendment or rename made later is not in the answer.
-- **On the axis** (`state_at`, `link_state_at`): the version that held at a point on the axis.
+Reads take a `View`: an optional axis point and an optional known-at, each defaulting to now. A point with fewer parts than the axis reads the top of its prefix.
 
-**Identity.** A hearing's identity is its content together with its source, hashed with BLAKE3 under the app's 32-byte key. Identical content from the same source is one hearing: a repeat under the same CloudEvent id records nothing; a repeat under a new id becomes an alias, an occurrence of the hearing at the repeat's own point. The key is held in memory only; the file keeps a check value, and opening it under another key returns `Error::KeyDiffers`.
+- **Now** (`find`, `hearings`, `seen`, `link_seen`, `link_end`): hearings with no `until`, the newest on the axis. A version that arrives late answers at its own point and becomes current only if it is the newest on the axis.
+- **In a view** (`state_at`, `link_state_at`): the newest version at or before the view's point among the hearings known at its known-at (`known` at or before it, `until` after it or absent). None needs a valid date. An amendment or rename known later is not in the answer.
+- **As of a valid date, in a view** (`find_as_of(class, key, date, view)`): the version valid on that date among those the view sees.
 
-**Links.** A link's endings sit beside its hearings at their own points. A live hearing at a later point reopens a link that ended. A correction records that the link was wrong, which is not an ending. A link that names a node that has not arrived waits in `_open`. When the node arrives, fill moves the link into its relation's table and appends one event to the log: type `rannoch.closed.<relation>`, source `rannoch`, a bare `UUIDv7` id, subject the link's from-key, data `{from, to, valid}`. Every worker is handed these events; a worker that does not care about them closes them as done.
+**Identity.** A hearing's identity is its content together with its source, hashed with BLAKE3 under the app's 32-byte key. Identical content from the same source is one hearing: a repeat under the same CloudEvent id records nothing; a repeat under a new id becomes an alias, an occurrence of the hearing at the repeat's own known-at. A declared axis point is content; known-at is not. The key is held in memory only; the file keeps a check value, and opening it under another key returns `Error::KeyDiffers`.
+
+**Links.** A link's hearings and endings carry axis points through the same path as nodes: the same link heard at two builds is two hearings, each at its build. Its endings sit beside its hearings at their own points. A live hearing at a later point reopens a link that ended. A correction records that the link was wrong, which is not an ending. The latest conclusion, ending or correction, is chosen by known-at and then event id, never by arrival. A link that names a node that has not arrived waits in `_open`. When the node arrives, fill moves the link into its relation's table and appends one event to the log: type `rannoch.closed.<relation>`, source `rannoch`, a bare `UUIDv7` id, subject the link's from-key, data `{from, to, valid}`. Every worker is handed these events; a worker that does not care about them closes them as done.
 
 ## Amend and rename
 
 **Amend is rare.** It corrects a mistake: an event that was written wrong. It is not how an app records change. A value that changes is a new event, a new hearing at its own point, and the store's history keeps both. An app that amends routinely is modelling change the wrong way.
 
-An amendment is an event of type `rannoch.amended`. Its subject is the log id (`Event.id`) of the event it amends; its data is a JSON Merge Patch (RFC 7386) of that event. Its point is the record time in its own CloudEvent id.
+An amendment is an event of type `rannoch.amended` whose data is `{"target": {"source": ..., "id": ...}, "patch": {...}}`: the target's own CloudEvent source and id, and a JSON Merge Patch (RFC 7386) of that event. It is known at the clock in its own CloudEvent id. Amendments are allowed in every class.
 
-When fill reaches an amendment, it records it in `_amendments`, then derives the target's hearings again: it applies every amendment of the target in point order, then event id, and wherever the event reads differently, it writes a new hearing known from that amendment's point and closes the hearing before it at that point. The amended event in the log is never changed. Read as known before the amendment, the event reads as written.
+Each store resolves the target when it fills the amendment, by reading the log for the first event with that source and id. That read scans the log; only amendments, which are rare, run it, and nothing on the write path pays for it. So a store replaying another's log applies the same amendment. An amendment whose target the store has not filled yet (not in the log, or logged after the amendment) waits in `_waiting` and applies when the target fills, so the target's arrival order does not change the answer. If the target then made no hearing, the amendment is refused. While nothing waits, fill looks nothing up for it; while something does, only an event whose origin is waited for is looked up.
 
-**A rename is an amendment that patches the subject.** Fill records it in `_renames` as a mapping from the old key to the new key, known from the amendment's point. Every event that names the old key is heard again through the mapping: the node's own events and every link to or from it. Link endings and corrections are copied onto the new key; their old-key rows stay, so reads as known before the rename are unchanged. A link, ending or node event arriving after the rename that names the old key lands on the new key. A second rename maps on from the new key.
+When fill applies an amendment, it records it in `_amendments`, then derives the target's hearings again: it applies every amendment of the target by known-at, then event id, and wherever the event reads differently, it writes a new hearing known from that amendment's known-at and closes the hearing before it then. A patched `data.axis` moves the hearing to the patched point. The amended event in the log is never changed. Read as known before the amendment, the event reads as written.
 
-Fill refuses an amendment whose id is not `<uuid>:<fact>`; that has no subject; that names an event not in the log; that names an event which made no hearing of its own (a declaration, an app's own event, a link ending or correction, content identical to an earlier hearing, or any event that states no fact); that amends an event of an integer-keyed class; or whose point is before the target's record time, the target's own point, or the latest amendment already applied to it. Fill also refuses an amendment whose patch leaves the event invalid against the ontology or stating no node or link. A refused amendment is a failed try (below); it never stops fill.
+**A rename is an amendment that patches the subject.** Fill records it in `_renames` as a mapping from the old key to the new key, known from the amendment's known-at. Every event that names the old key is heard again through the mapping: the node's own events and every link to or from it. Link endings and corrections are copied onto the new key; their old-key rows stay, so reads as known before the rename are unchanged. A link, ending or node event arriving after the rename that names the old key lands on the new key. A second rename maps on from the new key.
+
+The store refuses no amendment for its timing: amendments of one event stack by known-at, then event id, whatever order they arrive in, and one known before its target counts from the target's own known-at. Fill refuses only what cannot be stored: an amendment whose id is not `<uuid>:<fact>`; that names no target or has no patch; or whose target made no hearing of its own (a declaration, an app's own event, a link ending or correction, content identical to an earlier hearing, or any event that states no fact). Fill also refuses an amendment whose patch leaves the event invalid against the ontology or stating no node or link. A refused amendment is a failed try (below); it never stops fill.
 
 While the store holds no rename, fill does no rename lookup for nodes, links or endings. It checks once per batch, and again after each amendment lands.
 
@@ -143,8 +148,8 @@ Each worker reads with its own cursor, held in the queue's memory: every event a
 
 ## Limits
 
-- **No lookup from a CloudEvent id to a log id.** Issue #164 adds one that returns the first log id an event's source and id arrived under; it is not built, and it is for tracking down the event a mistake came from, and nothing else. An app that will amend an event keeps its log id from `commit`'s result, from `events().since(...)`, or from the `Event` a worker takes. A queue app gets a `Ticket` from `accept`, not an `Event`, so it has the last two.
-- **At-least-once, no dedupe by CloudEvent id.** The log mints a fresh log id for every event, and the queue accepts a body it has accepted before. A repeat under the same CloudEvent id records nothing in the graph. A repeat under a new id is an alias of its hearing at the repeat's own point; if that point is newer than the current version, the repeated (older) content becomes current through it. The log holds both events and every worker is handed both, so workers must be idempotent.
+- **No public lookup from a CloudEvent id to a log id.** Fill resolves an amendment's target by source and id itself; issue #164 exposes that lookup to apps, and is not built.
+- **At-least-once, no dedupe by CloudEvent id.** The log mints a fresh log id for every event, and the queue accepts a body it has accepted before. A repeat under the same CloudEvent id records nothing in the graph. A repeat under a new id is an alias of its hearing at the repeat's own known-at; on an undeclared axis, if that is newer than the current version, the repeated (older) content becomes current through it. The log holds both events and every worker is handed both, so workers must be idempotent.
 - **The queue owns its graph.** `Queue::open` takes the `Graph` by value. An app with a queue open reads, and calls `stopped`, `retry`, `set_try_limit` and `copy_to`, through a second handle (`rannoch_store::open`).
 - **An event a worker takes and never closes stays in progress** until the process restarts, and holds the worker's cursor and the processed mark below it until it is closed.
 - **A crash hands a worker again what it closed since the last group commit**, about 20 ms of work at the default interval.

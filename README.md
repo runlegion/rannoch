@@ -31,7 +31,7 @@ rannoch-store = { git = "https://github.com/runlegion/rannoch", tag = "v0.5.0" }
 rannoch-queue = { git = "https://github.com/runlegion/rannoch", tag = "v0.5.0" }
 ```
 
-`rannoch-store` re-exports from `rannoch-ontology`: `Class`, `Declaration`, `HistoryKey`, `Ontology`, `Relation`, `Value`, `ValueType`; and from `rannoch-cloudevents`: `Date`, `EventId`, `NodeRef`, `ValidTime`. A worker that parses event bodies itself also depends on `rannoch-cloudevents` (its `read` and `attributes`) or on `serde_json`.
+`rannoch-store` re-exports from `rannoch-ontology`: `Class`, `Declaration`, `Ontology`, `Relation`, `Value`, `ValueType`; and from `rannoch-cloudevents`: `Date`, `EventId`, `NodeRef`, `ValidTime`. A worker that parses event bodies itself also depends on `rannoch-cloudevents` (its `read` and `attributes`) or on `serde_json`.
 
 Rust 1.98, edition 2024.
 

@@ -3,14 +3,14 @@
 //! A committed `CloudEvent` says what the store must fill: a node of a class, a link of a
 //! relation, or nothing. The shapes are the ones the `CloudEvents` toy proved lossless
 //! (research 01a16140): a node is type `rannoch.node.<class>`, its subject the node's key and its
-//! data `{properties, valid}`; a link is type `rannoch.link.<relation>`, its data
-//! `{from: {class, key}, to: {class, key}, valid}`; the source is `rannoch:<the write's source>`.
-//! Its id is `<event uuid>:<fact>`: the origin's event, a `UUIDv7`, and the fact within it. The
-//! writer's point is `data.time` (milliseconds since the Unix epoch, UTC) and its integer key
-//! `data.integer`, as the oracle's `NodeFact` names them. A link that ended is type
-//! `rannoch.ended.<relation>`, its data `{from, to, at, valid}` with `at` its point in
-//! milliseconds; a link found wrong is type `rannoch.corrected.<relation>`, its data `{from, to}`:
-//! the oracle's `Change::Ended` and `Change::Corrected` fields.
+//! data `{properties, valid, axis}`; a link is type `rannoch.link.<relation>`, its data
+//! `{from: {class, key}, to: {class, key}, valid, axis}`; the source is
+//! `rannoch:<the write's source>`. Its id is `<event uuid>:<fact>`: the origin's event, a
+//! `UUIDv7`, whose millisecond is when the fact became known, and the fact within it. Its point on
+//! its class's or relation's declared axis is `data.axis`, each named part an integer; `valid`
+//! may be left out, meaning unknown. A link that ended is type `rannoch.ended.<relation>`, its
+//! data `{from, to, valid, axis}`; a link found wrong is type `rannoch.corrected.<relation>`, its
+//! data `{from, to}`.
 //!
 //! Reading checks the format only: whether a class or relation is declared, and whether a fact
 //! fits it, is for the caller to check against its ontology.
@@ -47,8 +47,9 @@ impl EventId {
         EventId(Uuid::now_v7())
     }
 
-    /// The millisecond the id was minted at: when the store that minted it recorded its event.
-    /// None when the id carries no timestamp, as an id that is not a `UUIDv7` may not.
+    /// The millisecond the id was minted at: when its event became known, by the clock of the
+    /// host that minted it. None when the id carries no timestamp, as an id that is not a
+    /// `UUIDv7` may not.
     fn millis(self) -> Option<i64> {
         self.0.get_timestamp().map(|at| {
             let (seconds, nanos) = at.to_unix();
@@ -59,8 +60,8 @@ impl EventId {
         })
     }
 
-    /// The millisecond the id was minted at, for an event that came from outside this store's
-    /// own write path: refused when the id carries none, since no other time stands in for it.
+    /// The millisecond the id was minted at: for a `CloudEvent`'s own id, its known-at. Refused
+    /// when the id carries none, since no other time stands in for it.
     ///
     /// # Errors
     /// [`Error::Refused`] when the id is not a `UUIDv7`.
@@ -236,28 +237,24 @@ struct Envelope {
 #[derive(Deserialize)]
 struct NodeData {
     properties: BTreeMap<String, Value>,
+    #[serde(default = "unknown")]
     valid: ValidTime,
     #[serde(default)]
-    time: Option<i64>,
-    #[serde(default)]
-    integer: Option<i64>,
+    axis: BTreeMap<String, i64>,
 }
 
 #[derive(Deserialize)]
 struct LinkData {
     from: NodeRef,
     to: NodeRef,
+    #[serde(default = "unknown")]
     valid: ValidTime,
     #[serde(default)]
-    time: Option<i64>,
+    axis: BTreeMap<String, i64>,
 }
 
-#[derive(Deserialize)]
-struct EndedData {
-    from: NodeRef,
-    to: NodeRef,
-    at: i64,
-    valid: ValidTime,
+fn unknown() -> ValidTime {
+    ValidTime::Unknown
 }
 
 #[derive(Deserialize)]
@@ -276,10 +273,8 @@ pub struct NodeFact {
     pub source: String,
     pub properties: BTreeMap<String, Value>,
     pub valid: ValidTime,
-    /// The time its writer supplied, in milliseconds since the Unix epoch (UTC).
-    pub time: Option<i64>,
-    /// The integer key its writer supplied.
-    pub integer: Option<i64>,
+    /// Its point on its class's declared axis, as named parts; empty when none is given.
+    pub axis: BTreeMap<String, i64>,
 }
 
 /// A link, named by its relation and both of its endpoints, as an event holds it.
@@ -292,13 +287,12 @@ pub struct LinkFact {
     pub to: NodeRef,
     pub source: String,
     pub valid: ValidTime,
-    /// The time its writer supplied, in milliseconds since the Unix epoch (UTC): the link's
-    /// point. `None` puts it at the origin's record time.
-    pub time: Option<i64>,
+    /// Its point on its relation's declared axis, as named parts; empty when none is given.
+    pub axis: BTreeMap<String, i64>,
 }
 
-/// How a link came to an end, as an event holds it: it ended, at its own point and with the
-/// valid time it stopped holding at, or it was found wrong.
+/// How a link came to an end, as an event holds it: it ended, at its own point on its
+/// relation's axis and with the valid time it stopped holding at, or it was found wrong.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Conclusion {
     /// The origin's event.
@@ -307,9 +301,8 @@ pub struct Conclusion {
     pub relation: String,
     pub from: NodeRef,
     pub to: NodeRef,
-    /// The ending's point, in milliseconds since the Unix epoch (UTC), and its valid time;
-    /// `None` for a correction.
-    pub ended: Option<(i64, ValidTime)>,
+    /// The ending's point on its relation's axis and its valid time; `None` for a correction.
+    pub ended: Option<(BTreeMap<String, i64>, ValidTime)>,
 }
 
 /// What one event says.
@@ -375,8 +368,7 @@ pub fn read(body: &str) -> Result<Fact, Error> {
                 source,
                 properties: node.properties,
                 valid: node.valid,
-                time: node.time,
-                integer: node.integer,
+                axis: node.axis,
             }))
         }
         "link" => {
@@ -389,14 +381,14 @@ pub fn read(body: &str) -> Result<Fact, Error> {
                 to: link.to,
                 source,
                 valid: link.valid,
-                time: link.time,
+                axis: link.axis,
             }))
         }
         "ended" | "corrected" => {
             let (from, to, ended) = if kind == "ended" {
-                let ended: EndedData = serde_json::from_value(data)?;
+                let ended: LinkData = serde_json::from_value(data)?;
                 ended.valid.checked()?;
-                (ended.from, ended.to, Some((ended.at, ended.valid)))
+                (ended.from, ended.to, Some((ended.axis, ended.valid)))
             } else {
                 let corrected: CorrectedData = serde_json::from_value(data)?;
                 (corrected.from, corrected.to, None)
@@ -461,7 +453,7 @@ mod tests {
     #[test]
     fn a_node_reads_into_its_fact() -> Result<(), Box<dyn std::error::Error>> {
         let body = format!(
-            r#"{{"specversion":"1.0","id":"{}","source":"rannoch:my%20shop","type":"rannoch.node.book","subject":"b1","data":{{"properties":{{"title":"hi"}},"valid":{{"on":"2024-02-29"}},"time":5}}}}"#,
+            r#"{{"specversion":"1.0","id":"{}","source":"rannoch:my%20shop","type":"rannoch.node.book","subject":"b1","data":{{"properties":{{"title":"hi"}},"valid":{{"on":"2024-02-29"}},"axis":{{"build":5}}}}}}"#,
             id()
         );
         let Fact::Node(node) = read(&body)? else {
@@ -471,7 +463,7 @@ mod tests {
         assert_eq!(node.source, "my shop");
         assert_eq!(node.properties.get("title"), Some(&"hi".into()));
         assert_eq!(node.valid.as_text(), Some("2024-02-29"));
-        assert_eq!((node.time, node.integer), (Some(5), None));
+        assert_eq!(node.axis.get("build"), Some(&5));
         Ok(())
     }
 
@@ -485,16 +477,23 @@ mod tests {
                 id()
             )
         };
-        let Fact::Link(link) = read(&body("link", r#","valid":"unknown""#))? else {
+        let Fact::Link(link) = read(&body("link", ""))? else {
             return Err("a link event is a link fact".into());
         };
         assert_eq!(link.relation, "wrote");
         assert_eq!(link.to, NodeRef::new("book", "b1"));
         assert_eq!(link.source, "shop");
-        let Fact::Concluded(ended) = read(&body("ended", r#","at":7,"valid":"unknown""#))? else {
+        assert_eq!(
+            link.valid,
+            ValidTime::Unknown,
+            "a valid time left out is unknown"
+        );
+        assert!(link.axis.is_empty());
+        let Fact::Concluded(ended) = read(&body("ended", r#","axis":{"build":7}"#))? else {
             return Err("an ended event is a conclusion".into());
         };
-        assert_eq!(ended.ended, Some((7, ValidTime::Unknown)));
+        let axis = [("build".to_string(), 7)].into_iter().collect();
+        assert_eq!(ended.ended, Some((axis, ValidTime::Unknown)));
         let Fact::Concluded(corrected) = read(&body("corrected", ""))? else {
             return Err("a corrected event is a conclusion".into());
         };
