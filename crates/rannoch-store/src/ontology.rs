@@ -9,7 +9,7 @@ use serde::Serialize;
 use crate::Error;
 use crate::queries::{
     LOAD_ONTOLOGY, SAVE_ONTOLOGY, add_property_column, concat, create_class_table,
-    create_relation_table, property_column,
+    create_property_index, create_relation_table, property_column,
 };
 
 impl From<Refused> for Error {
@@ -90,6 +90,9 @@ pub(crate) fn build(
                 format!(", {} {}", property_column(p), column(*of))
             });
             tx.execute_batch(&create_class_table(&class.name, &columns))?;
+            for property in &class.indexed {
+                tx.execute_batch(&create_property_index(&class.name, property))?;
+            }
             save(tx, CLASS, &class.name, class)?;
         }
         Declaration::Relation(relation) => {

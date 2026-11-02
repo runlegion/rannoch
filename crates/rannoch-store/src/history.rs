@@ -1242,10 +1242,10 @@ fn read_version(
 
 /// A version's columns as a row holds them: event, source, valid, axis point, known-at,
 /// properties.
-type VersionColumns = (String, String, Option<String>, Vec<u8>, i64, Option<String>);
+pub(crate) type VersionColumns = (String, String, Option<String>, Vec<u8>, i64, Option<String>);
 
 /// The [`VersionColumns`] of `row` from the column `at`.
-fn columns(row: &rusqlite::Row, at: usize) -> rusqlite::Result<VersionColumns> {
+pub(crate) fn columns(row: &rusqlite::Row, at: usize) -> rusqlite::Result<VersionColumns> {
     Ok((
         row.get(at)?,
         row.get(at + 1)?,
@@ -1257,7 +1257,7 @@ fn columns(row: &rusqlite::Row, at: usize) -> rusqlite::Result<VersionColumns> {
 }
 
 /// The version a row's [`VersionColumns`] name, `ended` when it is an ending.
-fn version_of(
+pub(crate) fn version_of(
     (event, source, valid, axis, known, properties): VersionColumns,
     ended: bool,
 ) -> Result<Version, Error> {
@@ -1275,7 +1275,7 @@ fn version_of(
 /// The bounds `view` puts on the versions of `owner` (a class or relation) whose axis is
 /// `declared`: the encoded top of its axis prefix, and its known-at in milliseconds; each `None`
 /// for now.
-fn bounds(
+pub(crate) fn bounds(
     declared: &[String],
     view: &View,
     owner: &str,
@@ -1356,6 +1356,29 @@ pub(crate) fn unknown_ending(relation: &str, (from, to): (&str, &str), day: &str
         "the {relation} link from {from} to {to} ended, and its ending's valid time is unknown: \
          a read as of {day} cannot say whether the link held"
     ))
+}
+
+/// The version of the link of `relation` from `from` to `to` in the view of the encoded axis
+/// bound and the known-at `(axis, known)`: see [`Graph::link_state_at`].
+pub(crate) fn link_in_view(
+    conn: &Connection,
+    relation: &str,
+    (from, to): (&str, &str),
+    (axis, known): (Option<Vec<u8>>, Option<i64>),
+) -> Result<Option<Version>, Error> {
+    let newest = conn
+        .prepare_cached(&link_state())?
+        .query_row(
+            params![link_entity(relation), from, to, axis, known],
+            |row| Ok((columns(row, 0)?, row.get::<_, bool>(6)?)),
+        )
+        .optional()?;
+    let Some((columns, ending)) = newest else {
+        return Ok(None);
+    };
+    let mut version = version_of(columns, ending)?;
+    version.ended = ended(conn, relation, (from, to), (axis.as_deref(), known), None)?;
+    Ok(Some(version))
 }
 
 /// An ending's row: event, source, axis point, known-at, valid time.
@@ -1507,28 +1530,8 @@ impl Graph {
     ) -> Result<Option<Version>, Error> {
         let ontology = self.current_ontology()?;
         let declared = ontology.relation(relation)?;
-        let relation = declared.name.clone();
-        let (axis, known) = bounds(&declared.axis, view, &format!("relation {relation}"))?;
-        let newest = self
-            .conn
-            .prepare_cached(&link_state())?
-            .query_row(
-                params![link_entity(&relation), from, to, axis, known],
-                |row| Ok((columns(row, 0)?, row.get::<_, bool>(6)?)),
-            )
-            .optional()?;
-        let Some((columns, ending)) = newest else {
-            return Ok(None);
-        };
-        let mut version = version_of(columns, ending)?;
-        version.ended = ended(
-            &self.conn,
-            &relation,
-            (from, to),
-            (axis.as_deref(), known),
-            None,
-        )?;
-        Ok(Some(version))
+        let bounds = bounds(&declared.axis, view, &format!("relation {}", declared.name))?;
+        link_in_view(&self.conn, &declared.name, (from, to), bounds)
     }
 
     /// When `node` was heard: its first and last versions on its class's axis, the version this

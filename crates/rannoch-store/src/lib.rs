@@ -22,7 +22,7 @@ pub use inbox::{FILL, Place, State};
 pub use log::{Cursor, Event, Events};
 pub use rannoch_cloudevents::{Date, EventId, NodeRef, ValidTime};
 pub use rannoch_ontology::{Class, Declaration, Ontology, Relation, Value, ValueType};
-pub use read::Node;
+pub use read::{Counts, Description, Direction, Node};
 
 use crate::history::{
     Heard, Key, Of, Stamp, Subject, alias, amend, conclude, derive, heard, link_entity,

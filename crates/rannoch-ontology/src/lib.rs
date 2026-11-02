@@ -2,7 +2,7 @@
 //! class at each end. Declaring, checking a declaration against what is declared, and checking a
 //! value against its declared type. Pure code with no I/O.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -23,6 +23,10 @@ pub struct Class {
     /// each part refines the one before it. Empty: its axis is when each fact became known.
     #[serde(default)]
     pub axis: Vec<String>,
+    /// The properties its nodes can be listed by. Only these are indexed, so writing a node
+    /// pays for an index only where one is declared.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub indexed: BTreeSet<String>,
 }
 
 impl Class {
@@ -39,6 +43,7 @@ impl Class {
                 .map(|p| (p.into(), ValueType::Text))
                 .collect(),
             axis: Vec::new(),
+            indexed: BTreeSet::new(),
         }
     }
 
@@ -286,7 +291,17 @@ impl Ontology {
                     list(&class.properties),
                     class.axis
                 ))),
-                None => Ok(true),
+                None => match class
+                    .indexed
+                    .iter()
+                    .find(|p| !class.properties.contains_key(*p))
+                {
+                    Some(property) => Err(Refused(format!(
+                        "class {} indexes property {property}, which it does not declare",
+                        class.name
+                    ))),
+                    None => Ok(true),
+                },
             },
             Declaration::Relation(relation) => {
                 if let Some(have) = self.relations.get(&relation.name) {
@@ -390,6 +405,23 @@ mod tests {
         assert_eq!(
             ontology.check(&Declaration::Class(Class::new("shelf", ["label"]))),
             Ok(true)
+        );
+    }
+
+    #[test]
+    fn a_class_indexes_only_properties_it_declares() {
+        let ontology = declared();
+        let shelf = |indexed: &str| {
+            Declaration::Class(Class {
+                indexed: [indexed.to_string()].into(),
+                ..Class::new("shelf", ["label"])
+            })
+        };
+        assert_eq!(ontology.check(&shelf("label")), Ok(true));
+        assert!(
+            ontology
+                .check(&shelf("colour"))
+                .is_err_and(|refused| refused.0.contains("colour"))
         );
     }
 
