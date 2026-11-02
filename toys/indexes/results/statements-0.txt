@@ -1,0 +1,225 @@
+== links out 1 now
+PRAGMA schema_version
+;;
+== links out 1 now
+SELECT to_key, name, source, valid, axis, known, properties FROM (SELECT key, to_key, name, source, valid, axis, known, properties, ending FROM (SELECT *, row_number() OVER (PARTITION BY key, to_key ORDER BY axis DESC, known DESC, event DESC) AS n FROM (SELECT key, to_key, name, source, valid, axis, known, properties, event, 0 AS ending FROM (SELECT * FROM (SELECT h.arrived, h.identity, h.key, h.to_key, h.event AS name, h.source, h.valid, h.recorded, h.properties, h.until, h.axis AS axis, h.known AS known, h.event AS event FROM _hearings h WHERE h.entity = ?1 AND h.line = 'main' AND h.to_key IS NOT NULL AND h.key = ?4 AND (h.until IS NULL OR h.until > coalesce(?3, 9223372036854775807)) UNION ALL SELECT h.arrived, h.identity, h.key, h.to_key, h.event AS name, h.source, h.valid, h.recorded, h.properties, h.until, a.axis, a.known, a.alias FROM _hearings h CROSS JOIN _aliases a ON a.line = h.line AND a.identity = h.identity WHERE h.entity = ?1 AND h.line = 'main' AND h.to_key IS NOT NULL AND h.key = ?4 AND (h.until IS NULL OR h.until > coalesce(?3, 9223372036854775807))) WHERE (?3 IS NULL OR known <= ?3) AND (?2 IS NULL OR axis <= ?2)) UNION ALL SELECT key, to_key, event, source, valid, axis, known, NULL, event, 1 FROM _endings WHERE entity = ?1 AND line = 'main' AND key = ?4 AND (?2 IS NULL OR axis <= ?2) AND (?3 IS NULL OR known <= ?3))) WHERE n = 1) f WHERE ending = 0 OR (EXISTS (SELECT 1 FROM _ends c WHERE c.entity = ?1 AND c.line = 'main' AND c.key = f.key AND c.to_key = f.to_key AND c.axis IS NULL AND (?3 IS NULL OR c.known <= ?3)) AND EXISTS (SELECT 1 FROM _hearings WHERE entity = ?1 AND line = 'main' AND (?2 IS NULL OR axis <= ?2) AND (?3 IS NULL OR known <= ?3) AND (until IS NULL OR until > coalesce(?3, 9223372036854775807)) AND key = f.key AND to_key = f.to_key)) ORDER BY to_key
+;;
+== links in 1 now
+SELECT key, name, source, valid, axis, known, properties FROM (SELECT key, to_key, name, source, valid, axis, known, properties, ending FROM (SELECT *, row_number() OVER (PARTITION BY key, to_key ORDER BY axis DESC, known DESC, event DESC) AS n FROM (SELECT key, to_key, name, source, valid, axis, known, properties, event, 0 AS ending FROM (SELECT * FROM (SELECT h.arrived, h.identity, h.key, h.to_key, h.event AS name, h.source, h.valid, h.recorded, h.properties, h.until, h.axis AS axis, h.known AS known, h.event AS event FROM _hearings h WHERE h.entity = ?1 AND h.line = 'main' AND h.to_key IS NOT NULL AND h.to_key = ?4 AND (h.until IS NULL OR h.until > coalesce(?3, 9223372036854775807)) UNION ALL SELECT h.arrived, h.identity, h.key, h.to_key, h.event AS name, h.source, h.valid, h.recorded, h.properties, h.until, a.axis, a.known, a.alias FROM _hearings h CROSS JOIN _aliases a ON a.line = h.line AND a.identity = h.identity WHERE h.entity = ?1 AND h.line = 'main' AND h.to_key IS NOT NULL AND h.to_key = ?4 AND (h.until IS NULL OR h.until > coalesce(?3, 9223372036854775807))) WHERE (?3 IS NULL OR known <= ?3) AND (?2 IS NULL OR axis <= ?2)) UNION ALL SELECT key, to_key, event, source, valid, axis, known, NULL, event, 1 FROM _endings WHERE entity = ?1 AND line = 'main' AND to_key = ?4 AND key IN (SELECT key FROM _hearings WHERE entity = ?1 AND line = 'main' AND to_key = ?4) AND (?2 IS NULL OR axis <= ?2) AND (?3 IS NULL OR known <= ?3))) WHERE n = 1) f WHERE ending = 0 OR (EXISTS (SELECT 1 FROM _ends c WHERE c.entity = ?1 AND c.line = 'main' AND c.key = f.key AND c.to_key = f.to_key AND c.axis IS NULL AND (?3 IS NULL OR c.known <= ?3)) AND EXISTS (SELECT 1 FROM _hearings WHERE entity = ?1 AND line = 'main' AND (?2 IS NULL OR axis <= ?2) AND (?3 IS NULL OR known <= ?3) AND (until IS NULL OR until > coalesce(?3, 9223372036854775807)) AND key = f.key AND to_key = f.to_key)) ORDER BY key
+;;
+== page out 1
+SELECT to_key, name, source, valid, axis, known, properties FROM (SELECT key, to_key, name, source, valid, axis, known, properties, ending FROM (SELECT *, row_number() OVER (PARTITION BY key, to_key ORDER BY axis DESC, known DESC, event DESC) AS n FROM (SELECT key, to_key, name, source, valid, axis, known, properties, event, 0 AS ending FROM (SELECT * FROM (SELECT h.arrived, h.identity, h.key, h.to_key, h.event AS name, h.source, h.valid, h.recorded, h.properties, h.until, h.axis AS axis, h.known AS known, h.event AS event FROM _hearings h WHERE h.entity = ?1 AND h.line = 'main' AND h.to_key IS NOT NULL AND h.key = ?4 AND h.to_key > ?5 AND to_key <= (SELECT max(to_key) FROM (SELECT to_key FROM _hearings WHERE entity = ?1 AND line = 'main' AND key = ?4 AND to_key > ?5 ORDER BY to_key LIMIT ?6)) AND (h.until IS NULL OR h.until > coalesce(?3, 9223372036854775807)) UNION ALL SELECT h.arrived, h.identity, h.key, h.to_key, h.event AS name, h.source, h.valid, h.recorded, h.properties, h.until, a.axis, a.known, a.alias FROM _hearings h CROSS JOIN _aliases a ON a.line = h.line AND a.identity = h.identity WHERE h.entity = ?1 AND h.line = 'main' AND h.to_key IS NOT NULL AND h.key = ?4 AND h.to_key > ?5 AND to_key <= (SELECT max(to_key) FROM (SELECT to_key FROM _hearings WHERE entity = ?1 AND line = 'main' AND key = ?4 AND to_key > ?5 ORDER BY to_key LIMIT ?6)) AND (h.until IS NULL OR h.until > coalesce(?3, 9223372036854775807))) WHERE (?3 IS NULL OR known <= ?3) AND (?2 IS NULL OR axis <= ?2)) UNION ALL SELECT key, to_key, event, source, valid, axis, known, NULL, event, 1 FROM _endings WHERE entity = ?1 AND line = 'main' AND key = ?4 AND to_key > ?5 AND to_key <= (SELECT max(to_key) FROM (SELECT to_key FROM _hearings WHERE entity = ?1 AND line = 'main' AND key = ?4 AND to_key > ?5 ORDER BY to_key LIMIT ?6)) AND (?2 IS NULL OR axis <= ?2) AND (?3 IS NULL OR known <= ?3))) WHERE n = 1) f WHERE ending = 0 OR (EXISTS (SELECT 1 FROM _ends c WHERE c.entity = ?1 AND c.line = 'main' AND c.key = f.key AND c.to_key = f.to_key AND c.axis IS NULL AND (?3 IS NULL OR c.known <= ?3)) AND EXISTS (SELECT 1 FROM _hearings WHERE entity = ?1 AND line = 'main' AND (?2 IS NULL OR axis <= ?2) AND (?3 IS NULL OR known <= ?3) AND (until IS NULL OR until > coalesce(?3, 9223372036854775807)) AND key = f.key AND to_key = f.to_key)) ORDER BY to_key
+;;
+== page in 1
+SELECT key, name, source, valid, axis, known, properties FROM (SELECT key, to_key, name, source, valid, axis, known, properties, ending FROM (SELECT *, row_number() OVER (PARTITION BY key, to_key ORDER BY axis DESC, known DESC, event DESC) AS n FROM (SELECT key, to_key, name, source, valid, axis, known, properties, event, 0 AS ending FROM (SELECT * FROM (SELECT h.arrived, h.identity, h.key, h.to_key, h.event AS name, h.source, h.valid, h.recorded, h.properties, h.until, h.axis AS axis, h.known AS known, h.event AS event FROM _hearings h WHERE h.entity = ?1 AND h.line = 'main' AND h.to_key IS NOT NULL AND h.to_key = ?4 AND h.key > ?5 AND key <= (SELECT max(key) FROM (SELECT key FROM _hearings WHERE entity = ?1 AND line = 'main' AND to_key = ?4 AND key > ?5 ORDER BY key LIMIT ?6)) AND (h.until IS NULL OR h.until > coalesce(?3, 9223372036854775807)) UNION ALL SELECT h.arrived, h.identity, h.key, h.to_key, h.event AS name, h.source, h.valid, h.recorded, h.properties, h.until, a.axis, a.known, a.alias FROM _hearings h CROSS JOIN _aliases a ON a.line = h.line AND a.identity = h.identity WHERE h.entity = ?1 AND h.line = 'main' AND h.to_key IS NOT NULL AND h.to_key = ?4 AND h.key > ?5 AND key <= (SELECT max(key) FROM (SELECT key FROM _hearings WHERE entity = ?1 AND line = 'main' AND to_key = ?4 AND key > ?5 ORDER BY key LIMIT ?6)) AND (h.until IS NULL OR h.until > coalesce(?3, 9223372036854775807))) WHERE (?3 IS NULL OR known <= ?3) AND (?2 IS NULL OR axis <= ?2)) UNION ALL SELECT key, to_key, event, source, valid, axis, known, NULL, event, 1 FROM _endings WHERE entity = ?1 AND line = 'main' AND to_key = ?4 AND key > ?5 AND key <= (SELECT max(key) FROM (SELECT key FROM _hearings WHERE entity = ?1 AND line = 'main' AND to_key = ?4 AND key > ?5 ORDER BY key LIMIT ?6)) AND (?2 IS NULL OR axis <= ?2) AND (?3 IS NULL OR known <= ?3))) WHERE n = 1) f WHERE ending = 0 OR (EXISTS (SELECT 1 FROM _ends c WHERE c.entity = ?1 AND c.line = 'main' AND c.key = f.key AND c.to_key = f.to_key AND c.axis IS NULL AND (?3 IS NULL OR c.known <= ?3)) AND EXISTS (SELECT 1 FROM _hearings WHERE entity = ?1 AND line = 'main' AND (?2 IS NULL OR axis <= ?2) AND (?3 IS NULL OR known <= ?3) AND (until IS NULL OR until > coalesce(?3, 9223372036854775807)) AND key = f.key AND to_key = f.to_key)) ORDER BY key
+;;
+== describe out-hub 1
+SELECT name, source, valid, axis, known, properties, recorded, identity FROM (SELECT * FROM (SELECT h.arrived, h.identity, h.key, h.to_key, h.event AS name, h.source, h.valid, h.recorded, h.properties, h.until, h.axis AS axis, h.known AS known, h.event AS event FROM _hearings h WHERE h.entity = ?1 AND h.line = 'main' AND h.key = ?2 AND h.to_key IS ?3 AND (h.until IS NULL OR h.until > coalesce(?5, 9223372036854775807)) UNION ALL SELECT h.arrived, h.identity, h.key, h.to_key, h.event AS name, h.source, h.valid, h.recorded, h.properties, h.until, a.axis, a.known, a.alias FROM _hearings h CROSS JOIN _aliases a ON a.line = h.line AND a.identity = h.identity WHERE h.entity = ?1 AND h.line = 'main' AND h.key = ?2 AND h.to_key IS ?3 AND (h.until IS NULL OR h.until > coalesce(?5, 9223372036854775807))) WHERE (?5 IS NULL OR known <= ?5) AND (?4 IS NULL OR axis <= ?4)) WHERE true ORDER BY axis DESC, known DESC, event DESC LIMIT 1
+;;
+== describe out-hub 1
+SELECT count(*) FROM (SELECT to_key, name, source, valid, axis, known, properties FROM (SELECT key, to_key, name, source, valid, axis, known, properties, ending FROM (SELECT *, row_number() OVER (PARTITION BY key, to_key ORDER BY axis DESC, known DESC, event DESC) AS n FROM (SELECT key, to_key, name, source, valid, axis, known, properties, event, 0 AS ending FROM (SELECT * FROM (SELECT h.arrived, h.identity, h.key, h.to_key, h.event AS name, h.source, h.valid, h.recorded, h.properties, h.until, h.axis AS axis, h.known AS known, h.event AS event FROM _hearings h WHERE h.entity = ?1 AND h.line = 'main' AND h.to_key IS NOT NULL AND h.key = ?4 AND (h.until IS NULL OR h.until > coalesce(?3, 9223372036854775807)) UNION ALL SELECT h.arrived, h.identity, h.key, h.to_key, h.event AS name, h.source, h.valid, h.recorded, h.properties, h.until, a.axis, a.known, a.alias FROM _hearings h CROSS JOIN _aliases a ON a.line = h.line AND a.identity = h.identity WHERE h.entity = ?1 AND h.line = 'main' AND h.to_key IS NOT NULL AND h.key = ?4 AND (h.until IS NULL OR h.until > coalesce(?3, 9223372036854775807))) WHERE (?3 IS NULL OR known <= ?3) AND (?2 IS NULL OR axis <= ?2)) UNION ALL SELECT key, to_key, event, source, valid, axis, known, NULL, event, 1 FROM _endings WHERE entity = ?1 AND line = 'main' AND key = ?4 AND (?2 IS NULL OR axis <= ?2) AND (?3 IS NULL OR known <= ?3))) WHERE n = 1) f WHERE ending = 0 OR (EXISTS (SELECT 1 FROM _ends c WHERE c.entity = ?1 AND c.line = 'main' AND c.key = f.key AND c.to_key = f.to_key AND c.axis IS NULL AND (?3 IS NULL OR c.known <= ?3)) AND EXISTS (SELECT 1 FROM _hearings WHERE entity = ?1 AND line = 'main' AND (?2 IS NULL OR axis <= ?2) AND (?3 IS NULL OR known <= ?3) AND (until IS NULL OR until > coalesce(?3, 9223372036854775807)) AND key = f.key AND to_key = f.to_key)) ORDER BY to_key)
+;;
+== describe in-hub 1
+SELECT count(*) FROM (SELECT key, name, source, valid, axis, known, properties FROM (SELECT key, to_key, name, source, valid, axis, known, properties, ending FROM (SELECT *, row_number() OVER (PARTITION BY key, to_key ORDER BY axis DESC, known DESC, event DESC) AS n FROM (SELECT key, to_key, name, source, valid, axis, known, properties, event, 0 AS ending FROM (SELECT * FROM (SELECT h.arrived, h.identity, h.key, h.to_key, h.event AS name, h.source, h.valid, h.recorded, h.properties, h.until, h.axis AS axis, h.known AS known, h.event AS event FROM _hearings h WHERE h.entity = ?1 AND h.line = 'main' AND h.to_key IS NOT NULL AND h.to_key = ?4 AND (h.until IS NULL OR h.until > coalesce(?3, 9223372036854775807)) UNION ALL SELECT h.arrived, h.identity, h.key, h.to_key, h.event AS name, h.source, h.valid, h.recorded, h.properties, h.until, a.axis, a.known, a.alias FROM _hearings h CROSS JOIN _aliases a ON a.line = h.line AND a.identity = h.identity WHERE h.entity = ?1 AND h.line = 'main' AND h.to_key IS NOT NULL AND h.to_key = ?4 AND (h.until IS NULL OR h.until > coalesce(?3, 9223372036854775807))) WHERE (?3 IS NULL OR known <= ?3) AND (?2 IS NULL OR axis <= ?2)) UNION ALL SELECT key, to_key, event, source, valid, axis, known, NULL, event, 1 FROM _endings WHERE entity = ?1 AND line = 'main' AND to_key = ?4 AND key IN (SELECT key FROM _hearings WHERE entity = ?1 AND line = 'main' AND to_key = ?4) AND (?2 IS NULL OR axis <= ?2) AND (?3 IS NULL OR known <= ?3))) WHERE n = 1) f WHERE ending = 0 OR (EXISTS (SELECT 1 FROM _ends c WHERE c.entity = ?1 AND c.line = 'main' AND c.key = f.key AND c.to_key = f.to_key AND c.axis IS NULL AND (?3 IS NULL OR c.known <= ?3)) AND EXISTS (SELECT 1 FROM _hearings WHERE entity = ?1 AND line = 'main' AND (?2 IS NULL OR axis <= ?2) AND (?3 IS NULL OR known <= ?3) AND (until IS NULL OR until > coalesce(?3, 9223372036854775807)) AND key = f.key AND to_key = f.to_key)) ORDER BY key)
+;;
+== link_state_at now
+SELECT event, source, valid, axis, known, properties, ending FROM ( SELECT name AS event, source, valid, axis, known, properties, 0 AS ending FROM (SELECT * FROM (SELECT h.arrived, h.identity, h.key, h.to_key, h.event AS name, h.source, h.valid, h.recorded, h.properties, h.until, h.axis AS axis, h.known AS known, h.event AS event FROM _hearings h WHERE h.entity = ?1 AND h.line = 'main' AND h.key = ?2 AND h.to_key IS ?3 AND (h.until IS NULL OR h.until > coalesce(?5, 9223372036854775807)) UNION ALL SELECT h.arrived, h.identity, h.key, h.to_key, h.event AS name, h.source, h.valid, h.recorded, h.properties, h.until, a.axis, a.known, a.alias FROM _hearings h CROSS JOIN _aliases a ON a.line = h.line AND a.identity = h.identity WHERE h.entity = ?1 AND h.line = 'main' AND h.key = ?2 AND h.to_key IS ?3 AND (h.until IS NULL OR h.until > coalesce(?5, 9223372036854775807))) WHERE (?5 IS NULL OR known <= ?5) AND (?4 IS NULL OR axis <= ?4)) UNION ALL SELECT event, source, valid, axis, known, NULL, 1 FROM _endings WHERE entity = ?1 AND line = 'main' AND key = ?2 AND to_key = ?3 AND (?4 IS NULL OR axis <= ?4) AND (?5 IS NULL OR known <= ?5)) ORDER BY axis DESC, known DESC, event DESC LIMIT 1
+;;
+== link_state_at now
+SELECT ?6 IS NULL OR (CASE WHEN length(e.valid) = 7 THEN e.valid || '-01' ELSE e.valid END) <= ?6 FROM _endings e WHERE e.id = (SELECT x.id FROM _endings x WHERE x.entity = ?1 AND x.line = 'main' AND x.key = ?2 AND x.to_key = ?3 AND (?4 IS NULL OR x.axis <= ?4) AND (?5 IS NULL OR x.known <= ?5) AND (x.axis, x.known, x.event) > (coalesce((SELECT axis FROM (SELECT * FROM (SELECT h.arrived, h.identity, h.key, h.to_key, h.event AS name, h.source, h.valid, h.recorded, h.properties, h.until, h.axis AS axis, h.known AS known, h.event AS event FROM _hearings h WHERE h.entity = ?1 AND h.line = 'main' AND h.key = ?2 AND h.to_key = ?3 AND (h.until IS NULL OR h.until > coalesce(?5, 9223372036854775807)) UNION ALL SELECT h.arrived, h.identity, h.key, h.to_key, h.event AS name, h.source, h.valid, h.recorded, h.properties, h.until, a.axis, a.known, a.alias FROM _hearings h CROSS JOIN _aliases a ON a.line = h.line AND a.identity = h.identity WHERE h.entity = ?1 AND h.line = 'main' AND h.key = ?2 AND h.to_key = ?3 AND (h.until IS NULL OR h.until > coalesce(?5, 9223372036854775807))) WHERE (?5 IS NULL OR known <= ?5) AND (?4 IS NULL OR axis <= ?4)) ORDER BY axis DESC, known DESC, event DESC LIMIT 1), X''), coalesce((SELECT known FROM (SELECT * FROM (SELECT h.arrived, h.identity, h.key, h.to_key, h.event AS name, h.source, h.valid, h.recorded, h.properties, h.until, h.axis AS axis, h.known AS known, h.event AS event FROM _hearings h WHERE h.entity = ?1 AND h.line = 'main' AND h.key = ?2 AND h.to_key = ?3 AND (h.until IS NULL OR h.until > coalesce(?5, 9223372036854775807)) UNION ALL SELECT h.arrived, h.identity, h.key, h.to_key, h.event AS name, h.source, h.valid, h.recorded, h.properties, h.until, a.axis, a.known, a.alias FROM _hearings h CROSS JOIN _aliases a ON a.line = h.line AND a.identity = h.identity WHERE h.entity = ?1 AND h.line = 'main' AND h.key = ?2 AND h.to_key = ?3 AND (h.until IS NULL OR h.until > coalesce(?5, 9223372036854775807))) WHERE (?5 IS NULL OR known <= ?5) AND (?4 IS NULL OR axis <= ?4)) ORDER BY axis DESC, known DESC, event DESC LIMIT 1), -9223372036854775808), coalesce((SELECT event FROM (SELECT * FROM (SELECT h.arrived, h.identity, h.key, h.to_key, h.event AS name, h.source, h.valid, h.recorded, h.properties, h.until, h.axis AS axis, h.known AS known, h.event AS event FROM _hearings h WHERE h.entity = ?1 AND h.line = 'main' AND h.key = ?2 AND h.to_key = ?3 AND (h.until IS NULL OR h.until > coalesce(?5, 9223372036854775807)) UNION ALL SELECT h.arrived, h.identity, h.key, h.to_key, h.event AS name, h.source, h.valid, h.recorded, h.properties, h.until, a.axis, a.known, a.alias FROM _hearings h CROSS JOIN _aliases a ON a.line = h.line AND a.identity = h.identity WHERE h.entity = ?1 AND h.line = 'main' AND h.key = ?2 AND h.to_key = ?3 AND (h.until IS NULL OR h.until > coalesce(?5, 9223372036854775807))) WHERE (?5 IS NULL OR known <= ?5) AND (?4 IS NULL OR axis <= ?4)) ORDER BY axis DESC, known DESC, event DESC LIMIT 1), '')) ORDER BY x.axis, x.known, x.event LIMIT 1) AND NOT EXISTS (SELECT 1 FROM _ends c WHERE c.entity = ?1 AND c.line = 'main' AND c.key = ?2 AND c.to_key = ?3 AND c.axis IS NULL AND (?5 IS NULL OR c.known <= ?5))
+;;
+== find
+SELECT name, source, valid, axis, known, properties, recorded, identity FROM (SELECT h.arrived, h.identity, h.key, h.to_key, h.event AS name, h.source, h.valid, h.recorded, h.properties, h.until, h.axis AS axis, h.known AS known, h.event AS event FROM _hearings h WHERE h.entity = ?1 AND h.line = 'main' AND h.key = ?2 AND h.to_key IS ?3 AND h.until IS NULL UNION ALL SELECT h.arrived, h.identity, h.key, h.to_key, h.event AS name, h.source, h.valid, h.recorded, h.properties, h.until, a.axis, a.known, a.alias FROM _hearings h CROSS JOIN _aliases a ON a.line = h.line AND a.identity = h.identity WHERE h.entity = ?1 AND h.line = 'main' AND h.key = ?2 AND h.to_key IS ?3 AND h.until IS NULL) WHERE true ORDER BY axis DESC, known DESC, event DESC
+;;
+== nodes book title=g7 now (4k rows)
+SELECT key, name, source, valid, axis, known, properties FROM (SELECT *, row_number() OVER (PARTITION BY key ORDER BY axis DESC, known DESC, event DESC) AS n FROM (SELECT * FROM (SELECT h.arrived, h.identity, h.key, h.to_key, h.event AS name, h.source, h.valid, h.recorded, h.properties, h.until, h.axis AS axis, h.known AS known, h.event AS event FROM _hearings h WHERE h.entity = ?1 AND h.line = 'main' AND h.key IN (SELECT key FROM _hearings WHERE entity = 'class:book' AND json_extract(properties, '$."title"') = json_extract(?4, '$') AND line = 'main' AND (?2 IS NULL OR axis <= ?2) AND (?3 IS NULL OR known <= ?3) AND (until IS NULL OR until > coalesce(?3, 9223372036854775807))) AND (h.until IS NULL OR h.until > coalesce(?3, 9223372036854775807)) UNION ALL SELECT h.arrived, h.identity, h.key, h.to_key, h.event AS name, h.source, h.valid, h.recorded, h.properties, h.until, a.axis, a.known, a.alias FROM _hearings h CROSS JOIN _aliases a ON a.line = h.line AND a.identity = h.identity WHERE h.entity = ?1 AND h.line = 'main' AND h.key IN (SELECT key FROM _hearings WHERE entity = 'class:book' AND json_extract(properties, '$."title"') = json_extract(?4, '$') AND line = 'main' AND (?2 IS NULL OR axis <= ?2) AND (?3 IS NULL OR known <= ?3) AND (until IS NULL OR until > coalesce(?3, 9223372036854775807))) AND (h.until IS NULL OR h.until > coalesce(?3, 9223372036854775807))) WHERE (?3 IS NULL OR known <= ?3) AND (?2 IS NULL OR axis <= ?2))) WHERE n = 1 ORDER BY key
+;;
+== counts now
+SELECT count(DISTINCT key) FROM _hearings WHERE entity = ?1 AND line = 'main' AND (?2 IS NULL OR axis <= ?2) AND (?3 IS NULL OR known <= ?3) AND (until IS NULL OR until > coalesce(?3, 9223372036854775807))
+;;
+== counts now
+SELECT (SELECT count(*) FROM (SELECT DISTINCT key, to_key FROM _hearings WHERE entity = ?1 AND line = 'main' AND (?2 IS NULL OR axis <= ?2) AND (?3 IS NULL OR known <= ?3) AND (until IS NULL OR until > coalesce(?3, 9223372036854775807)))) - (SELECT count(*) FROM (SELECT key, to_key, ending FROM (SELECT *, row_number() OVER (PARTITION BY key, to_key ORDER BY axis DESC, known DESC, event DESC) AS n FROM (SELECT key, to_key, name, source, valid, axis, known, properties, event, 0 AS ending FROM (SELECT * FROM (SELECT h.arrived, h.identity, h.key, h.to_key, h.event AS name, h.source, h.valid, h.recorded, h.properties, h.until, h.axis AS axis, h.known AS known, h.event AS event FROM _hearings h WHERE h.entity = ?1 AND h.line = 'main' AND h.to_key IS NOT NULL AND (h.key, h.to_key) IN (SELECT key, to_key FROM _endings WHERE entity = ?1 AND line = 'main' AND (?2 IS NULL OR axis <= ?2) AND (?3 IS NULL OR known <= ?3)) AND (h.until IS NULL OR h.until > coalesce(?3, 9223372036854775807)) UNION ALL SELECT h.arrived, h.identity, h.key, h.to_key, h.event AS name, h.source, h.valid, h.recorded, h.properties, h.until, a.axis, a.known, a.alias FROM _hearings h CROSS JOIN _aliases a ON a.line = h.line AND a.identity = h.identity WHERE h.entity = ?1 AND h.line = 'main' AND h.to_key IS NOT NULL AND (h.key, h.to_key) IN (SELECT key, to_key FROM _endings WHERE entity = ?1 AND line = 'main' AND (?2 IS NULL OR axis <= ?2) AND (?3 IS NULL OR known <= ?3)) AND (h.until IS NULL OR h.until > coalesce(?3, 9223372036854775807))) WHERE (?3 IS NULL OR known <= ?3) AND (?2 IS NULL OR axis <= ?2)) UNION ALL SELECT key, to_key, event, source, valid, axis, known, NULL, event, 1 FROM _endings WHERE entity = ?1 AND line = 'main' AND (key, to_key) IN (SELECT key, to_key FROM _endings WHERE entity = ?1 AND line = 'main' AND (?2 IS NULL OR axis <= ?2) AND (?3 IS NULL OR known <= ?3)) AND (?2 IS NULL OR axis <= ?2) AND (?3 IS NULL OR known <= ?3))) WHERE n = 1) f WHERE ending = 1 AND NOT EXISTS (SELECT 1 FROM _ends c WHERE c.entity = ?1 AND c.line = 'main' AND c.key = f.key AND c.to_key = f.to_key AND c.axis IS NULL AND (?3 IS NULL OR c.known <= ?3)) AND EXISTS (SELECT 1 FROM _hearings WHERE entity = ?1 AND line = 'main' AND (?2 IS NULL OR axis <= ?2) AND (?3 IS NULL OR known <= ?3) AND (until IS NULL OR until > coalesce(?3, 9223372036854775807)) AND key = f.key AND to_key = f.to_key))
+;;
+== toy stats read
+SELECT entity, n FROM _stats ORDER BY entity
+;;
+== answer counts, default known-at
+SELECT max(k) FROM (SELECT max(known) AS k FROM _hearings UNION ALL SELECT max(until) FROM _hearings UNION ALL SELECT max(known) FROM _aliases UNION ALL SELECT max(known) FROM _endings UNION ALL SELECT max(known) FROM _ends)
+;;
+== fill
+SELECT try_limit FROM _fill WHERE one = 1
+;;
+== fill
+SELECT seq FROM _work WHERE worker = ?1 AND reason IS NOT NULL AND tries < ?2 ORDER BY seq
+;;
+== fill
+SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = '_events'), 0)
+;;
+== fill
+BEGIN IMMEDIATE
+;;
+== fill
+SELECT cursor FROM _places WHERE worker = ?1
+;;
+== fill
+SELECT kind, body FROM _ontology
+;;
+== fill
+CREATE TABLE IF NOT EXISTS _stats(entity TEXT PRIMARY KEY, n INTEGER NOT NULL) WITHOUT ROWID;
+;;
+== fill
+CREATE TEMP TABLE IF NOT EXISTS stats_delta(entity TEXT NOT NULL, d INTEGER NOT NULL);
+;;
+== fill
+CREATE TEMP TRIGGER IF NOT EXISTS stats_o0_i AFTER INSERT ON main._open WHEN new.rel = 'wrote' BEGIN INSERT INTO stats_delta VALUES ('link:wrote', 1); END;
+;;
+== fill
+CREATE TEMP TRIGGER IF NOT EXISTS stats_o0_d AFTER DELETE ON main._open WHEN old.rel = 'wrote' BEGIN INSERT INTO stats_delta VALUES ('link:wrote', -1); END;
+;;
+== fill
+SELECT DISTINCT id FROM _waiting
+;;
+== fill
+SELECT EXISTS (SELECT 1 FROM _renames)
+;;
+== fill
+SAVEPOINT event
+;;
+== fill
+SELECT seq, id, body FROM _events WHERE seq > ?1 AND seq <= ?2 ORDER BY seq
+;;
+== fill
+SELECT event, seq FROM _hearings WHERE line = 'main' AND identity = ?1
+;;
+== fill
+INSERT INTO _hearings(identity, entity, key, to_key, event, seq, source, valid, axis, known, recorded, properties) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+;;
+== fill
+SELECT s.first_hearing, s.first_ending, coalesce(fh.axis, fe.axis), coalesce(fh.known, fe.known), coalesce(fh.event, fe.event), s.last_hearing, s.last_ending, coalesce((SELECT axis FROM (SELECT h.arrived, h.identity, h.key, h.to_key, h.event AS name, h.source, h.valid, h.recorded, h.properties, h.until, h.axis AS axis, h.known AS known, h.event AS event FROM _hearings h WHERE h.arrived = s.last_hearing AND h.until IS NULL UNION ALL SELECT h.arrived, h.identity, h.key, h.to_key, h.event AS name, h.source, h.valid, h.recorded, h.properties, h.until, a.axis, a.known, a.alias FROM _hearings h CROSS JOIN _aliases a ON a.line = h.line AND a.identity = h.identity WHERE h.arrived = s.last_hearing AND h.until IS NULL) ORDER BY axis DESC, known DESC, event DESC LIMIT 1), le.axis), coalesce((SELECT known FROM (SELECT h.arrived, h.identity, h.key, h.to_key, h.event AS name, h.source, h.valid, h.recorded, h.properties, h.until, h.axis AS axis, h.known AS known, h.event AS event FROM _hearings h WHERE h.arrived = s.last_hearing AND h.until IS NULL UNION ALL SELECT h.arrived, h.identity, h.key, h.to_key, h.event AS name, h.source, h.valid, h.recorded, h.properties, h.until, a.axis, a.known, a.alias FROM _hearings h CROSS JOIN _aliases a ON a.line = h.line AND a.identity = h.identity WHERE h.arrived = s.last_hearing AND h.until IS NULL) ORDER BY axis DESC, known DESC, event DESC LIMIT 1), le.known), coalesce((SELECT event FROM (SELECT h.arrived, h.identity, h.key, h.to_key, h.event AS name, h.source, h.valid, h.recorded, h.properties, h.until, h.axis AS axis, h.known AS known, h.event AS event FROM _hearings h WHERE h.arrived = s.last_hearing AND h.until IS NULL UNION ALL SELECT h.arrived, h.identity, h.key, h.to_key, h.event AS name, h.source, h.valid, h.recorded, h.properties, h.until, a.axis, a.known, a.alias FROM _hearings h CROSS JOIN _aliases a ON a.line = h.line AND a.identity = h.identity WHERE h.arrived = s.last_hearing AND h.until IS NULL) ORDER BY axis DESC, known DESC, event DESC LIMIT 1), le.event) FROM _seen s LEFT JOIN _hearings fh ON fh.arrived = s.first_hearing LEFT JOIN _endings fe ON fe.id = s.first_ending LEFT JOIN _hearings lh ON lh.arrived = s.last_hearing LEFT JOIN _endings le ON le.id = s.last_ending WHERE s.entity = ?1 AND s.line = 'main' AND s.key = ?2 AND s.to_key = ?3
+;;
+== fill
+SELECT * FROM (SELECT arrived, NULL, axis, known, event, valid FROM _hearings WHERE entity = ?1 AND line = 'main' AND key = ?2 AND to_key IS nullif(?3, '') AND until IS NULL AND arrived IS NOT ?4 UNION ALL SELECT NULL, id, axis, known, event, valid FROM _endings WHERE entity = ?1 AND line = 'main' AND key = ?2 AND to_key = ?3 AND id IS NOT ?5) LIMIT 1
+;;
+== fill
+INSERT INTO "class:book"(key, source, valid, recorded, "p:title") VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(key) DO NOTHING
+;;
+== fill
+SELECT from_key, to_key, source, valid FROM _open WHERE rel = ?1 AND to_key = ?2
+;;
+== fill
+INSERT INTO "class:author"(key, source, valid, recorded, "p:title") VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(key) DO NOTHING
+;;
+== fill
+SELECT from_key, to_key, source, valid FROM _open WHERE rel = ?1 AND from_key = ?2
+;;
+== fill
+SELECT 1 FROM _endings WHERE entity = ?1 AND key = ?2 AND to_key = ?3 LIMIT 1
+;;
+== fill
+SELECT id FROM "class:author" WHERE key = ?1
+;;
+== fill
+SELECT id FROM "class:book" WHERE key = ?1
+;;
+== fill
+INSERT INTO "relation:wrote"(src, dst, source, valid, recorded) VALUES ((SELECT id FROM "class:author" WHERE key = ?1), (SELECT id FROM "class:book" WHERE key = ?2), ?3, ?4, ?5) ON CONFLICT(src, dst) DO NOTHING
+;;
+== fill
+INSERT INTO _ends(entity, key, to_key, event, source, axis, valid, known) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT(entity, line, key, to_key) DO UPDATE SET event = excluded.event, source = excluded.source, axis = excluded.axis, valid = excluded.valid, known = excluded.known WHERE (excluded.known, excluded.event) > (_ends.known, _ends.event)
+;;
+== fill
+INSERT OR IGNORE INTO _endings(entity, key, to_key, axis, event, source, valid, known) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+;;
+== fill
+INSERT INTO _seen(entity, key, to_key, first_hearing, first_ending, last_hearing, last_ending, recorded_hearing, recorded_ending, first_true, count) VALUES (?1, ?2, ?3, ?4, ?5, ?4, ?5, ?4, ?5, ?6, 1)
+;;
+== fill
+UPDATE _seen SET first_hearing = ?4, first_ending = ?5, last_hearing = ?6, last_ending = ?7, count = count + ?8, first_true = CASE WHEN ?9 IS NOT NULL AND (first_true IS NULL OR (CASE WHEN length(?9) = 7 THEN ?9 || '-01' ELSE ?9 END) < (CASE WHEN length(first_true) = 7 THEN first_true || '-01' ELSE first_true END)) THEN ?9 ELSE first_true END WHERE entity = ?1 AND line = 'main' AND key = ?2 AND to_key = ?3
+;;
+== fill
+INSERT OR IGNORE INTO _aliases(identity, alias, axis, known) VALUES (?1, ?2, ?3, ?4)
+;;
+== fill
+SELECT entity, key, to_key FROM _hearings WHERE line = 'main' AND identity = ?1
+;;
+== fill
+SELECT arrived, NULL, axis, known, event FROM (SELECT h.arrived, h.identity, h.key, h.to_key, h.event AS name, h.source, h.valid, h.recorded, h.properties, h.until, h.axis AS axis, h.known AS known, h.event AS event FROM _hearings h WHERE h.entity = ?1 AND h.line = 'main' AND h.key = ?2 AND h.to_key IS ?3 AND h.until IS NULL UNION ALL SELECT h.arrived, h.identity, h.key, h.to_key, h.event AS name, h.source, h.valid, h.recorded, h.properties, h.until, a.axis, a.known, a.alias FROM _hearings h CROSS JOIN _aliases a ON a.line = h.line AND a.identity = h.identity WHERE h.entity = ?1 AND h.line = 'main' AND h.key = ?2 AND h.to_key IS ?3 AND h.until IS NULL) ORDER BY axis ASC, known ASC, event ASC LIMIT 1
+;;
+== fill
+SELECT NULL, id, axis, known, event FROM _endings WHERE entity = ?1 AND line = 'main' AND key = ?2 AND to_key = ?3 ORDER BY axis ASC, known ASC, event ASC LIMIT 1
+;;
+== fill
+SELECT arrived, NULL, axis, known, event FROM (SELECT h.arrived, h.identity, h.key, h.to_key, h.event AS name, h.source, h.valid, h.recorded, h.properties, h.until, h.axis AS axis, h.known AS known, h.event AS event FROM _hearings h WHERE h.entity = ?1 AND h.line = 'main' AND h.key = ?2 AND h.to_key IS ?3 AND h.until IS NULL UNION ALL SELECT h.arrived, h.identity, h.key, h.to_key, h.event AS name, h.source, h.valid, h.recorded, h.properties, h.until, a.axis, a.known, a.alias FROM _hearings h CROSS JOIN _aliases a ON a.line = h.line AND a.identity = h.identity WHERE h.entity = ?1 AND h.line = 'main' AND h.key = ?2 AND h.to_key IS ?3 AND h.until IS NULL) ORDER BY axis DESC, known DESC, event DESC LIMIT 1
+;;
+== fill
+SELECT NULL, id, axis, known, event FROM _endings WHERE entity = ?1 AND line = 'main' AND key = ?2 AND to_key = ?3 ORDER BY axis DESC, known DESC, event DESC LIMIT 1
+;;
+== fill
+SELECT seq, body FROM _events WHERE CASE WHEN json_valid(body) THEN json_extract(body, '$.id') = ?2 AND json_extract(body, '$.source') = ?1 ELSE 0 END ORDER BY seq LIMIT 1
+;;
+== fill
+SELECT arrived, entity, key, to_key, event, axis, known FROM _hearings WHERE line = 'main' AND seq = ?1 AND amended IS NULL
+;;
+== fill
+INSERT OR IGNORE INTO _amendments(target, known, event, seq) VALUES (?1, ?2, ?3, ?4)
+;;
+== fill
+SELECT id, body FROM _events WHERE seq = ?1
+;;
+== fill
+SELECT entity, key, to_key FROM _hearings WHERE line = 'main' AND amended = ?1
+;;
+== fill
+DELETE FROM _hearings WHERE line = 'main' AND amended = ?1
+;;
+== fill
+UPDATE _hearings SET until = NULL WHERE arrived = ?1
+;;
+== fill
+SELECT old, new, known, event FROM _renames WHERE entity = ?1 ORDER BY known, event
+;;
+== fill
+SELECT a.known, a.event, e.body FROM _amendments a JOIN _events e ON e.seq = a.seq WHERE a.target = ?1 ORDER BY a.known, a.event
+;;
+== fill
+UPDATE _hearings SET until = ?2 WHERE arrived = ?1
+;;
+== fill
+INSERT INTO _hearings(identity, entity, key, to_key, event, seq, source, valid, axis, known, recorded, properties, amended) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?6)
+;;
+== fill
+SELECT (SELECT count(*) FROM _hearings WHERE entity = ?1 AND line = 'main' AND key = ?2 AND to_key IS nullif(?3, '') AND until IS NULL) + (SELECT count(*) FROM _endings WHERE entity = ?1 AND line = 'main' AND key = ?2 AND to_key = ?3)
+;;
+== fill
+DELETE FROM _seen WHERE entity = ?1 AND line = 'main' AND key = ?2 AND to_key = ?3
+;;
+== fill
+UPDATE "class:book" SET source = ?2, valid = ?3, recorded = ?4, "p:title" = ?5 WHERE key = ?1
+;;
+== fill
+RELEASE event
+;;
+== fill
+INSERT INTO stats_delta VALUES (?1, ?2)
+;;
+== fill
+INSERT INTO _stats(entity, n) SELECT entity, sum(d) FROM stats_delta WHERE true GROUP BY entity ON CONFLICT(entity) DO UPDATE SET n = n + excluded.n;
+;;
+== fill
+DELETE FROM stats_delta;
+;;
+== fill
+INSERT INTO _places(worker, cursor) VALUES (?1, ?2) ON CONFLICT(worker) DO UPDATE SET cursor = excluded.cursor
+;;
+== fill
+COMMIT
+;;
+== fill
+INSERT INTO _open(rel, from_key, to_key, source, valid) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(rel, from_key, to_key) DO UPDATE SET source = excluded.source, valid = excluded.valid WHERE source IS NOT excluded.source OR valid IS NOT excluded.valid
+;;
+== fill
+-- TRIGGER stats_o0_i
+;;
+== fill
+-- INSERT INTO stats_delta VALUES ('link:wrote', 1)
+;;

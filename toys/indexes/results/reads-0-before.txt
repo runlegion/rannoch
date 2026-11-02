@@ -1,0 +1,56 @@
+| read (0% aliases) | ms | rows |
+| links out 1 now | 0.104 | 1 |
+| links out 1 known | 0.097 | 1 |
+| links in 1 now | 0.101 | 1 |
+| page out 1 | 0.123 | 1 |
+| page in 1 | 0.120 | 1 |
+| describe out-hub 1 | 0.142 | 1 |
+| describe in-hub 1 | 0.147 | 1 |
+| links out 10 now | 0.106 | 10 |
+| links out 10 known | 0.106 | 10 |
+| links in 10 now | 0.115 | 10 |
+| page out 10 | 0.134 | 10 |
+| page in 10 | 0.345 | 10 |
+| describe out-hub 10 | 0.150 | 1 |
+| describe in-hub 10 | 0.158 | 1 |
+| links out 100 now | 0.230 | 100 |
+| links out 100 known | 0.230 | 100 |
+| links in 100 now | 0.272 | 100 |
+| page out 100 | 0.268 | 100 |
+| page in 100 | 0.496 | 100 |
+| describe out-hub 100 | 0.249 | 1 |
+| describe in-hub 100 | 0.292 | 1 |
+| links out 1000 now | 1.492 | 1000 |
+| links out 1000 known | 1.479 | 1000 |
+| links in 1000 now | 1.789 | 1000 |
+| page out 1000 | 0.269 | 100 |
+| page in 1000 | 0.349 | 100 |
+| describe out-hub 1000 | 1.260 | 1 |
+| describe in-hub 1000 | 1.565 | 1 |
+| links out 10000 now | 14.862 | 10000 |
+| links out 10000 known | 14.669 | 10000 |
+| links in 10000 now | 17.549 | 10000 |
+| page out 10000 | 0.269 | 100 |
+| page in 10000 | 0.286 | 100 |
+| describe out-hub 10000 | 12.779 | 1 |
+| describe in-hub 10000 | 15.684 | 1 |
+| links out 120000 now | 244.250 | 120000 |
+| links out 120000 known | 243.975 | 120000 |
+| links in 120000 now | 273.768 | 120000 |
+| page out 120000 | 0.283 | 100 |
+| page in 120000 | 0.275 | 100 |
+| describe out-hub 120000 | 200.504 | 1 |
+| describe in-hub 120000 | 229.280 | 1 |
+| state_at now | 0.044 | 1 |
+| state_at known | 0.043 | 1 |
+| link_state_at now | 0.180 | 1 |
+| link_state_at known | 0.178 | 1 |
+| find | 0.028 | 1 |
+| nodes book title=g7 now (4k rows) | 26.655 | 4000 |
+| nodes book title=g7 known | 27.166 | 4000 |
+| nodes book title=hub (6 rows) | 0.105 | 6 |
+| counts now | 185.579 | 1 |
+| counts known | 322.018 | 1 |
+| toy stats read | 0.001 | 3 |
+| answer counts, default known-at | 403.177 | 266 |
+| answer links f10, default known-at | 100.720 | 2001 |

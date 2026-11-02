@@ -17,3 +17,11 @@ P6. Covering index for counts. Including `until` and `known` in the index counts
 P7. Combined. All chosen changes together keep fill within 2% of today. (0.4: the per-batch values are cheap, but two new indexes may push it past 2%.)
 
 P8. Dropping the window form. If A answers every now read and B every past point read, the window form is still needed for listing at a past view (links, nodes at a known-at), so it cannot be dropped entirely. (0.6)
+
+P9 (Sean's prediction, 2026-11-02, his words relayed): "the proper indexes (the ActiveRecord patterns) give about another quarter": roughly 25% more fill throughput on top of the alias fix (#180, PR #181, which brings fill to about 39,000-41,000 events/s at 300k with aliases), and the common reads speed up with it. Fill's own lookups of a key's current version use the history SQL, so the backward-seek index may speed fill as well as the reads.
+
+ActiveRecord patterns to test, mapped onto rannoch (added before the candidate runs):
+- polymorphic belongs_to index `[item_type, item_id]` -> `(entity, line, key)`; with the history order column, `(entity, line, key, known)`.
+- paper_trail `where(created_at <= t).order(created_at desc).first` -> a backward seek per key instead of a window over every version.
+- has_many :through, one index per foreign key -> from end and to end of a link (`_hearings_at` leads with the from key; `_hearings_to` with the to key).
+- counter_cache -> per-node link counts per relation and direction, kept by fill per batch, read by describe.

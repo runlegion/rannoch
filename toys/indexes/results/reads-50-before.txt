@@ -1,0 +1,56 @@
+| read (50% aliases) | ms | rows |
+| links out 1 now | 0.113 | 1 |
+| links out 1 known | 0.102 | 1 |
+| links in 1 now | 0.124 | 1 |
+| page out 1 | 0.128 | 1 |
+| page in 1 | 0.137 | 1 |
+| describe out-hub 1 | 0.170 | 1 |
+| describe in-hub 1 | 0.185 | 1 |
+| links out 10 now | 0.136 | 10 |
+| links out 10 known | 0.144 | 10 |
+| links in 10 now | 0.147 | 10 |
+| page out 10 | 0.179 | 10 |
+| page in 10 | 0.407 | 10 |
+| describe out-hub 10 | 0.189 | 1 |
+| describe in-hub 10 | 0.186 | 1 |
+| links out 100 now | 0.369 | 100 |
+| links out 100 known | 0.339 | 100 |
+| links in 100 now | 0.389 | 100 |
+| page out 100 | 0.379 | 100 |
+| page in 100 | 0.604 | 100 |
+| describe out-hub 100 | 0.347 | 1 |
+| describe in-hub 100 | 0.404 | 1 |
+| links out 1000 now | 3.167 | 1000 |
+| links out 1000 known | 3.225 | 1000 |
+| links in 1000 now | 3.634 | 1000 |
+| page out 1000 | 0.372 | 100 |
+| page in 1000 | 0.460 | 100 |
+| describe out-hub 1000 | 3.060 | 1 |
+| describe in-hub 1000 | 3.442 | 1 |
+| links out 10000 now | 127.568 | 10000 |
+| links out 10000 known | 43.214 | 10000 |
+| links in 10000 now | 46.385 | 10000 |
+| page out 10000 | 0.365 | 100 |
+| page in 10000 | 0.372 | 100 |
+| describe out-hub 10000 | 39.689 | 1 |
+| describe in-hub 10000 | 39.956 | 1 |
+| links out 120000 now | 500.901 | 120000 |
+| links out 120000 known | 487.847 | 120000 |
+| links in 120000 now | 508.312 | 120000 |
+| page out 120000 | 0.372 | 100 |
+| page in 120000 | 0.364 | 100 |
+| describe out-hub 120000 | 444.868 | 1 |
+| describe in-hub 120000 | 470.761 | 1 |
+| state_at now | 0.048 | 1 |
+| state_at known | 0.047 | 1 |
+| link_state_at now | 0.193 | 1 |
+| link_state_at known | 0.188 | 1 |
+| find | 0.030 | 1 |
+| nodes book title=g7 now (4k rows) | 33.463 | 4000 |
+| nodes book title=g7 known | 33.624 | 4000 |
+| nodes book title=hub (6 rows) | 0.109 | 6 |
+| counts now | 199.434 | 1 |
+| counts known | 201.318 | 1 |
+| toy stats read | 0.001 | 3 |
+| answer counts, default known-at | 284.473 | 266 |
+| answer links f10, default known-at | 80.434 | 2001 |

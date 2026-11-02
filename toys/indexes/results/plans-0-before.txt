@@ -1,0 +1,593 @@
+## links out 1 now  [SEARCH h USING INDEX _hearings_at (entity=? AND line=? AND key=? AND to_key>?); SEARCH h USING INDEX _hearings_at (entity=? AND line=? AND key=? AND to_key>?); SEARCH _endings USING INDEX sqlite_autoindex__endings_1 (entity=? AND line=? AND key=?); SCAN (subquery-5); USE TEMP B-TREE FOR ORDER BY; SCAN (subquery-11); SCAN (subquery-6); SEARCH _hearings USING INDEX _hearings_to (entity=? AND line=? AND to_key=? AND key=?); USE TEMP B-TREE FOR ORDER BY]
+  SELECT to_key, name, source, valid, axis, known, properties FROM (SELECT key, to_key, name, source, valid, axis, known, properties, ending FROM (SELECT *, row_number() OVER (PARTITION BY key, to_key ORDER BY axis DESC, known DESC, event DES
+    CO-ROUTINE (subquery-6)
+    CO-ROUTINE (subquery-11)
+    CO-ROUTINE (subquery-5)
+    COMPOUND QUERY
+    LEFT-MOST SUBQUERY
+    COMPOUND QUERY
+    LEFT-MOST SUBQUERY
+    SEARCH h USING INDEX _hearings_at (entity=? AND line=? AND key=? AND to_key>?)
+    UNION ALL
+    SEARCH h USING INDEX _hearings_at (entity=? AND line=? AND key=? AND to_key>?)
+    SEARCH a USING COVERING INDEX _aliases_at (line=? AND identity=?)
+    UNION ALL
+    SEARCH _endings USING INDEX sqlite_autoindex__endings_1 (entity=? AND line=? AND key=?)
+    SCAN (subquery-5)
+    USE TEMP B-TREE FOR ORDER BY
+    SCAN (subquery-11)
+    SCAN (subquery-6)
+    CORRELATED SCALAR SUBQUERY 8
+    SEARCH c USING PRIMARY KEY (entity=? AND line=? AND key=? AND to_key=?)
+    CORRELATED SCALAR SUBQUERY 9
+    SEARCH _hearings USING INDEX _hearings_to (entity=? AND line=? AND to_key=? AND key=?)
+    USE TEMP B-TREE FOR ORDER BY
+
+## links in 1 now  [SEARCH h USING INDEX _hearings_to (entity=? AND line=? AND to_key=?); SEARCH h USING INDEX _hearings_to (entity=? AND line=? AND to_key=?); SEARCH _endings USING INDEX sqlite_autoindex__endings_1 (entity=? AND line=? AND key=? AND to_key=?); SCAN (subquery-6); USE TEMP B-TREE FOR ORDER BY; SCAN (subquery-12); SCAN (subquery-7); SEARCH _hearings USING INDEX _hearings_to (entity=? AND line=? AND to_key=? AND key=?); USE TEMP B-TREE FOR ORDER BY]
+  SELECT key, name, source, valid, axis, known, properties FROM (SELECT key, to_key, name, source, valid, axis, known, properties, ending FROM (SELECT *, row_number() OVER (PARTITION BY key, to_key ORDER BY axis DESC, known DESC, event DESC) 
+    CO-ROUTINE (subquery-7)
+    CO-ROUTINE (subquery-12)
+    CO-ROUTINE (subquery-6)
+    COMPOUND QUERY
+    LEFT-MOST SUBQUERY
+    COMPOUND QUERY
+    LEFT-MOST SUBQUERY
+    SEARCH h USING INDEX _hearings_to (entity=? AND line=? AND to_key=?)
+    UNION ALL
+    SEARCH h USING INDEX _hearings_to (entity=? AND line=? AND to_key=?)
+    SEARCH a USING COVERING INDEX _aliases_at (line=? AND identity=?)
+    UNION ALL
+    SEARCH _endings USING INDEX sqlite_autoindex__endings_1 (entity=? AND line=? AND key=? AND to_key=?)
+    LIST SUBQUERY 5
+    SEARCH _hearings USING COVERING INDEX _hearings_to (entity=? AND line=? AND to_key=?)
+    SCAN (subquery-6)
+    USE TEMP B-TREE FOR ORDER BY
+    SCAN (subquery-12)
+    SCAN (subquery-7)
+    CORRELATED SCALAR SUBQUERY 9
+    SEARCH c USING PRIMARY KEY (entity=? AND line=? AND key=? AND to_key=?)
+    CORRELATED SCALAR SUBQUERY 10
+    SEARCH _hearings USING INDEX _hearings_to (entity=? AND line=? AND to_key=? AND key=?)
+    USE TEMP B-TREE FOR ORDER BY
+
+## page out 1  [SEARCH h USING INDEX _hearings_at (entity=? AND line=? AND key=? AND to_key>? AND to_key<?); SEARCH h USING INDEX _hearings_at (entity=? AND line=? AND key=? AND to_key>? AND to_key<?); SEARCH _endings USING INDEX sqlite_autoindex__endings_1 (entity=? AND line=? AND key=? AND to_key>? AND to_key<?); SCAN (subquery-11); USE TEMP B-TREE FOR ORDER BY; SCAN (subquery-17); SCAN (subquery-12); SEARCH _hearings USING INDEX _hearings_to (entity=? AND line=? AND to_key=? AND key=?); USE TEMP B-TREE FOR ORDER BY]
+  SELECT to_key, name, source, valid, axis, known, properties FROM (SELECT key, to_key, name, source, valid, axis, known, properties, ending FROM (SELECT *, row_number() OVER (PARTITION BY key, to_key ORDER BY axis DESC, known DESC, event DES
+    CO-ROUTINE (subquery-12)
+    CO-ROUTINE (subquery-17)
+    CO-ROUTINE (subquery-11)
+    COMPOUND QUERY
+    LEFT-MOST SUBQUERY
+    COMPOUND QUERY
+    LEFT-MOST SUBQUERY
+    SEARCH h USING INDEX _hearings_at (entity=? AND line=? AND key=? AND to_key>? AND to_key<?)
+    SCALAR SUBQUERY 2
+    CO-ROUTINE (subquery-1)
+    SEARCH _hearings USING COVERING INDEX _hearings_at (entity=? AND line=? AND key=? AND to_key>?)
+    SEARCH (subquery-1)
+    UNION ALL
+    SEARCH h USING INDEX _hearings_at (entity=? AND line=? AND key=? AND to_key>? AND to_key<?)
+    SCALAR SUBQUERY 5
+    CO-ROUTINE (subquery-4)
+    SEARCH _hearings USING COVERING INDEX _hearings_at (entity=? AND line=? AND key=? AND to_key>?)
+    SEARCH (subquery-4)
+    SEARCH a USING COVERING INDEX _aliases_at (line=? AND identity=?)
+    UNION ALL
+    SEARCH _endings USING INDEX sqlite_autoindex__endings_1 (entity=? AND line=? AND key=? AND to_key>? AND to_key<?)
+    SCALAR SUBQUERY 10
+    CO-ROUTINE (subquery-9)
+    SEARCH _hearings USING COVERING INDEX _hearings_at (entity=? AND line=? AND key=? AND to_key>?)
+    SEARCH (subquery-9)
+    SCAN (subquery-11)
+    USE TEMP B-TREE FOR ORDER BY
+    SCAN (subquery-17)
+    SCAN (subquery-12)
+    CORRELATED SCALAR SUBQUERY 14
+    SEARCH c USING PRIMARY KEY (entity=? AND line=? AND key=? AND to_key=?)
+    CORRELATED SCALAR SUBQUERY 15
+    SEARCH _hearings USING INDEX _hearings_to (entity=? AND line=? AND to_key=? AND key=?)
+    USE TEMP B-TREE FOR ORDER BY
+
+## page in 1  [SEARCH h USING INDEX _hearings_to (entity=? AND line=? AND to_key=? AND key>? AND key<?); SEARCH h USING INDEX _hearings_to (entity=? AND line=? AND to_key=? AND key>? AND key<?); SEARCH _endings USING INDEX sqlite_autoindex__endings_1 (entity=? AND line=? AND key>? AND key<?); SCAN (subquery-11); USE TEMP B-TREE FOR ORDER BY; SCAN (subquery-17); SCAN (subquery-12); SEARCH _hearings USING INDEX _hearings_to (entity=? AND line=? AND to_key=? AND key=?); USE TEMP B-TREE FOR ORDER BY]
+  SELECT key, name, source, valid, axis, known, properties FROM (SELECT key, to_key, name, source, valid, axis, known, properties, ending FROM (SELECT *, row_number() OVER (PARTITION BY key, to_key ORDER BY axis DESC, known DESC, event DESC) 
+    CO-ROUTINE (subquery-12)
+    CO-ROUTINE (subquery-17)
+    CO-ROUTINE (subquery-11)
+    COMPOUND QUERY
+    LEFT-MOST SUBQUERY
+    COMPOUND QUERY
+    LEFT-MOST SUBQUERY
+    SEARCH h USING INDEX _hearings_to (entity=? AND line=? AND to_key=? AND key>? AND key<?)
+    SCALAR SUBQUERY 2
+    CO-ROUTINE (subquery-1)
+    SEARCH _hearings USING COVERING INDEX _hearings_to (entity=? AND line=? AND to_key=? AND key>?)
+    SEARCH (subquery-1)
+    UNION ALL
+    SEARCH h USING INDEX _hearings_to (entity=? AND line=? AND to_key=? AND key>? AND key<?)
+    SCALAR SUBQUERY 5
+    CO-ROUTINE (subquery-4)
+    SEARCH _hearings USING COVERING INDEX _hearings_to (entity=? AND line=? AND to_key=? AND key>?)
+    SEARCH (subquery-4)
+    SEARCH a USING COVERING INDEX _aliases_at (line=? AND identity=?)
+    UNION ALL
+    SEARCH _endings USING INDEX sqlite_autoindex__endings_1 (entity=? AND line=? AND key>? AND key<?)
+    SCALAR SUBQUERY 10
+    CO-ROUTINE (subquery-9)
+    SEARCH _hearings USING COVERING INDEX _hearings_to (entity=? AND line=? AND to_key=? AND key>?)
+    SEARCH (subquery-9)
+    SCAN (subquery-11)
+    USE TEMP B-TREE FOR ORDER BY
+    SCAN (subquery-17)
+    SCAN (subquery-12)
+    CORRELATED SCALAR SUBQUERY 14
+    SEARCH c USING PRIMARY KEY (entity=? AND line=? AND key=? AND to_key=?)
+    CORRELATED SCALAR SUBQUERY 15
+    SEARCH _hearings USING INDEX _hearings_to (entity=? AND line=? AND to_key=? AND key=?)
+    USE TEMP B-TREE FOR ORDER BY
+
+## describe out-hub 1  [SEARCH h USING INDEX _hearings_at (entity=? AND line=? AND key=? AND to_key=?); SEARCH h USING INDEX _hearings_at (entity=? AND line=? AND key=? AND to_key=?); SCAN (subquery-2); USE TEMP B-TREE FOR ORDER BY]
+  SELECT name, source, valid, axis, known, properties, recorded, identity FROM (SELECT * FROM (SELECT h.arrived, h.identity, h.key, h.to_key, h.event AS name, h.source, h.valid, h.recorded, h.properties, h.until, h.axis AS axis, h.known AS kn
+    CO-ROUTINE (subquery-2)
+    COMPOUND QUERY
+    LEFT-MOST SUBQUERY
+    SEARCH h USING INDEX _hearings_at (entity=? AND line=? AND key=? AND to_key=?)
+    UNION ALL
+    SEARCH h USING INDEX _hearings_at (entity=? AND line=? AND key=? AND to_key=?)
+    SEARCH a USING COVERING INDEX _aliases_at (line=? AND identity=?)
+    SCAN (subquery-2)
+    USE TEMP B-TREE FOR ORDER BY
+
+## describe out-hub 1  [SEARCH h USING INDEX _hearings_at (entity=? AND line=? AND key=? AND to_key>?); SEARCH h USING INDEX _hearings_at (entity=? AND line=? AND key=? AND to_key>?); SEARCH _endings USING INDEX sqlite_autoindex__endings_1 (entity=? AND line=? AND key=?); SCAN (subquery-5); USE TEMP B-TREE FOR ORDER BY; SCAN (subquery-12); SCAN (subquery-6); SEARCH _hearings USING INDEX _hearings_to (entity=? AND line=? AND to_key=? AND key=?); USE TEMP B-TREE FOR ORDER BY; SCAN (subquery-10)]
+  SELECT count(*) FROM (SELECT to_key, name, source, valid, axis, known, properties FROM (SELECT key, to_key, name, source, valid, axis, known, properties, ending FROM (SELECT *, row_number() OVER (PARTITION BY key, to_key ORDER BY axis DESC,
+    CO-ROUTINE (subquery-10)
+    CO-ROUTINE (subquery-6)
+    CO-ROUTINE (subquery-12)
+    CO-ROUTINE (subquery-5)
+    COMPOUND QUERY
+    LEFT-MOST SUBQUERY
+    COMPOUND QUERY
+    LEFT-MOST SUBQUERY
+    SEARCH h USING INDEX _hearings_at (entity=? AND line=? AND key=? AND to_key>?)
+    UNION ALL
+    SEARCH h USING INDEX _hearings_at (entity=? AND line=? AND key=? AND to_key>?)
+    SEARCH a USING COVERING INDEX _aliases_at (line=? AND identity=?)
+    UNION ALL
+    SEARCH _endings USING INDEX sqlite_autoindex__endings_1 (entity=? AND line=? AND key=?)
+    SCAN (subquery-5)
+    USE TEMP B-TREE FOR ORDER BY
+    SCAN (subquery-12)
+    SCAN (subquery-6)
+    CORRELATED SCALAR SUBQUERY 8
+    SEARCH c USING PRIMARY KEY (entity=? AND line=? AND key=? AND to_key=?)
+    CORRELATED SCALAR SUBQUERY 9
+    SEARCH _hearings USING INDEX _hearings_to (entity=? AND line=? AND to_key=? AND key=?)
+    USE TEMP B-TREE FOR ORDER BY
+    SCAN (subquery-10)
+
+## describe in-hub 1  [SEARCH h USING INDEX _hearings_to (entity=? AND line=? AND to_key=?); SEARCH h USING INDEX _hearings_to (entity=? AND line=? AND to_key=?); SEARCH _endings USING INDEX sqlite_autoindex__endings_1 (entity=? AND line=? AND key=? AND to_key=?); SCAN (subquery-6); USE TEMP B-TREE FOR ORDER BY; SCAN (subquery-13); SCAN (subquery-7); SEARCH _hearings USING INDEX _hearings_to (entity=? AND line=? AND to_key=? AND key=?); USE TEMP B-TREE FOR ORDER BY; SCAN (subquery-11)]
+  SELECT count(*) FROM (SELECT key, name, source, valid, axis, known, properties FROM (SELECT key, to_key, name, source, valid, axis, known, properties, ending FROM (SELECT *, row_number() OVER (PARTITION BY key, to_key ORDER BY axis DESC, kn
+    CO-ROUTINE (subquery-11)
+    CO-ROUTINE (subquery-7)
+    CO-ROUTINE (subquery-13)
+    CO-ROUTINE (subquery-6)
+    COMPOUND QUERY
+    LEFT-MOST SUBQUERY
+    COMPOUND QUERY
+    LEFT-MOST SUBQUERY
+    SEARCH h USING INDEX _hearings_to (entity=? AND line=? AND to_key=?)
+    UNION ALL
+    SEARCH h USING INDEX _hearings_to (entity=? AND line=? AND to_key=?)
+    SEARCH a USING COVERING INDEX _aliases_at (line=? AND identity=?)
+    UNION ALL
+    SEARCH _endings USING INDEX sqlite_autoindex__endings_1 (entity=? AND line=? AND key=? AND to_key=?)
+    LIST SUBQUERY 5
+    SEARCH _hearings USING COVERING INDEX _hearings_to (entity=? AND line=? AND to_key=?)
+    SCAN (subquery-6)
+    USE TEMP B-TREE FOR ORDER BY
+    SCAN (subquery-13)
+    SCAN (subquery-7)
+    CORRELATED SCALAR SUBQUERY 9
+    SEARCH c USING PRIMARY KEY (entity=? AND line=? AND key=? AND to_key=?)
+    CORRELATED SCALAR SUBQUERY 10
+    SEARCH _hearings USING INDEX _hearings_to (entity=? AND line=? AND to_key=? AND key=?)
+    USE TEMP B-TREE FOR ORDER BY
+    SCAN (subquery-11)
+
+## link_state_at now  [SEARCH h USING INDEX _hearings_at (entity=? AND line=? AND key=? AND to_key=?); SEARCH h USING INDEX _hearings_at (entity=? AND line=? AND key=? AND to_key=?); SEARCH _endings USING INDEX sqlite_autoindex__endings_1 (entity=? AND line=? AND key=? AND to_key=?); SCAN (subquery-5); USE TEMP B-TREE FOR ORDER BY]
+  SELECT event, source, valid, axis, known, properties, ending FROM ( SELECT name AS event, source, valid, axis, known, properties, 0 AS ending FROM (SELECT * FROM (SELECT h.arrived, h.identity, h.key, h.to_key, h.event AS name, h.source, h.v
+    CO-ROUTINE (subquery-5)
+    COMPOUND QUERY
+    LEFT-MOST SUBQUERY
+    COMPOUND QUERY
+    LEFT-MOST SUBQUERY
+    SEARCH h USING INDEX _hearings_at (entity=? AND line=? AND key=? AND to_key=?)
+    UNION ALL
+    SEARCH h USING INDEX _hearings_at (entity=? AND line=? AND key=? AND to_key=?)
+    SEARCH a USING COVERING INDEX _aliases_at (line=? AND identity=?)
+    UNION ALL
+    SEARCH _endings USING INDEX sqlite_autoindex__endings_1 (entity=? AND line=? AND key=? AND to_key=?)
+    SCAN (subquery-5)
+    USE TEMP B-TREE FOR ORDER BY
+
+## link_state_at now  [SEARCH x USING INDEX sqlite_autoindex__endings_1 (entity=? AND line=? AND key=? AND to_key=? AND axis>?); SEARCH h USING INDEX _hearings_to (entity=? AND line=? AND to_key=? AND key=?); SEARCH h USING INDEX _hearings_to (entity=? AND line=? AND to_key=? AND key=?); SCAN (subquery-2); USE TEMP B-TREE FOR ORDER BY; SEARCH h USING INDEX _hearings_to (entity=? AND line=? AND to_key=? AND key=?); SEARCH h USING INDEX _hearings_to (entity=? AND line=? AND to_key=? AND key=?); SCAN (subquery-6); USE TEMP B-TREE FOR ORDER BY; SEARCH h USING INDEX _hearings_to (entity=? AND line=? AND to_key=? AND key=?); SEARCH h USING INDEX _hearings_to (entity=? AND line=? AND to_key=? AND key=?); SCAN (subquery-10); USE TEMP B-TREE FOR ORDER BY; USE TEMP B-TREE FOR LAST 2 TERMS OF ORDER BY]
+  SELECT ?6 IS NULL OR (CASE WHEN length(e.valid) = 7 THEN e.valid || '-01' ELSE e.valid END) <= ?6 FROM _endings e WHERE e.id = (SELECT x.id FROM _endings x WHERE x.entity = ?1 AND x.line = 'main' AND x.key = ?2 AND x.to_key = ?3 AND (?4 IS 
+    SEARCH e USING INTEGER PRIMARY KEY (rowid=?)
+    SCALAR SUBQUERY 13
+    SEARCH x USING INDEX sqlite_autoindex__endings_1 (entity=? AND line=? AND key=? AND to_key=? AND axis>?)
+    SCALAR SUBQUERY 4
+    CO-ROUTINE (subquery-2)
+    COMPOUND QUERY
+    LEFT-MOST SUBQUERY
+    SEARCH h USING INDEX _hearings_to (entity=? AND line=? AND to_key=? AND key=?)
+    UNION ALL
+    SEARCH h USING INDEX _hearings_to (entity=? AND line=? AND to_key=? AND key=?)
+    SEARCH a USING COVERING INDEX _aliases_at (line=? AND identity=?)
+    SCAN (subquery-2)
+    USE TEMP B-TREE FOR ORDER BY
+    REUSE SUBQUERY 4
+    SCALAR SUBQUERY 8
+    CO-ROUTINE (subquery-6)
+    COMPOUND QUERY
+    LEFT-MOST SUBQUERY
+    SEARCH h USING INDEX _hearings_to (entity=? AND line=? AND to_key=? AND key=?)
+    UNION ALL
+    SEARCH h USING INDEX _hearings_to (entity=? AND line=? AND to_key=? AND key=?)
+    SEARCH a USING COVERING INDEX _aliases_at (line=? AND identity=?)
+    SCAN (subquery-6)
+    USE TEMP B-TREE FOR ORDER BY
+    SCALAR SUBQUERY 12
+    CO-ROUTINE (subquery-10)
+    COMPOUND QUERY
+    LEFT-MOST SUBQUERY
+    SEARCH h USING INDEX _hearings_to (entity=? AND line=? AND to_key=? AND key=?)
+    UNION ALL
+    SEARCH h USING INDEX _hearings_to (entity=? AND line=? AND to_key=? AND key=?)
+    SEARCH a USING COVERING INDEX _aliases_at (line=? AND identity=?)
+    SCAN (subquery-10)
+    USE TEMP B-TREE FOR ORDER BY
+    USE TEMP B-TREE FOR LAST 2 TERMS OF ORDER BY
+    SCALAR SUBQUERY 14
+    SEARCH c USING PRIMARY KEY (entity=? AND line=? AND key=? AND to_key=?)
+
+## find  [SEARCH h USING INDEX _hearings_at (entity=? AND line=? AND key=? AND to_key=?); SEARCH h USING INDEX _hearings_at (entity=? AND line=? AND key=? AND to_key=?); SCAN (subquery-2); USE TEMP B-TREE FOR ORDER BY]
+  SELECT name, source, valid, axis, known, properties, recorded, identity FROM (SELECT h.arrived, h.identity, h.key, h.to_key, h.event AS name, h.source, h.valid, h.recorded, h.properties, h.until, h.axis AS axis, h.known AS known, h.event AS
+    CO-ROUTINE (subquery-2)
+    COMPOUND QUERY
+    LEFT-MOST SUBQUERY
+    SEARCH h USING INDEX _hearings_at (entity=? AND line=? AND key=? AND to_key=?)
+    UNION ALL
+    SEARCH h USING INDEX _hearings_at (entity=? AND line=? AND key=? AND to_key=?)
+    SEARCH a USING COVERING INDEX _aliases_at (line=? AND identity=?)
+    SCAN (subquery-2)
+    USE TEMP B-TREE FOR ORDER BY
+
+## nodes book title=g7 now (4k rows)  [SEARCH h USING INDEX _hearings_at (entity=? AND line=? AND key=?); SEARCH _hearings USING INDEX _by:4:book:title (<expr>=?); USE TEMP B-TREE FOR LAST 3 TERMS OF ORDER BY; SEARCH h USING INDEX _hearings_at (entity=? AND line=? AND key=?); SEARCH _hearings USING INDEX _by:4:book:title (<expr>=?); USE TEMP B-TREE FOR LAST 3 TERMS OF ORDER BY; SCAN (subquery-8); SCAN (subquery-6); USE TEMP B-TREE FOR ORDER BY]
+  SELECT key, name, source, valid, axis, known, properties FROM (SELECT *, row_number() OVER (PARTITION BY key ORDER BY axis DESC, known DESC, event DESC) AS n FROM (SELECT * FROM (SELECT h.arrived, h.identity, h.key, h.to_key, h.event AS nam
+    CO-ROUTINE (subquery-6)
+    CO-ROUTINE (subquery-8)
+    MERGE (UNION ALL)
+    LEFT
+    SEARCH h USING INDEX _hearings_at (entity=? AND line=? AND key=?)
+    LIST SUBQUERY 1
+    SEARCH _hearings USING INDEX _by:4:book:title (<expr>=?)
+    USE TEMP B-TREE FOR LAST 3 TERMS OF ORDER BY
+    RIGHT
+    SEARCH h USING INDEX _hearings_at (entity=? AND line=? AND key=?)
+    LIST SUBQUERY 3
+    SEARCH _hearings USING INDEX _by:4:book:title (<expr>=?)
+    SEARCH a USING COVERING INDEX _aliases_at (line=? AND identity=?)
+    USE TEMP B-TREE FOR LAST 3 TERMS OF ORDER BY
+    SCAN (subquery-8)
+    SCAN (subquery-6)
+    USE TEMP B-TREE FOR ORDER BY
+
+## counts now  [SEARCH _hearings USING INDEX _hearings_at (entity=? AND line=?)]
+  SELECT count(DISTINCT key) FROM _hearings WHERE entity = ?1 AND line = 'main' AND (?2 IS NULL OR axis <= ?2) AND (?3 IS NULL OR known <= ?3) AND (until IS NULL OR until > coalesce(?3, 9223372036854775807))
+    SEARCH _hearings USING INDEX _hearings_at (entity=? AND line=?)
+
+## counts now  [SCAN CONSTANT ROW; SEARCH _hearings USING INDEX _hearings_at (entity=? AND line=?); SCAN (subquery-1); SEARCH h USING INDEX _hearings_to (entity=? AND line=? AND to_key=? AND key=?); SEARCH _endings USING INDEX sqlite_autoindex__endings_1 (entity=? AND line=?); SEARCH h USING INDEX _hearings_to (entity=? AND line=? AND to_key=? AND key=?); SEARCH _endings USING INDEX sqlite_autoindex__endings_1 (entity=? AND line=?); SEARCH _endings USING INDEX sqlite_autoindex__endings_1 (entity=? AND line=? AND key=? AND to_key=?); SEARCH _endings USING INDEX sqlite_autoindex__endings_1 (entity=? AND line=?); SCAN (subquery-10); USE TEMP B-TREE FOR ORDER BY; SCAN (subquery-17); SCAN (subquery-11); SEARCH _hearings EXISTS USING INDEX _hearings_to (entity=? AND line=? AND to_key=? AND key=?)]
+  SELECT (SELECT count(*) FROM (SELECT DISTINCT key, to_key FROM _hearings WHERE entity = ?1 AND line = 'main' AND (?2 IS NULL OR axis <= ?2) AND (?3 IS NULL OR known <= ?3) AND (until IS NULL OR until > coalesce(?3, 9223372036854775807)))) -
+    SCAN CONSTANT ROW
+    SCALAR SUBQUERY 2
+    CO-ROUTINE (subquery-1)
+    SEARCH _hearings USING INDEX _hearings_at (entity=? AND line=?)
+    SCAN (subquery-1)
+    SCALAR SUBQUERY 15
+    CO-ROUTINE (subquery-11)
+    CO-ROUTINE (subquery-17)
+    CO-ROUTINE (subquery-10)
+    COMPOUND QUERY
+    LEFT-MOST SUBQUERY
+    COMPOUND QUERY
+    LEFT-MOST SUBQUERY
+    SEARCH h USING INDEX _hearings_to (entity=? AND line=? AND to_key=? AND key=?)
+    LIST SUBQUERY 19
+    SEARCH _endings USING INDEX sqlite_autoindex__endings_1 (entity=? AND line=?)
+    UNION ALL
+    SEARCH h USING INDEX _hearings_to (entity=? AND line=? AND to_key=? AND key=?)
+    LIST SUBQUERY 20
+    SEARCH _endings USING INDEX sqlite_autoindex__endings_1 (entity=? AND line=?)
+    SEARCH a USING COVERING INDEX _aliases_at (line=? AND identity=?)
+    UNION ALL
+    SEARCH _endings USING INDEX sqlite_autoindex__endings_1 (entity=? AND line=? AND key=? AND to_key=?)
+    LIST SUBQUERY 21
+    SEARCH _endings USING INDEX sqlite_autoindex__endings_1 (entity=? AND line=?)
+    SCAN (subquery-10)
+    USE TEMP B-TREE FOR ORDER BY
+    SCAN (subquery-17)
+    SCAN (subquery-11)
+    CORRELATED SCALAR SUBQUERY 13
+    SEARCH c USING PRIMARY KEY (entity=? AND line=? AND key=? AND to_key=?)
+    SEARCH _hearings EXISTS USING INDEX _hearings_to (entity=? AND line=? AND to_key=? AND key=?)
+
+## toy stats read  [SCAN _stats]
+  SELECT entity, n FROM _stats ORDER BY entity
+    SCAN _stats
+
+## answer counts, default known-at  [seeks only]
+  SELECT max(k) FROM (SELECT max(known) AS k FROM _hearings UNION ALL SELECT max(until) FROM _hearings UNION ALL SELECT max(known) FROM _aliases UNION ALL SELECT max(known) FROM _endings UNION ALL SELECT max(known) FROM _ends)
+    CO-ROUTINE (subquery-5)
+    COMPOUND QUERY
+    LEFT-MOST SUBQUERY
+    SEARCH _hearings USING COVERING INDEX _hearings_at
+    UNION ALL
+    SEARCH _hearings
+    UNION ALL
+    SEARCH _aliases USING PRIMARY KEY
+    UNION ALL
+    SEARCH _endings
+    UNION ALL
+    SEARCH _ends USING PRIMARY KEY
+    SEARCH (subquery-5)
+
+## fill  [seeks only]
+  SELECT try_limit FROM _fill WHERE one = 1
+    SEARCH _fill USING INTEGER PRIMARY KEY (rowid=?)
+
+## fill  [seeks only]
+  SELECT seq FROM _work WHERE worker = ?1 AND reason IS NOT NULL AND tries < ?2 ORDER BY seq
+    SEARCH _work USING PRIMARY KEY (worker=?)
+
+## fill  [SCAN CONSTANT ROW; SCAN sqlite_sequence]
+  SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = '_events'), 0)
+    SCAN CONSTANT ROW
+    SCALAR SUBQUERY 1
+    SCAN sqlite_sequence
+
+## fill  [seeks only]
+  SELECT cursor FROM _places WHERE worker = ?1
+    SEARCH _places USING PRIMARY KEY (worker=?)
+
+## fill  [SCAN _ontology]
+  SELECT kind, body FROM _ontology
+    SCAN _ontology
+
+## fill  [SCAN _waiting; USE TEMP B-TREE FOR DISTINCT]
+  SELECT DISTINCT id FROM _waiting
+    SCAN _waiting
+    USE TEMP B-TREE FOR DISTINCT
+
+## fill  [SCAN CONSTANT ROW; SCAN _renames]
+  SELECT EXISTS (SELECT 1 FROM _renames)
+    SCAN CONSTANT ROW
+    SCALAR SUBQUERY 1
+    SCAN _renames
+
+## fill  [seeks only]
+  SELECT seq, id, body FROM _events WHERE seq > ?1 AND seq <= ?2 ORDER BY seq
+    SEARCH _events USING INTEGER PRIMARY KEY (rowid>? AND rowid<?)
+
+## fill  [SEARCH _hearings USING INDEX sqlite_autoindex__hearings_1 (line=? AND identity=?)]
+  SELECT event, seq FROM _hearings WHERE line = 'main' AND identity = ?1
+    SEARCH _hearings USING INDEX sqlite_autoindex__hearings_1 (line=? AND identity=?)
+
+## fill  [seeks only]
+  INSERT INTO _hearings(identity, entity, key, to_key, event, seq, source, valid, axis, known, recorded, properties) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+
+## fill  [SCAN (subquery-2); USE TEMP B-TREE FOR ORDER BY; SCAN (subquery-5); USE TEMP B-TREE FOR ORDER BY; SCAN (subquery-8); USE TEMP B-TREE FOR ORDER BY]
+  SELECT s.first_hearing, s.first_ending, coalesce(fh.axis, fe.axis), coalesce(fh.known, fe.known), coalesce(fh.event, fe.event), s.last_hearing, s.last_ending, coalesce((SELECT axis FROM (SELECT h.arrived, h.identity, h.key, h.to_key, h.even
+    SEARCH s USING PRIMARY KEY (entity=? AND line=? AND key=? AND to_key=?)
+    SEARCH fh USING INTEGER PRIMARY KEY (rowid=?) LEFT-JOIN
+    SEARCH fe USING INTEGER PRIMARY KEY (rowid=?) LEFT-JOIN
+    SEARCH le USING INTEGER PRIMARY KEY (rowid=?) LEFT-JOIN
+    CORRELATED SCALAR SUBQUERY 3
+    CO-ROUTINE (subquery-2)
+    COMPOUND QUERY
+    LEFT-MOST SUBQUERY
+    SEARCH h USING INTEGER PRIMARY KEY (rowid=?)
+    UNION ALL
+    SEARCH h USING INTEGER PRIMARY KEY (rowid=?)
+    SEARCH a USING COVERING INDEX _aliases_at (line=? AND identity=?)
+    SCAN (subquery-2)
+    USE TEMP B-TREE FOR ORDER BY
+    CORRELATED SCALAR SUBQUERY 6
+    CO-ROUTINE (subquery-5)
+    COMPOUND QUERY
+    LEFT-MOST SUBQUERY
+    SEARCH h USING INTEGER PRIMARY KEY (rowid=?)
+    UNION ALL
+    SEARCH h USING INTEGER PRIMARY KEY (rowid=?)
+    SEARCH a USING COVERING INDEX _aliases_at (line=? AND identity=?)
+    SCAN (subquery-5)
+    USE TEMP B-TREE FOR ORDER BY
+    CORRELATED SCALAR SUBQUERY 9
+    CO-ROUTINE (subquery-8)
+    COMPOUND QUERY
+    LEFT-MOST SUBQUERY
+    SEARCH h USING INTEGER PRIMARY KEY (rowid=?)
+    UNION ALL
+    SEARCH h USING INTEGER PRIMARY KEY (rowid=?)
+    SEARCH a USING COVERING INDEX _aliases_at (line=? AND identity=?)
+    SCAN (subquery-8)
+    USE TEMP B-TREE FOR ORDER BY
+
+## fill  [SEARCH _hearings USING INDEX _hearings_at (entity=? AND line=? AND key=? AND to_key=?); SEARCH _endings USING INDEX sqlite_autoindex__endings_1 (entity=? AND line=? AND key=? AND to_key=?); SCAN (subquery-2)]
+  SELECT * FROM (SELECT arrived, NULL, axis, known, event, valid FROM _hearings WHERE entity = ?1 AND line = 'main' AND key = ?2 AND to_key IS nullif(?3, '') AND until IS NULL AND arrived IS NOT ?4 UNION ALL SELECT NULL, id, axis, known, even
+    CO-ROUTINE (subquery-2)
+    COMPOUND QUERY
+    LEFT-MOST SUBQUERY
+    SEARCH _hearings USING INDEX _hearings_at (entity=? AND line=? AND key=? AND to_key=?)
+    UNION ALL
+    SEARCH _endings USING INDEX sqlite_autoindex__endings_1 (entity=? AND line=? AND key=? AND to_key=?)
+    SCAN (subquery-2)
+
+## fill  [seeks only]
+  INSERT INTO "class:book"(key, source, valid, recorded, "p:title") VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(key) DO NOTHING
+
+## fill  [seeks only]
+  SELECT from_key, to_key, source, valid FROM _open WHERE rel = ?1 AND to_key = ?2
+    SEARCH _open USING PRIMARY KEY (rel=?)
+
+## fill  [seeks only]
+  INSERT INTO "class:author"(key, source, valid, recorded, "p:title") VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(key) DO NOTHING
+
+## fill  [seeks only]
+  SELECT from_key, to_key, source, valid FROM _open WHERE rel = ?1 AND from_key = ?2
+    SEARCH _open USING PRIMARY KEY (rel=? AND from_key=?)
+
+## fill  [seeks only]
+  SELECT 1 FROM _endings WHERE entity = ?1 AND key = ?2 AND to_key = ?3 LIMIT 1
+    SEARCH _endings USING COVERING INDEX sqlite_autoindex__endings_1 (entity=?)
+
+## fill  [seeks only]
+  SELECT id FROM "class:author" WHERE key = ?1
+    SEARCH class:author USING COVERING INDEX sqlite_autoindex_class:author_1 (key=?)
+
+## fill  [seeks only]
+  SELECT id FROM "class:book" WHERE key = ?1
+    SEARCH class:book USING COVERING INDEX sqlite_autoindex_class:book_1 (key=?)
+
+## fill  [seeks only]
+  INSERT INTO "relation:wrote"(src, dst, source, valid, recorded) VALUES ((SELECT id FROM "class:author" WHERE key = ?1), (SELECT id FROM "class:book" WHERE key = ?2), ?3, ?4, ?5) ON CONFLICT(src, dst) DO NOTHING
+    SCALAR SUBQUERY 1
+    SEARCH class:author USING COVERING INDEX sqlite_autoindex_class:author_1 (key=?)
+    SCALAR SUBQUERY 2
+    SEARCH class:book USING COVERING INDEX sqlite_autoindex_class:book_1 (key=?)
+
+## fill  [seeks only]
+  INSERT INTO _ends(entity, key, to_key, event, source, axis, valid, known) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT(entity, line, key, to_key) DO UPDATE SET event = excluded.event, source = excluded.source, axis = excluded.axis, v
+
+## fill  [seeks only]
+  INSERT OR IGNORE INTO _endings(entity, key, to_key, axis, event, source, valid, known) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+
+## fill  [seeks only]
+  INSERT INTO _seen(entity, key, to_key, first_hearing, first_ending, last_hearing, last_ending, recorded_hearing, recorded_ending, first_true, count) VALUES (?1, ?2, ?3, ?4, ?5, ?4, ?5, ?4, ?5, ?6, 1)
+
+## fill  [seeks only]
+  UPDATE _seen SET first_hearing = ?4, first_ending = ?5, last_hearing = ?6, last_ending = ?7, count = count + ?8, first_true = CASE WHEN ?9 IS NOT NULL AND (first_true IS NULL OR (CASE WHEN length(?9) = 7 THEN ?9 || '-01' ELSE ?9 END) < (CAS
+    SEARCH _seen USING PRIMARY KEY (entity=? AND line=? AND key=? AND to_key=?)
+
+## fill  [seeks only]
+  INSERT OR IGNORE INTO _aliases(identity, alias, axis, known) VALUES (?1, ?2, ?3, ?4)
+
+## fill  [SEARCH _hearings USING INDEX sqlite_autoindex__hearings_1 (line=? AND identity=?)]
+  SELECT entity, key, to_key FROM _hearings WHERE line = 'main' AND identity = ?1
+    SEARCH _hearings USING INDEX sqlite_autoindex__hearings_1 (line=? AND identity=?)
+
+## fill  [SEARCH h USING INDEX _hearings_at (entity=? AND line=? AND key=? AND to_key=?); SEARCH h USING INDEX _hearings_at (entity=? AND line=? AND key=? AND to_key=?); USE TEMP B-TREE FOR ORDER BY]
+  SELECT arrived, NULL, axis, known, event FROM (SELECT h.arrived, h.identity, h.key, h.to_key, h.event AS name, h.source, h.valid, h.recorded, h.properties, h.until, h.axis AS axis, h.known AS known, h.event AS event FROM _hearings h WHERE h
+    MERGE (UNION ALL)
+    LEFT
+    SEARCH h USING INDEX _hearings_at (entity=? AND line=? AND key=? AND to_key=?)
+    RIGHT
+    SEARCH h USING INDEX _hearings_at (entity=? AND line=? AND key=? AND to_key=?)
+    SEARCH a USING COVERING INDEX _aliases_at (line=? AND identity=?)
+    USE TEMP B-TREE FOR ORDER BY
+
+## fill  [SEARCH _endings USING INDEX sqlite_autoindex__endings_1 (entity=? AND line=? AND key=? AND to_key=?); USE TEMP B-TREE FOR LAST 2 TERMS OF ORDER BY]
+  SELECT NULL, id, axis, known, event FROM _endings WHERE entity = ?1 AND line = 'main' AND key = ?2 AND to_key = ?3 ORDER BY axis ASC, known ASC, event ASC LIMIT 1
+    SEARCH _endings USING INDEX sqlite_autoindex__endings_1 (entity=? AND line=? AND key=? AND to_key=?)
+    USE TEMP B-TREE FOR LAST 2 TERMS OF ORDER BY
+
+## fill  [SEARCH h USING INDEX _hearings_at (entity=? AND line=? AND key=? AND to_key=?); SEARCH h USING INDEX _hearings_at (entity=? AND line=? AND key=? AND to_key=?); USE TEMP B-TREE FOR ORDER BY]
+  SELECT arrived, NULL, axis, known, event FROM (SELECT h.arrived, h.identity, h.key, h.to_key, h.event AS name, h.source, h.valid, h.recorded, h.properties, h.until, h.axis AS axis, h.known AS known, h.event AS event FROM _hearings h WHERE h
+    MERGE (UNION ALL)
+    LEFT
+    SEARCH h USING INDEX _hearings_at (entity=? AND line=? AND key=? AND to_key=?)
+    RIGHT
+    SEARCH h USING INDEX _hearings_at (entity=? AND line=? AND key=? AND to_key=?)
+    SEARCH a USING COVERING INDEX _aliases_at (line=? AND identity=?)
+    USE TEMP B-TREE FOR ORDER BY
+
+## fill  [SEARCH _endings USING INDEX sqlite_autoindex__endings_1 (entity=? AND line=? AND key=? AND to_key=?); USE TEMP B-TREE FOR LAST 2 TERMS OF ORDER BY]
+  SELECT NULL, id, axis, known, event FROM _endings WHERE entity = ?1 AND line = 'main' AND key = ?2 AND to_key = ?3 ORDER BY axis DESC, known DESC, event DESC LIMIT 1
+    SEARCH _endings USING INDEX sqlite_autoindex__endings_1 (entity=? AND line=? AND key=? AND to_key=?)
+    USE TEMP B-TREE FOR LAST 2 TERMS OF ORDER BY
+
+## fill  [SCAN _events]
+  SELECT seq, body FROM _events WHERE CASE WHEN json_valid(body) THEN json_extract(body, '$.id') = ?2 AND json_extract(body, '$.source') = ?1 ELSE 0 END ORDER BY seq LIMIT 1
+    SCAN _events
+
+## fill  [SEARCH _hearings USING INDEX _hearings_seq (seq=?)]
+  SELECT arrived, entity, key, to_key, event, axis, known FROM _hearings WHERE line = 'main' AND seq = ?1 AND amended IS NULL
+    SEARCH _hearings USING INDEX _hearings_seq (seq=?)
+
+## fill  [seeks only]
+  INSERT OR IGNORE INTO _amendments(target, known, event, seq) VALUES (?1, ?2, ?3, ?4)
+
+## fill  [seeks only]
+  SELECT id, body FROM _events WHERE seq = ?1
+    SEARCH _events USING INTEGER PRIMARY KEY (rowid=?)
+
+## fill  [SEARCH _hearings USING INDEX sqlite_autoindex__hearings_1 (line=?)]
+  SELECT entity, key, to_key FROM _hearings WHERE line = 'main' AND amended = ?1
+    SEARCH _hearings USING INDEX sqlite_autoindex__hearings_1 (line=?)
+
+## fill  [SEARCH _hearings USING INDEX sqlite_autoindex__hearings_1 (line=?)]
+  DELETE FROM _hearings WHERE line = 'main' AND amended = ?1
+    SEARCH _hearings USING INDEX sqlite_autoindex__hearings_1 (line=?)
+
+## fill  [seeks only]
+  UPDATE _hearings SET until = NULL WHERE arrived = ?1
+    SEARCH _hearings USING INTEGER PRIMARY KEY (rowid=?)
+
+## fill  [USE TEMP B-TREE FOR ORDER BY]
+  SELECT old, new, known, event FROM _renames WHERE entity = ?1 ORDER BY known, event
+    SEARCH _renames USING PRIMARY KEY (entity=?)
+    USE TEMP B-TREE FOR ORDER BY
+
+## fill  [seeks only]
+  SELECT a.known, a.event, e.body FROM _amendments a JOIN _events e ON e.seq = a.seq WHERE a.target = ?1 ORDER BY a.known, a.event
+    SEARCH a USING PRIMARY KEY (target=?)
+    SEARCH e USING INTEGER PRIMARY KEY (rowid=?)
+
+## fill  [seeks only]
+  UPDATE _hearings SET until = ?2 WHERE arrived = ?1
+    SEARCH _hearings USING INTEGER PRIMARY KEY (rowid=?)
+
+## fill  [seeks only]
+  INSERT INTO _hearings(identity, entity, key, to_key, event, seq, source, valid, axis, known, recorded, properties, amended) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?6)
+
+## fill  [SCAN CONSTANT ROW; SEARCH _hearings USING INDEX _hearings_at (entity=? AND line=? AND key=? AND to_key=?)]
+  SELECT (SELECT count(*) FROM _hearings WHERE entity = ?1 AND line = 'main' AND key = ?2 AND to_key IS nullif(?3, '') AND until IS NULL) + (SELECT count(*) FROM _endings WHERE entity = ?1 AND line = 'main' AND key = ?2 AND to_key = ?3)
+    SCAN CONSTANT ROW
+    SCALAR SUBQUERY 1
+    SEARCH _hearings USING INDEX _hearings_at (entity=? AND line=? AND key=? AND to_key=?)
+    SCALAR SUBQUERY 2
+    SEARCH _endings USING COVERING INDEX sqlite_autoindex__endings_1 (entity=? AND line=? AND key=? AND to_key=?)
+
+## fill  [seeks only]
+  DELETE FROM _seen WHERE entity = ?1 AND line = 'main' AND key = ?2 AND to_key = ?3
+    SEARCH _seen USING PRIMARY KEY (entity=? AND line=? AND key=? AND to_key=?)
+
+## fill  [SEARCH class:book USING INDEX sqlite_autoindex_class:book_1 (key=?)]
+  UPDATE "class:book" SET source = ?2, valid = ?3, recorded = ?4, "p:title" = ?5 WHERE key = ?1
+    SEARCH class:book USING INDEX sqlite_autoindex_class:book_1 (key=?)
+
+## fill
+  (plan failed: no such table: stats_delta)
+  INSERT INTO stats_delta VALUES (?1, ?2)
+
+## fill
+  (plan failed: no such table: stats_delta)
+  INSERT INTO _stats(entity, n) SELECT entity, sum(d) FROM stats_delta WHERE true GROUP BY entity ON CONFLICT(entity) DO UPDATE SET n = n + excluded.n;
+
+## fill
+  (plan failed: no such table: stats_delta)
+  DELETE FROM stats_delta;
+
+## fill  [seeks only]
+  INSERT INTO _places(worker, cursor) VALUES (?1, ?2) ON CONFLICT(worker) DO UPDATE SET cursor = excluded.cursor
+
+## fill  [seeks only]
+  INSERT INTO _open(rel, from_key, to_key, source, valid) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(rel, from_key, to_key) DO UPDATE SET source = excluded.source, valid = excluded.valid WHERE source IS NOT excluded.source OR valid IS NOT exclud
+
