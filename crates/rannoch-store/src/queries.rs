@@ -138,7 +138,8 @@ pub(crate) const RESET_TRIES: &str =
 /// known-at; the latest conclusion by known-at for each link that ended or was found wrong
 /// (`axis` null for a correction, which masks its endings); every ending of a link, at its point
 /// (`valid` null when unknown); what is kept of when each node and link was seen; the
-/// amendments waiting for their target; and the check value of the graph's key.
+/// amendments waiting for their target; the check value of the graph's key; and the highest
+/// known-at ever filled, a high-water mark seeded by one scan when a store first has none kept.
 ///
 /// Every history table carries the line it belongs to in its key. Every history read and write
 /// is on the line `'main'` until a second line exists.
@@ -158,8 +159,7 @@ pub(crate) const HISTORY_TABLES: &str = "
         event TEXT NOT NULL, PRIMARY KEY(entity, old, known, event)) WITHOUT ROWID;
     CREATE INDEX IF NOT EXISTS _hearings_at
         ON _hearings(entity, line, key, to_key, axis, known, event);
-    CREATE INDEX IF NOT EXISTS _hearings_to
-        ON _hearings(entity, line, to_key, key) WHERE to_key IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS _hearings_to ON _hearings(entity, line, to_key, key);
     CREATE TABLE IF NOT EXISTS _aliases(
         line TEXT NOT NULL DEFAULT 'main', identity BLOB NOT NULL, alias TEXT NOT NULL,
         axis BLOB NOT NULL, known INTEGER NOT NULL,
@@ -185,7 +185,13 @@ pub(crate) const HISTORY_TABLES: &str = "
     CREATE TABLE IF NOT EXISTS _waiting(
         source TEXT NOT NULL, id TEXT NOT NULL, known INTEGER NOT NULL, event TEXT NOT NULL,
         seq INTEGER NOT NULL, PRIMARY KEY(source, id, known, event)) WITHOUT ROWID;
-    CREATE TABLE IF NOT EXISTS _check(value TEXT NOT NULL);";
+    CREATE TABLE IF NOT EXISTS _check(value TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS _newest(one INTEGER PRIMARY KEY CHECK (one = 1), known INTEGER);
+    INSERT OR IGNORE INTO _newest(one, known) SELECT 1, (SELECT max(k) FROM (
+        SELECT max(known) AS k FROM _hearings UNION ALL SELECT max(until) FROM _hearings
+        UNION ALL SELECT max(known) FROM _aliases UNION ALL SELECT max(known) FROM _endings
+        UNION ALL SELECT max(known) FROM _ends))
+        WHERE NOT EXISTS (SELECT 1 FROM _newest);";
 
 pub(crate) const CHECK: &str = "SELECT value FROM _check";
 
@@ -708,11 +714,15 @@ pub(crate) fn node_count() -> String {
     format!("SELECT count(DISTINCT key) FROM _hearings WHERE entity = ?1 AND {IN_VIEW}")
 }
 
-/// The greatest known-at the store holds: of a hearing, the amendment that superseded one, an
-/// alias, an ending or a conclusion. A read known at it reads all the store knows.
-pub(crate) const KNOWN_NOW: &str = "SELECT max(k) FROM (SELECT max(known) AS k FROM _hearings \
-     UNION ALL SELECT max(until) FROM _hearings UNION ALL SELECT max(known) FROM _aliases \
-     UNION ALL SELECT max(known) FROM _endings UNION ALL SELECT max(known) FROM _ends)";
+/// The highest known-at ever filled: of a hearing, the amendment that superseded one, an alias,
+/// an ending or a conclusion, kept by fill per batch. It can exceed the greatest the tables hold
+/// now, after a later-filled amendment makes an earlier one redundant; a read known at either
+/// reads the same state, all the store knows.
+pub(crate) const KNOWN_NOW: &str = "SELECT known FROM _newest";
+
+/// Raises the highest known-at ever filled to `?1`.
+pub(crate) const KEEP_NEWEST: &str =
+    "UPDATE _newest SET known = ?1 WHERE known IS NULL OR known < ?1";
 
 /// Picks the newest version row in the view.
 pub(crate) fn newest_in_view() -> String {
@@ -886,14 +896,14 @@ fn property_value(property: &str) -> String {
     )
 }
 
-/// Indexes the hearings of `class`'s nodes by the value of `property`. Only that class's hearings
-/// are in it, so a write of any other pays nothing for it.
+/// Indexes the hearings of `class`'s nodes by the value of `property`, led by the entity so a
+/// read seeks that class's. No index is partial: a `WHERE` on a column a statement binds makes
+/// SQLite prepare that statement again whenever the bound value changes.
 pub(crate) fn create_property_index(class: &str, property: &str) -> String {
     format!(
-        "CREATE INDEX IF NOT EXISTS {} ON _hearings({}, key) WHERE entity = {} AND line = 'main';",
+        "CREATE INDEX IF NOT EXISTS {} ON _hearings(entity, {}, key);",
         ident(&format!("_by:{}:{class}:{property}", class.len())),
-        property_value(property),
-        literal(&format!("{CLASS}:{class}"))
+        property_value(property)
     )
 }
 

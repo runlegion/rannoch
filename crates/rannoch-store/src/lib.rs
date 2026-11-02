@@ -341,6 +341,7 @@ impl Graph {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let ontology = load(&tx)?;
+        history::take_noted();
         for seq in again {
             let Some(event) = event_at(&tx, Cursor(seq))? else {
                 continue;
@@ -350,6 +351,7 @@ impl Graph {
                 Err(cause) => tried(&tx, seq, &cause)?,
             };
         }
+        history::keep_noted(&tx)?;
         tx.commit()?;
         Ok(to)
     }
@@ -374,6 +376,7 @@ impl Graph {
         let log = Events { conn: &tx };
         let mut flags = Flags::read(&tx)?;
         let before = flags.clone();
+        history::take_noted();
         tx.execute_batch(SAVEPOINT)?;
         let mut to = from;
         let mut failed = false;
@@ -397,6 +400,7 @@ impl Graph {
         if failed {
             tx.execute_batch(ROLLBACK_TO)?;
             flags = before;
+            history::take_noted();
             for event in log.since_until(from, to)? {
                 if let Err(cause) = attempt(&tx, &ontology, &self.key, &event, &mut flags)? {
                     tried(&tx, event.cursor.0, &cause)?;
@@ -405,6 +409,7 @@ impl Graph {
         } else {
             tx.execute_batch(RELEASE)?;
         }
+        history::keep_noted(&tx)?;
         tx.prepare_cached(SET_PLACE)?.execute(params![FILL, to.0])?;
         tx.commit()?;
         Ok(to)
@@ -479,6 +484,7 @@ fn attempt(
 ) -> Result<Result<(), Error>, Error> {
     tx.execute_batch(SAVEPOINT)?;
     let before = flags.clone();
+    let noted = history::take_noted();
     let filled = fill_one(tx, ontology, key, event, flags).map_err(|cause| {
         Error::Refused(format!(
             "event at {} cannot be filled: {cause}",
@@ -487,7 +493,9 @@ fn attempt(
     });
     if filled.is_err() {
         *flags = before;
+        history::take_noted();
     }
+    history::note(noted);
     tx.execute_batch(if filled.is_ok() { RELEASE } else { ROLLBACK_TO })?;
     Ok(filled)
 }
@@ -2748,6 +2756,75 @@ mod tests {
             }
         }
         all
+    }
+
+    /// The greatest known-at the store holds, found by scanning every fact table.
+    fn newest_by_scan(g: &crate::Graph) -> Result<Option<i64>, crate::Error> {
+        Ok(g.conn.query_row(
+            "SELECT max(k) FROM (SELECT max(known) AS k FROM _hearings \
+             UNION ALL SELECT max(until) FROM _hearings UNION ALL SELECT max(known) FROM _aliases \
+             UNION ALL SELECT max(known) FROM _endings UNION ALL SELECT max(known) FROM _ends)",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    #[test]
+    fn a_query_with_no_known_at_reads_at_the_newest_fill_kept()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = graph("kept-known")?;
+        let target = book_at(1_000, "b1", "one");
+        let named: serde_json::Value = serde_json::from_str(&target)?;
+        let named = ("rannoch:shop", named["id"].as_str().unwrap_or_default());
+        let asked = |known: Option<i64>| {
+            let view = known.map_or(String::new(), |k| format!(r#","view":{{"known":{k}}}"#));
+            format!(
+                r#"{{"specversion":"1.0","id":"q","source":"app","type":"rannoch.query","data":{{"describe":{{"node":{{"class":"book","key":"b1"}}}}{view}}}}}"#
+            )
+        };
+        let batches = [
+            // An amendment known after its target, logged before it: it waits.
+            vec![
+                amending(4_000, named, r#"{"data":{"properties":{"title":"four"}}}"#),
+                node_with(&id_at(2_000), "author", "a1", "ann"),
+            ],
+            // The target, the author again under a later and an earlier id, and an ending.
+            vec![
+                target.clone(),
+                link_with(&id_at(2_500), "a1", "b1"),
+                node_with(&id_at(3_000), "author", "a1", "ann"),
+                node_with(&id_at(1_500), "author", "a1", "ann"),
+                concluded(&id_at(3_500), "ended", "a1", "b1"),
+            ],
+            vec![amending(
+                5_000,
+                named,
+                r#"{"data":{"properties":{"title":"five"}}}"#,
+            )],
+        ];
+        let mut kept = Vec::new();
+        for batch in &batches {
+            g.commit(&batch.iter().map(String::as_str).collect::<Vec<_>>(), &[])?;
+            g.fill()?;
+            assert_eq!(g.stopped()?, vec![]);
+            let scanned = newest_by_scan(&g)?;
+            let mut answer = String::new();
+            let ran = statements(&mut g, |g| {
+                answer = g.answer(&asked(None))?;
+                Ok(crate::Cursor(0))
+            })?;
+            assert!(
+                !ran.iter().any(|sql| sql.contains("max(known)")),
+                "no fact table is scanned: {ran:?}"
+            );
+            let answer: serde_json::Value = serde_json::from_str(&answer)?;
+            let at_scan: serde_json::Value = serde_json::from_str(&g.answer(&asked(scanned))?)?;
+            assert_eq!(answer["data"]["known"].as_i64(), scanned);
+            assert_eq!(answer["data"], at_scan["data"], "answers as the scan did");
+            kept.push(scanned);
+        }
+        assert_eq!(kept, [Some(2_000_000), Some(4_000_000), Some(5_000_000)]);
+        Ok(())
     }
 
     #[test]

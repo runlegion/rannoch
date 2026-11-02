@@ -238,8 +238,9 @@ impl Graph {
     /// Answers the `rannoch.query` event `query` with the body of a `rannoch.answer` event: its
     /// subject the query's id, its data the read's result and the known-at it was read at. A
     /// query's data is one read (`links`, `nodes`, `counts` or `describe`) and its `view`; a
-    /// view with no known-at is read at the greatest known-at the store holds, which reads all
-    /// it knows. The in-process reads are the fast path; this asks them.
+    /// view with no known-at is read at the highest known-at ever filled, which reads all it
+    /// knows. After a redundant amendment that can exceed the greatest known-at the tables hold
+    /// now; the state read is the same either way, and only the answer's known-at differs. The in-process reads are the fast path; this asks them.
     ///
     /// # Errors
     /// [`Error::Refused`] when `query` is not a `CloudEvents` 1.0 `rannoch.query` event or its
@@ -799,6 +800,74 @@ mod tests {
             g.describe(&b9, &View::default())?.map(|d| d.links),
             Some(BTreeMap::from([(("wrote".into(), In), 2)]))
         );
+        Ok(())
+    }
+
+    /// Each statement a traced connection ran: how often SQLite had prepared it again by its
+    /// first run, and by its last.
+    static PREPARED: std::sync::Mutex<BTreeMap<String, (i32, i32)>> =
+        std::sync::Mutex::new(BTreeMap::new());
+
+    fn prepared(event: rusqlite::trace::TraceEvent<'_>) {
+        if let rusqlite::trace::TraceEvent::Profile(statement, _) = event
+            && let Ok(mut seen) = PREPARED.lock()
+        {
+            let again = statement.get_status(rusqlite::StatementStatus::RePrepare);
+            seen.entry(statement.sql().into_owned())
+                .or_insert((again, again))
+                .1 = again;
+        }
+    }
+
+    #[test]
+    fn fill_and_reads_run_their_statements_without_preparing_them_again() -> Result {
+        let mut g = graph("reprepare")?;
+        g.conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_PROFILE,
+            Some(prepared),
+        );
+        let refs: Vec<String> = events();
+        let refs: Vec<&str> = refs.iter().map(String::as_str).collect();
+        for landed in g.commit(&refs, &[])? {
+            landed?;
+        }
+        g.fill()?;
+        let fiction = BTreeMap::from([("genre".to_string(), Value::from("fiction"))]);
+        for view in [View::default(), at(15)] {
+            for (node, direction) in [
+                (NodeRef::new("author", "a1"), Out),
+                (NodeRef::new("book", "b1"), In),
+            ] {
+                g.links(&node, "wrote", direction, &view)?;
+                g.describe(&node, &view)?;
+                g.state_at(&node, &view)?;
+            }
+            g.nodes("book", &fiction, &view)?;
+            g.link_state_at("wrote", "a1", "b1", &view)?;
+            g.link_state_at("wrote", "a2", "b1", &view)?;
+            g.counts(&view)?;
+        }
+        g.conn
+            .trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
+        let partial: Vec<String> = g
+            .conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND sql LIKE '% WHERE %'",
+            )?
+            .query_map([], |row| row.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        // A schema change prepares every statement again once; a bound value never should.
+        let again: Vec<String> = PREPARED
+            .lock()
+            .map(|seen| {
+                seen.iter()
+                    .filter(|(_, (first, last))| last > first)
+                    .map(|(sql, _)| sql.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(again, Vec::<String>::new(), "prepared again between runs");
+        assert_eq!(partial, Vec::<String>::new(), "no index is partial");
         Ok(())
     }
 

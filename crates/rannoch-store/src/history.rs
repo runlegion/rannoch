@@ -7,6 +7,7 @@
 //! hearing at a later point reopens it; a link found wrong records a correction, which is not an
 //! ending. When each node and link was first and last heard is kept as it is recorded.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -21,12 +22,38 @@ use crate::ontology::{CLASS, RELATION};
 use crate::queries::{
     ALIAS, ALIASES_OF, AMENDED_OF, AMENDMENT, AMENDMENTS_OF, CHECK, CONCLUDE, CORRECTED,
     DROP_AMENDED, ENDING, EVENT_AT, EVENT_BY_CLOUDEVENT, FACTS_KNOWN, HEAR, HEAR_AMENDED,
-    HEARING_OF, HELD, KNOWN_AGAIN, KNOWN_UNTIL, MADE_BY, PLACES_NAMING, RENAME, RENAME_ENDINGS,
-    RENAME_ENDS, RENAMED, RENAMES_IN, SEEN_OTHER, SEEN_PUT, SEEN_START, SET_CHECK, UNSEEN, WAIT,
-    WAS_RENAMED, as_of, edge_ending, edge_hearing, ended_sql, hearings, link_ending, link_state,
-    newest_in_view, order, seen_keep, seen_kept, seen_recount, seen_sql, version_row, view_row,
+    HEARING_OF, HELD, KEEP_NEWEST, KNOWN_AGAIN, KNOWN_UNTIL, MADE_BY, PLACES_NAMING, RENAME,
+    RENAME_ENDINGS, RENAME_ENDS, RENAMED, RENAMES_IN, SEEN_OTHER, SEEN_PUT, SEEN_START, SET_CHECK,
+    UNSEEN, WAIT, WAS_RENAMED, as_of, edge_ending, edge_hearing, ended_sql, hearings, link_ending,
+    link_state, newest_in_view, order, seen_keep, seen_kept, seen_recount, seen_sql, version_row,
+    view_row,
 };
 use crate::{Error, Graph};
+
+thread_local! {
+    /// The greatest known-at fill has written since the last take: what its batch keeps.
+    static NOTED: Cell<Option<i64>> = const { Cell::new(None) };
+}
+
+/// Notes a known-at fill writes into the history tables.
+pub(crate) fn note(known: Option<i64>) {
+    if let Some(known) = known {
+        NOTED.with(|noted| noted.set(Some(noted.get().map_or(known, |k| k.max(known)))));
+    }
+}
+
+/// The known-ats noted since the last take, leaving none: an event rolled back drops its own.
+pub(crate) fn take_noted() -> Option<i64> {
+    NOTED.with(Cell::take)
+}
+
+/// Raises the store's highest known-at ever filled to the greatest noted in the batch.
+pub(crate) fn keep_noted(tx: &Connection) -> Result<(), Error> {
+    if let Some(known) = take_noted() {
+        tx.prepare_cached(KEEP_NEWEST)?.execute([known])?;
+    }
+    Ok(())
+}
 
 /// The fixed label whose keyed hash is the check value.
 const CHECK_LABEL: &[u8] = b"rannoch content-identity check";
@@ -243,6 +270,7 @@ fn hear(
     };
     let known = of.event().recorded()?;
     let axis = point_or_known(declared.as_ref(), known);
+    note(Some(known));
     tx.prepare_cached(HEAR)?.execute(params![
         identity,
         entity,
@@ -436,6 +464,7 @@ pub(crate) fn alias(
     }
     let alias = if renamed { held.event } else { event };
     let known = alias.recorded()?;
+    note(Some(known));
     let new = tx.prepare_cached(ALIAS)?.execute(params![
         held.identity,
         alias.to_string(),
@@ -540,6 +569,7 @@ pub(crate) fn conclude(
     let (froms, tos) = (keys(from)?, keys(to)?);
     for from in &froms {
         for to in &tos {
+            note(Some(known));
             tx.prepare_cached(CONCLUDE)?
                 .execute(params![entity, from, to, by, source, at, valid, known])?;
             let Some(at) = &at else {
@@ -923,6 +953,8 @@ pub(crate) fn derive(
             continue;
         }
         heard = identity;
+        // The hearing before is known until `at`, and the new one from `at` or later.
+        note(Some(at.max(made.known)));
         tx.prepare_cached(KNOWN_UNTIL)?
             .execute(params![before, at])?;
         let of = fact.of(&by)?;
