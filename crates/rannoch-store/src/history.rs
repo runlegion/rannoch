@@ -237,24 +237,30 @@ pub(crate) struct Held {
     axis: Option<Vec<u8>>,
 }
 
+/// What [`hear`] did: held an identical hearing, recording nothing, or recorded a new one, which
+/// may be its node's or link's only fact.
+enum Recorded {
+    Held(Held),
+    New { alone: bool },
+}
+
 /// Records what `of` heard, whose content identity is `identity`, as a new version row named by
-/// its origin's event and filled at `stamp`, and returns `Err` saying whether it is its node's or
-/// link's only fact; or, when the graph holds a hearing identical to it, records nothing and
-/// returns that one.
+/// its origin's event and filled at `stamp`; or, when the graph holds a hearing identical to it,
+/// records nothing and returns that one.
 fn hear(
     tx: &impl Run,
     identity: [u8; 32],
     stamp: Stamp,
     of: &Of,
     ontology: &Ontology,
-) -> Result<Result<Held, bool>, Error> {
+) -> Result<Recorded, Error> {
     let held = tx.with(Sql::Held, |s| {
         s.query_row(params![identity], |row| row.get::<_, String>(0))
             .optional()
     })?;
     let declared = of.point(ontology)?;
     if let Some(held) = held {
-        return Ok(Ok(Held {
+        return Ok(Recorded::Held(Held {
             identity,
             event: serde_json::from_value(held.into())?,
             axis: declared,
@@ -292,7 +298,7 @@ fn hear(
         event: of.event().to_string(),
     };
     let alone = saw(tx, (&entity, from, to), &mark, of.valid().as_text())?;
-    Ok(Err(alone))
+    Ok(Recorded::New { alone })
 }
 
 /// A fact a kept seen row names, by its row: a hearing by when this store recorded it, or an
@@ -424,7 +430,7 @@ pub(crate) fn heard(
     let identity = of.identity(key)?;
     let (entity, from, to) = of.entity();
     match hear(tx, identity, stamp, of, ontology)? {
-        Ok(held) => {
+        Recorded::Held(held) => {
             if held.axis.is_some()
                 || newest(tx, (&entity, from, to))?.is_some_and(|(.., newest)| newest == identity)
             {
@@ -433,8 +439,8 @@ pub(crate) fn heard(
             alias(tx, &held, of.event(), stamp.cursor)?;
         }
         // Its only fact is its newest version.
-        Err(true) => return Ok(Heard::Newest),
-        Err(false) => {}
+        Recorded::New { alone: true } => return Ok(Heard::Newest),
+        Recorded::New { alone: false } => {}
     }
     Ok(match newest(tx, (&entity, from, to))? {
         Some((.., newest)) if newest != identity => Heard::Older,
