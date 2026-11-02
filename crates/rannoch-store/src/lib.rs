@@ -2151,6 +2151,65 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn every_alias_lookup_in_fill_and_reads_is_a_seek() -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = graph("alias-seek")?;
+        for seconds in [1_000, 2_000] {
+            g.commit(
+                &[
+                    &node_with(&id_at(seconds), "author", "a1", "ann"),
+                    &book_at(seconds, "b1", "hi"),
+                    &link_with(&id_at(seconds), "a1", "b1"),
+                ],
+                &[],
+            )?;
+        }
+        logged(&mut g, &concluded(&id_at(3_000), "ended", "a1", "b1"))?;
+        let (a1, b1) = (
+            crate::NodeRef::new("author", "a1"),
+            crate::NodeRef::new("book", "b1"),
+        );
+        let ran = statements(&mut g, |g| {
+            let filled = g.fill()?;
+            for view in [crate::View::default(), known_at(2_500)] {
+                g.find_as_of("book", "b1", &crate::Date::day(2024, 1, 1), &view)?;
+                g.links(&a1, "wrote", crate::Direction::Out, &view)?;
+                g.links(&b1, "wrote", crate::Direction::In, &view)?;
+                g.nodes("book", &std::collections::BTreeMap::new(), &view)?;
+                g.counts(&view)?;
+                g.describe(&a1, &view)?;
+                g.state_at(&b1, &view)?;
+                g.link_state_at("wrote", "a1", "b1", &view)?;
+            }
+            g.find("book", "b1")?;
+            g.hearings(&b1)?;
+            g.link_hearings("wrote", "a1", "b1")?;
+            g.seen(&b1)?;
+            g.link_seen("wrote", "a1", "b1")?;
+            g.link_end("wrote", "a1", "b1")?;
+            Ok(filled)
+        })?;
+        assert_eq!(g.hearings(&b1)?[0].aliases.len(), 1, "b1 has an alias");
+        let mut looked = std::collections::BTreeSet::new();
+        for sql in ran.iter().filter(|s| s.contains("_aliases")) {
+            let mut plan = g.conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+            let nulls = vec![rusqlite::types::Null; plan.parameter_count()];
+            let steps: Vec<String> = plan
+                .query_map(rusqlite::params_from_iter(nulls), |row| row.get(3))?
+                .collect::<std::result::Result<_, _>>()?;
+            for step in steps.iter().filter(|s| s.contains("_aliases")) {
+                assert!(
+                    step.starts_with("SEARCH")
+                        && (step.contains("identity=?") || step.contains("alias=?")),
+                    "an alias lookup that is not a seek: {step}\nin {sql}"
+                );
+                looked.insert(sql);
+            }
+        }
+        assert!(looked.len() > 1, "fill and reads look aliases up");
+        Ok(())
+    }
+
     /// A graph whose class `release` declares the axis (build), `run` declares (build, step),
     /// and `book` declares none; the relation `ships` from run to release declares (build).
     fn graph_on_axes(name: &str) -> Result<crate::Graph, crate::Error> {
