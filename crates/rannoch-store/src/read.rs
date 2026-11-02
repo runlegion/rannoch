@@ -201,28 +201,22 @@ impl Graph {
         let mut counts = Counts::default();
         for class in ontology.classes.values() {
             let (axis, known) = bounds(&class.axis, view, &format!("class {}", class.name))?;
-            let count: i64 = self
-                .conn
-                .prepare_cached(&node_count())?
-                .query_row(params![node_entity(&class.name), axis, known], |row| {
-                    row.get(0)
-                })?;
-            counts
-                .nodes
-                .insert(class.name.clone(), u64::try_from(count).unwrap_or(0));
+            let count = counted(
+                &self.conn,
+                &node_count(),
+                params![node_entity(&class.name), axis, known],
+            )?;
+            counts.nodes.insert(class.name.clone(), count);
         }
         for relation in ontology.relations.values() {
             let (axis, known) =
                 bounds(&relation.axis, view, &format!("relation {}", relation.name))?;
-            let count: i64 = self
-                .conn
-                .prepare_cached(&link_count())?
-                .query_row(params![link_entity(&relation.name), axis, known], |row| {
-                    row.get(0)
-                })?;
-            counts
-                .links
-                .insert(relation.name.clone(), u64::try_from(count).unwrap_or(0));
+            let count = counted(
+                &self.conn,
+                &link_count(),
+                params![link_entity(&relation.name), axis, known],
+            )?;
+            counts.links.insert(relation.name.clone(), count);
         }
         Ok(counts)
     }
@@ -250,21 +244,16 @@ impl Graph {
                 }
                 let (axis, known) =
                     bounds(&relation.axis, view, &format!("relation {}", relation.name))?;
-                let count: i64 = self
-                    .conn
-                    .prepare_cached(&format!(
+                let count = counted(
+                    &self.conn,
+                    &format!(
                         "SELECT count(*) FROM ({})",
                         links_in_view(direction == Direction::Out)
-                    ))?
-                    .query_row(
-                        params![link_entity(&relation.name), axis, known, node.key],
-                        |row| row.get(0),
-                    )?;
+                    ),
+                    params![link_entity(&relation.name), axis, known, node.key],
+                )?;
                 if count > 0 {
-                    links.insert(
-                        (relation.name.clone(), direction),
-                        u64::try_from(count).unwrap_or(0),
-                    );
+                    links.insert((relation.name.clone(), direction), count);
                 }
             }
         }
@@ -334,6 +323,16 @@ impl Graph {
         })
         .to_string())
     }
+}
+
+/// The one count `sql` reads with `bound`; refused as out of range if it is negative, which a
+/// count never is.
+fn counted(conn: &Connection, sql: &str, bound: impl rusqlite::Params) -> Result<u64, Error> {
+    let count: i64 = conn
+        .prepare_cached(sql)?
+        .query_row(bound, |row| row.get(0))?;
+    u64::try_from(count)
+        .map_err(|_| Error::Storage(rusqlite::Error::IntegralValueOutOfRange(0, count)))
 }
 
 /// The rows `sql` reads with `bound`, each a key and the columns of a version (see

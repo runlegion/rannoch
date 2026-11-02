@@ -283,13 +283,15 @@ impl Ontology {
             Declaration::Class(class) => match self.classes.get(&class.name) {
                 Some(have) if have == class => Ok(false),
                 Some(have) => Err(Refused(format!(
-                    "class {} is already declared with properties {} and axis {:?}; \
-                     this declaration has {} and {:?}",
+                    "class {} is already declared with properties {}, axis {:?} and indexed \
+                     {:?}; this declaration has {}, {:?} and {:?}",
                     class.name,
                     list(&have.properties),
                     have.axis,
+                    have.indexed,
                     list(&class.properties),
-                    class.axis
+                    class.axis,
+                    class.indexed
                 ))),
                 None => match class
                     .indexed
@@ -422,6 +424,17 @@ mod tests {
             ontology
                 .check(&shelf("colour"))
                 .is_err_and(|refused| refused.0.contains("colour"))
+        );
+        let mut indexed = declared();
+        let Declaration::Class(label) = shelf("label") else {
+            return;
+        };
+        indexed.classes.insert(label.name.clone(), label);
+        assert!(
+            indexed
+                .check(&Declaration::Class(Class::new("shelf", ["label"])))
+                .is_err_and(|refused| refused.0.contains(r#"indexed {"label"}"#)),
+            "a redeclaration that differs only in what it indexes names it"
         );
     }
 
