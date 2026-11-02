@@ -5,7 +5,7 @@ use std::time::SystemTime;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::history::{At, Versioned, newest, node_as_of, node_entity, time};
+use crate::history::{Versioned, View, newest, node_entity, node_in_view, time};
 use crate::queries::select_node;
 use crate::{Class, Date, Error, Graph, Ontology, ValidTime, Value};
 
@@ -32,22 +32,21 @@ impl Graph {
         find_in(&self.conn, &ontology, class, key)
     }
 
-    /// The node of `class` with natural key `key` as of the valid time `as_of`: the version
-    /// true then, as the store knows it now or, given `known_at`, as it knew it at that point on
-    /// the class's axis (a time, or in an integer-keyed class an integer key). Among the
-    /// versions valid on or before `as_of` (and heard at or before `known_at`), the greatest by
-    /// valid time wins, then by the class's order. A version whose valid time is unknown is never
-    /// returned; `None` when no version was valid by then. A month stands for its first day.
+    /// The node of `class` with natural key `key` as of the valid time `as_of`, in `view`: among
+    /// its versions in the view valid on or before `as_of`, the greatest by valid time wins, then
+    /// by the class's order. A version whose valid time is unknown is never returned; `None` when
+    /// no version was valid by then. A month stands for its first day. A read that needs no valid
+    /// time is [`Graph::state_at`].
     ///
     /// # Errors
-    /// [`Error::Refused`] when `as_of` is not a real date, or `known_at` is not on the class's
-    /// axis; the class is not declared, or the graph file cannot be read.
+    /// [`Error::Refused`] when `as_of` is not a real date, or the view's point has more parts
+    /// than the class's axis; the class is not declared, or the graph file cannot be read.
     pub fn find_as_of(
         &self,
         class: &str,
         key: &str,
         as_of: &Date,
-        known_at: Option<At>,
+        view: &View,
     ) -> Result<Option<Node>, Error> {
         let day = day_text(as_of.parts()?);
         let ontology = self.current_ontology()?;
@@ -55,7 +54,7 @@ impl Graph {
         Ok(node_in(
             class,
             key,
-            node_as_of(&self.conn, class, key, &day, known_at)?,
+            node_in_view(&self.conn, class, key, view, Some(&day))?,
         ))
     }
 }

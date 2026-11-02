@@ -1,4 +1,5 @@
-//! Hearings: every write is a hearing of a node or a link, at a point on the time axis. A
+//! Hearings: every write is a hearing of a node or a link, at a point on its class's or
+//! relation's axis, known from the millisecond in its `CloudEvent` id. A
 //! hearing's identity is its content, hashed under the app's key: identical content is one
 //! hearing, and an identical event that arrives from another store under its own id is held as an
 //! alias of it. The key never reaches the store's files; the store keeps only a check value.
@@ -10,21 +11,23 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rannoch_ontology::{Class, HistoryKey, Ontology, Value};
+use rannoch_ontology::{Class, Ontology, Value};
 use rusqlite::{Connection, OptionalExtension, ToSql, TransactionBehavior, params};
 
-use rannoch_cloudevents::{Conclusion, EventId, Fact, LinkFact, NodeFact, NodeRef, ValidTime};
+use rannoch_cloudevents::{
+    Axis, Conclusion, EventId, Fact, LinkFact, NodeFact, NodeRef, ValidTime,
+};
 
 use crate::log::Cursor;
 use crate::ontology::{CLASS, RELATION};
 use crate::queries::{
     ALIAS, ALIASES_OF, AMENDED_OF, AMENDMENT, AMENDMENTS_OF, CHECK, CONCLUDE, CORRECTED,
-    DROP_AMENDED, ENDING, EVENT_AT, EVENT_BY_ID, FACTS_KNOWN, HEAR, HEAR_AMENDED, HEARING_OF, HELD,
-    KNOWN_AGAIN, KNOWN_UNTIL, LATEST_AMENDMENT, MADE_BY, PLACES_NAMING, RENAME, RENAME_ENDINGS,
-    RENAME_ENDS, RENAMED, RENAMES_IN, SEEN_OTHER, SEEN_PUT, SEEN_START, SET_CHECK, UNSEEN,
-    WAS_RENAMED, as_of, by_integer_key, by_point, edge_ending, edge_hearing, ended_sql, hearings,
-    known_link_row, known_version_row, link_ending, link_state, order, seen_keep, seen_kept,
-    seen_recount, seen_sql, version_row,
+    DROP_AMENDED, ENDING, EVENT_AT, EVENT_BY_CLOUDEVENT, FACTS_KNOWN, HEAR, HEAR_AMENDED,
+    HEARING_OF, HELD, KNOWN_AGAIN, KNOWN_UNTIL, LATEST_AMENDMENT, MADE_BY, PLACES_NAMING, RENAME,
+    RENAME_ENDINGS, RENAME_ENDS, RENAMED, RENAMES_IN, SEEN_OTHER, SEEN_PUT, SEEN_START, SET_CHECK,
+    UNSEEN, WAIT, WAS_RENAMED, as_of, edge_ending, edge_hearing, ended_sql, hearings, link_ending,
+    link_state, newest_in_view, order, seen_keep, seen_kept, seen_recount, seen_sql, version_row,
+    view_row,
 };
 use crate::{Error, Graph};
 
@@ -80,18 +83,34 @@ impl Of<'_> {
         }
     }
 
-    pub(crate) fn time(&self) -> Option<i64> {
+    fn axis(&self) -> &Axis {
         match self {
-            Of::Node(node) => node.time,
-            Of::Link(link) => link.time,
+            Of::Node(node) => &node.axis,
+            Of::Link(link) => &link.axis,
         }
     }
 
-    fn integer(&self) -> Option<i64> {
-        match self {
-            Of::Node(node) => node.integer,
-            Of::Link(_) => None,
+    /// The axis its class or relation declares.
+    fn declared<'o>(&self, ontology: &'o Ontology) -> Result<&'o [String], Error> {
+        Ok(match self {
+            Of::Node(node) => &ontology.class(&node.class)?.axis,
+            Of::Link(link) => &ontology.relation(&link.relation)?.axis,
+        })
+    }
+
+    /// Its point on its declared axis, encoded; `None` when no axis is declared, so its point is
+    /// its known-at.
+    fn point(&self, ontology: &Ontology) -> Result<Option<Vec<u8>>, Error> {
+        let declared = self.declared(ontology)?;
+        if declared.is_empty() {
+            return Ok(None);
         }
+        let (entity, ..) = self.entity();
+        Ok(Some(encode(&crate::fact::point(
+            declared,
+            self.axis(),
+            &entity,
+        )?)))
     }
 
     /// The origin's event it arrived in.
@@ -109,8 +128,8 @@ impl Of<'_> {
         }
     }
 
-    /// Its identity: its content, with the source it was heard from, hashed under `key`. A point
-    /// rannoch assigns is not content; a time or an integer key the writer supplied is.
+    /// Its identity: its content, with the source it was heard from, hashed under `key`. Its
+    /// known-at is not content; its point on a declared axis is.
     pub(crate) fn identity(&self, key: &Key) -> Result<[u8; 32], Error> {
         let source = self.source();
         let content = match self {
@@ -121,36 +140,45 @@ impl Of<'_> {
                 &n.valid,
                 source,
                 &n.properties,
-                n.time,
-                n.integer,
+                &n.axis,
             ))?,
-            // A link's time joins its content only when its writer supplied one, so every link
-            // heard without one keeps the identity it always had.
-            Of::Link(l) => match l.time {
-                None => {
-                    serde_json::to_vec(&("link", &l.relation, &l.from, &l.to, &l.valid, source))?
-                }
-                Some(time) => serde_json::to_vec(&(
-                    "link",
-                    &l.relation,
-                    &l.from,
-                    &l.to,
-                    &l.valid,
-                    source,
-                    time,
-                ))?,
-            },
+            Of::Link(l) => serde_json::to_vec(&(
+                "link",
+                &l.relation,
+                &l.from,
+                &l.to,
+                &l.valid,
+                source,
+                &l.axis,
+            ))?,
         };
         Ok(*blake3::keyed_hash(&key.bytes, &content).as_bytes())
     }
 }
 
-/// Whether what `of` is a hearing of orders its history by an integer key.
-fn by_integer(ontology: &Ontology, of: &Of) -> Result<bool, Error> {
-    Ok(match of {
-        Of::Node(node) => ontology.class(&node.class)?.history == HistoryKey::Integer,
-        Of::Link(_) => false,
-    })
+/// An axis point's parts as bytes that compare as the parts do, part by part: each part
+/// big-endian with its sign bit flipped, so a byte comparison orders negative before positive.
+pub(crate) fn encode(parts: &[i64]) -> Vec<u8> {
+    parts
+        .iter()
+        .flat_map(|part| (part.cast_unsigned() ^ (1 << 63)).to_be_bytes())
+        .collect()
+}
+
+/// The parts [`encode`] encoded.
+pub(crate) fn decode_axis(bytes: &[u8]) -> Vec<i64> {
+    bytes
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|part| (u64::from_be_bytes(*part) ^ (1 << 63)).cast_signed())
+        .collect()
+}
+
+/// The point of a fact known at `known` whose declared point is `declared`: the declared one,
+/// else its known-at.
+fn point_or_known(declared: Option<&Vec<u8>>, known: i64) -> Vec<u8> {
+    declared.cloned().unwrap_or_else(|| encode(&[known]))
 }
 
 pub(crate) fn node_entity(class: &str) -> String {
@@ -173,13 +201,14 @@ pub(crate) struct Stamp {
 pub(crate) struct Held {
     identity: [u8; 32],
     event: EventId,
-    time: Option<i64>,
+    /// Its point on a declared axis, which is part of its content; `None` when the axis is its
+    /// known-at, so each occurrence has its own.
+    axis: Option<Vec<u8>>,
 }
 
 /// Records what `of` heard, whose content identity is `identity`, as a new version row named by
 /// its origin's event and filled at `stamp`, and returns `None`; or, when the graph holds a
-/// hearing identical to it, records nothing and returns that one. Its integer key is kept only
-/// when its class is ordered by one, so every other class's rows order by point alone.
+/// hearing identical to it, records nothing and returns that one.
 fn hear(
     tx: &Connection,
     identity: [u8; 32],
@@ -191,11 +220,12 @@ fn hear(
         .prepare_cached(HELD)?
         .query_row(params![identity], |row| row.get::<_, String>(0))
         .optional()?;
+    let declared = of.point(ontology)?;
     if let Some(held) = held {
         return Ok(Some(Held {
             identity,
             event: serde_json::from_value(held.into())?,
-            time: of.time(),
+            axis: declared,
         }));
     }
     let (entity, from, to) = of.entity();
@@ -203,12 +233,8 @@ fn hear(
         Of::Node(node) => Some(serde_json::to_string(&node.properties)?),
         Of::Link(_) => None,
     };
-    let integer = if by_integer(ontology, of)? {
-        of.integer()
-    } else {
-        None
-    };
-    let point = of.time().map_or_else(|| of.event().recorded(), Ok)?;
+    let known = of.event().recorded()?;
+    let axis = point_or_known(declared.as_ref(), known);
     tx.prepare_cached(HEAR)?.execute(params![
         identity,
         entity,
@@ -218,16 +244,16 @@ fn hear(
         stamp.cursor.0,
         of.source(),
         of.valid().as_text(),
-        point,
-        integer,
+        axis,
+        known,
         stamp.recorded,
         properties
     ])?;
     let mark = Mark {
         hearing: Some(tx.last_insert_rowid()),
         ending: None,
-        integer,
-        point,
+        axis,
+        known,
         event: of.event().to_string(),
     };
     saw(tx, (&entity, from, to), &mark, of.valid().as_text())?;
@@ -239,24 +265,23 @@ fn hear(
 struct Mark {
     hearing: Option<i64>,
     ending: Option<i64>,
-    integer: Option<i64>,
-    point: i64,
+    axis: Vec<u8>,
+    known: i64,
     event: String,
 }
 
 impl Mark {
-    /// Its place in its class's order (see [`order`]): no integer key orders first, as SQL's
-    /// NULL does.
-    fn rank(&self) -> (Option<i64>, i64, &str) {
-        (self.integer, self.point, &self.event)
+    /// Its place in its class's order (see [`order`]).
+    fn rank(&self) -> (&[u8], i64, &str) {
+        (&self.axis, self.known, &self.event)
     }
 
     fn row(row: &rusqlite::Row, at: usize) -> rusqlite::Result<Mark> {
         Ok(Mark {
             hearing: row.get(at)?,
             ending: row.get(at + 1)?,
-            integer: row.get(at + 2)?,
-            point: row.get(at + 3)?,
+            axis: row.get(at + 2)?,
+            known: row.get(at + 3)?,
             event: row.get(at + 4)?,
         })
     }
@@ -351,7 +376,8 @@ pub(crate) enum Heard {
 }
 
 /// Hears `of`: the identical hearing held when it is its node's or link's current version, or
-/// when its writer supplied its point, which is then part of its identity; else a new hearing,
+/// when its class or relation declares an axis, whose point is then part of its identity; else
+/// a new hearing,
 /// or a return to an older one, which this event is a new occurrence of. Current state takes
 /// either only when it is now the newest version.
 pub(crate) fn heard(
@@ -364,7 +390,7 @@ pub(crate) fn heard(
     let identity = of.identity(key)?;
     let (entity, from, to) = of.entity();
     if let Some(held) = hear(tx, identity, stamp, of, ontology)? {
-        if of.time().is_some()
+        if held.axis.is_some()
             || newest(tx, (&entity, from, to))?.is_some_and(|(.., newest)| newest == identity)
         {
             return Ok(Heard::Held(held));
@@ -378,8 +404,8 @@ pub(crate) fn heard(
 }
 
 /// Holds `event`, at `cursor`, as an alias of `held`, whose content it arrived with: an
-/// occurrence of the hearing at its own point. When `event` is the smaller id the hearing takes
-/// its name and its point, the id it was named by becomes the alias, and this returns true.
+/// occurrence of the hearing at its own known-at. When `event` is the smaller id the hearing takes
+/// its name and its known-at, the id it was named by becomes the alias, and this returns true.
 pub(crate) fn alias(
     tx: &Connection,
     held: &Held,
@@ -391,18 +417,22 @@ pub(crate) fn alias(
     }
     let renamed = event < held.event;
     if renamed {
+        let known = event.recorded()?;
         tx.prepare_cached(RENAME)?.execute(params![
             held.identity,
             event.to_string(),
             cursor.0,
-            held.time.map_or_else(|| event.recorded(), Ok)?
+            point_or_known(held.axis.as_ref(), known),
+            known
         ])?;
     }
     let alias = if renamed { held.event } else { event };
+    let known = alias.recorded()?;
     let new = tx.prepare_cached(ALIAS)?.execute(params![
         held.identity,
         alias.to_string(),
-        held.time.map_or_else(|| alias.recorded(), Ok)?
+        point_or_known(held.axis.as_ref(), known),
+        known
     ])?;
     if renamed || new == 1 {
         reseen(tx, held.identity)?;
@@ -411,7 +441,7 @@ pub(crate) fn alias(
 }
 
 /// Finds the first and last facts of the node or link the hearing `identity` is of again, by
-/// index seeks, after that hearing took another event's id and maybe another point.
+/// index seeks, after that hearing took another event's id and maybe another known-at.
 fn reseen(tx: &Connection, identity: [u8; 32]) -> Result<(), Error> {
     let (entity, key, to): (String, String, Option<String>) = tx
         .prepare_cached(HEARING_OF)?
@@ -454,12 +484,14 @@ fn edges(
     Ok(edge("ASC")?.zip(edge("DESC")?))
 }
 
-/// Records how a link came to an end, when `conclusion` is an ending (at its point, with its
-/// valid time) or a correction (with neither). Every ending is kept, and counts as a fact of the
-/// link; the latest conclusion to arrive replaces any before it, so a correction that came last
-/// masks the endings.
+/// Records how a link came to an end, when `conclusion` is an ending (at its point on its
+/// relation's axis, with its valid time) or a correction (with neither). Every ending is kept,
+/// and counts as a fact of the link; the latest conclusion by known-at and then event id replaces
+/// any before it, whatever order they arrive in, so a correction that is latest masks the
+/// endings.
 pub(crate) fn conclude(
     tx: &Connection,
+    ontology: &Ontology,
     conclusion: &Conclusion,
     renames: bool,
 ) -> Result<(), Error> {
@@ -471,7 +503,21 @@ pub(crate) fn conclude(
         to,
         ended,
     } = conclusion;
-    let at = ended.as_ref().map(|(at, _)| *at);
+    let known = event.recorded()?;
+    let declared = &ontology.relation(relation)?.axis;
+    let at = ended
+        .as_ref()
+        .map(|(axis, _)| -> Result<Vec<u8>, Error> {
+            if declared.is_empty() {
+                return Ok(encode(&[known]));
+            }
+            Ok(encode(&crate::fact::point(
+                declared,
+                axis,
+                &format!("relation {relation}"),
+            )?))
+        })
+        .transpose()?;
     let valid = ended.as_ref().and_then(|(_, valid)| valid.as_text());
     let entity = link_entity(relation);
     // The ends as renamed by now: a conclusion naming a renamed key concludes the renamed link.
@@ -494,7 +540,8 @@ pub(crate) fn conclude(
         event.to_string(),
         source,
         at,
-        valid
+        valid,
+        known
     ])?;
     if let Some(at) = at {
         let new = tx.prepare_cached(ENDING)?.execute(params![
@@ -504,14 +551,15 @@ pub(crate) fn conclude(
             at,
             event.to_string(),
             source,
-            valid
+            valid,
+            known
         ])?;
         if new == 1 {
             let mark = Mark {
                 hearing: None,
                 ending: Some(tx.last_insert_rowid()),
-                integer: None,
-                point: at,
+                axis: at,
+                known,
                 event: event.to_string(),
             };
             saw(tx, (&entity, from, Some(to)), &mark, valid)?;
@@ -529,93 +577,107 @@ struct Made {
     of: Subject,
     /// The event it is named by.
     name: String,
-    point: i64,
-    integer: Option<i64>,
+    axis: Vec<u8>,
+    known: i64,
 }
 
-/// Folds the amendment `body`, at its place `cursor`: it names the event it amends by its id in
-/// the log (its subject), and its data is a JSON Merge Patch of that event. The amended event
-/// stays in the log as written. An amendment that gives a node event another key renames the
-/// node: its key as known just before is mapped to the new one from the amendment's point, and
-/// every event naming the old key is heard again through the mapping. Returns what the hearings
-/// made and dropped are of, whose current state is to be read again.
+/// Folds the amendment `body`, at its place `cursor`: its data names the event it amends by that
+/// event's `CloudEvent` source and id (`target`), and holds a JSON Merge Patch of it (`patch`).
+/// The amended event stays in the log as written. An amendment whose target this store has not
+/// filled yet, because the log does not hold it or holds it after the amendment, waits for it and
+/// returns `None`; filling the target applies it. An amendment that gives a node event another
+/// key renames the node: its key as known just before is mapped to the new one from the
+/// amendment's known-at, and every event naming the old key is heard again through the mapping.
+/// Returns what the hearings made and dropped are of, whose current state is to be read again.
 pub(crate) fn amend(
     tx: &Connection,
     ontology: &Ontology,
     key: &Key,
     body: &str,
     cursor: Cursor,
-) -> Result<Vec<Subject>, Error> {
+) -> Result<Option<Vec<Subject>>, Error> {
     let amendment: serde_json::Value = serde_json::from_str(body)?;
-    let field = |name: &str| amendment.get(name).and_then(serde_json::Value::as_str);
-    let id = field("id").unwrap_or_default();
-    let event: EventId = id
-        .split(':')
-        .next()
-        .unwrap_or_default()
-        .parse()
-        .map_err(|_| Error::Refused(format!("amendment {id} is not <event uuid>:<fact>")))?;
-    let target = field("subject")
-        .ok_or_else(|| Error::Refused(format!("amendment {id} names no event as its subject")))?;
-    let (seq, written): (i64, String) = tx
-        .prepare_cached(EVENT_BY_ID)?
-        .query_row(params![target], |row| Ok((row.get(0)?, row.get(1)?)))
-        .optional()?
-        .ok_or_else(|| Error::Refused(format!("amendment {id} names {target}, not in the log")))?;
-    let made = made_by(tx, seq)?.ok_or_else(|| {
+    let id = amendment
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let uuid = |id: &str| -> Option<EventId> { id.split(':').next()?.parse().ok() };
+    let event = uuid(id)
+        .ok_or_else(|| Error::Refused(format!("amendment {id} is not <event uuid>:<fact>")))?;
+    let data = amendment.get("data");
+    let target = data.and_then(|data| data.get("target"));
+    let named = |field: &str| target.and_then(|t| t.get(field)?.as_str());
+    let (Some(source), Some(target)) = (named("source"), named("id")) else {
+        return Err(Error::Refused(format!(
+            "amendment {id} names no target: its data has no target {{source, id}}"
+        )));
+    };
+    if data.and_then(|data| data.get("patch")).is_none() {
+        return Err(Error::Refused(format!("amendment {id} has no patch")));
+    }
+    let known = event.recorded()?;
+    let target_known = uuid(target)
+        .ok_or_else(|| {
+            Error::Refused(format!(
+                "amendment {id} names {target}, which is not <event uuid>:<fact>"
+            ))
+        })?
+        .recorded()?;
+    if known < target_known {
+        return Err(Error::Refused(format!(
+            "amendment {id} of {target} is known at {known}, before {target_known}: an \
+             amendment known before its target is refused"
+        )));
+    }
+    let found: Option<(i64, String)> = tx
+        .prepare_cached(EVENT_BY_CLOUDEVENT)?
+        .query_row(params![source, target], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .optional()?;
+    let made = match &found {
+        Some((seq, _)) => made_by(tx, *seq)?,
+        None => None,
+    };
+    // A target the log holds before the amendment and that made no hearing never will.
+    let Some((seq, written)) = found.filter(|(seq, _)| made.is_some() || *seq <= cursor.0) else {
+        tx.prepare_cached(WAIT)?.execute(params![
+            source,
+            target,
+            known,
+            event.to_string(),
+            cursor.0
+        ])?;
+        return Ok(None);
+    };
+    let made = made.ok_or_else(|| {
         Error::Refused(format!(
             "amendment {id} names {target}, which made no hearing of its own"
         ))
     })?;
-    if made.integer.is_some() {
-        return Err(Error::Refused(format!(
-            "amendment {id} names {target}, in a class ordered by an integer key: an amendment \
-             has no integer key to be known at"
-        )));
-    }
-    let point = event.recorded()?;
-    // When the target was recorded, from its own id, as the amendment's point is from the
-    // amendment's; the target's point on its axis (its writer's time, else that record time) is
-    // `made.point`.
-    let written_at = serde_json::from_str::<serde_json::Value>(&written)?
-        .get("id")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|own| own.split(':').next())
-        .and_then(|own| own.parse::<EventId>().ok())
-        .ok_or_else(|| {
-            Error::Refused(format!(
-                "amendment {id} names {target}, whose id has no point"
-            ))
-        })?
-        .recorded()?;
     let latest: Option<i64> = tx
         .prepare_cached(LATEST_AMENDMENT)?
         .query_row(params![seq], |row| row.get(0))?;
-    if let Some(before) = [written_at, made.point]
-        .into_iter()
-        .chain(latest)
-        .filter(|at| point < *at)
-        .max()
-    {
+    if let Some(latest) = latest.filter(|latest| known < *latest) {
         return Err(Error::Refused(format!(
-            "amendment {id} of {target} is at {point}, before {before}: an amendment before the \
-             event's record time, its own point or its latest amendment is refused"
+            "amendment {id} of {target} is known at {known}, before {latest}: an amendment \
+             known before the target's latest amendment is refused"
         )));
     }
     let by = event.to_string();
     tx.prepare_cached(AMENDMENT)?
-        .execute(params![seq, point, by, cursor.0])?;
+        .execute(params![seq, known, by, cursor.0])?;
     let mut places = vec![seq];
-    let renamed_to = amendment
-        .get("data")
-        .and_then(|data| data.get("subject"))
+    let renamed_to = data
+        .and_then(|data| data.get("patch"))
+        .and_then(|patch| patch.get("subject"))
         .and_then(serde_json::Value::as_str);
     if let (Some(new), None) = (renamed_to, &made.of.2) {
         let entity = &made.of.0;
-        let old = key_before(tx, (seq, &written), entity, (point, &by))?;
+        let old = key_before(tx, (seq, &written), entity, (known, &by))?;
         if old != new {
             tx.prepare_cached(RENAMED)?
-                .execute(params![entity, old, new, point, by])?;
+                .execute(params![entity, old, new, known, by])?;
             rename_ends(tx, ontology, entity, &old, new)?;
             places.extend(naming(tx, ontology, entity, &old)?);
         }
@@ -628,7 +690,7 @@ pub(crate) fn amend(
     }
     touched.sort();
     touched.dedup();
-    Ok(touched)
+    Ok(Some(touched))
 }
 
 /// The hearing the event at the place `seq` made itself, if it made one.
@@ -640,17 +702,17 @@ fn made_by(tx: &Connection, seq: i64) -> Result<Option<Made>, Error> {
                 arrived: row.get(0)?,
                 of: (row.get(1)?, row.get(2)?, row.get(3)?),
                 name: row.get(4)?,
-                point: row.get(5)?,
-                integer: row.get(6)?,
+                axis: row.get(5)?,
+                known: row.get(6)?,
             })
         })
         .optional()?)
 }
 
-/// A rename: old key, new key, point and the amendment that made it.
+/// A rename: old key, new key, known-at and the amendment that made it.
 type Rename = (String, String, i64, String);
 
-/// Every rename in the class entity `entity`, in point order and then event id.
+/// Every rename in the class entity `entity`, by known-at and then event id.
 fn renames_in(tx: &Connection, entity: &str) -> Result<Vec<Rename>, Error> {
     Ok(tx
         .prepare_cached(RENAMES_IN)?
@@ -661,7 +723,7 @@ fn renames_in(tx: &Connection, entity: &str) -> Result<Vec<Rename>, Error> {
 }
 
 /// The key `key` resolves to through `renames`, taken in order, as known at `upto` (a point and
-/// event id): each rename made by then that names the key it has reached maps it on.
+/// event id): each rename known by then that names the key it has reached maps it on.
 fn resolve(renames: &[Rename], key: &str, upto: (i64, &str)) -> String {
     let mut key = key.to_string();
     for (old, new, point, event) in renames {
@@ -717,7 +779,7 @@ fn key_before(
     Ok(resolve(&before, key, upto))
 }
 
-/// Every amendment of the event at `seq` in point order and then event id: its point, event and
+/// Every amendment of the event at `seq` by known-at and then event id: its known-at, event and
 /// the merge patch its data holds.
 fn amendments_of(
     tx: &Connection,
@@ -732,7 +794,11 @@ fn amendments_of(
     rows.into_iter()
         .map(|(at, by, body)| {
             let body: serde_json::Value = serde_json::from_str(&body)?;
-            let patch = body.get("data").cloned().unwrap_or(serde_json::Value::Null);
+            let patch = body
+                .get("data")
+                .and_then(|data| data.get("patch"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
             Ok((at, by, patch))
         })
         .collect()
@@ -792,12 +858,12 @@ fn rename_ends(
 }
 
 /// Hears the event at the place `seq` again from the log: its own hearing stays, known until the
-/// first change, and each amendment of it and each rename of a key it names is a point where it
-/// may read differently. At each such point, in point order and then event id, the event is its
-/// body with every amendment by then applied and its keys resolved through every rename by then;
-/// when that differs from the hearing before, it is heard at the event's own point and integer
-/// key, known from that point (never before the event itself), and the hearing before is known
-/// until it. Returns what the hearings it made and dropped are of.
+/// first change, and each amendment of it and each rename of a key it names is a known-at where
+/// it may read differently. At each, by known-at and then event id, the event is its body with
+/// every amendment by then applied and its keys resolved through every rename by then; when that
+/// differs from the hearing before, it is heard at its axis point (the patched one on a declared
+/// axis, else the event's own known-at), known from then (never before the event itself), and the
+/// hearing before is known until then. Returns what the hearings it made and dropped are of.
 pub(crate) fn derive(
     tx: &Connection,
     (ontology, key): (&Ontology, &Key),
@@ -820,6 +886,11 @@ pub(crate) fn derive(
     tx.prepare_cached(KNOWN_AGAIN)?
         .execute(params![made.arrived])?;
     let mut body: serde_json::Value = serde_json::from_str(&written)?;
+    let own = body
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
     let named: Vec<String> = match crate::fact::check(&written, ontology)? {
         Fact::Node(node) => vec![node_entity(&node.class)],
         Fact::Link(link) => vec![node_entity(&link.from.class), node_entity(&link.to.class)],
@@ -830,8 +901,8 @@ pub(crate) fn derive(
         let found = renames_in(tx, &entity)?;
         renames.insert(entity, found);
     }
-    // Each point: its point, event, and the patch when an amendment (before a rename at the
-    // same point and event).
+    // Each change: its known-at, event, and the patch when an amendment (before a rename at the
+    // same known-at and event).
     let mut points: Vec<(i64, String, Option<serde_json::Value>)> = amendments_of(tx, seq)?
         .into_iter()
         .map(|(at, by, patch)| (at, by, Some(patch)))
@@ -858,11 +929,14 @@ pub(crate) fn derive(
         let (entity, of_key, to) = of.entity();
         let mut named = identity.to_vec();
         named.extend_from_slice(by.as_bytes());
-        named.extend_from_slice(&seq.to_le_bytes());
+        // The target's own id, not its place in this store's log, so every store replaying the
+        // log names the hearing alike.
+        named.extend_from_slice(own.as_bytes());
         let properties = match &of {
             Of::Node(node) => Some(serde_json::to_string(&node.properties)?),
             Of::Link(_) => None,
         };
+        let axis = of.point(ontology)?.unwrap_or_else(|| made.axis.clone());
         tx.prepare_cached(HEAR_AMENDED)?.execute(params![
             blake3::keyed_hash(&key.bytes, &named).as_bytes(),
             entity,
@@ -872,12 +946,11 @@ pub(crate) fn derive(
             seq,
             of.source(),
             of.valid().as_text(),
-            made.point,
-            made.integer,
+            axis,
+            // A rename can be known before the event itself; an amendment never is.
+            at.max(made.known),
             at,
-            properties,
-            // A rename can come before the event's own point; an amendment never does.
-            at.max(made.point)
+            properties
         ])?;
         before = tx.last_insert_rowid();
         touched.push((entity, of_key.to_string(), to.map(str::to_string)));
@@ -1065,11 +1138,11 @@ pub struct Hearing {
     pub event: EventId,
     pub source: String,
     pub valid: ValidTime,
-    /// Its point on the time axis: the time its writer supplied, or else the record time of
-    /// the store that first recorded it, which its event's id carries.
-    pub point: SystemTime,
-    /// The integer key its writer supplied, in an integer-keyed class.
-    pub integer: Option<i64>,
+    /// Its point on its class's or relation's axis, a part per declared part; on an undeclared
+    /// axis, its known-at in milliseconds.
+    pub axis: Vec<i64>,
+    /// When it became known: the millisecond in its event's id.
+    pub known: SystemTime,
     /// Its content identity: its content hashed under the graph's key.
     pub identity: [u8; 32],
     /// Every other event id it arrived under.
@@ -1081,8 +1154,10 @@ pub struct Hearing {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum End {
     Ended {
-        /// The ending's point on the time axis.
-        at: SystemTime,
+        /// The ending's point on its relation's axis.
+        axis: Vec<i64>,
+        /// When the ending became known.
+        known: SystemTime,
         /// When the link stopped holding in the world, which may be unknown.
         valid: ValidTime,
         source: String,
@@ -1094,12 +1169,14 @@ pub enum End {
     },
 }
 
-/// A point to read a node's or a link's state at: a time on the axis, or, in an integer-keyed
-/// class, an integer key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum At {
-    Time(SystemTime),
-    Key(i64),
+/// What a read sees: the versions at or before a point on the axis, as they were known at a
+/// time. Each defaults to now: no point reads the top of the axis, and no known-at reads all the
+/// store knows. A point with fewer parts than the axis declares reads the top of its prefix; on
+/// an undeclared axis a point is one part, a known-at in milliseconds.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct View {
+    pub axis: Option<Vec<i64>>,
+    pub known: Option<SystemTime>,
 }
 
 /// One version of a node or a link: the hearing that held at a point, by its class's order.
@@ -1109,10 +1186,10 @@ pub struct Version {
     pub event: EventId,
     pub source: String,
     pub valid: ValidTime,
-    /// Its point on the time axis.
-    pub point: SystemTime,
-    /// Its integer key, in an integer-keyed class.
-    pub integer: Option<i64>,
+    /// Its point on the axis.
+    pub axis: Vec<i64>,
+    /// When it became known.
+    pub known: SystemTime,
     /// A node's properties as that version holds them; a link has none.
     pub properties: BTreeMap<String, Value>,
     /// Whether a link had ended by the point read, or, as [`Seen`] names a link's fact, whether
@@ -1132,10 +1209,10 @@ pub struct Seen {
     pub first_true: ValidTime,
     /// Its hearings, and a link's endings with them.
     pub count: u64,
-    /// When a link ended: the point of its earliest ending after its last live hearing, by
-    /// point and then event id; `None` for a node, and for a link that has not ended, was found
-    /// wrong or was heard live after its endings.
-    pub ended: Option<SystemTime>,
+    /// When a link ended: the axis point of its earliest ending after its last live hearing, by
+    /// axis point, known-at and then event id; `None` for a node, and for a link that has not
+    /// ended, was found wrong or was heard live after its endings.
+    pub ended: Option<Vec<i64>>,
 }
 
 /// One version row: the version, when this store recorded it and its content identity.
@@ -1143,151 +1220,127 @@ pub(crate) type Versioned = (Version, i64, [u8; 32]);
 
 /// Reads one version row of `entity` keyed `key` (and `to`, for a link), as `tail` picks it
 /// among its hearings' occurrences, with `bound` bound from `?4` on: see [`Versioned`]. The
-/// version is named by its hearing's event, at the occurrence's point.
+/// version is named by its hearing's event, at the occurrence's axis point and known-at.
 fn read_version(
     conn: &Connection,
     (entity, key, to): (&str, &str, Option<&str>),
     (rows, tail): (fn(&str) -> String, &str),
     bound: &[&dyn ToSql],
 ) -> Result<Option<Versioned>, Error> {
-    /// A version row: event, source, valid, point, integer key, properties, recorded, identity.
-    type Row = (
-        String,
-        String,
-        Option<String>,
-        i64,
-        Option<i64>,
-        Option<String>,
-        i64,
-        [u8; 32],
-    );
     let mut statement = conn.prepare_cached(&rows(tail))?;
-    let read = |row: &rusqlite::Row| -> rusqlite::Result<Row> {
-        Ok((
-            row.get(0)?,
-            row.get(1)?,
-            row.get(2)?,
-            row.get(3)?,
-            row.get(4)?,
-            row.get(5)?,
-            row.get(6)?,
-            row.get(7)?,
-        ))
+    let read = |row: &rusqlite::Row| -> rusqlite::Result<(VersionColumns, i64, [u8; 32])> {
+        Ok((columns(row, 0)?, row.get(6)?, row.get(7)?))
     };
     let mut all: Vec<&dyn ToSql> = vec![&entity, &key, &to];
     all.extend_from_slice(bound);
     let row = statement.query_row(all.as_slice(), read).optional()?;
-    let Some((event, source, valid, point, integer, properties, recorded, identity)) = row else {
+    let Some((columns, recorded, identity)) = row else {
         return Ok(None);
     };
-    let version = version_of((event, source, valid, point, integer, properties), false)?;
-    Ok(Some((version, recorded, identity)))
+    Ok(Some((version_of(columns, false)?, recorded, identity)))
 }
 
-/// A version's columns as a row holds them: event, source, valid, point, integer key, properties.
-type VersionColumns = (
-    String,
-    String,
-    Option<String>,
-    i64,
-    Option<i64>,
-    Option<String>,
-);
+/// A version's columns as a row holds them: event, source, valid, axis point, known-at,
+/// properties.
+type VersionColumns = (String, String, Option<String>, Vec<u8>, i64, Option<String>);
+
+/// The [`VersionColumns`] of `row` from the column `at`.
+fn columns(row: &rusqlite::Row, at: usize) -> rusqlite::Result<VersionColumns> {
+    Ok((
+        row.get(at)?,
+        row.get(at + 1)?,
+        row.get(at + 2)?,
+        row.get(at + 3)?,
+        row.get(at + 4)?,
+        row.get(at + 5)?,
+    ))
+}
 
 /// The version a row's [`VersionColumns`] name, `ended` when it is an ending.
 fn version_of(
-    (event, source, valid, point, integer, properties): VersionColumns,
+    (event, source, valid, axis, known, properties): VersionColumns,
     ended: bool,
 ) -> Result<Version, Error> {
     Ok(Version {
         event: serde_json::from_value(event.into())?,
         source,
         valid: ValidTime::from_text(valid),
-        point: time(point),
-        integer,
+        axis: decode_axis(&axis),
+        known: time(known),
         properties: decode(properties.as_deref())?,
         ended,
     })
 }
 
-/// The version of the node keyed `key` in `class` that holds at `at` (a point, or an integer key
-/// when the class is ordered by one): the greatest by the class's order at or before it, ties
-/// going to the larger event id.
-fn node_at(
+/// The bounds `view` puts on the versions of `owner` (a class or relation) whose axis is
+/// `declared`: the encoded top of its axis prefix, and its known-at in milliseconds; each `None`
+/// for now.
+fn bounds(
+    declared: &[String],
+    view: &View,
+    owner: &str,
+) -> Result<(Option<Vec<u8>>, Option<i64>), Error> {
+    let parts = declared.len().max(1);
+    let axis = view
+        .axis
+        .as_ref()
+        .map(|point| {
+            if point.len() > parts {
+                return Err(Error::Refused(format!(
+                    "{owner} has an axis of {parts} part(s), {declared:?}; the view names {}",
+                    point.len()
+                )));
+            }
+            let mut top = encode(point);
+            top.resize(parts * 8, 0xFF);
+            Ok(top)
+        })
+        .transpose()?;
+    Ok((axis, view.known.map(millis)))
+}
+
+/// The version of the node keyed `key` in `class` in `view`: the newest by its class's order,
+/// or, given the valid time `day` (`YYYY-MM-DD`), the one true then: among its versions valid on
+/// or before `day`, the greatest by valid time, then by its class's order. A version of unknown
+/// valid time is never true on a day.
+pub(crate) fn node_in_view(
     conn: &Connection,
     class: &Class,
     key: &str,
-    at: i64,
+    view: &View,
+    day: Option<&str>,
 ) -> Result<Option<Versioned>, Error> {
-    let tail = if class.history == HistoryKey::Integer {
-        by_integer_key()
-    } else {
-        by_point()
-    };
-    read_version(
-        conn,
-        (&node_entity(&class.name), key, None),
-        (version_row, &tail),
-        &[&at],
-    )
-}
-
-/// What a read known at `at` bounds the versions of `class` by, or of a link when `class` is
-/// `None`: the column on its axis and the bound. A link is read at a time only.
-pub(crate) fn known_bound(class: Option<&Class>, at: At) -> Result<(&'static str, i64), Error> {
-    match (class, at) {
-        (Some(class), at) if class.history == HistoryKey::Integer => {
-            Ok(("integer", axis(class, at)?))
-        }
-        (Some(class), at) => Ok(("point", axis(class, at)?)),
-        (None, At::Time(time)) => Ok(("point", millis(time))),
-        (None, At::Key(_)) => Err(Error::Refused(format!(
-            "a link is read at a time, not at {at:?}"
-        ))),
-    }
-}
-
-/// The version of the node keyed `key` in `class` true at the valid time `day`
-/// (`YYYY-MM-DD`), as known at `known` when given: among its versions valid on or before `day`,
-/// the greatest by valid time, then by its class's order. A version of unknown valid time is
-/// never one.
-pub(crate) fn node_as_of(
-    conn: &Connection,
-    class: &Class,
-    key: &str,
-    day: &str,
-    known: Option<At>,
-) -> Result<Option<Versioned>, Error> {
-    let of = (node_entity(&class.name), key, None);
-    match known.map(|at| known_bound(Some(class), at)).transpose()? {
+    let (axis, known) = bounds(&class.axis, view, &format!("class {}", class.name))?;
+    let of = node_entity(&class.name);
+    match day {
         None => read_version(
             conn,
-            (&of.0, of.1, of.2),
-            (version_row, &as_of(None)),
-            &[&day],
+            (&of, key, None),
+            (view_row, &newest_in_view()),
+            &[&axis, &known],
         ),
-        Some((column, at)) => read_version(
+        Some(day) => read_version(
             conn,
-            (&of.0, of.1, of.2),
-            (known_version_row, &as_of(Some(column))),
-            &[&day, &at],
+            (&of, key, None),
+            (view_row, &as_of()),
+            &[&axis, &known, &day],
         ),
     }
 }
 
-/// Whether the link of `relation` from `from` to `to` had ended by the point `known` and, as of
-/// `day` when given, by then; refused as of `day` when its ending's valid time is unknown.
+/// Whether the link of `relation` from `from` to `to` had ended in the view `(axis, known)` and,
+/// as of `day` when given, by then; refused as of `day` when its ending's valid time is unknown.
 fn ended(
     conn: &Connection,
     relation: &str,
     (from, to): (&str, &str),
-    known: i64,
+    (axis, known): (Option<&[u8]>, Option<i64>),
     day: Option<&str>,
 ) -> Result<bool, Error> {
     let ending: Option<Option<bool>> = conn
         .prepare_cached(&ended_sql())?
         .query_row(
-            params![link_entity(relation), from, to, known, day],
+            params![link_entity(relation), from, to, axis, known, day],
             |row| row.get(0),
         )
         .optional()?;
@@ -1305,23 +1358,14 @@ pub(crate) fn unknown_ending(relation: &str, (from, to): (&str, &str), day: &str
     ))
 }
 
-/// Refuses an integer key for a class not ordered by one, and a time for one that is.
-fn axis(class: &Class, at: At) -> Result<i64, Error> {
-    match (class.history == HistoryKey::Integer, at) {
-        (false, At::Time(time)) => Ok(millis(time)),
-        (true, At::Key(key)) => Ok(key),
-        _ => Err(Error::Refused(format!(
-            "class {} is not read at {at:?}: it is ordered by {:?}",
-            class.name, class.history
-        ))),
-    }
-}
+/// An ending's row: event, source, axis point, known-at, valid time.
+type EndingRow = (String, String, Vec<u8>, i64, Option<String>);
 
 impl Graph {
     /// How the link of `relation` from the node keyed `from` to the node keyed `to` came to an
-    /// end: found wrong, when a correction is its latest conclusion to arrive; else its ending,
-    /// the earliest after its last live hearing by point and then event id; `None` while it has
-    /// neither ended nor been found wrong, and once heard live after its endings.
+    /// end: found wrong, when a correction is its latest conclusion by known-at; else its ending,
+    /// the earliest after its last live hearing by axis point, known-at and then event id; `None`
+    /// while it has neither ended nor been found wrong, and once heard live after its endings.
     ///
     /// # Errors
     /// The relation is not declared, or the graph file cannot be read.
@@ -1337,26 +1381,33 @@ impl Graph {
             let event = serde_json::from_value(event.into())?;
             return Ok(Some(End::Corrected { source, event }));
         }
-        let row: Option<(String, String, i64, Option<String>)> = self
+        let row: Option<EndingRow> = self
             .conn
             .prepare_cached(&link_ending())?
             .query_row(link, |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
             })
             .optional()?;
-        let Some((event, source, at, valid)) = row else {
+        let Some((event, source, axis, known, valid)) = row else {
             return Ok(None);
         };
         Ok(Some(End::Ended {
-            at: time(at),
+            axis: decode_axis(&axis),
+            known: time(known),
             valid: ValidTime::from_text(valid),
             source,
             event: serde_json::from_value(event.into())?,
         }))
     }
 
-    /// Every hearing of `node`, in order on its class's axis: by integer key in an
-    /// integer-keyed class, then by point, then by event id.
+    /// Every hearing of `node`, in order on its class's axis: by axis point, then known-at,
+    /// then event id.
     ///
     /// # Errors
     /// The class is not declared, or the graph file cannot be read.
@@ -1366,7 +1417,7 @@ impl Graph {
     }
 
     /// Every hearing of the link of `relation` from the node keyed `from` to the node keyed
-    /// `to`, by point and then by event id (a link is never ordered by an integer key).
+    /// `to`, in order on its relation's axis.
     ///
     /// # Errors
     /// The relation is not declared, or the graph file cannot be read.
@@ -1386,8 +1437,8 @@ impl Graph {
         key: &str,
         to: Option<&str>,
     ) -> Result<Vec<Hearing>, Error> {
-        /// A hearing's row: identity, event, source, valid time, point and integer key.
-        type Row = ([u8; 32], String, String, Option<String>, i64, Option<i64>);
+        /// A hearing's row: identity, event, source, valid time, axis point and known-at.
+        type Row = ([u8; 32], String, String, Option<String>, Vec<u8>, i64);
         let rows: Vec<Row> = self
             .conn
             .prepare_cached(&hearings())?
@@ -1403,7 +1454,7 @@ impl Graph {
             })?
             .collect::<Result<_, _>>()?;
         let mut hearings = Vec::new();
-        for (identity, event, source, valid, point, integer) in rows {
+        for (identity, event, source, valid, axis, known) in rows {
             let aliases: Vec<String> = self
                 .conn
                 .prepare_cached(ALIASES_OF)?
@@ -1413,8 +1464,8 @@ impl Graph {
                 event: serde_json::from_value(event.into())?,
                 source,
                 valid: ValidTime::from_text(valid),
-                point: time(point),
-                integer,
+                axis: decode_axis(&axis),
+                known: time(known),
                 identity,
                 aliases: aliases
                     .into_iter()
@@ -1425,88 +1476,58 @@ impl Graph {
         Ok(hearings)
     }
 
-    /// The version of `node` that held at `at`: the newest by its class's order at or before
-    /// it (by point, or in an integer-keyed class by integer key and then point), ties going to
-    /// the larger event id. `None` before its first version. A version that arrived late
-    /// answers at its own point like any other.
+    /// The version of `node` in `view`: the newest by its class's order (axis point, then
+    /// known-at, then event id) at or before the view's point, among the versions known at its
+    /// known-at. `None` before its first version. A version that arrived late answers at its own
+    /// point like any other, and a correction at the same point answers only from its known-at.
     ///
     /// # Errors
-    /// [`Error::Refused`] when `at` is a time and the class is integer-keyed, or an integer key
-    /// and it is not; the class is not declared, or the graph file cannot be read.
-    pub fn state_at(&self, node: &NodeRef, at: At) -> Result<Option<Version>, Error> {
+    /// [`Error::Refused`] when the view's point has more parts than the class's axis; the class
+    /// is not declared, or the graph file cannot be read.
+    pub fn state_at(&self, node: &NodeRef, view: &View) -> Result<Option<Version>, Error> {
         let ontology = self.current_ontology()?;
         let class = ontology.class(&node.class)?;
-        Ok(node_at(&self.conn, class, &node.key, axis(class, at)?)?.map(|(v, ..)| v))
+        Ok(node_in_view(&self.conn, class, &node.key, view, None)?.map(|(v, ..)| v))
     }
 
     /// The version of the link of `relation` from the node keyed `from` to the node keyed `to`
-    /// that held at the time `at`: the newest of its live hearings and endings at or before it,
-    /// by point and then event id, and whether the link had ended by then. `None` before its
-    /// first version.
+    /// in `view`: the newest of its live hearings and endings at or before the view's point and
+    /// known at its known-at, and whether the link had ended by then. `None` before its first
+    /// version. An amendment or rename known after the view's known-at is not in it.
     ///
     /// # Errors
-    /// [`Error::Refused`] when `at` is an integer key; the relation is not declared, or the
-    /// graph file cannot be read.
+    /// [`Error::Refused`] when the view's point has more parts than the relation's axis; the
+    /// relation is not declared, or the graph file cannot be read.
     pub fn link_state_at(
         &self,
         relation: &str,
         from: &str,
         to: &str,
-        at: At,
+        view: &View,
     ) -> Result<Option<Version>, Error> {
-        let (_, at) = known_bound(None, at)?;
-        let relation = self.current_ontology()?.relation(relation)?.name.clone();
+        let ontology = self.current_ontology()?;
+        let declared = ontology.relation(relation)?;
+        let relation = declared.name.clone();
+        let (axis, known) = bounds(&declared.axis, view, &format!("relation {relation}"))?;
         let newest = self
             .conn
             .prepare_cached(&link_state())?
-            .query_row(params![link_entity(&relation), from, to, at], |row| {
-                let columns: VersionColumns = (
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                );
-                Ok((columns, row.get::<_, bool>(6)?))
-            })
+            .query_row(
+                params![link_entity(&relation), from, to, axis, known],
+                |row| Ok((columns(row, 0)?, row.get::<_, bool>(6)?)),
+            )
             .optional()?;
         let Some((columns, ending)) = newest else {
             return Ok(None);
         };
         let mut version = version_of(columns, ending)?;
-        version.ended = ended(&self.conn, &relation, (from, to), at, None)?;
-        Ok(Some(version))
-    }
-
-    /// The version of the link of `relation` from the node keyed `from` to the node keyed `to`
-    /// as known at the time `known`: the newest by point and then event id among its hearings
-    /// known then, so an amendment or a rename made later is not in it; and whether the link had
-    /// ended by then. `None` when no hearing of it was known then.
-    ///
-    /// # Errors
-    /// [`Error::Refused`] when `known` is an integer key; the relation is not declared, or the
-    /// graph file cannot be read.
-    pub fn link_known_at(
-        &self,
-        relation: &str,
-        from: &str,
-        to: &str,
-        known: At,
-    ) -> Result<Option<Version>, Error> {
-        let (_, at) = known_bound(None, known)?;
-        let relation = self.current_ontology()?.relation(relation)?.name.clone();
-        let tail = format!("ORDER BY {} LIMIT 1", order("DESC"));
-        let Some((mut version, ..)) = read_version(
+        version.ended = ended(
             &self.conn,
-            (&link_entity(&relation), from, Some(to)),
-            (known_link_row, &tail),
-            &[&at],
-        )?
-        else {
-            return Ok(None);
-        };
-        version.ended = ended(&self.conn, &relation, (from, to), at, None)?;
+            &relation,
+            (from, to),
+            (axis.as_deref(), known),
+            None,
+        )?;
         Ok(Some(version))
     }
 
@@ -1538,15 +1559,7 @@ impl Graph {
     fn seen_of(&self, of: (&str, &str, &str)) -> Result<Option<Seen>, Error> {
         let sql = seen_sql();
         let version = |row: &rusqlite::Row, at: usize| -> rusqlite::Result<_> {
-            let columns: VersionColumns = (
-                row.get(at)?,
-                row.get(at + 1)?,
-                row.get(at + 2)?,
-                row.get(at + 3)?,
-                row.get(at + 4)?,
-                row.get(at + 5)?,
-            );
-            Ok((columns, row.get::<_, bool>(at + 6)?))
+            Ok((columns(row, at)?, row.get::<_, bool>(at + 6)?))
         };
         let row = self
             .conn
@@ -1555,7 +1568,7 @@ impl Graph {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, Option<String>>(1)?,
-                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<Vec<u8>>>(2)?,
                     [version(row, 3)?, version(row, 10)?, version(row, 17)?],
                 ))
             })
@@ -1571,7 +1584,7 @@ impl Graph {
             first_recorded: first_recorded?,
             first_true: ValidTime::from_text(first_true),
             count: u64::try_from(count).unwrap_or(0),
-            ended: ended.map(time),
+            ended: ended.as_deref().map(decode_axis),
         }))
     }
 }
