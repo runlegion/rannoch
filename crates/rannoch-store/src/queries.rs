@@ -158,6 +158,8 @@ pub(crate) const HISTORY_TABLES: &str = "
         event TEXT NOT NULL, PRIMARY KEY(entity, old, known, event)) WITHOUT ROWID;
     CREATE INDEX IF NOT EXISTS _hearings_at
         ON _hearings(entity, line, key, to_key, axis, known, event);
+    CREATE INDEX IF NOT EXISTS _hearings_to
+        ON _hearings(entity, line, to_key, key) WHERE to_key IS NOT NULL;
     CREATE TABLE IF NOT EXISTS _aliases(
         line TEXT NOT NULL DEFAULT 'main', identity BLOB NOT NULL, alias TEXT NOT NULL,
         axis BLOB NOT NULL, known INTEGER NOT NULL,
@@ -336,7 +338,7 @@ pub(crate) fn occurrences(filter: &str) -> String {
 /// Every occurrence of the hearings `filter` picks, whether known now or only before an
 /// amendment superseded them: each row also carries its hearing's `until`.
 fn known_occurrences(filter: &str) -> String {
-    let hearing = "h.arrived, h.identity, h.event AS name, h.source, h.valid, \
+    let hearing = "h.arrived, h.identity, h.key, h.to_key, h.event AS name, h.source, h.valid, \
                    h.recorded, h.properties, h.until";
     format!(
         "(SELECT {hearing}, h.axis AS axis, h.known AS known, h.event AS event FROM _hearings h \
@@ -561,6 +563,156 @@ pub(crate) fn seen_sql() -> String {
     )
 }
 
+/// The hearings in the view of the axis bound `?2` and the known-at `?3` (each NULL for now), as
+/// columns of `_hearings` unqualified. A node or link is in the view exactly when one of its
+/// hearings' own rows is: a hearing is named by its smallest id, so no alias of it is known
+/// before it.
+const IN_VIEW: &str = "line = 'main' AND (?2 IS NULL OR axis <= ?2) \
+     AND (?3 IS NULL OR known <= ?3) \
+     AND (until IS NULL OR until > coalesce(?3, 9223372036854775807))";
+
+/// The view `?2`, `?3` as bounds on the occurrences [`in_view`] reads.
+const VIEW: (&str, &str) = ("?2", "?3");
+
+/// The newest of the rows `facts` holds for each `of` (a column), by their class's order, with
+/// `columns` read from it.
+fn newest_each(facts: &str, of: &str, columns: &str) -> String {
+    format!(
+        "SELECT {columns} FROM (SELECT *, row_number() OVER (PARTITION BY {of} ORDER BY {}) AS n \
+         FROM {facts}) WHERE n = 1",
+        order("DESC")
+    )
+}
+
+/// The version of each node of the class entity `?1` in the view `?2`, `?3`, in key order, its
+/// key first, then the columns [`view_row`] reads; `keys` (SQL) narrows the keys read, or is
+/// empty for every key.
+pub(crate) fn nodes_in_view(keys: &str) -> String {
+    let filter = if keys.is_empty() {
+        "h.entity = ?1 AND h.line = 'main'".to_string()
+    } else {
+        format!("h.entity = ?1 AND h.line = 'main' AND h.key IN ({keys})")
+    };
+    format!(
+        "{} ORDER BY key",
+        newest_each(
+            &in_view(&filter, VIEW),
+            "key",
+            "key, name, source, valid, axis, known, properties"
+        )
+    )
+}
+
+/// The keys of the class `class` with a hearing in the view `?2`, `?3` whose `property` held the
+/// value whose JSON is `?4`: read through the property's declared index.
+pub(crate) fn keys_by_property(class: &str, property: &str) -> String {
+    format!(
+        "SELECT key FROM _hearings WHERE entity = {} AND {} = json_extract(?4, '$') \
+         AND {IN_VIEW}",
+        literal(&format!("{CLASS}:{class}")),
+        property_value(property)
+    )
+}
+
+/// The links of the relation entity `?1` at the node keyed `?4`, from it (`out`) or to it, that
+/// hold in the view `?2`, `?3`, in the other end's key order: the other end's key, then the
+/// columns of the newest of each one's live hearings and endings, as [`link_state`] reads it.
+/// A link holds when it has a hearing in the view and has not ended there: its newest fact is a
+/// hearing, or a correction masks its endings, as [`ended_sql`] decides.
+pub(crate) fn links_in_view(out: bool) -> String {
+    if out {
+        holding("key = ?4", "to_key", "key = ?4")
+    } else {
+        // Endings have no index by target: those of the links heard to the node are sought.
+        holding(
+            "to_key = ?4",
+            "key",
+            "to_key = ?4 AND key IN (SELECT key FROM _hearings \
+             WHERE entity = ?1 AND line = 'main' AND to_key = ?4)",
+        )
+    }
+}
+
+/// How many links of the relation entity `?1` hold in the view `?2`, `?3`, as
+/// [`links_in_view`] decides: those heard in it, less those of them it reads as ended, which
+/// only a link with an ending in the view can be.
+pub(crate) fn link_count() -> String {
+    let ended = "IN (SELECT key, to_key FROM _endings WHERE entity = ?1 AND line = 'main' \
+         AND (?2 IS NULL OR axis <= ?2) AND (?3 IS NULL OR known <= ?3))";
+    format!(
+        "SELECT (SELECT count(*) FROM (SELECT DISTINCT key, to_key FROM _hearings \
+         WHERE entity = ?1 AND {IN_VIEW})) - (SELECT count(*) FROM ({}) f WHERE ending = 1 AND NOT {} AND {})",
+        newest_each(
+            &link_facts(
+                &format!("(h.key, h.to_key) {ended}"),
+                &format!("(key, to_key) {ended}")
+            ),
+            "key, to_key",
+            "key, to_key, ending"
+        ),
+        CORRECTED_IN_VIEW,
+        heard_in_view()
+    )
+}
+
+/// Whether a correction known in the view masks the endings of the link of `?1` named by the
+/// row `f`.
+const CORRECTED_IN_VIEW: &str = "EXISTS (SELECT 1 FROM _ends c WHERE c.entity = ?1 \
+     AND c.line = 'main' AND c.key = f.key AND c.to_key = f.to_key AND c.axis IS NULL \
+     AND (?3 IS NULL OR c.known <= ?3))";
+
+/// Whether the link of `?1` named by the row `f` has a hearing in the view `?2`, `?3`.
+fn heard_in_view() -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM _hearings WHERE entity = ?1 AND {IN_VIEW} AND key = f.key \
+         AND to_key = f.to_key)"
+    )
+}
+
+/// The live hearings' occurrences (`ending` 0) and the endings (`ending` 1) in the view `?2`,
+/// `?3` of the links of `?1` whose hearings `heard` picks (SQL over `_hearings h`) and whose
+/// endings `ends` picks (over `_endings`), each with its link's ends and the columns
+/// [`link_state`] reads.
+fn link_facts(heard: &str, ends: &str) -> String {
+    format!(
+        "(SELECT key, to_key, name, source, valid, axis, known, properties, event, 0 AS ending \
+         FROM {} UNION ALL SELECT key, to_key, event, source, valid, axis, known, NULL, event, 1 \
+         FROM _endings WHERE entity = ?1 AND line = 'main' AND {ends} \
+         AND (?2 IS NULL OR axis <= ?2) AND (?3 IS NULL OR known <= ?3))",
+        in_view(
+            &format!("h.entity = ?1 AND h.line = 'main' AND h.to_key IS NOT NULL AND {heard}"),
+            VIEW
+        )
+    )
+}
+
+/// The links of `?1` whose hearings `heard` picks (SQL over `_hearings`) and whose endings `ends`
+/// picks (over `_endings`) that hold in the view `?2`, `?3`, each named by `other`, newest fact
+/// first: see [`links_in_view`].
+fn holding(heard: &str, other: &str, ends: &str) -> String {
+    format!(
+        "SELECT {other}, name, source, valid, axis, known, properties FROM ({}) f \
+         WHERE ending = 0 OR ({CORRECTED_IN_VIEW} AND {}) ORDER BY {other}",
+        newest_each(
+            &link_facts(&format!("h.{heard}"), ends),
+            "key, to_key",
+            "key, to_key, name, source, valid, axis, known, properties, ending"
+        ),
+        heard_in_view()
+    )
+}
+
+/// How many keys of the class entity `?1` have a version in the view `?2`, `?3`.
+pub(crate) fn node_count() -> String {
+    format!("SELECT count(DISTINCT key) FROM _hearings WHERE entity = ?1 AND {IN_VIEW}")
+}
+
+/// The greatest known-at the store holds: of a hearing, the amendment that superseded one, an
+/// alias, an ending or a conclusion. A read known at it reads all the store knows.
+pub(crate) const KNOWN_NOW: &str = "SELECT max(k) FROM (SELECT max(known) AS k FROM _hearings \
+     UNION ALL SELECT max(until) FROM _hearings UNION ALL SELECT max(known) FROM _aliases \
+     UNION ALL SELECT max(known) FROM _endings UNION ALL SELECT max(known) FROM _ends)";
+
 /// Picks the newest version row in the view.
 pub(crate) fn newest_in_view() -> String {
     format!("ORDER BY {} LIMIT 1", order("DESC"))
@@ -717,6 +869,31 @@ pub(crate) const COUNT_BETWEEN: &str = "SELECT COUNT(*) FROM _events WHERE seq >
 /// A quoted SQL identifier.
 fn ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// A quoted SQL string literal, for the one place a value cannot be bound: an index's
+/// definition, and the query that must name the same text to read through it.
+fn literal(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "''"))
+}
+
+/// A node hearing's value of `property`, as its declared index holds it.
+fn property_value(property: &str) -> String {
+    format!(
+        "json_extract(properties, {})",
+        literal(&format!("$.\"{property}\""))
+    )
+}
+
+/// Indexes the hearings of `class`'s nodes by the value of `property`. Only that class's hearings
+/// are in it, so a write of any other pays nothing for it.
+pub(crate) fn create_property_index(class: &str, property: &str) -> String {
+    format!(
+        "CREATE INDEX IF NOT EXISTS {} ON _hearings({}, key) WHERE entity = {} AND line = 'main';",
+        ident(&format!("_by:{}:{class}:{property}", class.len())),
+        property_value(property),
+        literal(&format!("{CLASS}:{class}"))
+    )
 }
 
 /// The table that holds a class's nodes. Its name differs from the class's own name, so no

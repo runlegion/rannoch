@@ -36,6 +36,7 @@ g.declare(
 
 - `Class::new` gives every property the type text. Set `properties` to use `integer`, `decimal` (exact digits), `float` or `float_vector(n)`.
 - A class or relation may declare an axis: `axis` is an ordered list of part names, such as `["build"]` or `["build", "step"]`. Each part is an integer (a time is a part in milliseconds). Every event of it carries its point as `data.axis`, a value per part; a missing part, or a part not declared, is refused. With no axis declared, its history is ordered by each fact's known-at. See [Three times](#three-times).
+- A class may index properties: `indexed` names the properties its nodes can be listed by. Each one gets an index when the class is declared; a class that indexes nothing adds none, so a write pays for an index only where one is declared.
 - `Declaration::Property` adds a property to a declared class. Older nodes read without it; nothing is default-filled.
 - `Relation::new(name, from, to, containment)`: the last argument says the source is part of the target. Set `axis` to declare one.
 - An identical declaration writes nothing and returns `Ok(None)`. A conflicting one is refused with a reason in ontology terms.
@@ -118,7 +119,16 @@ Reads take a `View { axis, known }`: an optional axis point and an optional know
 | `seen(node)` | first and last heard, first recorded, first true, and how many hearings |
 | `link_state_at(rel, from, to, view)` | the link's version in the view, and whether it had ended; an amendment or rename known later is not in it |
 | `link_hearings`, `link_seen`, `link_end` | as for nodes; `link_end` says whether it ended or was found wrong |
+| `links(node, rel, direction, view)` | the links of `rel` from the node (`Direction::Out`) or to it that hold in the view (a version, not ended), each as the other end's key and the link's version, in the other end's key order |
+| `nodes(class, filter, view)` | the class's nodes in the view, each as its key and version, in key order; `filter` maps indexed properties to values |
+| `counts(view)` | how many nodes each class has and how many links hold in each relation, in the view |
+| `describe(node, view)` | the node's version and each relation it has links in, by name and direction, with how many hold |
+| `answer(query)` | the `rannoch.answer` event body for a `rannoch.query` event body: see below |
 | `events().since(cursor)`, `at(cursor)`, `committed()` | the log itself |
+
+None of these reads drops a version whose valid time is unknown: it is returned with `ValidTime::Unknown`.
+
+A read can be asked as an event. A `rannoch.query` event's data is one read and its view: `{"links": {"node": {"class", "key"}, "relation", "direction": "out" | "in"}}`, `{"nodes": {"class", "filter": {...}}}`, `{"counts": {}}` or `{"describe": {"node": {...}}}`, with `"view": {"axis": [...], "known": <ms>}`, each part optional. `answer` returns a `rannoch.answer` event whose subject is the query's id and whose data is `{"result", "known"}`: the read's result and the known-at it was read at. A view with no known-at is read at the greatest known-at the store holds, which reads all it knows, so asking again with that known-at gives the same answer on the same log. Both events can be logged and filled like any other; they fill no table.
 
 A version that arrives late answers at its own point; it does not change what is current unless it is newer on the axis. A link's latest conclusion (ending or correction) is chosen by known-at, then event id, never by arrival. Reading the same log in any order, or after a rebuild, gives the same answers; only `Node.recorded` and `Seen.first_recorded`, which name this store's own receipt, may differ.
 
