@@ -99,7 +99,7 @@ Every fact has three times, each with one job:
 - **Its axis point**, the key its class or relation declares, carried in `data.axis`. With no axis declared, the axis is known-at.
 - **Its valid time**, what it claims about the world: optional, and possibly unknown.
 
-Declare an axis when facts arrive in an order of your own, such as builds an importer reads, and a fix to a build must read as that build, known from when it was fixed. A correction is a new event at the same axis point: read as known before it, the point reads as the original; from its known-at on, as the correction. That holds in every class.
+Declare an axis when facts arrive in an order of your own, such as builds an importer reads, and a fix to a build must read as that build, known from when it was fixed. A correction is a new event at the same axis point: read as known before it, the point reads as the original; from its known-at on, as the correction. That holds in every class. In a class with no axis declared, every event lands at its own known-at, so a correction there is an amendment, which reads the same way.
 
 **Axis parts must refine each other in order.** In `(build, step)`, a step orders only within its build. Counters that move independently of each other are not an axis: make them properties.
 
@@ -120,7 +120,7 @@ Reads take a `View { axis, known }`: an optional axis point and an optional know
 | `link_hearings`, `link_seen`, `link_end` | as for nodes; `link_end` says whether it ended or was found wrong |
 | `events().since(cursor)`, `at(cursor)`, `committed()` | the log itself |
 
-A version that arrives late answers at its own point; it does not change what is current unless it is newer on the axis. A link's latest conclusion (ending or correction) is chosen by known-at, then event id, never by arrival. Reading the same log in any order, or after a rebuild, gives the same answers; only `Node.recorded` and `Seen.first_recorded`, which name this store's own receipt, may differ.
+A version that arrives late answers at its own point; it does not change what is current unless it is newer on the axis. A link's latest conclusion (ending or correction) is chosen by known-at, then event id, never by arrival. Reading the same log in any order, or after a rebuild, gives the same answers; only `Node.recorded` and `Seen.first_recorded`, which name this store's own receipt, may differ. One exception is the refusal below of an amendment known before the target's latest amendment: which amendment is latest when it fills depends on arrival.
 
 ```rust
 let book = g.find("book", "b1")?.ok_or("b1 is there")?;
@@ -143,7 +143,7 @@ g.commit(&[&amended(b1, r#"{"subject":"b9"}"#)], &[])?;
 g.fill()?;
 ```
 
-- Each store resolves the target when it fills the amendment, so a store replaying another's log applies the same amendment. An amendment that arrives before its target waits and applies when the target fills, so arrival order never changes the answer.
+- Each store resolves the target when it fills the amendment, so a store replaying another's log applies the same amendment. An amendment that arrives before its target waits and applies when the target fills, so the target's arrival order does not change the answer.
 - Amendments are allowed in every class. A patch of `data.axis` moves the version to the patched point.
 - The amended event stays in the log as written. Read as known before the amendment, it reads as written; from the amendment's known-at on, it reads patched.
 - An amendment is known at the clock in its own CloudEvent id. Amendments stack by known-at; at the same known-at, by event id.
@@ -155,7 +155,7 @@ Amendments are the slow path: finding the target reads the whole log. One amendm
 Fill refuses an amendment that:
 
 - names no target or has no patch;
-- is known before its target's known-at, or before its latest amendment already applied;
+- is known before its target's known-at, or before its latest amendment already applied (which one is latest when it fills depends on the order amendments arrive in);
 - amends an event logged before it with no hearing of its own: a declaration, an app's own event, or content identical to an earlier hearing.
 
 An amendment whose target is not in the log is not refused: it waits.

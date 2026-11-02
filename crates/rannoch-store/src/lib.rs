@@ -32,9 +32,9 @@ use crate::inbox::place;
 use crate::log::{append, event_at, store};
 use crate::ontology::{Bound, build, load};
 use crate::queries::{
-    ANY_RENAME, ANY_WAITING, CLOSE_OPEN, COPY_INTO, DONE_RETRY, HISTORY_TABLES, OPEN_LINK,
-    OWN_TABLES, PRAGMAS, RELEASE, RESET_TRIES, RETRY_WORK, ROLLBACK_TO, SAVEPOINT, SCHEMA_VERSION,
-    SET_PLACE, SET_POSITION, SET_TRY_LIMIT, STOP_WAITING, STOPPED_WORK, TRIED_WORK, TRY_LIMIT,
+    ANY_RENAME, CLOSE_OPEN, COPY_INTO, DONE_RETRY, HISTORY_TABLES, OPEN_LINK, OWN_TABLES, PRAGMAS,
+    RELEASE, RESET_TRIES, RETRY_WORK, ROLLBACK_TO, SAVEPOINT, SCHEMA_VERSION, SET_PLACE,
+    SET_POSITION, SET_TRY_LIMIT, STOP_WAITING, STOPPED_WORK, TRIED_WORK, TRY_LIMIT, WAITED,
     WAITING_FOR, delete_link, delete_node, node_id, upsert_link, upsert_node, waiting,
 };
 
@@ -373,7 +373,7 @@ impl Graph {
         let ontology = load(&tx)?;
         let log = Events { conn: &tx };
         let mut flags = Flags::read(&tx)?;
-        let before = flags;
+        let before = flags.clone();
         tx.execute_batch(SAVEPOINT)?;
         let mut to = from;
         let mut failed = false;
@@ -478,7 +478,7 @@ fn attempt(
     flags: &mut Flags,
 ) -> Result<Result<(), Error>, Error> {
     tx.execute_batch(SAVEPOINT)?;
-    let before = *flags;
+    let before = flags.clone();
     let filled = fill_one(tx, ontology, key, event, flags).map_err(|cause| {
         Error::Refused(format!(
             "event at {} cannot be filled: {cause}",
@@ -492,19 +492,27 @@ fn attempt(
     Ok(filled)
 }
 
-/// What fill looks up for each event only while the store holds any: renames, and amendments
-/// waiting for their target. Read once per batch, and again after each amendment lands.
-#[derive(Debug, Clone, Copy)]
+/// What fill looks up for each event only while the store holds any: renames, and the origin
+/// events amendments wait for. Read once per batch, and again after each amendment lands, so an
+/// event is looked up against the waiting amendments only when its own origin is waited for.
+#[derive(Debug, Clone)]
 struct Flags {
     renames: bool,
-    waiting: bool,
+    waiting: std::collections::BTreeSet<EventId>,
 }
 
 impl Flags {
     fn read(tx: &Connection) -> rusqlite::Result<Flags> {
+        let waited: Vec<String> = tx
+            .prepare_cached(WAITED)?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
         Ok(Flags {
             renames: renamed(tx)?,
-            waiting: tx.query_row(ANY_WAITING, [], |row| row.get(0))?,
+            waiting: waited
+                .iter()
+                .filter_map(|id| id.split(':').next()?.parse().ok())
+                .collect(),
         })
     }
 }
@@ -519,13 +527,21 @@ fn fill_one(
     event: &Event,
     flags: &mut Flags,
 ) -> Result<(), Error> {
-    let renames = &mut flags.renames;
     let recorded = event.id.recorded().map_err(Error::from)?;
     let stamp = Stamp {
         cursor: event.cursor,
         recorded,
     };
-    match fact::check(&event.body, ontology)? {
+    let fact = fact::check(&event.body, ontology)?;
+    // The origin event a fact names; `None` for an event that names none parsed here.
+    let origin = match &fact {
+        fact::Fact::Node(node) => Some(node.event),
+        fact::Fact::Link(link) => Some(link.event),
+        fact::Fact::Concluded(conclusion) => Some(conclusion.event),
+        fact::Fact::Declared | fact::Fact::None => None,
+    };
+    let renames = &mut flags.renames;
+    match fact {
         fact::Fact::Node(node) => {
             let (entity, key) = (node_entity(&node.class), node.key.as_str());
             match heard(tx, ontology, store_key, stamp, &Of::Node(&node))? {
@@ -563,13 +579,13 @@ fn fill_one(
             conclude(tx, ontology, &conclusion, *renames)?;
         }
         fact::Fact::None => {
-            if amended(tx, ontology, store_key, event)? {
+            if amended(tx, ontology, store_key, event, false)? {
                 *flags = Flags::read(tx)?;
             }
         }
         fact::Fact::Declared => {}
     }
-    if flags.waiting {
+    if !flags.waiting.is_empty() && origin.is_none_or(|origin| flags.waiting.contains(&origin)) {
         awaited(tx, ontology, store_key, event, flags)?;
     }
     Ok(())
@@ -601,7 +617,7 @@ fn awaited(
             continue;
         };
         tx.execute_batch(SAVEPOINT)?;
-        let applied = amended(tx, ontology, key, &amendment);
+        let applied = amended(tx, ontology, key, &amendment, true);
         tx.execute_batch(if applied.is_ok() {
             RELEASE
         } else {
@@ -664,12 +680,25 @@ fn amendment(body: &str) -> bool {
 
 /// Folds `event` when it is an amendment, and puts what it touched into the tables kept for
 /// speed; an amendment whose target is not filled yet waits for it. Any other event that says
-/// no fact fills nothing. Says whether it was an amendment.
-fn amended(tx: &Connection, ontology: &Ontology, key: &Key, event: &Event) -> Result<bool, Error> {
+/// no fact fills nothing. `target_filled` says the amendment's target has just filled, so it
+/// never waits again. Says whether it was an amendment.
+fn amended(
+    tx: &Connection,
+    ontology: &Ontology,
+    key: &Key,
+    event: &Event,
+    target_filled: bool,
+) -> Result<bool, Error> {
     if !amendment(&event.body) {
         return Ok(false);
     }
-    if let Some(touched) = amend(tx, ontology, key, &event.body, event.cursor)? {
+    if let Some(touched) = amend(
+        tx,
+        ontology,
+        key,
+        (&event.body, event.cursor),
+        target_filled,
+    )? {
         refresh(tx, ontology, touched)?;
     }
     Ok(true)
@@ -2565,6 +2594,69 @@ mod tests {
             feed(&mut copy, &order)?;
             assert_eq!(answers(&copy)?, origin, "{name}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn a_waiting_amendment_whose_target_makes_no_hearing_is_refused_when_it_fills()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = graph("waits-no-hearing")?;
+        g.set_try_limit(1)?;
+        let order = format!(
+            r#"{{"specversion":"1.0","id":"{}","source":"shop","type":"shop.order"}}"#,
+            id_at(1_000)
+        );
+        let named: serde_json::Value = serde_json::from_str(&order)?;
+        let fix = logged(
+            &mut g,
+            &amending(
+                2_000,
+                ("shop", named["id"].as_str().unwrap_or_default()),
+                r#"{"data":{"x":1}}"#,
+            ),
+        )?;
+        g.fill()?;
+        assert!(
+            g.stopped()?.is_empty(),
+            "it waits while its target is missing"
+        );
+        logged(&mut g, &order)?;
+        for _ in 0..3 {
+            g.fill()?;
+        }
+        let stopped: Vec<crate::Cursor> = g.stopped()?.into_iter().map(|(at, _)| at).collect();
+        assert_eq!(stopped, [fix.cursor], "refused once its target filled");
+        let waiting: i64 = g
+            .conn
+            .query_row("SELECT count(*) FROM _waiting", [], |row| row.get(0))?;
+        assert_eq!(waiting, 0, "nothing is left waiting");
+        Ok(())
+    }
+
+    #[test]
+    fn an_amendment_of_the_axis_moves_the_version_to_the_patched_point()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = graph_on_axes("patched-axis")?;
+        let r1 = logged(
+            &mut g,
+            &on_axis(1_000, "release", "r1", r#"{"build":12}"#, "wrong build"),
+        )?;
+        logged(
+            &mut g,
+            &amended(2_000, &r1, r#"{"data":{"axis":{"build":13}}}"#),
+        )?;
+        g.fill()?;
+        let r1 = ("release", "r1");
+        assert_eq!(title_in(&g, r1, &view(Some(&[12]), None))?, None);
+        assert_eq!(
+            title_in(&g, r1, &view(Some(&[13]), None))?,
+            Some("wrong build".into())
+        );
+        assert_eq!(
+            title_in(&g, r1, &view(Some(&[12]), Some(1_500)))?,
+            Some("wrong build".into()),
+            "known before the amendment, it is at build 12"
+        );
         Ok(())
     }
 }

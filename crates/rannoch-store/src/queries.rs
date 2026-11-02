@@ -209,8 +209,8 @@ pub(crate) const EVENT_BY_CLOUDEVENT: &str = "SELECT seq, body FROM _events \
 pub(crate) const WAIT: &str = "INSERT OR IGNORE INTO _waiting(source, id, known, event, seq) \
      VALUES (?1, ?2, ?3, ?4, ?5)";
 
-/// Whether any amendment waits for its target.
-pub(crate) const ANY_WAITING: &str = "SELECT EXISTS (SELECT 1 FROM _waiting)";
+/// The `CloudEvent` id of every target an amendment waits for.
+pub(crate) const WAITED: &str = "SELECT DISTINCT id FROM _waiting";
 
 /// The places of the amendments waiting for the event whose source is `?1` and id `?2`, by
 /// known-at and then event id.

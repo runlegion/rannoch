@@ -4,7 +4,9 @@
 //! declares.
 
 pub(crate) use rannoch_cloudevents::Fact;
-use rannoch_cloudevents::{Axis, Conclusion, LinkFact, NodeRef};
+use std::collections::BTreeMap;
+
+use rannoch_cloudevents::{Conclusion, LinkFact, NodeRef};
 use rannoch_ontology::{Ontology, Relation};
 
 use crate::Error;
@@ -30,7 +32,7 @@ pub fn check(body: &str, ontology: &Ontology) -> Result<Fact, Error> {
     match &fact {
         Fact::Node(node) => {
             let class = ontology.class(&node.class)?;
-            point(&class.axis, &node.axis, &format!("class {}", class.name))?;
+            point(&class.axis, &node.axis, ("class", &class.name))?;
             class.check(&node.properties)?;
         }
         Fact::Link(LinkFact {
@@ -48,7 +50,7 @@ pub fn check(body: &str, ontology: &Ontology) -> Result<Fact, Error> {
             ..
         }) => {
             let relation = ontology.relation(relation)?;
-            point(&relation.axis, axis, &format!("relation {}", relation.name))?;
+            point(&relation.axis, axis, ("relation", &relation.name))?;
             ends(relation, from, to)?;
         }
         Fact::Concluded(Conclusion {
@@ -64,15 +66,24 @@ fn ends(relation: &Relation, from: &NodeRef, to: &NodeRef) -> Result<(), Error> 
     Ok(relation.holds(&from.class, &to.class)?)
 }
 
-/// The point `given` names on the axis `declared` (of `owner`, a class or relation), its parts in
-/// declared order; empty when the axis is undeclared, so the point is the fact's known-at.
+/// The point `given` names on the axis `declared` (of `owner`, a class or relation, as its kind
+/// and name), its parts in declared order; empty when the axis is undeclared, so the point is the
+/// fact's known-at.
 ///
 /// # Errors
 /// A declared part `given` leaves out, or a part it names that is not declared.
-pub(crate) fn point(declared: &[String], given: &Axis, owner: &str) -> Result<Vec<i64>, Error> {
+pub(crate) fn point(
+    declared: &[String],
+    given: &BTreeMap<String, i64>,
+    (kind, name): (&str, &str),
+) -> Result<Vec<i64>, Error> {
+    if declared.is_empty() && given.is_empty() {
+        return Ok(Vec::new());
+    }
     if let Some(extra) = given.keys().find(|part| !declared.contains(part)) {
         return Err(Error::Refused(format!(
-            "{owner} declares axis {declared:?}; the event names part {extra}, which it does not"
+            "{kind} {name} declares axis {declared:?}; the event names part {extra}, which it \
+             does not"
         )));
     }
     declared
@@ -80,7 +91,8 @@ pub(crate) fn point(declared: &[String], given: &Axis, owner: &str) -> Result<Ve
         .map(|part| {
             given.get(part).copied().ok_or_else(|| {
                 Error::Refused(format!(
-                    "{owner} declares axis {declared:?}; the event's data.axis leaves out {part}"
+                    "{kind} {name} declares axis {declared:?}; the event's data.axis leaves out \
+                     {part}"
                 ))
             })
         })

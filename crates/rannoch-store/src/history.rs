@@ -14,9 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rannoch_ontology::{Class, Ontology, Value};
 use rusqlite::{Connection, OptionalExtension, ToSql, TransactionBehavior, params};
 
-use rannoch_cloudevents::{
-    Axis, Conclusion, EventId, Fact, LinkFact, NodeFact, NodeRef, ValidTime,
-};
+use rannoch_cloudevents::{Conclusion, EventId, Fact, LinkFact, NodeFact, NodeRef, ValidTime};
 
 use crate::log::Cursor;
 use crate::ontology::{CLASS, RELATION};
@@ -83,33 +81,38 @@ impl Of<'_> {
         }
     }
 
-    fn axis(&self) -> &Axis {
+    fn axis(&self) -> &BTreeMap<String, i64> {
         match self {
             Of::Node(node) => &node.axis,
             Of::Link(link) => &link.axis,
         }
     }
 
-    /// The axis its class or relation declares.
-    fn declared<'o>(&self, ontology: &'o Ontology) -> Result<&'o [String], Error> {
+    /// The axis its class or relation declares, and the kind and name of what declares it.
+    fn declared<'o>(
+        &'o self,
+        ontology: &'o Ontology,
+    ) -> Result<(&'o [String], (&'static str, &'o str)), Error> {
         Ok(match self {
-            Of::Node(node) => &ontology.class(&node.class)?.axis,
-            Of::Link(link) => &ontology.relation(&link.relation)?.axis,
+            Of::Node(node) => (&ontology.class(&node.class)?.axis, ("class", &node.class)),
+            Of::Link(link) => (
+                &ontology.relation(&link.relation)?.axis,
+                ("relation", &link.relation),
+            ),
         })
     }
 
     /// Its point on its declared axis, encoded; `None` when no axis is declared, so its point is
     /// its known-at.
     fn point(&self, ontology: &Ontology) -> Result<Option<Vec<u8>>, Error> {
-        let declared = self.declared(ontology)?;
+        let (declared, owner) = self.declared(ontology)?;
         if declared.is_empty() {
             return Ok(None);
         }
-        let (entity, ..) = self.entity();
         Ok(Some(encode(&crate::fact::point(
             declared,
             self.axis(),
-            &entity,
+            owner,
         )?)))
     }
 
@@ -514,7 +517,7 @@ pub(crate) fn conclude(
             Ok(encode(&crate::fact::point(
                 declared,
                 axis,
-                &format!("relation {relation}"),
+                ("relation", relation),
             )?))
         })
         .transpose()?;
@@ -585,7 +588,7 @@ struct Made {
 /// event's `CloudEvent` source and id (`target`), and holds a JSON Merge Patch of it (`patch`).
 /// The amended event stays in the log as written. An amendment whose target this store has not
 /// filled yet, because the log does not hold it or holds it after the amendment, waits for it and
-/// returns `None`; filling the target applies it. An amendment that gives a node event another
+/// returns `None`; filling the target applies it, `target_filled` set. An amendment that gives a node event another
 /// key renames the node: its key as known just before is mapped to the new one from the
 /// amendment's known-at, and every event naming the old key is heard again through the mapping.
 /// Returns what the hearings made and dropped are of, whose current state is to be read again.
@@ -593,8 +596,8 @@ pub(crate) fn amend(
     tx: &Connection,
     ontology: &Ontology,
     key: &Key,
-    body: &str,
-    cursor: Cursor,
+    (body, cursor): (&str, Cursor),
+    target_filled: bool,
 ) -> Result<Option<Vec<Subject>>, Error> {
     let amendment: serde_json::Value = serde_json::from_str(body)?;
     let id = amendment
@@ -639,8 +642,11 @@ pub(crate) fn amend(
         Some((seq, _)) => made_by(tx, *seq)?,
         None => None,
     };
-    // A target the log holds before the amendment and that made no hearing never will.
-    let Some((seq, written)) = found.filter(|(seq, _)| made.is_some() || *seq <= cursor.0) else {
+    // A target that has filled, or that the log holds before the amendment, and made no hearing
+    // never will.
+    let Some((seq, written)) =
+        found.filter(|(seq, _)| made.is_some() || target_filled || *seq <= cursor.0)
+    else {
         tx.prepare_cached(WAIT)?.execute(params![
             source,
             target,

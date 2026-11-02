@@ -234,16 +234,13 @@ struct Envelope {
     data: Option<serde_json::Value>,
 }
 
-/// A point on a declared axis: each named part's integer.
-pub type Axis = BTreeMap<String, i64>;
-
 #[derive(Deserialize)]
 struct NodeData {
     properties: BTreeMap<String, Value>,
     #[serde(default = "unknown")]
     valid: ValidTime,
     #[serde(default)]
-    axis: Axis,
+    axis: BTreeMap<String, i64>,
 }
 
 #[derive(Deserialize)]
@@ -253,7 +250,7 @@ struct LinkData {
     #[serde(default = "unknown")]
     valid: ValidTime,
     #[serde(default)]
-    axis: Axis,
+    axis: BTreeMap<String, i64>,
 }
 
 fn unknown() -> ValidTime {
@@ -277,7 +274,7 @@ pub struct NodeFact {
     pub properties: BTreeMap<String, Value>,
     pub valid: ValidTime,
     /// Its point on its class's declared axis, as named parts; empty when none is given.
-    pub axis: Axis,
+    pub axis: BTreeMap<String, i64>,
 }
 
 /// A link, named by its relation and both of its endpoints, as an event holds it.
@@ -291,7 +288,7 @@ pub struct LinkFact {
     pub source: String,
     pub valid: ValidTime,
     /// Its point on its relation's declared axis, as named parts; empty when none is given.
-    pub axis: Axis,
+    pub axis: BTreeMap<String, i64>,
 }
 
 /// How a link came to an end, as an event holds it: it ended, at its own point on its
@@ -305,7 +302,7 @@ pub struct Conclusion {
     pub from: NodeRef,
     pub to: NodeRef,
     /// The ending's point on its relation's axis and its valid time; `None` for a correction.
-    pub ended: Option<(Axis, ValidTime)>,
+    pub ended: Option<(BTreeMap<String, i64>, ValidTime)>,
 }
 
 /// What one event says.
