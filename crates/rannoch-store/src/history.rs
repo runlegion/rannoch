@@ -47,7 +47,7 @@ pub(crate) fn take_noted() -> Option<i64> {
     NOTED.with(Cell::take)
 }
 
-/// Keeps the greatest known-at noted in the batch as the store's, when it is greater.
+/// Raises the store's highest known-at ever filled to the greatest noted in the batch.
 pub(crate) fn keep_noted(tx: &Connection) -> Result<(), Error> {
     if let Some(known) = take_noted() {
         tx.prepare_cached(KEEP_NEWEST)?.execute([known])?;

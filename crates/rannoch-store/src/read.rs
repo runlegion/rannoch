@@ -238,8 +238,9 @@ impl Graph {
     /// Answers the `rannoch.query` event `query` with the body of a `rannoch.answer` event: its
     /// subject the query's id, its data the read's result and the known-at it was read at. A
     /// query's data is one read (`links`, `nodes`, `counts` or `describe`) and its `view`; a
-    /// view with no known-at is read at the greatest known-at the store holds, which reads all
-    /// it knows. The in-process reads are the fast path; this asks them.
+    /// view with no known-at is read at the highest known-at ever filled, which reads all it
+    /// knows. After a redundant amendment that can exceed the greatest known-at the tables hold
+    /// now; the state read is the same either way, and only the answer's known-at differs. The in-process reads are the fast path; this asks them.
     ///
     /// # Errors
     /// [`Error::Refused`] when `query` is not a `CloudEvents` 1.0 `rannoch.query` event or its

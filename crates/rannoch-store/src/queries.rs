@@ -138,8 +138,8 @@ pub(crate) const RESET_TRIES: &str =
 /// known-at; the latest conclusion by known-at for each link that ended or was found wrong
 /// (`axis` null for a correction, which masks its endings); every ending of a link, at its point
 /// (`valid` null when unknown); what is kept of when each node and link was seen; the
-/// amendments waiting for their target; the check value of the graph's key; and the greatest
-/// known-at the store holds, found by a scan once when a store first has none kept.
+/// amendments waiting for their target; the check value of the graph's key; and the highest
+/// known-at ever filled, a high-water mark seeded by one scan when a store first has none kept.
 ///
 /// Every history table carries the line it belongs to in its key. Every history read and write
 /// is on the line `'main'` until a second line exists.
@@ -714,12 +714,13 @@ pub(crate) fn node_count() -> String {
     format!("SELECT count(DISTINCT key) FROM _hearings WHERE entity = ?1 AND {IN_VIEW}")
 }
 
-/// The greatest known-at the store holds: of a hearing, the amendment that superseded one, an
-/// alias, an ending or a conclusion, as fill keeps it per batch. A read known at it reads all the
-/// store knows.
+/// The highest known-at ever filled: of a hearing, the amendment that superseded one, an alias,
+/// an ending or a conclusion, kept by fill per batch. It can exceed the greatest the tables hold
+/// now, after a later-filled amendment makes an earlier one redundant; a read known at either
+/// reads the same state, all the store knows.
 pub(crate) const KNOWN_NOW: &str = "SELECT known FROM _newest";
 
-/// Raises the greatest known-at the store holds to `?1`.
+/// Raises the highest known-at ever filled to `?1`.
 pub(crate) const KEEP_NEWEST: &str =
     "UPDATE _newest SET known = ?1 WHERE known IS NULL OR known < ?1";
 
