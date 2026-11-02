@@ -2000,10 +2000,10 @@ mod tests {
         Ok(())
     }
 
-    /// How many statements fill runs per event of one kind: the statements of filling `more`
-    /// events of it less those of filling `few`, over the difference, so what a fill runs once
-    /// cancels out.
-    fn per_event(
+    /// How many statements fill runs for `more - few` events of one kind: the statements of
+    /// filling `more` events of it less those of filling `few`, so what a fill runs once cancels
+    /// out.
+    fn extra_statements(
         g: &mut crate::Graph,
         bodies: impl Fn(std::ops::Range<usize>) -> Vec<String>,
         (few, more): (usize, usize),
@@ -2015,7 +2015,7 @@ mod tests {
             g.commit(&refs, &[])?;
             ran.push(statements(g, crate::Graph::fill)?.len());
         }
-        Ok((ran[1] - ran[0]) / (more - few))
+        Ok(ran[1] - ran[0])
     }
 
     #[test]
@@ -2032,11 +2032,18 @@ mod tests {
             keys.map(|i| link(&format!("a{i}"), &format!("b{i}")))
                 .collect()
         };
-        let node_cost = per_event(&mut g, authors, (10, 20))?;
-        per_event(&mut g, books, (10, 20))?;
-        let link_cost = per_event(&mut g, links, (10, 20))?;
-        assert!(node_cost <= 6, "a node costs {node_cost} statements, was 7");
-        assert!(link_cost <= 5, "a link costs {link_cost} statements, was 8");
+        // Ten events more each time: any statement more per event, on any of them, fails.
+        let nodes = extra_statements(&mut g, authors, (10, 20))?;
+        extra_statements(&mut g, books, (10, 20))?;
+        let links = extra_statements(&mut g, links, (10, 20))?;
+        assert!(
+            nodes <= 6 * 10,
+            "ten nodes cost {nodes} statements, were 70"
+        );
+        assert!(
+            links <= 5 * 10,
+            "ten links cost {links} statements, were 80"
+        );
         Ok(())
     }
 
