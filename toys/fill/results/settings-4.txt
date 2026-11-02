@@ -1,0 +1,3 @@
+cache32M+rest | 52755 53422 52942 | median 52942
+cache64M+rest | 57848 57581 58085 | median 57848
+combo+fullfsync_off_MEASURE | 58984 58230 58833 | median 58833

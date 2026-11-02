@@ -1,0 +1,4 @@
+baseline | 31862 35158 36644 | median 35158
+cache256M | 53612 52811 53638 | median 53612
+cache+mmap | 50818 52134 53060 | median 52134
+fullfsync_off_MEASURE | 24243 34928 34780 | median 34780

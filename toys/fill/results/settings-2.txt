@@ -1,0 +1,5 @@
+cache1G | 51498 51568 52441 | median 51568
+cache+secure_delete_off | 51664 52957 54537 | median 52957
+cache+temp_mem | 55753 56349 56123 | median 56123
+cache+autockpt10k | 57147 56402 56788 | median 56788
+cache+sync_normal_MEASURE | 54825 40721 16702 | median 40721
