@@ -106,14 +106,7 @@ impl Of<'_> {
     /// its known-at.
     fn point(&self, ontology: &Ontology) -> Result<Option<Vec<u8>>, Error> {
         let (declared, owner) = self.declared(ontology)?;
-        if declared.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(encode(&crate::fact::point(
-            declared,
-            self.axis(),
-            owner,
-        )?)))
+        declared_point(declared, self.axis(), owner)
     }
 
     /// The origin's event it arrived in.
@@ -176,6 +169,19 @@ pub(crate) fn decode_axis(bytes: &[u8]) -> Vec<i64> {
         .iter()
         .map(|part| (u64::from_be_bytes(*part) ^ (1 << 63)).cast_signed())
         .collect()
+}
+
+/// The encoded point `given` names on the axis `declared` of `owner` (its kind and name); `None`
+/// when no axis is declared, so the point is the fact's known-at.
+fn declared_point(
+    declared: &[String],
+    given: &BTreeMap<String, i64>,
+    owner: (&str, &str),
+) -> Result<Option<Vec<u8>>, Error> {
+    if declared.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(encode(&crate::fact::point(declared, given, owner)?)))
 }
 
 /// The point of a fact known at `known` whose declared point is `declared`: the declared one,
@@ -510,15 +516,9 @@ pub(crate) fn conclude(
     let declared = &ontology.relation(relation)?.axis;
     let at = ended
         .as_ref()
-        .map(|(axis, _)| -> Result<Vec<u8>, Error> {
-            if declared.is_empty() {
-                return Ok(encode(&[known]));
-            }
-            Ok(encode(&crate::fact::point(
-                declared,
-                axis,
-                ("relation", relation),
-            )?))
+        .map(|(axis, _)| {
+            let declared = declared_point(declared, axis, ("relation", relation))?;
+            Ok::<_, Error>(point_or_known(declared.as_ref(), known))
         })
         .transpose()?;
     let valid = ended.as_ref().and_then(|(_, valid)| valid.as_text());

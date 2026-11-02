@@ -1240,16 +1240,11 @@ mod tests {
     /// An amendment known at `seconds` of the event `target`, named by its `CloudEvent` source
     /// and id, its patch `patch`.
     fn amended(seconds: u64, target: &crate::Event, patch: &str) -> String {
-        let named = rannoch_cloudevents::attributes(&target.body).unwrap_or_else(|_| {
-            rannoch_cloudevents::Attributes {
-                specversion: String::new(),
-                id: String::new(),
-                source: String::new(),
-                ty: String::new(),
-                subject: None,
-            }
-        });
-        amending(seconds, (&named.source, &named.id), patch)
+        let named = rannoch_cloudevents::attributes(&target.body).ok();
+        let named = named
+            .as_ref()
+            .map_or(("", ""), |n| (n.source.as_str(), n.id.as_str()));
+        amending(seconds, named, patch)
     }
 
     /// An amendment known at `seconds` of the event whose source and id are `target`.
