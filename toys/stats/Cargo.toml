@@ -1,0 +1,13 @@
+[package]
+name = "rannoch-toy-stats"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+rannoch-store = { path = "../../crates/rannoch-store" }
+
+[profile.release]
+debug = false

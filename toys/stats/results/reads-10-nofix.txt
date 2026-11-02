@@ -1,0 +1,33 @@
+| read | fan | now ms | known-at ms | rows |
+| links out | 1 | 3086.555 | 105.120 | 1 |
+| links out | 10 | 102.936 | 102.307 | 10 |
+| links out | 100 | 101.892 | 101.966 | 100 |
+| links out | 1000 | 105.336 | 104.923 | 1000 |
+| links out | 10000 | 124.940 | 125.896 | 10000 |
+| links out | 120000 | 364.388 | 352.319 | 120000 |
+| links in | 1 | 103.013 | 102.550 | 1 |
+| links in | 10 | 101.313 | 102.849 | 10 |
+| links in | 100 | 101.046 | 102.017 | 100 |
+| links in | 1000 | 103.594 | 103.667 | 1000 |
+| links in | 10000 | 125.922 | 123.575 | 10000 |
+| links in | 120000 | 352.161 | 349.875 | 120000 |
+| page out (100; then after b5 at known-at) | 1 | 0.439 | 0.151 | 1 |
+| page out (100; then after b5 at known-at) | 10 | 0.184 | 0.140 | 10 |
+| page out (100; then after b5 at known-at) | 100 | 0.457 | 0.236 | 100 |
+| page out (100; then after b5 at known-at) | 1000 | 0.423 | 0.411 | 100 |
+| page out (100; then after b5 at known-at) | 10000 | 0.418 | 0.407 | 100 |
+| page out (100; then after b5 at known-at) | 120000 | 0.433 | 0.404 | 100 |
+| page in (100; then after a5 at known-at) | 1 | 0.255 | 0.126 | 1 |
+| page in (100; then after a5 at known-at) | 10 | 0.152 | 0.130 | 10 |
+| page in (100; then after a5 at known-at) | 100 | 0.384 | 0.228 | 100 |
+| page in (100; then after a5 at known-at) | 1000 | 0.386 | 0.387 | 100 |
+| page in (100; then after a5 at known-at) | 10000 | 0.389 | 0.393 | 100 |
+| page in (100; then after a5 at known-at) | 120000 | 0.393 | 0.394 | 100 |
+| describe | 1 | 210.309 | 211.328 | - |
+| describe | 10 | 205.537 | 204.497 | - |
+| describe | 100 | 205.988 | 212.079 | - |
+| describe | 1000 | 212.458 | 204.510 | - |
+| describe | 10000 | 220.909 | 228.928 | - |
+| describe | 120000 | 410.868 | 418.309 | - |
+| counts() now | - | 272.655 | - | - |
+| stats read | - | 0.0332 | - | - |

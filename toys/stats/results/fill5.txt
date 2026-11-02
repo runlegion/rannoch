@@ -1,0 +1,8 @@
+fill 300000 events in 7.402 s: 40529 events/s (stats 0)
+fill 300000 events in 7.715 s: 38884 events/s (stats on)
+fill 300000 events in 7.278 s: 41218 events/s (stats 0)
+fill 300000 events in 7.261 s: 41316 events/s (stats on)
+fill 300000 events in 7.436 s: 40345 events/s (stats 0)
+fill 300000 events in 7.983 s: 37580 events/s (stats on)
+fill 300000 events in 7.560 s: 39684 events/s (stats 0)
+fill 300000 events in 7.277 s: 41227 events/s (stats on)

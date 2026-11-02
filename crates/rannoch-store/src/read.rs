@@ -125,6 +125,31 @@ impl Graph {
         )
     }
 
+    /// TOY ONLY: one page of [`Graph::links`]: at most `n` links whose other end's key comes
+    /// after `after`, in key order.
+    ///
+    /// # Errors
+    /// As [`Graph::links`].
+    pub fn links_page(
+        &self,
+        node: &NodeRef,
+        relation: &str,
+        direction: Direction,
+        view: &View,
+        after: &str,
+        n: i64,
+    ) -> Result<Vec<(String, Version)>, Error> {
+        let ontology = self.current_ontology()?;
+        let declared = ontology.relation(relation)?;
+        let out = direction == Direction::Out;
+        let (axis, known) = bounds(&declared.axis, view, &format!("relation {relation}"))?;
+        keyed_versions(
+            &self.conn,
+            &crate::queries::links_page(out),
+            params![link_entity(relation), axis, known, node.key, after, n],
+        )
+    }
+
     /// The nodes of `class` in `view`, each as its key and its version there, in key order:
     /// those whose version has every value in `filter`. A filter names only properties the class
     /// declares indexed, and is read through their index.

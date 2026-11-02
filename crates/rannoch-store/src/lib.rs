@@ -15,6 +15,7 @@ mod log;
 mod ontology;
 mod queries;
 mod read;
+pub mod toy_stats;
 
 pub use fact::check;
 pub use history::{End, Hearing, Seen, Version, View};
@@ -341,6 +342,7 @@ impl Graph {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let ontology = load(&tx)?;
+        toy_stats::prepare(&tx, &ontology)?;
         for seq in again {
             let Some(event) = event_at(&tx, Cursor(seq))? else {
                 continue;
@@ -350,6 +352,7 @@ impl Graph {
                 Err(cause) => tried(&tx, seq, &cause)?,
             };
         }
+        toy_stats::flush(&tx)?;
         tx.commit()?;
         Ok(to)
     }
@@ -371,6 +374,7 @@ impl Graph {
             return Ok(from);
         }
         let ontology = load(&tx)?;
+        toy_stats::prepare(&tx, &ontology)?;
         let log = Events { conn: &tx };
         let mut flags = Flags::read(&tx)?;
         let before = flags.clone();
@@ -405,9 +409,18 @@ impl Graph {
         } else {
             tx.execute_batch(RELEASE)?;
         }
+        toy_stats::flush(&tx)?;
         tx.prepare_cached(SET_PLACE)?.execute(params![FILL, to.0])?;
         tx.commit()?;
         Ok(to)
+    }
+
+    /// TOY ONLY: the stats fill keeps, per class and relation, now.
+    ///
+    /// # Errors
+    /// The graph file cannot be read.
+    pub fn toy_stats(&self) -> Result<Vec<(String, i64)>, Error> {
+        toy_stats::read(&self.conn)
     }
 
     /// Sets the store's try limit: how many times fill tries an event before it stops (3 until
@@ -574,9 +587,23 @@ fn fill_one(
                 follow(tx, ontology, store_key, event.cursor, &Of::Node(&node))?;
             }
         }
-        fact::Fact::Link(link) => fill_link(tx, (ontology, store_key), stamp, &link, *renames)?,
+        fact::Fact::Link(link) => {
+            let (rel, from, to) = (link.relation.as_str(), link.from.key.as_str(), link.to.key.as_str());
+            if toy_stats::enabled() && toy_stats::ever_ended(tx, rel, from, to)? {
+                let before = toy_stats::holding(tx, rel, from, to)?;
+                fill_link(tx, (ontology, store_key), stamp, &link, *renames)?;
+                toy_stats::moved(tx, rel, before, toy_stats::holding(tx, rel, from, to)?)?;
+            } else {
+                fill_link(tx, (ontology, store_key), stamp, &link, *renames)?;
+            }
+        }
         fact::Fact::Concluded(conclusion) => {
+            let (rel, from, to) = (conclusion.relation.as_str(), conclusion.from.key.as_str(), conclusion.to.key.as_str());
+            let before = toy_stats::enabled() && toy_stats::holding(tx, rel, from, to)?;
             conclude(tx, ontology, &conclusion, *renames)?;
+            if toy_stats::enabled() {
+                toy_stats::moved(tx, rel, before, toy_stats::holding(tx, rel, from, to)?)?;
+            }
         }
         fact::Fact::None => {
             if amended(tx, ontology, store_key, event, false)? {
@@ -769,7 +796,7 @@ fn current(tx: &Connection, ontology: &Ontology, subject: &Subject) -> Result<()
                     arrived(tx, ontology, class, key, recorded)?;
                 }
                 None => {
-                    tx.prepare_cached(&delete_node(class))?
+                    let gone = tx.prepare_cached(&delete_node(class))?
                         .execute([key])
                         .map_err(|e| {
                             Error::Refused(format!(
@@ -777,6 +804,9 @@ fn current(tx: &Connection, ontology: &Ontology, subject: &Subject) -> Result<()
                                  still name it: {e}"
                             ))
                         })?;
+                    if gone > 0 {
+                        toy_stats::tally(format!("class:{class}"), -1);
+                    }
                 }
             }
         }
@@ -792,8 +822,11 @@ fn current(tx: &Connection, ontology: &Ontology, subject: &Subject) -> Result<()
                 );
             }
             let declared = ontology.relation(relation)?;
-            tx.prepare_cached(&delete_link(relation, &declared.from, &declared.to))?
-                .execute([key, to])?;
+            if tx.prepare_cached(&delete_link(relation, &declared.from, &declared.to))?
+                .execute([key, to])? > 0
+            {
+                toy_stats::tally(format!("link:{relation}"), -1);
+            }
             tx.prepare_cached(CLOSE_OPEN)?
                 .execute(rusqlite::params![relation, key, to])?;
         }
@@ -815,8 +848,17 @@ fn put_node(
     let mut values: Vec<&dyn rusqlite::ToSql> = vec![&key, &source, &valid, &recorded];
     let bound: Vec<Bound<'_>> = properties.values().map(Bound).collect();
     values.extend(bound.iter().map(|v| v as &dyn rusqlite::ToSql));
-    tx.prepare_cached(&upsert_node(class, &names))?
-        .execute(values.as_slice())?;
+    if toy_stats::enabled() {
+        let (insert, update) = toy_stats::node_split(class, &names);
+        if tx.prepare_cached(&insert)?.execute(values.as_slice())? == 1 {
+            toy_stats::tally(format!("class:{class}"), 1);
+        } else {
+            tx.prepare_cached(&update)?.execute(values.as_slice())?;
+        }
+    } else {
+        tx.prepare_cached(&upsert_node(class, &names))?
+            .execute(values.as_slice())?;
+    }
     Ok(())
 }
 
@@ -832,8 +874,7 @@ fn put_link(
     let declared = ontology.relation(relation)?;
     let valid = valid.as_text();
     if present(tx, &declared.from, from)? && present(tx, &declared.to, to)? {
-        tx.prepare_cached(&upsert_link(relation, &declared.from, &declared.to))?
-            .execute(rusqlite::params![from, to, source, valid, recorded])?;
+        toy_stats::put_link(tx, relation, &declared.from, &declared.to, rusqlite::params![from, to, source, valid, recorded])?;
     } else {
         tx.prepare_cached(OPEN_LINK)?
             .execute(rusqlite::params![relation, from, to, source, valid])?;
@@ -876,8 +917,7 @@ fn arrived(
                 {
                     continue;
                 }
-                tx.prepare_cached(&upsert_link(&relation.name, &relation.from, &relation.to))?
-                    .execute(rusqlite::params![from_key, to_key, source, valid, recorded])?;
+                toy_stats::put_link(tx, &relation.name, &relation.from, &relation.to, rusqlite::params![from_key, to_key, source, valid, recorded])?;
                 tx.prepare_cached(CLOSE_OPEN)?.execute(rusqlite::params![
                     relation.name,
                     from_key,

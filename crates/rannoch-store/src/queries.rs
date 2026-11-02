@@ -344,7 +344,7 @@ fn known_occurrences(filter: &str) -> String {
         "(SELECT {hearing}, h.axis AS axis, h.known AS known, h.event AS event FROM _hearings h \
          WHERE {filter} \
          UNION ALL SELECT {hearing}, a.axis, a.known, a.alias FROM _hearings h \
-         JOIN _aliases a ON a.line = h.line AND a.identity = h.identity WHERE {filter})"
+         CROSS JOIN _aliases a ON a.line = h.line AND a.identity = h.identity WHERE {filter})"
     )
 }
 
@@ -700,6 +700,23 @@ fn holding(heard: &str, other: &str, ends: &str) -> String {
         ),
         heard_in_view()
     )
+}
+
+/// TOY ONLY: one page of [`links_in_view`]: the links whose other end's key is after `?5`, at
+/// most `?6` of them, found by an index seek on the other end's key before any version is picked.
+pub(crate) fn links_page(out: bool) -> String {
+    let page = if out {
+        "to_key > ?5 AND to_key <= (SELECT max(to_key) FROM (SELECT to_key FROM _hearings \
+         WHERE entity = ?1 AND line = 'main' AND key = ?4 AND to_key > ?5 ORDER BY to_key LIMIT ?6))"
+    } else {
+        "key > ?5 AND key <= (SELECT max(key) FROM (SELECT key FROM _hearings \
+         WHERE entity = ?1 AND line = 'main' AND to_key = ?4 AND key > ?5 ORDER BY key LIMIT ?6))"
+    };
+    if out {
+        holding(&format!("key = ?4 AND h.{page}"), "to_key", &format!("key = ?4 AND {page}"))
+    } else {
+        holding(&format!("to_key = ?4 AND h.{page}"), "key", &format!("to_key = ?4 AND {page}"))
+    }
 }
 
 /// How many keys of the class entity `?1` have a version in the view `?2`, `?3`.
