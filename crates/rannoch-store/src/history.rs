@@ -17,16 +17,12 @@ use rusqlite::{Connection, OptionalExtension, ToSql, TransactionBehavior, params
 
 use rannoch_cloudevents::{Conclusion, EventId, Fact, LinkFact, NodeFact, NodeRef, ValidTime};
 
+use crate::handles::Run;
 use crate::log::Cursor;
 use crate::ontology::{CLASS, RELATION};
 use crate::queries::{
-    ALIAS, ALIASES_OF, AMENDED_OF, AMENDMENT, AMENDMENTS_OF, CHECK, CONCLUDE, CORRECTED,
-    DROP_AMENDED, ENDING, EVENT_AT, EVENT_BY_CLOUDEVENT, FACTS_KNOWN, HEAR, HEAR_AMENDED,
-    HEARING_OF, HELD, KEEP_NEWEST, KNOWN_AGAIN, KNOWN_UNTIL, MADE_BY, PLACES_NAMING, RENAME,
-    RENAME_ENDINGS, RENAME_ENDS, RENAMED, RENAMES_IN, SEEN_OTHER, SEEN_PUT, SEEN_START, SET_CHECK,
-    UNSEEN, WAIT, WAS_RENAMED, as_of, edge_ending, edge_hearing, ended_sql, hearings, link_ending,
-    link_state, newest_in_view, order, seen_keep, seen_kept, seen_recount, seen_sql, version_row,
-    view_row,
+    ALIASES_OF, CHECK, CORRECTED, SET_CHECK, Sql, Stmt, ended_sql, hearings, link_ending,
+    link_state, seen_sql,
 };
 use crate::{Error, Graph};
 
@@ -48,9 +44,9 @@ pub(crate) fn take_noted() -> Option<i64> {
 }
 
 /// Raises the store's highest known-at ever filled to the greatest noted in the batch.
-pub(crate) fn keep_noted(tx: &Connection) -> Result<(), Error> {
+pub(crate) fn keep_noted(tx: &impl Run) -> Result<(), Error> {
     if let Some(known) = take_noted() {
-        tx.prepare_cached(KEEP_NEWEST)?.execute([known])?;
+        tx.with(Sql::KeepNewest, |s| s.execute([known]))?;
     }
     Ok(())
 }
@@ -242,22 +238,23 @@ pub(crate) struct Held {
 }
 
 /// Records what `of` heard, whose content identity is `identity`, as a new version row named by
-/// its origin's event and filled at `stamp`, and returns `None`; or, when the graph holds a
-/// hearing identical to it, records nothing and returns that one.
+/// its origin's event and filled at `stamp`, and returns `Err` saying whether it is its node's or
+/// link's only fact; or, when the graph holds a hearing identical to it, records nothing and
+/// returns that one.
 fn hear(
-    tx: &Connection,
+    tx: &impl Run,
     identity: [u8; 32],
     stamp: Stamp,
     of: &Of,
     ontology: &Ontology,
-) -> Result<Option<Held>, Error> {
-    let held = tx
-        .prepare_cached(HELD)?
-        .query_row(params![identity], |row| row.get::<_, String>(0))
-        .optional()?;
+) -> Result<Result<Held, bool>, Error> {
+    let held = tx.with(Sql::Held, |s| {
+        s.query_row(params![identity], |row| row.get::<_, String>(0))
+            .optional()
+    })?;
     let declared = of.point(ontology)?;
     if let Some(held) = held {
-        return Ok(Some(Held {
+        return Ok(Ok(Held {
             identity,
             event: serde_json::from_value(held.into())?,
             axis: declared,
@@ -271,29 +268,31 @@ fn hear(
     let known = of.event().recorded()?;
     let axis = point_or_known(declared.as_ref(), known);
     note(Some(known));
-    tx.prepare_cached(HEAR)?.execute(params![
-        identity,
-        entity,
-        from,
-        to,
-        of.event().to_string(),
-        stamp.cursor.0,
-        of.source(),
-        of.valid().as_text(),
-        axis,
-        known,
-        stamp.recorded,
-        properties
-    ])?;
+    tx.with(Sql::Hear, |s| {
+        s.execute(params![
+            identity,
+            entity,
+            from,
+            to,
+            of.event().to_string(),
+            stamp.cursor.0,
+            of.source(),
+            of.valid().as_text(),
+            axis,
+            known,
+            stamp.recorded,
+            properties
+        ])
+    })?;
     let mark = Mark {
-        hearing: Some(tx.last_insert_rowid()),
+        hearing: Some(tx.conn().last_insert_rowid()),
         ending: None,
         axis,
         known,
         event: of.event().to_string(),
     };
-    saw(tx, (&entity, from, to), &mark, of.valid().as_text())?;
-    Ok(None)
+    let alone = saw(tx, (&entity, from, to), &mark, of.valid().as_text())?;
+    Ok(Err(alone))
 }
 
 /// A fact a kept seen row names, by its row: a hearing by when this store recorded it, or an
@@ -327,46 +326,42 @@ impl Mark {
 /// ending of it with the valid time `valid`, in the transaction that records it: the first and
 /// last of its facts by its class's order, the first this store recorded, the earliest valid
 /// time it was given (a month standing for its first day) and how many facts it has. A link's
-/// endings count among its facts, as its versions do.
+/// endings count among its facts, as its versions do. Says whether `mark` is its only fact.
 fn saw(
-    tx: &Connection,
+    tx: &impl Run,
     (entity, key, to): (&str, &str, Option<&str>),
     mark: &Mark,
     valid: Option<&str>,
-) -> Result<(), Error> {
+) -> Result<bool, Error> {
     let to = to.unwrap_or_default();
-    let kept = tx
-        .prepare_cached(&seen_kept())?
-        .query_row(params![entity, key, to], |row| {
+    let kept = tx.with(Sql::SeenKept, |s| {
+        s.query_row(params![entity, key, to], |row| {
             Ok((Mark::row(row, 0)?, Mark::row(row, 5)?))
         })
-        .optional()?;
+        .optional()
+    })?;
     let Some((first, last)) = kept else {
         // One fact keeps no row, since it is its own first, last and first recorded; the second
         // starts the row from the one before it.
-        let other = tx
-            .prepare_cached(SEEN_OTHER)?
-            .query_row(params![entity, key, to, mark.hearing, mark.ending], |row| {
+        let other = tx.with(Sql::SeenOther, |s| {
+            s.query_row(params![entity, key, to, mark.hearing, mark.ending], |row| {
                 Ok((Mark::row(row, 0)?, row.get::<_, Option<String>>(5)?))
             })
-            .optional()?;
+            .optional()
+        })?;
         let Some((other, was)) = other else {
-            return Ok(());
+            return Ok(true);
         };
-        tx.prepare_cached(SEEN_START)?.execute(params![
-            entity,
-            key,
-            to,
-            other.hearing,
-            other.ending,
-            was
-        ])?;
+        tx.with(Sql::SeenStart, |s| {
+            s.execute(params![entity, key, to, other.hearing, other.ending, was])
+        })?;
         let (first, last) = if mark.rank() < other.rank() {
             (mark, &other)
         } else {
             (&other, mark)
         };
-        return keep(tx, (entity, key, to), (first, last), (1, valid));
+        keep(tx, (entity, key, to), (first, last), (1, valid))?;
+        return Ok(false);
     };
     let first = if mark.rank() < first.rank() {
         mark
@@ -378,28 +373,31 @@ fn saw(
     } else {
         &last
     };
-    keep(tx, (entity, key, to), (first, last), (1, valid))
+    keep(tx, (entity, key, to), (first, last), (1, valid))?;
+    Ok(false)
 }
 
 /// Keeps `first` and `last` as the first and last facts of `of` (its target key `''` for a
 /// node), adds `added` facts to its count and takes `valid` as its first true when earlier.
 fn keep(
-    tx: &Connection,
+    tx: &impl Run,
     (entity, key, to): (&str, &str, &str),
     (first, last): (&Mark, &Mark),
     (added, valid): (i64, Option<&str>),
 ) -> Result<(), Error> {
-    tx.prepare_cached(&seen_keep())?.execute(params![
-        entity,
-        key,
-        to,
-        first.hearing,
-        first.ending,
-        last.hearing,
-        last.ending,
-        added,
-        valid
-    ])?;
+    tx.with(Sql::SeenKeep, |s| {
+        s.execute(params![
+            entity,
+            key,
+            to,
+            first.hearing,
+            first.ending,
+            last.hearing,
+            last.ending,
+            added,
+            valid
+        ])
+    })?;
     Ok(())
 }
 
@@ -417,7 +415,7 @@ pub(crate) enum Heard {
 /// or a return to an older one, which this event is a new occurrence of. Current state takes
 /// either only when it is now the newest version.
 pub(crate) fn heard(
-    tx: &Connection,
+    tx: &impl Run,
     ontology: &Ontology,
     key: &Key,
     stamp: Stamp,
@@ -425,13 +423,18 @@ pub(crate) fn heard(
 ) -> Result<Heard, Error> {
     let identity = of.identity(key)?;
     let (entity, from, to) = of.entity();
-    if let Some(held) = hear(tx, identity, stamp, of, ontology)? {
-        if held.axis.is_some()
-            || newest(tx, (&entity, from, to))?.is_some_and(|(.., newest)| newest == identity)
-        {
-            return Ok(Heard::Held(held));
+    match hear(tx, identity, stamp, of, ontology)? {
+        Ok(held) => {
+            if held.axis.is_some()
+                || newest(tx, (&entity, from, to))?.is_some_and(|(.., newest)| newest == identity)
+            {
+                return Ok(Heard::Held(held));
+            }
+            alias(tx, &held, of.event(), stamp.cursor)?;
         }
-        alias(tx, &held, of.event(), stamp.cursor)?;
+        // Its only fact is its newest version.
+        Err(true) => return Ok(Heard::Newest),
+        Err(false) => {}
     }
     Ok(match newest(tx, (&entity, from, to))? {
         Some((.., newest)) if newest != identity => Heard::Older,
@@ -443,7 +446,7 @@ pub(crate) fn heard(
 /// occurrence of the hearing at its own known-at. When `event` is the smaller id the hearing takes
 /// its name and its known-at, the id it was named by becomes the alias, and this returns true.
 pub(crate) fn alias(
-    tx: &Connection,
+    tx: &impl Run,
     held: &Held,
     event: EventId,
     cursor: Cursor,
@@ -454,23 +457,27 @@ pub(crate) fn alias(
     let renamed = event < held.event;
     if renamed {
         let known = event.recorded()?;
-        tx.prepare_cached(RENAME)?.execute(params![
-            held.identity,
-            event.to_string(),
-            cursor.0,
-            point_or_known(held.axis.as_ref(), known),
-            known
-        ])?;
+        tx.with(Sql::Rename, |s| {
+            s.execute(params![
+                held.identity,
+                event.to_string(),
+                cursor.0,
+                point_or_known(held.axis.as_ref(), known),
+                known
+            ])
+        })?;
     }
     let alias = if renamed { held.event } else { event };
     let known = alias.recorded()?;
     note(Some(known));
-    let new = tx.prepare_cached(ALIAS)?.execute(params![
-        held.identity,
-        alias.to_string(),
-        point_or_known(held.axis.as_ref(), known),
-        known
-    ])?;
+    let new = tx.with(Sql::Alias, |s| {
+        s.execute(params![
+            held.identity,
+            alias.to_string(),
+            point_or_known(held.axis.as_ref(), known),
+            known
+        ])
+    })?;
     if renamed || new == 1 {
         reseen(tx, held.identity)?;
     }
@@ -479,12 +486,12 @@ pub(crate) fn alias(
 
 /// Finds the first and last facts of the node or link the hearing `identity` is of again, by
 /// index seeks, after that hearing took another event's id and maybe another known-at.
-fn reseen(tx: &Connection, identity: [u8; 32]) -> Result<(), Error> {
-    let (entity, key, to): (String, String, Option<String>) = tx
-        .prepare_cached(HEARING_OF)?
-        .query_row(params![identity], |row| {
+fn reseen(tx: &impl Run, identity: [u8; 32]) -> Result<(), Error> {
+    let (entity, key, to): (String, String, Option<String>) = tx.with(Sql::HearingOf, |s| {
+        s.query_row(params![identity], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })?;
+        })
+    })?;
     if let Some((first, last)) = edges(tx, (&entity, &key, to.as_deref()))? {
         let of = (
             entity.as_str(),
@@ -499,26 +506,29 @@ fn reseen(tx: &Connection, identity: [u8; 32]) -> Result<(), Error> {
 /// The first and last facts of `of` (entity, key, target key), hearings by their occurrences
 /// and endings, by index seeks; `None` when it has none.
 fn edges(
-    tx: &Connection,
+    tx: &impl Run,
     (entity, key, to): (&str, &str, Option<&str>),
 ) -> Result<Option<(Mark, Mark)>, Error> {
-    let edge = |direction: &str| -> Result<Option<Mark>, Error> {
-        let hearing = tx
-            .prepare_cached(&edge_hearing(direction))?
-            .query_row(params![entity, key, to], |row| Mark::row(row, 0))
-            .optional()?;
-        let ending = tx
-            .prepare_cached(&edge_ending(direction))?
-            .query_row(params![entity, key, to], |row| Mark::row(row, 0))
-            .optional()?;
-        let later = direction == "DESC";
+    let edge = |later: bool| -> Result<Option<Mark>, Error> {
+        let (hearing, ending) = if later {
+            (Sql::LastHearing, Sql::LastEnding)
+        } else {
+            (Sql::FirstHearing, Sql::FirstEnding)
+        };
+        let mark = |sql: Sql| {
+            tx.with(sql, |s| {
+                s.query_row(params![entity, key, to], |row| Mark::row(row, 0))
+                    .optional()
+            })
+        };
+        let (hearing, ending) = (mark(hearing)?, mark(ending)?);
         Ok(match (hearing, ending) {
             (Some(h), Some(e)) if (e.rank() > h.rank()) == later => Some(e),
             (Some(h), _) => Some(h),
             (None, e) => e,
         })
     };
-    Ok(edge("ASC")?.zip(edge("DESC")?))
+    Ok(edge(false)?.zip(edge(true)?))
 }
 
 /// Records how a link came to an end, when `conclusion` is an ending (at its point on its
@@ -527,7 +537,7 @@ fn edges(
 /// any before it, whatever order they arrive in, so a correction that is latest masks the
 /// endings.
 pub(crate) fn conclude(
-    tx: &Connection,
+    tx: &impl Run,
     ontology: &Ontology,
     conclusion: &Conclusion,
     renames: bool,
@@ -570,18 +580,19 @@ pub(crate) fn conclude(
     for from in &froms {
         for to in &tos {
             note(Some(known));
-            tx.prepare_cached(CONCLUDE)?
-                .execute(params![entity, from, to, by, source, at, valid, known])?;
+            tx.with(Sql::Conclude, |s| {
+                s.execute(params![entity, from, to, by, source, at, valid, known])
+            })?;
             let Some(at) = &at else {
                 continue;
             };
-            let new = tx
-                .prepare_cached(ENDING)?
-                .execute(params![entity, from, to, at, by, source, valid, known])?;
+            let new = tx.with(Sql::Ending, |s| {
+                s.execute(params![entity, from, to, at, by, source, valid, known])
+            })?;
             if new == 1 {
                 let mark = Mark {
                     hearing: None,
-                    ending: Some(tx.last_insert_rowid()),
+                    ending: Some(tx.conn().last_insert_rowid()),
                     axis: at.clone(),
                     known,
                     event: by.clone(),
@@ -627,7 +638,7 @@ struct Made {
 /// amendment's known-at, and every event naming the old key is heard again through the mapping.
 /// Returns what the hearings made and dropped are of, whose current state is to be read again.
 pub(crate) fn amend(
-    tx: &Connection,
+    tx: &impl Run,
     ontology: &Ontology,
     key: &Key,
     (body, cursor): (&str, Cursor),
@@ -653,25 +664,21 @@ pub(crate) fn amend(
         return Err(Error::Refused(format!("amendment {id} has no patch")));
     }
     let known = event.recorded()?;
-    let found: Option<(i64, String)> = tx
-        .prepare_cached(EVENT_BY_CLOUDEVENT)?
-        .query_row(params![source, target], |row| {
+    let found: Option<(i64, String)> = tx.with(Sql::EventByCloudevent, |s| {
+        s.query_row(params![source, target], |row| {
             Ok((row.get(0)?, row.get(1)?))
         })
-        .optional()?;
+        .optional()
+    })?;
     let made = match &found {
         Some((seq, _)) => made_by(tx, *seq)?,
         None => None,
     };
     let filled = target_filled || (made.is_none() && filled_before(tx, found.as_ref(), cursor)?);
     let Some((seq, written)) = found.filter(|_| made.is_some() || filled) else {
-        tx.prepare_cached(WAIT)?.execute(params![
-            source,
-            target,
-            known,
-            event.to_string(),
-            cursor.0
-        ])?;
+        tx.with(Sql::Wait, |s| {
+            s.execute(params![source, target, known, event.to_string(), cursor.0])
+        })?;
         return Ok(None);
     };
     let made = made.ok_or_else(|| {
@@ -680,8 +687,9 @@ pub(crate) fn amend(
         ))
     })?;
     let by = event.to_string();
-    tx.prepare_cached(AMENDMENT)?
-        .execute(params![seq, known, by, cursor.0])?;
+    tx.with(Sql::Amendment, |s| {
+        s.execute(params![seq, known, by, cursor.0])
+    })?;
     let mut places = vec![seq];
     let renamed_to = data
         .and_then(|data| data.get("patch"))
@@ -691,8 +699,9 @@ pub(crate) fn amend(
         let entity = &made.of.0;
         let old = key_before(tx, (seq, &written), entity, (known, &by))?;
         if old != new {
-            tx.prepare_cached(RENAMED)?
-                .execute(params![entity, old, new, known, by])?;
+            tx.with(Sql::Renamed, |s| {
+                s.execute(params![entity, old, new, known, by])
+            })?;
             rename_ends(tx, ontology, entity, &old, new)?;
             places.extend(naming(tx, ontology, entity, &old)?);
         }
@@ -713,7 +722,7 @@ pub(crate) fn amend(
 /// amendment. A target that filled with no hearing never makes one. Fill's place is read only
 /// for a target with no hearing, which is rare.
 fn filled_before(
-    tx: &Connection,
+    tx: &impl Run,
     found: Option<&(i64, String)>,
     cursor: Cursor,
 ) -> Result<bool, Error> {
@@ -724,10 +733,9 @@ fn filled_before(
 }
 
 /// The hearing the event at the place `seq` made itself, if it made one.
-fn made_by(tx: &Connection, seq: i64) -> Result<Option<Made>, Error> {
-    Ok(tx
-        .prepare_cached(MADE_BY)?
-        .query_row(params![seq], |row| {
+fn made_by(tx: &impl Run, seq: i64) -> Result<Option<Made>, Error> {
+    Ok(tx.with(Sql::MadeBy, |s| {
+        s.query_row(params![seq], |row| {
             Ok(Made {
                 arrived: row.get(0)?,
                 of: (row.get(1)?, row.get(2)?, row.get(3)?),
@@ -736,20 +744,21 @@ fn made_by(tx: &Connection, seq: i64) -> Result<Option<Made>, Error> {
                 known: row.get(6)?,
             })
         })
-        .optional()?)
+        .optional()
+    })?)
 }
 
 /// A rename: old key, new key, known-at and the amendment that made it.
 type Rename = (String, String, i64, String);
 
 /// Every rename in the class entity `entity`, by known-at and then event id.
-fn renames_in(tx: &Connection, entity: &str) -> Result<Vec<Rename>, Error> {
-    Ok(tx
-        .prepare_cached(RENAMES_IN)?
-        .query_map(params![entity], |row| {
+fn renames_in(tx: &impl Run, entity: &str) -> Result<Vec<Rename>, Error> {
+    Ok(tx.with(Sql::RenamesIn, |s| {
+        s.query_map(params![entity], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
         })?
-        .collect::<Result<_, _>>()?)
+        .collect()
+    })?)
 }
 
 /// The key `key` resolves to through `renames`, taken in order, as known at `upto` (a point and
@@ -765,7 +774,7 @@ fn resolve(renames: &[Rename], key: &str, upto: (i64, &str)) -> String {
 }
 
 /// Whether a key `of` names, its node's or a link's ends, was ever renamed.
-pub(crate) fn names_renamed(tx: &Connection, of: &Of) -> Result<bool, Error> {
+pub(crate) fn names_renamed(tx: &impl Run, of: &Of) -> Result<bool, Error> {
     let ends = match of {
         Of::Node(node) => vec![(&node.class, &node.key)],
         Of::Link(link) => vec![
@@ -774,9 +783,9 @@ pub(crate) fn names_renamed(tx: &Connection, of: &Of) -> Result<bool, Error> {
         ],
     };
     for (class, key) in ends {
-        let renamed: bool = tx
-            .prepare_cached(WAS_RENAMED)?
-            .query_row(params![node_entity(class), key], |row| row.get(0))?;
+        let renamed: bool = tx.with(Sql::WasRenamed, |s| {
+            s.query_row(params![node_entity(class), key], |row| row.get(0))
+        })?;
         if renamed {
             return Ok(true);
         }
@@ -787,7 +796,7 @@ pub(crate) fn names_renamed(tx: &Connection, of: &Of) -> Result<bool, Error> {
 /// The key the event at `seq` (`written` as the log holds it) gives its node as known just
 /// before `upto`: its amendments before then applied, then the renames before then.
 fn key_before(
-    tx: &Connection,
+    tx: &impl Run,
     (seq, written): (i64, &str),
     entity: &str,
     upto: (i64, &str),
@@ -811,16 +820,13 @@ fn key_before(
 
 /// Every amendment of the event at `seq` by known-at and then event id: its known-at, event and
 /// the merge patch its data holds.
-fn amendments_of(
-    tx: &Connection,
-    seq: i64,
-) -> Result<Vec<(i64, String, serde_json::Value)>, Error> {
-    let rows: Vec<(i64, String, String)> = tx
-        .prepare_cached(AMENDMENTS_OF)?
-        .query_map(params![seq], |row| {
+fn amendments_of(tx: &impl Run, seq: i64) -> Result<Vec<(i64, String, serde_json::Value)>, Error> {
+    let rows: Vec<(i64, String, String)> = tx.with(Sql::AmendmentsOf, |s| {
+        s.query_map(params![seq], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?
-        .collect::<Result<_, _>>()?;
+        .collect()
+    })?;
     rows.into_iter()
         .map(|(at, by, body)| {
             let body: serde_json::Value = serde_json::from_str(&body)?;
@@ -836,20 +842,15 @@ fn amendments_of(
 
 /// The places of every event with a hearing that names the node keyed `key` of the class entity
 /// `entity`: its own, and every link to or from it.
-fn naming(
-    tx: &Connection,
-    ontology: &Ontology,
-    entity: &str,
-    key: &str,
-) -> Result<Vec<i64>, Error> {
+fn naming(tx: &impl Run, ontology: &Ontology, entity: &str, key: &str) -> Result<Vec<i64>, Error> {
     let mut asks = vec![(entity.to_string(), false)];
     asks.extend(link_ends(ontology, entity));
     let mut places = Vec::new();
     for (of, target) in asks {
-        let found: Vec<i64> = tx
-            .prepare_cached(PLACES_NAMING)?
-            .query_map(params![of, key, target], |row| row.get(0))?
-            .collect::<Result<_, _>>()?;
+        let found: Vec<i64> = tx.with(Sql::PlacesNaming, |s| {
+            s.query_map(params![of, key, target], |row| row.get(0))?
+                .collect()
+        })?;
         places.extend(found);
     }
     Ok(places)
@@ -872,17 +873,19 @@ fn link_ends(ontology: &Ontology, entity: &str) -> Vec<(String, bool)> {
 /// Copies the endings and conclusions of every link keyed `old` at a node of `entity` onto
 /// `new`; the rows under `old` stay, so the link reads as it was known before the rename.
 fn rename_ends(
-    tx: &Connection,
+    tx: &impl Run,
     ontology: &Ontology,
     entity: &str,
     old: &str,
     new: &str,
 ) -> Result<(), Error> {
     for (of, target) in link_ends(ontology, entity) {
-        tx.prepare_cached(RENAME_ENDINGS)?
-            .execute(params![of, old, new, target])?;
-        tx.prepare_cached(RENAME_ENDS)?
-            .execute(params![of, old, new, target])?;
+        tx.with(Sql::RenameEndings, |s| {
+            s.execute(params![of, old, new, target])
+        })?;
+        tx.with(Sql::RenameEnds, |s| {
+            s.execute(params![of, old, new, target])
+        })?;
     }
     Ok(())
 }
@@ -895,26 +898,25 @@ fn rename_ends(
 /// axis, else the event's own known-at), known from then (never before the event itself), and the
 /// hearing before is known until then. Returns what the hearings it made and dropped are of.
 pub(crate) fn derive(
-    tx: &Connection,
+    tx: &impl Run,
     (ontology, key): (&Ontology, &Key),
     seq: i64,
 ) -> Result<Vec<Subject>, Error> {
     let Some(made) = made_by(tx, seq)? else {
         return Ok(Vec::new());
     };
-    let written: String = tx
-        .prepare_cached(EVENT_AT)?
-        .query_row(params![seq], |row| row.get(1))?;
-    let mut touched: Vec<Subject> = tx
-        .prepare_cached(AMENDED_OF)?
-        .query_map(params![seq], |row| {
+    let written: String = tx.with(Sql::EventAt, |s| {
+        s.query_row(params![seq], |row| row.get(1))
+    })?;
+    let mut touched: Vec<Subject> = tx.with(Sql::AmendedOf, |s| {
+        s.query_map(params![seq], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?
-        .collect::<Result<_, _>>()?;
+        .collect()
+    })?;
     touched.push(made.of.clone());
-    tx.prepare_cached(DROP_AMENDED)?.execute(params![seq])?;
-    tx.prepare_cached(KNOWN_AGAIN)?
-        .execute(params![made.arrived])?;
+    tx.with(Sql::DropAmended, |s| s.execute(params![seq]))?;
+    tx.with(Sql::KnownAgain, |s| s.execute(params![made.arrived]))?;
     let mut body: serde_json::Value = serde_json::from_str(&written)?;
     let own = body
         .get("id")
@@ -955,8 +957,7 @@ pub(crate) fn derive(
         heard = identity;
         // The hearing before is known until `at`, and the new one from `at` or later.
         note(Some(at.max(made.known)));
-        tx.prepare_cached(KNOWN_UNTIL)?
-            .execute(params![before, at])?;
+        tx.with(Sql::KnownUntil, |s| s.execute(params![before, at]))?;
         let of = fact.of(&by)?;
         let (entity, of_key, to) = of.entity();
         let mut named = identity.to_vec();
@@ -969,22 +970,24 @@ pub(crate) fn derive(
             Of::Link(_) => None,
         };
         let axis = of.point(ontology)?.unwrap_or_else(|| made.axis.clone());
-        tx.prepare_cached(HEAR_AMENDED)?.execute(params![
-            blake3::keyed_hash(&key.bytes, &named).as_bytes(),
-            entity,
-            of_key,
-            to,
-            made.name,
-            seq,
-            of.source(),
-            of.valid().as_text(),
-            axis,
-            // A rename can be known before the event itself; an amendment never is.
-            at.max(made.known),
-            at,
-            properties
-        ])?;
-        before = tx.last_insert_rowid();
+        tx.with(Sql::HearAmended, |s| {
+            s.execute(params![
+                blake3::keyed_hash(&key.bytes, &named).as_bytes(),
+                entity,
+                of_key,
+                to,
+                made.name,
+                seq,
+                of.source(),
+                of.valid().as_text(),
+                axis,
+                // A rename can be known before the event itself; an amendment never is.
+                at.max(made.known),
+                at,
+                properties
+            ])
+        })?;
+        before = tx.conn().last_insert_rowid();
         touched.push((entity, of_key.to_string(), to.map(str::to_string)));
     }
     Ok(touched)
@@ -1064,36 +1067,38 @@ fn merge(target: &mut serde_json::Value, patch: &serde_json::Value) {
 /// Keeps what is seen of `of` in step after amendments and renames, counted again from what is
 /// known now: its first and last facts, the first this store recorded, its first true and its
 /// count; or no row once it has one fact or none, as one fact keeps no row.
-pub(crate) fn reseen_of(tx: &Connection, (entity, key, to): &Subject) -> Result<(), Error> {
+pub(crate) fn reseen_of(tx: &impl Run, (entity, key, to): &Subject) -> Result<(), Error> {
     let to = to.as_deref().unwrap_or_default();
-    let count: i64 = tx
-        .prepare_cached(FACTS_KNOWN)?
-        .query_row(params![entity, key, to], |row| row.get(0))?;
+    let count: i64 = tx.with(Sql::FactsKnown, |s| {
+        s.query_row(params![entity, key, to], |row| row.get(0))
+    })?;
     let edges = edges(tx, (entity, key, (!to.is_empty()).then_some(to)))?;
     let Some((first, last)) = edges.filter(|_| count > 1) else {
-        tx.prepare_cached(UNSEEN)?
-            .execute(params![entity, key, to])?;
+        tx.with(Sql::Unseen, |s| s.execute(params![entity, key, to]))?;
         return Ok(());
     };
-    let (hearing, ending, first_true): (Option<i64>, Option<i64>, Option<String>) = tx
-        .prepare_cached(&seen_recount())?
-        .query_row(params![entity, key, to], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+    let (hearing, ending, first_true): (Option<i64>, Option<i64>, Option<String>) =
+        tx.with(Sql::SeenRecount, |s| {
+            s.query_row(params![entity, key, to], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
         })?;
     let ending = if hearing.is_some() { None } else { ending };
-    tx.prepare_cached(SEEN_PUT)?.execute(params![
-        entity,
-        key,
-        to,
-        first.hearing,
-        first.ending,
-        last.hearing,
-        last.ending,
-        hearing,
-        ending,
-        first_true,
-        count
-    ])?;
+    tx.with(Sql::SeenPut, |s| {
+        s.execute(params![
+            entity,
+            key,
+            to,
+            first.hearing,
+            first.ending,
+            last.hearing,
+            last.ending,
+            hearing,
+            ending,
+            first_true,
+            count
+        ])
+    })?;
     Ok(())
 }
 
@@ -1128,15 +1133,10 @@ pub(crate) fn take(conn: &mut Connection, key: &Key) -> Result<(), Error> {
 /// The current version of the node or link `of` (entity, key, target key): the newest by its
 /// class's order, as every read and write of current state chooses it.
 pub(crate) fn newest(
-    conn: &Connection,
+    conn: &impl Run,
     of: (&str, &str, Option<&str>),
 ) -> Result<Option<Versioned>, Error> {
-    read_version(
-        conn,
-        of,
-        (version_row, &format!("ORDER BY {}", order("DESC"))),
-        &[],
-    )
+    read_version(conn, of, Sql::NewestVersion, &[])
 }
 
 /// A version row's properties: a node's, or none for a link, whose row holds null.
@@ -1253,19 +1253,18 @@ pub(crate) type Versioned = (Version, i64, [u8; 32]);
 /// Reads one version row of `entity` keyed `key` (and `to`, for a link), as `tail` picks it
 /// among its hearings' occurrences, with `bound` bound from `?4` on: see [`Versioned`]. The
 /// version is named by its hearing's event, at the occurrence's axis point and known-at.
-fn read_version(
-    conn: &Connection,
+fn read_version<'s>(
+    conn: &impl Run,
     (entity, key, to): (&str, &str, Option<&str>),
-    (rows, tail): (fn(&str) -> String, &str),
+    rows: impl Into<Stmt<'s>>,
     bound: &[&dyn ToSql],
 ) -> Result<Option<Versioned>, Error> {
-    let mut statement = conn.prepare_cached(&rows(tail))?;
     let read = |row: &rusqlite::Row| -> rusqlite::Result<(VersionColumns, i64, [u8; 32])> {
         Ok((columns(row, 0)?, row.get(6)?, row.get(7)?))
     };
     let mut all: Vec<&dyn ToSql> = vec![&entity, &key, &to];
     all.extend_from_slice(bound);
-    let row = statement.query_row(all.as_slice(), read).optional()?;
+    let row = conn.with(rows, |s| s.query_row(all.as_slice(), read).optional())?;
     let Some((columns, recorded, identity)) = row else {
         return Ok(None);
     };
@@ -1345,18 +1344,8 @@ pub(crate) fn node_in_view(
     let (axis, known) = bounds(&class.axis, view, &format!("class {}", class.name))?;
     let of = node_entity(&class.name);
     match day {
-        None => read_version(
-            conn,
-            (&of, key, None),
-            (view_row, &newest_in_view()),
-            &[&axis, &known],
-        ),
-        Some(day) => read_version(
-            conn,
-            (&of, key, None),
-            (view_row, &as_of()),
-            &[&axis, &known, &day],
-        ),
+        None => read_version(conn, (&of, key, None), Sql::NewestInView, &[&axis, &known]),
+        Some(day) => read_version(conn, (&of, key, None), Sql::AsOf, &[&axis, &known, &day]),
     }
 }
 
@@ -1370,7 +1359,7 @@ fn ended(
     day: Option<&str>,
 ) -> Result<bool, Error> {
     let ending: Option<Option<bool>> = conn
-        .prepare_cached(&ended_sql())?
+        .prepare_cached(ended_sql())?
         .query_row(
             params![link_entity(relation), from, to, axis, known, day],
             |row| row.get(0),
@@ -1399,7 +1388,7 @@ pub(crate) fn link_in_view(
     (axis, known): (Option<Vec<u8>>, Option<i64>),
 ) -> Result<Option<Version>, Error> {
     let newest = conn
-        .prepare_cached(&link_state())?
+        .prepare_cached(link_state())?
         .query_row(
             params![link_entity(relation), from, to, axis, known],
             |row| Ok((columns(row, 0)?, row.get::<_, bool>(6)?)),
@@ -1438,7 +1427,7 @@ impl Graph {
         }
         let row: Option<EndingRow> = self
             .conn
-            .prepare_cached(&link_ending())?
+            .prepare_cached(link_ending())?
             .query_row(link, |row| {
                 Ok((
                     row.get(0)?,
@@ -1496,7 +1485,7 @@ impl Graph {
         type Row = ([u8; 32], String, String, Option<String>, Vec<u8>, i64);
         let rows: Vec<Row> = self
             .conn
-            .prepare_cached(&hearings())?
+            .prepare_cached(hearings())?
             .query_map(params![entity, key, to], |row| {
                 Ok((
                     row.get(0)?,
@@ -1598,7 +1587,7 @@ impl Graph {
         };
         let row = self
             .conn
-            .prepare_cached(&sql)?
+            .prepare_cached(sql)?
             .query_row(params![of.0, of.1, of.2], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,

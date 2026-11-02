@@ -4,11 +4,12 @@
 
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
+use crate::handles::Run;
 use crate::log::{Cursor, Event, decode, event_at};
 use crate::queries::{
     DONE_RETRY, DONE_WORK, DROP_OPEN_WORK, FAIL_WORK, FAILED_WORK, JOIN_WORKER, NEXT_EVENT,
-    OPEN_WORK, PLACE, PLACES, POSITION, PROCESSED, REMOVE_KEPT, REMOVE_PLACE, REMOVE_WORK,
-    SET_KEPT, SET_PLACE, START_WORK, WORK,
+    OPEN_WORK, PLACES, POSITION, PROCESSED, REMOVE_KEPT, REMOVE_PLACE, REMOVE_WORK, SET_KEPT,
+    SET_PLACE, START_WORK, Sql, WORK,
 };
 use crate::{Error, Graph};
 
@@ -133,13 +134,13 @@ impl Graph {
             .into_iter()
             .find(|seq| !self.handed.contains(&(worker.to_string(), *seq)))
         {
-            let event = event_at(&tx, Cursor(seq))?;
+            let event = event_at(&*tx, Cursor(seq))?;
             drop(tx);
             self.handed.insert((worker.to_string(), seq));
             return Ok(event);
         }
         tx.prepare_cached(JOIN_WORKER)?.execute([worker])?;
-        let place = place(&tx, worker)?;
+        let place = place(&*tx, worker)?;
         let row: Option<(i64, String, String)> = tx
             .prepare_cached(NEXT_EVENT)?
             .query_row(params![place.0, until.0], |row| {
@@ -253,12 +254,12 @@ fn in_progress(closed: usize, worker: &str, cursor: Cursor) -> Result<(), Error>
 }
 
 /// Worker `worker`'s place, or [`Cursor::START`] before its first event.
-pub(crate) fn place(conn: &rusqlite::Connection, worker: &str) -> Result<Cursor, Error> {
+pub(crate) fn place(conn: &impl Run, worker: &str) -> Result<Cursor, Error> {
     Ok(Cursor(
-        conn.prepare_cached(PLACE)?
-            .query_row([worker], |row| row.get(0))
-            .optional()?
-            .unwrap_or(0),
+        conn.with(Sql::Place, |s| {
+            s.query_row([worker], |row| row.get(0)).optional()
+        })?
+        .unwrap_or(0),
     ))
 }
 

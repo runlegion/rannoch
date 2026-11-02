@@ -6,9 +6,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::Error;
-use crate::queries::{
-    APPEND_EVENT, COUNT_BETWEEN, EVENT_AT, EVENTS_BETWEEN, EVENTS_CHUNK, HIGH_WATER,
-};
+use crate::handles::Run;
+use crate::queries::{COUNT_BETWEEN, EVENTS_BETWEEN, EVENTS_CHUNK, HIGH_WATER, Sql};
 
 /// A place in a graph's event log. Reading since a cursor returns the events after it. An app
 /// stores a cursor by serializing it, and a graph rebuilt from the log keeps each event's place,
@@ -63,11 +62,11 @@ pub(crate) fn decode(seq: i64, id: &str, body: String) -> Result<Event, Error> {
 }
 
 /// The event at `cursor`, if the log holds one there.
-pub(crate) fn event_at(conn: &Connection, cursor: Cursor) -> Result<Option<Event>, Error> {
-    let row: Option<(String, String)> = conn
-        .prepare_cached(EVENT_AT)?
-        .query_row(params![cursor.0], |row| Ok((row.get(0)?, row.get(1)?)))
-        .optional()?;
+pub(crate) fn event_at(conn: &impl Run, cursor: Cursor) -> Result<Option<Event>, Error> {
+    let row: Option<(String, String)> = conn.with(Sql::EventAt, |s| {
+        s.query_row(params![cursor.0], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()
+    })?;
     row.map(|(id, body)| decode(cursor.0, &id, body))
         .transpose()
 }
@@ -75,19 +74,17 @@ pub(crate) fn event_at(conn: &Connection, cursor: Cursor) -> Result<Option<Event
 /// Appends one event under the id it already has, inside the caller's transaction: at `place`
 /// when it has one, otherwise at the end of the log.
 pub(crate) fn store(
-    tx: &Connection,
+    tx: &impl Run,
     id: EventId,
     place: Option<Cursor>,
     body: &str,
 ) -> Result<Event, Error> {
-    tx.prepare_cached(APPEND_EVENT)?.execute(params![
-        place.map(|cursor| cursor.0),
-        body,
-        id.to_string()
-    ])?;
+    tx.with(Sql::AppendEvent, |s| {
+        s.execute(params![place.map(|cursor| cursor.0), body, id.to_string()])
+    })?;
     Ok(Event {
         id,
-        cursor: Cursor(tx.last_insert_rowid()),
+        cursor: Cursor(tx.conn().last_insert_rowid()),
         body: body.to_string(),
     })
 }

@@ -2,7 +2,21 @@
 //! statement; [`ident`] is the only function that quotes an identifier, and every value reaches
 //! SQL as a bound parameter.
 
+use std::collections::BTreeMap;
+
+use rannoch_ontology::Ontology;
+
+use crate::Error;
 use crate::ontology::{CLASS, RELATION};
+
+/// A statement's text built on first use and kept for the life of the process, so no call
+/// formats it again.
+macro_rules! built {
+    ($text:expr) => {{
+        static TEXT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| $text);
+        TEXT.as_str()
+    }};
+}
 
 /// How a connection is opened. Freed space is zeroed on every deletion and page split, so no copy
 /// of a removed body is left in free space by a split made before the removal. A commit is
@@ -302,17 +316,19 @@ pub(crate) const FACTS_KNOWN: &str = "SELECT (SELECT count(*) FROM _hearings WHE
 
 /// The first hearing this store recorded of `?1`, `?2`, `?3` among those known now, else its
 /// first ending, and the earliest valid time any of its facts was given.
-pub(crate) fn seen_recount() -> String {
-    format!(
-        "SELECT (SELECT min(arrived) FROM _hearings WHERE {h}), \
-         (SELECT min(id) FROM _endings WHERE {e}), \
-         (SELECT valid FROM (SELECT valid FROM _hearings WHERE {h} UNION ALL \
-         SELECT valid FROM _endings WHERE {e}) WHERE valid IS NOT NULL ORDER BY {} LIMIT 1)",
-        valid_day("valid"),
-        h = "entity = ?1 AND line = 'main' AND key = ?2 AND to_key IS nullif(?3, '') \
-             AND until IS NULL",
-        e = "entity = ?1 AND line = 'main' AND key = ?2 AND to_key = ?3",
-    )
+pub(crate) fn seen_recount() -> &'static str {
+    built!({
+        format!(
+            "SELECT (SELECT min(arrived) FROM _hearings WHERE {h}), \
+             (SELECT min(id) FROM _endings WHERE {e}), \
+             (SELECT valid FROM (SELECT valid FROM _hearings WHERE {h} UNION ALL \
+             SELECT valid FROM _endings WHERE {e}) WHERE valid IS NOT NULL ORDER BY {} LIMIT 1)",
+            valid_day("valid"),
+            h = "entity = ?1 AND line = 'main' AND key = ?2 AND to_key IS nullif(?3, '') \
+                 AND until IS NULL",
+            e = "entity = ?1 AND line = 'main' AND key = ?2 AND to_key = ?3",
+        )
+    })
 }
 
 /// Puts the seen row of `?1`, `?2`, `?3` whole: first and last facts, first recorded, first
@@ -369,14 +385,16 @@ pub(crate) fn occurrences_of() -> String {
     occurrences(OF)
 }
 
-/// One version row of the node or link `?1`, `?2`, `?3` among its hearings' occurrences, as
-/// `tail` picks it: event, source, valid, axis, known-at, properties, recorded, identity.
-pub(crate) fn version_row(tail: &str) -> String {
-    format!(
+/// The newest version row of the node or link `?1`, `?2`, `?3` among its hearings'
+/// occurrences, by its class's order: event, source, valid, axis, known-at, properties,
+/// recorded, identity.
+pub(crate) fn newest_version() -> &'static str {
+    built!(format!(
         "SELECT name, source, valid, axis, known, properties, recorded, identity \
-         FROM {} WHERE true {tail}",
-        occurrences_of()
-    )
+         FROM {} WHERE true ORDER BY {}",
+        occurrences_of(),
+        order("DESC")
+    ))
 }
 
 /// The occurrences of the hearings `filter` picks as the view of the axis bound `axis` and the
@@ -394,13 +412,30 @@ fn in_view(filter: &str, (axis, known): (&str, &str)) -> String {
 }
 
 /// One version row of the node or link `?1`, `?2`, `?3` among its hearings in the view of the
-/// axis bound `?4` and the known-at `?5`, as `tail` picks it: see [`version_row`].
-pub(crate) fn view_row(tail: &str) -> String {
+/// axis bound `?4` and the known-at `?5`, as `tail` picks it: see [`newest_version`].
+fn view_row(tail: &str) -> String {
     format!(
         "SELECT name, source, valid, axis, known, properties, recorded, identity \
          FROM {} WHERE true {tail}",
         in_view(OF, ("?4", "?5"))
     )
+}
+
+/// The newest version row in the view `?4`, `?5`: see [`view_row`].
+pub(crate) fn newest_in_view() -> &'static str {
+    built!(view_row(&format!("ORDER BY {} LIMIT 1", order("DESC"))))
+}
+
+/// The version row in the view `?4`, `?5` valid on or before the day `?6`, the greatest by valid
+/// time and then by its class's order: see [`view_row`].
+pub(crate) fn as_of() -> &'static str {
+    built!({
+        let valid = valid_day("valid");
+        view_row(&format!(
+            "AND {valid} <= ?6 ORDER BY {valid} DESC, {} LIMIT 1",
+            order("DESC")
+        ))
+    })
 }
 
 /// The `column` of the newest occurrence of the hearing whose `arrived` is `hearing` (SQL).
@@ -420,21 +455,23 @@ pub(crate) fn valid_day(column: &str) -> String {
 
 /// The kept seen row of `?1`, `?2`, `?3` (its target key `''` for a node), with the facts it
 /// names as first and last: hearing, ending, axis point, known-at and event of each.
-pub(crate) fn seen_kept() -> String {
-    format!(
-        "SELECT s.first_hearing, s.first_ending, coalesce(fh.axis, fe.axis), \
-         coalesce(fh.known, fe.known), coalesce(fh.event, fe.event), s.last_hearing, \
-         s.last_ending, coalesce({}, le.axis), coalesce({}, le.known), coalesce({}, le.event) \
-         FROM _seen s \
-         LEFT JOIN _hearings fh ON fh.arrived = s.first_hearing \
-         LEFT JOIN _endings fe ON fe.id = s.first_ending \
-         LEFT JOIN _hearings lh ON lh.arrived = s.last_hearing \
-         LEFT JOIN _endings le ON le.id = s.last_ending \
-         WHERE s.entity = ?1 AND s.line = 'main' AND s.key = ?2 AND s.to_key = ?3",
-        newest_occurrence("s.last_hearing", "axis"),
-        newest_occurrence("s.last_hearing", "known"),
-        newest_occurrence("s.last_hearing", "event")
-    )
+pub(crate) fn seen_kept() -> &'static str {
+    built!({
+        format!(
+            "SELECT s.first_hearing, s.first_ending, coalesce(fh.axis, fe.axis), \
+             coalesce(fh.known, fe.known), coalesce(fh.event, fe.event), s.last_hearing, \
+             s.last_ending, coalesce({}, le.axis), coalesce({}, le.known), coalesce({}, le.event) \
+             FROM _seen s \
+             LEFT JOIN _hearings fh ON fh.arrived = s.first_hearing \
+             LEFT JOIN _endings fe ON fe.id = s.first_ending \
+             LEFT JOIN _hearings lh ON lh.arrived = s.last_hearing \
+             LEFT JOIN _endings le ON le.id = s.last_ending \
+             WHERE s.entity = ?1 AND s.line = 'main' AND s.key = ?2 AND s.to_key = ?3",
+            newest_occurrence("s.last_hearing", "axis"),
+            newest_occurrence("s.last_hearing", "known"),
+            newest_occurrence("s.last_hearing", "event")
+        )
+    })
 }
 
 /// A fact of `?1`, `?2`, `?3` other than the hearing `?4` or the ending `?5`: hearing, ending,
@@ -453,14 +490,16 @@ pub(crate) const SEEN_START: &str = "INSERT INTO _seen(entity, key, to_key, firs
 
 /// Keeps `?4`/`?5` as first and `?6`/`?7` as last of `?1`, `?2`, `?3`, adds `?8` to its count and
 /// takes the valid time `?9` as its first true when earlier.
-pub(crate) fn seen_keep() -> String {
-    let earlier = format!("{} < {}", valid_day("?9"), valid_day("first_true"));
-    format!(
-        "UPDATE _seen SET first_hearing = ?4, first_ending = ?5, last_hearing = ?6, \
-         last_ending = ?7, count = count + ?8, first_true = CASE WHEN ?9 IS NOT NULL \
-         AND (first_true IS NULL OR {earlier}) THEN ?9 ELSE first_true END \
-         WHERE entity = ?1 AND line = 'main' AND key = ?2 AND to_key = ?3"
-    )
+pub(crate) fn seen_keep() -> &'static str {
+    built!({
+        let earlier = format!("{} < {}", valid_day("?9"), valid_day("first_true"));
+        format!(
+            "UPDATE _seen SET first_hearing = ?4, first_ending = ?5, last_hearing = ?6, \
+             last_ending = ?7, count = count + ?8, first_true = CASE WHEN ?9 IS NOT NULL \
+             AND (first_true IS NULL OR {earlier}) THEN ?9 ELSE first_true END \
+             WHERE entity = ?1 AND line = 'main' AND key = ?2 AND to_key = ?3"
+        )
+    })
 }
 
 /// The SQL deciding a link's ending, the `_endings` row `e`, of the link `(entity, from, to)` (SQL
@@ -523,57 +562,59 @@ pub(crate) fn ending_sql(
 /// id; or, for a node or link with one fact, which keeps no row, that fact. Then when a link
 /// ended: count, first true, the axis point it ended at, then first heard, last heard and first
 /// recorded as event, source, valid time, axis point, known-at, properties and whether an ending.
-pub(crate) fn seen_sql() -> String {
-    let fact = |p: &str, (axis, known): (&str, &str)| {
+pub(crate) fn seen_sql() -> &'static str {
+    built!({
+        let fact = |p: &str, (axis, known): (&str, &str)| {
+            format!(
+                "coalesce({p}h.event, {p}e.event), coalesce({p}h.source, {p}e.source), \
+                 CASE WHEN {p}h.arrived IS NULL THEN {p}e.valid ELSE {p}h.valid END, \
+                 coalesce({axis}, {p}e.axis), coalesce({known}, {p}e.known), {p}h.properties, \
+                 {p}h.arrived IS NULL"
+            )
+        };
+        let join = |p: &str, column: &str| {
+            format!(
+                "LEFT JOIN _hearings {p}h ON {p}h.arrived = s.{column}_hearing \
+                 LEFT JOIN _endings {p}e ON {p}e.id = s.{column}_ending"
+            )
+        };
+        let (ending, _) = ending_sql("n", ("?1", "?2", "?3"), None, "NULL");
+        // A node or link with one fact, a hearing or an ending, keeps no row: that fact is read.
+        let one = |fact: &str, from: &str, to: &str| {
+            format!(
+                "UNION ALL SELECT 1, valid, (SELECT n.axis FROM _endings n WHERE {ending}), \
+                 {fact}, {fact}, {fact} FROM {from} WHERE entity = ?1 AND line = 'main' AND key = ?2 \
+                 AND {to} AND NOT EXISTS (SELECT 1 FROM _seen WHERE entity = ?1 AND line = 'main' \
+                 AND key = ?2 AND to_key = ?3)"
+            )
+        };
+        let (last_axis, last_known) = (
+            newest_occurrence("s.last_hearing", "axis"),
+            newest_occurrence("s.last_hearing", "known"),
+        );
         format!(
-            "coalesce({p}h.event, {p}e.event), coalesce({p}h.source, {p}e.source), \
-             CASE WHEN {p}h.arrived IS NULL THEN {p}e.valid ELSE {p}h.valid END, \
-             coalesce({axis}, {p}e.axis), coalesce({known}, {p}e.known), {p}h.properties, \
-             {p}h.arrived IS NULL"
+            "SELECT s.count, s.first_true, (SELECT n.axis FROM _endings n WHERE {ending}), \
+             {}, {}, {} FROM _seen s {} {} {} WHERE s.entity = ?1 AND s.line = 'main' \
+             AND s.key = ?2 AND s.to_key = ?3 {} {} LIMIT 1",
+            fact("f", ("fh.axis", "fh.known")),
+            // A hearing heard again is last heard at its newest occurrence.
+            fact("l", (&last_axis, &last_known)),
+            fact("r", ("rh.axis", "rh.known")),
+            join("f", "first"),
+            join("l", "last"),
+            join("r", "recorded"),
+            one(
+                "event, source, valid, axis, known, properties, 0",
+                "_hearings",
+                "to_key IS nullif(?3, '') AND until IS NULL"
+            ),
+            one(
+                "event, source, valid, axis, known, NULL, 1",
+                "_endings",
+                "to_key = ?3"
+            ),
         )
-    };
-    let join = |p: &str, column: &str| {
-        format!(
-            "LEFT JOIN _hearings {p}h ON {p}h.arrived = s.{column}_hearing \
-             LEFT JOIN _endings {p}e ON {p}e.id = s.{column}_ending"
-        )
-    };
-    let (ending, _) = ending_sql("n", ("?1", "?2", "?3"), None, "NULL");
-    // A node or link with one fact, a hearing or an ending, keeps no row: that fact is read.
-    let one = |fact: &str, from: &str, to: &str| {
-        format!(
-            "UNION ALL SELECT 1, valid, (SELECT n.axis FROM _endings n WHERE {ending}), \
-             {fact}, {fact}, {fact} FROM {from} WHERE entity = ?1 AND line = 'main' AND key = ?2 \
-             AND {to} AND NOT EXISTS (SELECT 1 FROM _seen WHERE entity = ?1 AND line = 'main' \
-             AND key = ?2 AND to_key = ?3)"
-        )
-    };
-    let (last_axis, last_known) = (
-        newest_occurrence("s.last_hearing", "axis"),
-        newest_occurrence("s.last_hearing", "known"),
-    );
-    format!(
-        "SELECT s.count, s.first_true, (SELECT n.axis FROM _endings n WHERE {ending}), \
-         {}, {}, {} FROM _seen s {} {} {} WHERE s.entity = ?1 AND s.line = 'main' \
-         AND s.key = ?2 AND s.to_key = ?3 {} {} LIMIT 1",
-        fact("f", ("fh.axis", "fh.known")),
-        // A hearing heard again is last heard at its newest occurrence.
-        fact("l", (&last_axis, &last_known)),
-        fact("r", ("rh.axis", "rh.known")),
-        join("f", "first"),
-        join("l", "last"),
-        join("r", "recorded"),
-        one(
-            "event, source, valid, axis, known, properties, 0",
-            "_hearings",
-            "to_key IS nullif(?3, '') AND until IS NULL"
-        ),
-        one(
-            "event, source, valid, axis, known, NULL, 1",
-            "_endings",
-            "to_key = ?3"
-        ),
-    )
+    })
 }
 
 /// The hearings in the view of the axis bound `?2` and the known-at `?3` (each NULL for now), as
@@ -600,7 +641,7 @@ fn newest_each(facts: &str, of: &str, columns: &str) -> String {
 /// The version of each node of the class entity `?1` in the view `?2`, `?3`, in key order, its
 /// key first, then the columns [`view_row`] reads; `keys` (SQL) narrows the keys read, or is
 /// empty for every key.
-pub(crate) fn nodes_in_view(keys: &str) -> String {
+fn nodes_in_view(keys: &str) -> String {
     let filter = if keys.is_empty() {
         "h.entity = ?1 AND h.line = 'main'".to_string()
     } else {
@@ -616,9 +657,14 @@ pub(crate) fn nodes_in_view(keys: &str) -> String {
     )
 }
 
+/// Every node of the class entity `?1` in the view `?2`, `?3`: see [`nodes_in_view`].
+pub(crate) fn all_nodes_in_view() -> &'static str {
+    built!(nodes_in_view(""))
+}
+
 /// The keys of the class `class` with a hearing in the view `?2`, `?3` whose `property` held the
 /// value whose JSON is `?4`: read through the property's declared index.
-pub(crate) fn keys_by_property(class: &str, property: &str) -> String {
+fn keys_by_property(class: &str, property: &str) -> String {
     format!(
         "SELECT key FROM _hearings WHERE entity = {} AND {} = json_extract(?4, '$') \
          AND {IN_VIEW}",
@@ -632,40 +678,51 @@ pub(crate) fn keys_by_property(class: &str, property: &str) -> String {
 /// columns of the newest of each one's live hearings and endings, as [`link_state`] reads it.
 /// A link holds when it has a hearing in the view and has not ended there: its newest fact is a
 /// hearing, or a correction masks its endings, as [`ended_sql`] decides.
-pub(crate) fn links_in_view(out: bool) -> String {
+pub(crate) fn links_in_view(out: bool) -> &'static str {
     if out {
-        holding("key = ?4", "to_key", "key = ?4")
+        built!(holding("key = ?4", "to_key", "key = ?4"))
     } else {
         // Endings have no index by target: those of the links heard to the node are sought.
-        holding(
+        built!(holding(
             "to_key = ?4",
             "key",
             "to_key = ?4 AND key IN (SELECT key FROM _hearings \
              WHERE entity = ?1 AND line = 'main' AND to_key = ?4)",
-        )
+        ))
+    }
+}
+
+/// How many links [`links_in_view`] reads.
+pub(crate) fn links_counted(out: bool) -> &'static str {
+    if out {
+        built!(format!("SELECT count(*) FROM ({})", links_in_view(true)))
+    } else {
+        built!(format!("SELECT count(*) FROM ({})", links_in_view(false)))
     }
 }
 
 /// How many links of the relation entity `?1` hold in the view `?2`, `?3`, as
 /// [`links_in_view`] decides: those heard in it, less those of them it reads as ended, which
 /// only a link with an ending in the view can be.
-pub(crate) fn link_count() -> String {
-    let ended = "IN (SELECT key, to_key FROM _endings WHERE entity = ?1 AND line = 'main' \
-         AND (?2 IS NULL OR axis <= ?2) AND (?3 IS NULL OR known <= ?3))";
-    format!(
-        "SELECT (SELECT count(*) FROM (SELECT DISTINCT key, to_key FROM _hearings \
-         WHERE entity = ?1 AND {IN_VIEW})) - (SELECT count(*) FROM ({}) f WHERE ending = 1 AND NOT {} AND {})",
-        newest_each(
-            &link_facts(
-                &format!("(h.key, h.to_key) {ended}"),
-                &format!("(key, to_key) {ended}")
+pub(crate) fn link_count() -> &'static str {
+    built!({
+        let ended = "IN (SELECT key, to_key FROM _endings WHERE entity = ?1 AND line = 'main' \
+             AND (?2 IS NULL OR axis <= ?2) AND (?3 IS NULL OR known <= ?3))";
+        format!(
+            "SELECT (SELECT count(*) FROM (SELECT DISTINCT key, to_key FROM _hearings \
+             WHERE entity = ?1 AND {IN_VIEW})) - (SELECT count(*) FROM ({}) f WHERE ending = 1 AND NOT {} AND {})",
+            newest_each(
+                &link_facts(
+                    &format!("(h.key, h.to_key) {ended}"),
+                    &format!("(key, to_key) {ended}")
+                ),
+                "key, to_key",
+                "key, to_key, ending"
             ),
-            "key, to_key",
-            "key, to_key, ending"
-        ),
-        CORRECTED_IN_VIEW,
-        heard_in_view()
-    )
+            CORRECTED_IN_VIEW,
+            heard_in_view()
+        )
+    })
 }
 
 /// Whether a correction known in the view masks the endings of the link of `?1` named by the
@@ -716,8 +773,8 @@ fn holding(heard: &str, other: &str, ends: &str) -> String {
 }
 
 /// How many keys of the class entity `?1` have a version in the view `?2`, `?3`.
-pub(crate) fn node_count() -> String {
-    format!("SELECT count(DISTINCT key) FROM _hearings WHERE entity = ?1 AND {IN_VIEW}")
+pub(crate) fn node_count() -> &'static str {
+    built!({ format!("SELECT count(DISTINCT key) FROM _hearings WHERE entity = ?1 AND {IN_VIEW}") })
 }
 
 /// The highest known-at ever filled: of a hearing, the amendment that superseded one, an alias,
@@ -730,42 +787,31 @@ pub(crate) const KNOWN_NOW: &str = "SELECT known FROM _newest";
 pub(crate) const KEEP_NEWEST: &str =
     "UPDATE _newest SET known = ?1 WHERE known IS NULL OR known < ?1";
 
-/// Picks the newest version row in the view.
-pub(crate) fn newest_in_view() -> String {
-    format!("ORDER BY {} LIMIT 1", order("DESC"))
-}
-
-/// Picks the version row valid on or before the day `?6`, the greatest by valid time and then
-/// by its class's order.
-pub(crate) fn as_of() -> String {
-    let valid = valid_day("valid");
-    format!(
-        "AND {valid} <= ?6 ORDER BY {valid} DESC, {} LIMIT 1",
-        order("DESC")
-    )
-}
-
 /// The newest of the live hearings and endings of the link `?1`, `?2`, `?3` in the view of the
 /// axis bound `?4` and the known-at `?5`: event, source, valid, axis point, known-at, properties,
 /// whether an ending.
-pub(crate) fn link_state() -> String {
-    format!(
-        "SELECT event, source, valid, axis, known, properties, ending FROM ( \
-         SELECT name AS event, source, valid, axis, known, properties, 0 AS ending FROM {} \
-         UNION ALL SELECT event, source, valid, axis, known, NULL, 1 \
-         FROM _endings WHERE entity = ?1 AND line = 'main' AND key = ?2 AND to_key = ?3 \
-         AND (?4 IS NULL OR axis <= ?4) AND (?5 IS NULL OR known <= ?5)) ORDER BY {} LIMIT 1",
-        in_view(OF, ("?4", "?5")),
-        order("DESC")
-    )
+pub(crate) fn link_state() -> &'static str {
+    built!({
+        format!(
+            "SELECT event, source, valid, axis, known, properties, ending FROM ( \
+             SELECT name AS event, source, valid, axis, known, properties, 0 AS ending FROM {} \
+             UNION ALL SELECT event, source, valid, axis, known, NULL, 1 \
+             FROM _endings WHERE entity = ?1 AND line = 'main' AND key = ?2 AND to_key = ?3 \
+             AND (?4 IS NULL OR axis <= ?4) AND (?5 IS NULL OR known <= ?5)) ORDER BY {} LIMIT 1",
+            in_view(OF, ("?4", "?5")),
+            order("DESC")
+        )
+    })
 }
 
 /// Whether the link `?1`, `?2`, `?3` had ended in the view of the axis bound `?4` and the
 /// known-at `?5`, and as of the valid time `?6` when given (NULL when its ending's valid time is
 /// unknown); no row when it had not ended.
-pub(crate) fn ended_sql() -> String {
-    let (ending, valid_by) = ending_sql("e", ("?1", "?2", "?3"), Some(("?4", "?5")), "?6");
-    format!("SELECT ?6 IS NULL OR {valid_by} FROM _endings e WHERE {ending}")
+pub(crate) fn ended_sql() -> &'static str {
+    built!({
+        let (ending, valid_by) = ending_sql("e", ("?1", "?2", "?3"), Some(("?4", "?5")), "?6");
+        format!("SELECT ?6 IS NULL OR {valid_by} FROM _endings e WHERE {ending}")
+    })
 }
 
 /// Records the conclusion of the link `?1`, `?2`, `?3` in the event `?4` from `?5`, at the axis
@@ -787,9 +833,11 @@ pub(crate) const CORRECTED: &str = "SELECT event, source FROM _ends \
      WHERE entity = ?1 AND line = 'main' AND key = ?2 AND to_key = ?3 AND axis IS NULL";
 
 /// The ending of the link `?1`, `?2`, `?3`: event, source, axis point, known-at, valid.
-pub(crate) fn link_ending() -> String {
-    let (ending, _) = ending_sql("e", ("?1", "?2", "?3"), None, "NULL");
-    format!("SELECT event, source, axis, known, valid FROM _endings e WHERE {ending}")
+pub(crate) fn link_ending() -> &'static str {
+    built!({
+        let (ending, _) = ending_sql("e", ("?1", "?2", "?3"), None, "NULL");
+        format!("SELECT event, source, axis, known, valid FROM _endings e WHERE {ending}")
+    })
 }
 
 /// Names the hearing `?1` by the event `?2` at the place `?3`, at the axis point `?4` and the
@@ -809,9 +857,9 @@ pub(crate) const ALIASES_OF: &str =
 pub(crate) const HEARING_OF: &str =
     "SELECT entity, key, to_key FROM _hearings WHERE line = 'main' AND identity = ?1";
 
-/// The first (`ASC`) or last (`DESC`) occurrence of a hearing of `?1`, `?2`, `?3`: hearing,
-/// ending (NULL), axis point, known-at, event.
-pub(crate) fn edge_hearing(direction: &str) -> String {
+/// The first or the last occurrence of a hearing of `?1`, `?2`, `?3`: hearing, ending (NULL),
+/// axis point, known-at, event.
+fn edge_hearing(direction: &str) -> String {
     format!(
         "SELECT arrived, NULL, axis, known, event FROM {} ORDER BY {} LIMIT 1",
         occurrences_of(),
@@ -819,9 +867,9 @@ pub(crate) fn edge_hearing(direction: &str) -> String {
     )
 }
 
-/// The first (`ASC`) or last (`DESC`) ending of the link `?1`, `?2`, `?3`: hearing (NULL),
-/// ending, axis point, known-at, event.
-pub(crate) fn edge_ending(direction: &str) -> String {
+/// The first or the last ending of the link `?1`, `?2`, `?3`: hearing (NULL), ending, axis
+/// point, known-at, event.
+fn edge_ending(direction: &str) -> String {
     format!(
         "SELECT NULL, id, axis, known, event FROM _endings \
          WHERE entity = ?1 AND line = 'main' AND key = ?2 AND to_key = ?3 \
@@ -832,13 +880,15 @@ pub(crate) fn edge_ending(direction: &str) -> String {
 
 /// Every hearing of `?1`, `?2`, `?3` in order on its axis: identity, event, source, valid,
 /// axis point, known-at.
-pub(crate) fn hearings() -> String {
-    format!(
-        "SELECT identity, event, source, valid, axis, known FROM _hearings \
-         WHERE entity = ?1 AND line = 'main' AND key = ?2 AND to_key IS ?3 AND until IS NULL \
-         ORDER BY {}",
-        order("ASC")
-    )
+pub(crate) fn hearings() -> &'static str {
+    built!({
+        format!(
+            "SELECT identity, event, source, valid, axis, known FROM _hearings \
+             WHERE entity = ?1 AND line = 'main' AND key = ?2 AND to_key IS ?3 AND until IS NULL \
+             ORDER BY {}",
+            order("ASC")
+        )
+    })
 }
 
 /// Puts a link that waits for an end into `_open`, or updates the one already waiting.
@@ -957,15 +1007,21 @@ pub(crate) fn create_relation_table(relation: &str, from: &str, to: &str) -> Str
     )
 }
 
-/// Writes a node into its class's table under its key: a new row, or the same row with the
-/// given properties, source, valid time and record time replaced. Binds `?1` key, `?2` source,
-/// `?3` valid, `?4` recorded, then one value per property in `properties`' order.
-pub(crate) fn upsert_node(class: &str, properties: &[&str]) -> String {
-    let columns = concat(properties, |p| format!(", {}", property_column(p)));
-    let holes = concat(0..properties.len(), |i| format!(", ?{}", i + 5));
-    let updates = concat(properties, |p| {
+/// Writes a node into its class's table under its key: a new row, or the same row with its
+/// source, valid time and record time replaced and each property the version carries. Binds `?1`
+/// key, `?2` source, `?3` valid, `?4` recorded, then for each of `properties` in order its value
+/// and whether the version carries it; one it does not carry is left as the row holds it.
+fn upsert_node<'a>(class: &str, properties: impl Iterator<Item = &'a String> + Clone) -> String {
+    let columns = concat(properties.clone(), |p| format!(", {}", property_column(p)));
+    let holes = concat(properties.clone().enumerate(), |(i, _)| {
+        format!(", ?{}", 2 * i + 5)
+    });
+    let updates = concat(properties.enumerate(), |(i, p)| {
         let column = property_column(p);
-        format!(", {column} = excluded.{column}")
+        format!(
+            ", {column} = CASE WHEN ?{} THEN excluded.{column} ELSE {column} END",
+            2 * i + 6
+        )
     });
     format!(
         "INSERT INTO {}(key, source, valid, recorded{columns}) VALUES (?1, ?2, ?3, ?4{holes}) \
@@ -977,8 +1033,9 @@ pub(crate) fn upsert_node(class: &str, properties: &[&str]) -> String {
 
 /// Writes a link into its relation's table between the nodes with the from-key `?1` and the
 /// to-key `?2`; `?3` source, `?4` valid, `?5` recorded. A missing end leaves its id NULL, which
-/// the table refuses.
-pub(crate) fn upsert_link(relation: &str, from: &str, to: &str) -> String {
+/// the table refuses as a NOT NULL constraint, so the insert itself says whether both ends are
+/// present. One row of values, not a select, so SQLite needs no statement journal for it.
+fn upsert_link(relation: &str, from: &str, to: &str) -> String {
     format!(
         "INSERT INTO {}(src, dst, source, valid, recorded) \
          VALUES ((SELECT id FROM {} WHERE key = ?1), (SELECT id FROM {} WHERE key = ?2), ?3, ?4, ?5) \
@@ -991,7 +1048,7 @@ pub(crate) fn upsert_link(relation: &str, from: &str, to: &str) -> String {
 }
 
 /// Reads the node keyed `?1` from its class's table: its source, valid time and record time.
-pub(crate) fn select_node(class: &str) -> String {
+fn select_node(class: &str) -> String {
     format!(
         "SELECT source, valid, recorded FROM {} WHERE key = ?1",
         class_table(class)
@@ -999,12 +1056,12 @@ pub(crate) fn select_node(class: &str) -> String {
 }
 
 /// Removes the node keyed `?1` from its class's table.
-pub(crate) fn delete_node(class: &str) -> String {
+fn delete_node(class: &str) -> String {
     format!("DELETE FROM {} WHERE key = ?1", class_table(class))
 }
 
 /// Removes the link from the node keyed `?1` to the node keyed `?2` from its relation's table.
-pub(crate) fn delete_link(relation: &str, from: &str, to: &str) -> String {
+fn delete_link(relation: &str, from: &str, to: &str) -> String {
     format!(
         "DELETE FROM {} WHERE src = (SELECT id FROM {} WHERE key = ?1) \
          AND dst = (SELECT id FROM {} WHERE key = ?2)",
@@ -1014,14 +1071,9 @@ pub(crate) fn delete_link(relation: &str, from: &str, to: &str) -> String {
     )
 }
 
-/// The id of the node keyed `?1` in its class's table.
-pub(crate) fn node_id(class: &str) -> String {
-    format!("SELECT id FROM {} WHERE key = ?1", class_table(class))
-}
-
-/// The open links of the relation `?1` waiting on the key `?2` at the end `column`
-/// (`from_key` or `to_key`).
-pub(crate) fn waiting(column: &str) -> String {
+/// The open links of the relation `?1` waiting on the key `?2` at their target end (`to`), or at
+/// their source end.
+fn waiting(column: &str) -> String {
     format!("SELECT from_key, to_key, source, valid FROM _open WHERE rel = ?1 AND {column} = ?2")
 }
 
@@ -1037,4 +1089,205 @@ pub(crate) fn add_property_column(class: &str, property: &str, column_type: &str
 /// Each item formatted by `each` and joined into one string.
 pub(crate) fn concat<T>(items: impl IntoIterator<Item = T>, each: impl Fn(T) -> String) -> String {
     items.into_iter().map(each).collect::<Vec<_>>().concat()
+}
+
+/// A statement by its text and its slot: where a fill transaction keeps its handle.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Stmt<'a> {
+    pub(crate) slot: usize,
+    pub(crate) text: &'a str,
+}
+
+/// A statement whose text is one per class or relation, built when the ontology loads.
+#[derive(Debug)]
+pub(crate) struct Owned {
+    slot: usize,
+    text: String,
+}
+
+impl Owned {
+    pub(crate) fn stmt(&self) -> Stmt<'_> {
+        Stmt {
+            slot: self.slot,
+            text: &self.text,
+        }
+    }
+}
+
+/// The statements of one class: writing and removing a node, which fill runs; reading its row,
+/// and its nodes by each indexed property, which the reads run.
+#[derive(Debug)]
+pub(crate) struct ClassSql {
+    /// Its declared properties, in the order `put` binds them.
+    pub(crate) properties: Vec<String>,
+    pub(crate) put: Owned,
+    pub(crate) remove: Owned,
+    pub(crate) row: String,
+    pub(crate) by: BTreeMap<String, String>,
+}
+
+/// The statements of one relation that fill runs: writing and removing a link.
+#[derive(Debug)]
+pub(crate) struct RelationSql {
+    pub(crate) put: Owned,
+    pub(crate) remove: Owned,
+}
+
+/// Every statement of an ontology's classes and relations, each text built once when the
+/// ontology loads.
+#[derive(Debug)]
+pub(crate) struct Catalogue {
+    pub(crate) classes: BTreeMap<String, ClassSql>,
+    pub(crate) relations: BTreeMap<String, RelationSql>,
+    /// How many slots its statements and the fixed ones take.
+    pub(crate) slots: usize,
+}
+
+impl Catalogue {
+    /// The statements of the class `name`.
+    pub(crate) fn class(&self, name: &str) -> Result<&ClassSql, Error> {
+        self.classes
+            .get(name)
+            .ok_or_else(|| Error::Refused(format!("class {name} is not declared")))
+    }
+
+    /// The statements of the relation `name`.
+    pub(crate) fn relation(&self, name: &str) -> Result<&RelationSql, Error> {
+        self.relations
+            .get(name)
+            .ok_or_else(|| Error::Refused(format!("relation {name} is not declared")))
+    }
+
+    pub(crate) fn new(ontology: &Ontology) -> Catalogue {
+        let mut slots = Sql::COUNT;
+        let mut owned = |text: String| {
+            slots += 1;
+            Owned {
+                slot: slots - 1,
+                text,
+            }
+        };
+        let classes = ontology
+            .classes
+            .values()
+            .map(|class| {
+                let sql = ClassSql {
+                    properties: class.properties.keys().cloned().collect(),
+                    put: owned(upsert_node(&class.name, class.properties.keys())),
+                    remove: owned(delete_node(&class.name)),
+                    row: select_node(&class.name),
+                    by: class
+                        .indexed
+                        .iter()
+                        .map(|p| {
+                            let keys = keys_by_property(&class.name, p);
+                            (p.clone(), nodes_in_view(&keys))
+                        })
+                        .collect(),
+                };
+                (class.name.clone(), sql)
+            })
+            .collect();
+        let relations = ontology
+            .relations
+            .values()
+            .map(|r| {
+                let sql = RelationSql {
+                    put: owned(upsert_link(&r.name, &r.from, &r.to)),
+                    remove: owned(delete_link(&r.name, &r.from, &r.to)),
+                };
+                (r.name.clone(), sql)
+            })
+            .collect();
+        Catalogue {
+            classes,
+            relations,
+            slots,
+        }
+    }
+}
+
+/// The statements whose text is the same for every ontology, numbered by their slots.
+macro_rules! fixed {
+    ($($name:ident => $text:expr,)*) => {
+        /// A statement whose text is the same for every ontology.
+        #[derive(Debug, Clone, Copy)]
+        pub(crate) enum Sql {
+            $($name,)*
+        }
+
+        impl Sql {
+            pub(crate) const COUNT: usize = [$(Sql::$name),*].len();
+
+            pub(crate) fn text(self) -> &'static str {
+                match self {
+                    $(Sql::$name => $text,)*
+                }
+            }
+        }
+    };
+}
+
+impl From<Sql> for Stmt<'static> {
+    fn from(sql: Sql) -> Self {
+        Stmt {
+            slot: sql as usize,
+            text: sql.text(),
+        }
+    }
+}
+
+fixed! {
+    Held => HELD,
+    Hear => HEAR,
+    SeenKept => seen_kept(),
+    SeenOther => SEEN_OTHER,
+    SeenStart => SEEN_START,
+    SeenKeep => seen_keep(),
+    Rename => RENAME,
+    Alias => ALIAS,
+    HearingOf => HEARING_OF,
+    FirstHearing => built!(edge_hearing("ASC")),
+    LastHearing => built!(edge_hearing("DESC")),
+    FirstEnding => built!(edge_ending("ASC")),
+    LastEnding => built!(edge_ending("DESC")),
+    Conclude => CONCLUDE,
+    Ending => ENDING,
+    EventByCloudevent => EVENT_BY_CLOUDEVENT,
+    Wait => WAIT,
+    Amendment => AMENDMENT,
+    Renamed => RENAMED,
+    MadeBy => MADE_BY,
+    RenamesIn => RENAMES_IN,
+    WasRenamed => WAS_RENAMED,
+    AmendmentsOf => AMENDMENTS_OF,
+    PlacesNaming => PLACES_NAMING,
+    RenameEndings => RENAME_ENDINGS,
+    RenameEnds => RENAME_ENDS,
+    EventAt => EVENT_AT,
+    AmendedOf => AMENDED_OF,
+    DropAmended => DROP_AMENDED,
+    KnownAgain => KNOWN_AGAIN,
+    KnownUntil => KNOWN_UNTIL,
+    HearAmended => HEAR_AMENDED,
+    FactsKnown => FACTS_KNOWN,
+    Unseen => UNSEEN,
+    SeenRecount => seen_recount(),
+    SeenPut => SEEN_PUT,
+    NewestVersion => newest_version(),
+    NewestInView => newest_in_view(),
+    AsOf => as_of(),
+    KeepNewest => KEEP_NEWEST,
+    TriedWork => TRIED_WORK,
+    DoneRetry => DONE_RETRY,
+    Waited => WAITED,
+    AnyRename => ANY_RENAME,
+    WaitingFor => WAITING_FOR,
+    StopWaiting => STOP_WAITING,
+    CloseOpen => CLOSE_OPEN,
+    OpenLink => OPEN_LINK,
+    WaitingOnTarget => built!(waiting("to_key")),
+    WaitingOnSource => built!(waiting("from_key")),
+    AppendEvent => APPEND_EVENT,
+    Place => PLACE,
 }
