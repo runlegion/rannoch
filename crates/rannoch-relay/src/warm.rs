@@ -195,6 +195,9 @@ pub(crate) struct Warm {
     /// tests count. The time it takes is measured in `toys/relay`.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) reads: u64,
+    /// How many nodes its walks have visited: what a walk costs where no read is made.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) walked: u64,
     /// Everything read may be wrong, as an amendment or a rename makes it: read it all again.
     stale: bool,
 }
@@ -240,6 +243,7 @@ impl Warm {
             last_via: None,
             moved: false,
             reads: 0,
+            walked: 0,
             stale: false,
         }
     }
@@ -344,7 +348,8 @@ impl Warm {
         let Ok(attributes) = rannoch_cloudevents::attributes(body) else {
             return;
         };
-        if attributes.ty == "rannoch.amended" {
+        // An amendment can move anything, and a retried fill was folded before it held.
+        if attributes.ty == "rannoch.amended" || attributes.ty == "rannoch.refilled" {
             self.stale = true;
             return;
         }
@@ -490,6 +495,7 @@ impl Warm {
         // Every node marked: those taken, and those this step has already looked at.
         let mut visited: HashSet<Id, Fast> =
             HashSet::with_capacity_and_hasher(size, Fast::default());
+        self.walked += self.roots.len() as u64;
         for root in &self.roots {
             if let Some(version) = version_of(
                 graph,
@@ -567,6 +573,7 @@ impl Warm {
                     if !visited.insert(Arc::clone(reached)) {
                         continue;
                     }
+                    self.walked += 1;
                     let version = version_of(
                         graph,
                         &self.view,
@@ -847,6 +854,42 @@ mod tests {
         assert_eq!(warm.set.nodes().len(), 1_001);
         // The root, its list; each schematic, its list; each item.
         assert_eq!(warm.reads, 1 + 1 + 500 + 500 + 500);
+        Ok(())
+    }
+
+    #[test]
+    fn a_walk_visits_every_node_only_when_something_it_holds_moved() -> Result {
+        let dir = tempfile::tempdir()?;
+        let mut g = hub(&dir, 500)?;
+        let mut warm = Warm::seed(&g, shape(None), View::default(), Cursor::START)?;
+        assert_eq!(warm.walked, 1_001);
+        let mut visited = |bodies: &[String]| -> Result<u64> {
+            let before = warm.walked;
+            reads_to_fold(&mut warm, &mut g, bodies)?;
+            Ok(warm.walked - before)
+        };
+        assert_eq!(visited(&[node("other", "x", "t")])?, 0, "no walk");
+        assert_eq!(visited(&[node("schematic", "s0010", "new")])?, 1_001);
+        let ended = link("ended", "crafts", ("schematic", "s0010"), ("item", "i0010"));
+        assert_eq!(visited(&[ended])?, 1_000);
+        let two = [
+            node("schematic", "s0011", "a"),
+            node("schematic", "s0012", "b"),
+        ];
+        assert_eq!(visited(&two)?, 1_000, "one walk for the batch");
+        Ok(())
+    }
+
+    #[test]
+    fn a_retried_fill_rewalks() -> Result {
+        let dir = tempfile::tempdir()?;
+        let mut g = hub(&dir, 10)?;
+        let mut warm = Warm::seed(&g, shape(None), View::default(), Cursor::START)?;
+        let seeded = warm.reads;
+        let told = json!({"specversion": "1.0", "id": EventId::now().to_string(),
+            "source": "rannoch", "type": "rannoch.refilled", "data": {"cursor": 1}})
+        .to_string();
+        assert_eq!(reads_to_fold(&mut warm, &mut g, &[told])?, seeded);
         Ok(())
     }
 

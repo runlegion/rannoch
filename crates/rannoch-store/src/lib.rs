@@ -367,7 +367,20 @@ impl Graph {
                 continue;
             };
             match attempt(&run, &ontology, &self.key, &event, &mut Flags::read(&run)?)? {
-                Ok(()) => run.with(Sql::DoneRetry, |s| s.execute(params![FILL, seq]))?,
+                Ok(()) => {
+                    run.with(Sql::DoneRetry, |s| s.execute(params![FILL, seq]))?;
+                    // A reader past this event has no other way to hear that it now holds.
+                    let id = EventId::now();
+                    let body = serde_json::json!({
+                        "specversion": "1.0",
+                        "id": id.to_string(),
+                        "source": "rannoch",
+                        "type": "rannoch.refilled",
+                        "data": {"cursor": seq},
+                    });
+                    store(&run, id, None, &body.to_string())?;
+                    1
+                }
                 Err(cause) => tried(&run, seq, &cause)?,
             };
         }
@@ -1840,6 +1853,12 @@ mod tests {
         declare_film(&mut late)?;
         late.fill()?;
         assert_eq!(late.state(crate::FILL, f1)?, crate::State::Done);
+        let told = late.events().since(f1)?;
+        assert!(
+            told.iter()
+                .any(|e| e.body.contains("rannoch.refilled") && e.body.contains(r#""cursor":"#)),
+            "a retry that succeeds is told in the log"
+        );
         let mut first = graph("first-film")?;
         declare_film(&mut first)?;
         first.commit(&[&body], &[])?;

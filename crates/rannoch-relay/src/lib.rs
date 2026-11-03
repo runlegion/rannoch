@@ -709,8 +709,7 @@ impl Drop for Temporary {
 }
 
 /// Fills `into`, an empty graph, from `source`'s log up to `until`: what `source` declares now,
-/// then every event but its declarations and the closed events fill appended, which filling
-/// appends again.
+/// then every event but its declarations and what fill appended, which filling appends again.
 fn replay(source: &Graph, into: &mut Graph, until: Cursor) -> Result<(), Error> {
     let ontology = source.current_ontology()?;
     let declared = |name: &str| {
@@ -743,6 +742,7 @@ fn replay(source: &Graph, into: &mut Graph, until: Cursor) -> Result<(), Error> 
                 attributes(body).is_ok_and(|event| {
                     !event.ty.starts_with("rannoch.declared.")
                         && !event.ty.starts_with("rannoch.closed.")
+                        && event.ty != "rannoch.refilled"
                 })
             })
             .collect();
@@ -799,7 +799,11 @@ mod tests {
         .to_string();
         let answer: serde_json::Value = serde_json::from_str(&relays.answer(&query)?)?;
         let id = answer["data"]["result"]["relay"].as_str().ok_or("relay")?;
-        let reads = |relays: &Relays| lock(&relays.inner.state).relays[id].warm.reads;
+        let reads = |relays: &Relays| {
+            let state = lock(&relays.inner.state);
+            let warm = &state.relays[id].warm;
+            (warm.reads, warm.walked)
+        };
         let before = reads(&relays);
         for _ in 0..1_000 {
             let set = relays.read(id).ok_or("the relay")?;
