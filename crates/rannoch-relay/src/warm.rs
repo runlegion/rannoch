@@ -191,6 +191,10 @@ pub(crate) struct Warm {
     last_via: Option<ValidTime>,
     /// The walk must run again.
     moved: bool,
+    /// How many reads of the graph this relay has made: the cause of what a fold costs, which the
+    /// tests count. The time it takes is measured in `toys/relay`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) reads: u64,
     /// Everything read may be wrong, as an amendment or a rename makes it: read it all again.
     stale: bool,
 }
@@ -235,6 +239,7 @@ impl Warm {
             via: HashMap::new(),
             last_via: None,
             moved: false,
+            reads: 0,
             stale: false,
         }
     }
@@ -311,6 +316,7 @@ impl Warm {
                     .insert(Arc::new(NodeRef::new(node.class.clone(), node.key.clone())));
             }
             Roots::Class { class, filter } => {
+                self.reads += 1;
                 let listed = graph.nodes(class, filter, &self.view)?;
                 for (key, version) in listed {
                     let node = Arc::new(NodeRef::new(class.clone(), key));
@@ -382,10 +388,14 @@ impl Warm {
     /// Reads a node an event named again. A node the graph knows under no name it was just heard
     /// by has been renamed: only reading everything again finds where it went.
     fn read_node(&mut self, graph: &Graph, node: Id) -> Result<(), Error> {
+        self.reads += 1;
         let version = graph.state_at(&node, &self.view)?;
-        if version.is_none() && graph.state_at(&node, &View::default())?.is_none() {
-            self.stale = true;
-            return Ok(());
+        if version.is_none() {
+            self.reads += 1;
+            if graph.state_at(&node, &View::default())?.is_none() {
+                self.stale = true;
+                return Ok(());
+            }
         }
         let root = match &self.shape.roots {
             Roots::Class { class, filter } if *class == node.class => {
@@ -430,14 +440,17 @@ impl Warm {
         from: &NodeRef,
         to: &NodeRef,
     ) -> Result<(), Error> {
+        self.reads += 1;
         let version = graph.link_state_at(relation, &from.key, &to.key, &self.view)?;
-        if version.is_none()
-            && graph
+        if version.is_none() {
+            self.reads += 1;
+            if graph
                 .link_state_at(relation, &from.key, &to.key, &View::default())?
                 .is_none()
-        {
-            self.stale = true;
-            return Ok(());
+            {
+                self.stale = true;
+                return Ok(());
+            }
         }
         let holds = version.as_ref().is_some_and(|v| !v.ended);
         let mut changed = false;
@@ -482,7 +495,7 @@ impl Warm {
                 graph,
                 &self.view,
                 &mut self.versions,
-                &mut self.set.known,
+                (&mut self.set.known, &mut self.reads),
                 root,
             )? {
                 held.nodes.insert(Arc::clone(root), version);
@@ -540,6 +553,7 @@ impl Warm {
                 let ends = read.of(direction);
                 if !ends.contains_key(&**node) {
                     let mut others = BTreeSet::new();
+                    self.reads += 1;
                     for (key, version) in graph.links(node, name, direction, &self.view)? {
                         raise(&mut self.set.known, &version, fixed);
                         others.insert(Arc::new(NodeRef::new(other.clone(), key)));
@@ -557,7 +571,7 @@ impl Warm {
                         graph,
                         &self.view,
                         &mut self.versions,
-                        &mut self.set.known,
+                        (&mut self.set.known, &mut self.reads),
                         reached,
                     )?;
                     match version {
@@ -702,12 +716,13 @@ fn version_of(
     graph: &Graph,
     view: &View,
     versions: &mut HashMap<Id, Option<Arc<Version>>, Fast>,
-    known: &mut Option<i64>,
+    (known, reads): (&mut Option<i64>, &mut u64),
     node: &Id,
 ) -> Result<Option<Arc<Version>>, Error> {
     if let Some(version) = versions.get(node) {
         return Ok(version.clone());
     }
+    *reads += 1;
     let version = graph.state_at(node, view)?.map(Arc::new);
     if let Some(version) = &version {
         raise(known, version, view.known.is_some());
@@ -718,4 +733,208 @@ fn version_of(
 
 fn key_order(a: &Id, b: &Id) -> std::cmp::Ordering {
     (&a.key, &a.class).cmp(&(&b.key, &b.class))
+}
+
+#[cfg(test)]
+mod tests {
+    use rannoch_cloudevents::EventId;
+    use rannoch_store::{Anchor, Class, Cursor, Declaration, Relation, Step, open};
+    use serde_json::json;
+
+    use super::*;
+
+    const KEY: [u8; 32] = [3; 32];
+
+    type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+    fn node(class: &str, key: &str, title: &str) -> String {
+        json!({"specversion": "1.0", "id": format!("{}:0", EventId::now()), "source": "rannoch:t",
+               "type": format!("rannoch.node.{class}"), "subject": key,
+               "data": {"properties": {"title": title}}})
+        .to_string()
+    }
+
+    fn link(kind: &str, relation: &str, from: (&str, &str), to: (&str, &str)) -> String {
+        json!({"specversion": "1.0", "id": format!("{}:0", EventId::now()), "source": "rannoch:t",
+               "type": format!("rannoch.{kind}.{relation}"),
+               "data": {"from": {"class": from.0, "key": from.1},
+                        "to": {"class": to.0, "key": to.1}}})
+        .to_string()
+    }
+
+    /// A material used by `count` schematics, each crafting an item, with `other` beside them.
+    fn hub(dir: &tempfile::TempDir, count: usize) -> Result<Graph> {
+        let mut g = open(dir.path().join("graph"), &KEY)?;
+        let declared = |name: &str| {
+            json!({"specversion": "1.0", "id": format!("d-{name}"), "source": "rannoch:t",
+                   "type": format!("rannoch.declared.{name}")})
+            .to_string()
+        };
+        for class in ["material", "schematic", "item", "other"] {
+            g.declare(
+                &Declaration::Class(Class::new(class, ["title"])),
+                &declared(class),
+            )?;
+        }
+        for (name, from, to) in [
+            ("uses", "schematic", "material"),
+            ("crafts", "schematic", "item"),
+            ("beside", "other", "other"),
+        ] {
+            g.declare(
+                &Declaration::Relation(Relation::new(name, from, to, false)),
+                &declared(name),
+            )?;
+        }
+        let mut bodies = vec![node("material", "m", "t")];
+        for i in 0..count {
+            let (s, it) = (format!("s{:04}", 10 + i), format!("i{:04}", 10 + i));
+            bodies.push(node("schematic", &s, "t"));
+            bodies.push(node("item", &it, "t"));
+            bodies.push(link("link", "uses", ("schematic", &s), ("material", "m")));
+            bodies.push(link("link", "crafts", ("schematic", &s), ("item", &it)));
+        }
+        apply(&mut g, &bodies)?;
+        Ok(g)
+    }
+
+    /// Commits and fills `bodies`, returning where each landed.
+    fn apply(g: &mut Graph, bodies: &[String]) -> Result<Vec<Cursor>> {
+        let refs: Vec<&str> = bodies.iter().map(String::as_str).collect();
+        let mut cursors = Vec::new();
+        for landed in g.commit(&refs, &[])? {
+            cursors.push(landed?.cursor);
+        }
+        g.fill()?;
+        Ok(cursors)
+    }
+
+    fn shape(cap: Option<usize>) -> Shape {
+        Shape {
+            name: "hub".into(),
+            roots: Roots::Node {
+                node: Anchor {
+                    class: "material".into(),
+                    key: "m".into(),
+                },
+            },
+            steps: vec![
+                Step {
+                    cap,
+                    ..Step::new("uses<-")
+                },
+                Step::new("crafts"),
+            ],
+        }
+    }
+
+    /// How many graph reads folding `bodies` in one batch costs `warm`.
+    fn reads_to_fold(warm: &mut Warm, g: &mut Graph, bodies: &[String]) -> Result<u64> {
+        let cursors = apply(g, bodies)?;
+        let before = warm.reads;
+        for (cursor, body) in cursors.into_iter().zip(bodies) {
+            warm.fold(g, cursor, body);
+        }
+        warm.settle(g)?;
+        Ok(warm.reads - before)
+    }
+
+    #[test]
+    fn seeding_a_planet_sized_relay_reads_each_node_and_list_once() -> Result {
+        let dir = tempfile::tempdir()?;
+        let g = hub(&dir, 500)?;
+        let warm = Warm::seed(&g, shape(None), View::default(), Cursor::START)?;
+        assert_eq!(warm.set.nodes().len(), 1_001);
+        // The root, its list; each schematic, its list; each item.
+        assert_eq!(warm.reads, 1 + 1 + 500 + 500 + 500);
+        Ok(())
+    }
+
+    #[test]
+    fn restoring_a_saved_relay_reads_nothing() -> Result {
+        let dir = tempfile::tempdir()?;
+        let g = hub(&dir, 50)?;
+        let warm = Warm::seed(&g, shape(None), View::default(), Cursor::START)?;
+        let restored = Warm::restored(&g, shape(None), View::default(), warm.saved())?;
+        assert_eq!(restored.reads, 0);
+        assert_eq!(restored.set, warm.set);
+        Ok(())
+    }
+
+    #[test]
+    fn an_applied_event_reads_only_what_it_named_at_any_size() -> Result {
+        for size in [10, 500] {
+            let dir = tempfile::tempdir()?;
+            let mut g = hub(&dir, size)?;
+            let mut warm = Warm::seed(&g, shape(None), View::default(), Cursor::START)?;
+            let mut fold = |bodies: &[String]| reads_to_fold(&mut warm, &mut g, bodies);
+            // Nothing it holds: no read.
+            assert_eq!(fold(&[node("other", "x", "t")])?, 0);
+            assert_eq!(
+                fold(&[link("link", "beside", ("other", "x"), ("other", "x"))])?,
+                0
+            );
+            // A node it holds, changed: that node, and the walk reads nothing it holds.
+            assert_eq!(fold(&[node("schematic", "s0010", "new")])?, 1);
+            // A link it holds, ended: that link.
+            assert_eq!(
+                fold(&[link(
+                    "ended",
+                    "crafts",
+                    ("schematic", "s0010"),
+                    ("item", "i0010")
+                )])?,
+                1
+            );
+            // A new schematic: nothing for its node, unheard; its link, then its version and list.
+            let bodies = [
+                node("schematic", "s9", "t"),
+                link("link", "uses", ("schematic", "s9"), ("material", "m")),
+            ];
+            assert_eq!(fold(&bodies)?, 1 + 1 + 1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn boundary_churn_reads_no_list_again() -> Result {
+        let dir = tempfile::tempdir()?;
+        let mut g = hub(&dir, 8)?;
+        let mut warm = Warm::seed(&g, shape(Some(5)), View::default(), Cursor::START)?;
+        assert_eq!(warm.set.steps()[0].dropped, 3);
+        // A key below the cut comes in: its link, its version and list. The old fifth goes on
+        // what is held.
+        let bodies = [
+            node("schematic", "s0000", "t"),
+            link("link", "uses", ("schematic", "s0000"), ("material", "m")),
+        ];
+        assert_eq!(reads_to_fold(&mut warm, &mut g, &bodies)?, 1 + 1 + 1);
+        assert_eq!(warm.set.steps()[0].dropped, 4);
+        assert_eq!(warm.set.steps()[0].nodes.len(), 5);
+        // A kept link ends: its link. The next key, cut before, was held, and what it crafts was
+        // read when it was taken earlier.
+        let ended = [link(
+            "ended",
+            "uses",
+            ("schematic", "s0000"),
+            ("material", "m"),
+        )];
+        assert_eq!(reads_to_fold(&mut warm, &mut g, &ended)?, 1);
+        assert_eq!(warm.set.steps()[0].dropped, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn an_amendment_reads_everything_again() -> Result {
+        let dir = tempfile::tempdir()?;
+        let mut g = hub(&dir, 10)?;
+        let mut warm = Warm::seed(&g, shape(None), View::default(), Cursor::START)?;
+        let seeded = warm.reads;
+        let amended = json!({"specversion": "1.0", "id": format!("{}:0", EventId::now()),
+            "source": "rannoch:t", "type": "rannoch.amended",
+            "data": {"target": {"source": "rannoch:t", "id": "none"}, "patch": {}}})
+        .to_string();
+        assert_eq!(reads_to_fold(&mut warm, &mut g, &[amended])?, seeded);
+        Ok(())
+    }
 }

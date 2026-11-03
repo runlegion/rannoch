@@ -18,6 +18,9 @@ use serde_json::{Value as Json, json};
 
 const KEY: [u8; 32] = [7; 32];
 const INTERVAL: Duration = Duration::from_millis(5);
+/// How long a test waits before it calls itself hung. No test asserts how long anything takes:
+/// the time bounds are measured in `toys/relay`.
+const HUNG: Duration = Duration::from_secs(120);
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -173,18 +176,15 @@ impl World {
     fn settled(&self, id: &str) -> Result<WarmSet> {
         let graph = open(path(self.dir.path()), &KEY)?;
         let high = graph.events().committed()?;
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let set = self.relays.read(id).ok_or("the relay is there")?;
-            if set.cursor() >= high {
-                return Ok(set);
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the relay did not reach {high:?}"
-            );
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        until(|| self.relays.read(id).is_some_and(|set| set.cursor() >= high))?;
+        Ok(self.relays.read(id).ok_or("the relay is there")?)
+    }
+
+    /// Relay `id`'s file saved past everything folded, and its events closed.
+    fn closed(&self, id: &str) -> Result {
+        let worker = format!("rannoch.relay.{id}");
+        let high = self.settled(id)?.cursor();
+        until(|| self.queue.join(&worker) >= high && matches!(self.queue.lag(&worker), Ok(0)))
     }
 
     fn query(&self, source: &str, shape: &str, view: &Json) -> Result<(String, Json)> {
@@ -202,6 +202,18 @@ impl World {
         let ontology = graph.current_ontology()?;
         cold(&graph, ontology.shape(shape_name)?, view)
     }
+}
+
+/// Waits for `done`, and fails only when the test is hung.
+fn until(mut done: impl FnMut() -> bool) -> Result {
+    let hung = Instant::now() + HUNG;
+    while !done() {
+        if Instant::now() > hung {
+            return Err("hung".into());
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    Ok(())
 }
 
 fn query(source: &str, shape: &str, view: &Json) -> String {
@@ -395,20 +407,21 @@ fn a_query_in_the_inbox_is_answered_by_the_worker_and_graph_answer_refuses_it() 
     let id = rannoch_cloudevents::attributes(&asked)?.id;
     world.write(std::slice::from_ref(&asked))?;
     let graph = open(path(world.dir.path()), &KEY)?;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let answer = loop {
+    let mut found = None;
+    until(|| {
         let _ = world.queue.flush();
-        let found = graph
+        found = graph
             .events()
-            .since(rannoch_store::Cursor::START)?
-            .into_iter()
-            .find(|e| e.body.contains("rannoch.answer"));
-        if let Some(found) = found {
-            break found.body;
-        }
-        assert!(Instant::now() < deadline, "no answer");
-        std::thread::sleep(Duration::from_millis(1));
-    };
+            .since(rannoch_store::Cursor::START)
+            .ok()
+            .and_then(|events| {
+                events
+                    .into_iter()
+                    .find(|e| e.body.contains("rannoch.answer"))
+            });
+        found.is_some()
+    })?;
+    let answer = found.ok_or("an answer")?.body;
     let answer: Json = serde_json::from_str(&answer)?;
     assert_eq!(answer["subject"], json!(id));
     assert_eq!(answer["type"], json!("rannoch.answer"));
@@ -479,6 +492,15 @@ fn a_hub_cut_is_deterministic_and_boundary_churn_is_one_event() -> Result {
     };
     assert!(named("entered").contains(&"s00".to_string()));
     assert!(named("left").contains(&"s14".to_string()));
+    let graph = open(path(world.dir.path()), &KEY)?;
+    assert!(
+        !graph
+            .events()
+            .since(rannoch_store::Cursor::START)?
+            .iter()
+            .any(|e| e.body.contains("rannoch.relay.changed")),
+        "a change event is not logged"
+    );
     Ok(())
 }
 
@@ -654,12 +676,10 @@ fn a_restart_resumes_and_a_file_behind_reseeds() -> Result {
     world.settled(&id)?;
     let file = world.dir.path().join("relays").join(format!("{id}.json"));
     let early = std::fs::read(&file)?;
-    // Past the one-second limit, so the file is saved and the events closed.
     for i in 0..3 {
         world.write(&[node("quest", &format!("q{}", i + 1), &format!("t{i}"))])?;
-        std::thread::sleep(Duration::from_millis(1_100));
     }
-    world.settled(&id)?;
+    world.closed(&id)?;
     assert_ne!(std::fs::read(&file)?, early);
     let world = world.restart()?;
     let set = world.settled(&id)?;
@@ -668,8 +688,7 @@ fn a_restart_resumes_and_a_file_behind_reseeds() -> Result {
 
     // The file put back behind its worker's cursor: the relay does not trust it.
     world.write(&[node("quest", "q1", "after")])?;
-    std::thread::sleep(Duration::from_millis(1_200));
-    world.settled(&id)?;
+    world.closed(&id)?;
     let World {
         dir,
         queue,
@@ -693,23 +712,20 @@ fn events_close_only_after_the_file_is_saved() -> Result {
     world.write(&cycle(3))?;
     let (id, _) = world.query("app", "chain", &json!({}))?;
     let worker = format!("rannoch.relay.{id}");
-    world.write(&[node("quest", "q1", "one")])?;
-    let set = world.settled(&id)?;
-    // Within the second since the seed's save, the event is folded and not closed.
-    assert!(world.queue.lag(&worker)? >= 1, "folded, not closed");
     let file = world.dir.path().join("relays").join(format!("{id}.json"));
-    let saved: Json = serde_json::from_slice(&std::fs::read(&file)?)?;
-    assert!(saved["cursor"].as_i64() < serde_json::to_value(set.cursor())?.as_i64());
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while world.queue.lag(&worker)? > 0 {
-        assert!(
-            Instant::now() < deadline,
-            "the file came due and the events closed"
-        );
-        std::thread::sleep(Duration::from_millis(20));
+    let file_cursor = || -> Result<Json> {
+        let saved: Json = serde_json::from_slice(&std::fs::read(&file)?)?;
+        Ok(saved["cursor"].clone())
+    };
+    for i in 0..5 {
+        world.write(&[node("quest", "q1", &format!("t{i}"))])?;
+        // Whenever it is looked at, the worker's cursor is not ahead of the file's.
+        let place = serde_json::to_value(world.queue.join(&worker))?;
+        assert!(place.as_i64() <= file_cursor()?.as_i64());
     }
-    let saved: Json = serde_json::from_slice(&std::fs::read(&file)?)?;
-    assert_eq!(saved["cursor"], serde_json::to_value(set.cursor())?);
+    let set = world.settled(&id)?;
+    world.closed(&id)?;
+    assert_eq!(file_cursor()?, serde_json::to_value(set.cursor())?);
     Ok(())
 }
 
@@ -905,31 +921,5 @@ fn a_change_carries_a_propertys_before_and_after_once_per_commit() -> Result {
     assert_eq!(deltas[0]["property"], json!("title"));
     assert_eq!(deltas[0]["before"], json!("t"));
     assert_eq!(deltas[0]["after"], json!("a"));
-    Ok(())
-}
-
-#[test]
-fn a_planet_sized_relay_stays_within_its_times() -> Result {
-    let walk = shape(
-        "planet",
-        "material",
-        "stabilizer",
-        vec![step("uses<-", None), step("crafts", None)],
-    );
-    let world = World::new(vec![walk])?;
-    world.write(&hub(500))?;
-    let began = Instant::now();
-    let (id, answer) = world.query("app", "planet", &json!({}))?;
-    let seeded = began.elapsed();
-    assert_eq!(answer["data"]["result"]["steps"][1]["nodes"], json!(500));
-    assert!(seeded < Duration::from_secs(2), "seeded in {seeded:?}");
-    let set = world.settled(&id)?;
-    assert_eq!(set.nodes().len(), 1_001);
-    let began = Instant::now();
-    for _ in 0..1_000 {
-        let _ = world.relays.read(&id);
-    }
-    let per = began.elapsed() / 1_000;
-    assert!(per < Duration::from_micros(50), "read in {per:?}");
     Ok(())
 }

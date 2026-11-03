@@ -49,7 +49,7 @@ impl From<rannoch_cloudevents::Error> for Error {
 }
 
 /// The worker that takes `rannoch.query` events carrying `shape`.
-pub const QUERIES: &str = "rannoch.relay";
+const QUERIES: &str = "rannoch.relay";
 /// How often a relay's file is replaced, at most.
 const SAVE_EVERY: Duration = Duration::from_secs(1);
 /// How long the relays' thread sleeps with no commit, so a file due is still saved.
@@ -208,7 +208,7 @@ impl Relays {
     /// Answers the `rannoch.query` event `query`, carrying `shape` and `view`, with the body of a
     /// `rannoch.answer` event acknowledging the relay of that shape and view, seeded now unless
     /// one is held already. The query's `source` holds the relay. A query in the inbox is answered
-    /// by the worker [`QUERIES`] the same way, its answer accepted back into the inbox.
+    /// by the worker `rannoch.relay` the same way, its answer accepted back into the inbox.
     ///
     /// # Errors
     /// [`Error::Refused`] when `query` is not a `rannoch.query` carrying `shape`, or the shape is
@@ -752,4 +752,60 @@ fn replay(source: &Graph, into: &mut Graph, until: Cursor) -> Result<(), Error> 
         into.fill()?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use rannoch_store::{Anchor, Class, Roots, Step, Value};
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn read_makes_no_graph_read() -> Result<(), Box<dyn std::error::Error>> {
+        const KEY: [u8; 32] = [4; 32];
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("graph");
+        let mut g = open(&path, &KEY)?;
+        let declared = json!({"specversion": "1.0", "id": "d", "source": "t",
+                              "type": "rannoch.declared.x"})
+        .to_string();
+        let mut class = Class::new("a", ["n"]);
+        class.indexed = BTreeSet::from(["n".to_string()]);
+        g.declare(&Declaration::Class(class), &declared)?;
+        let shape = Shape {
+            name: "s".into(),
+            roots: Roots::Node {
+                node: Anchor {
+                    class: "a".into(),
+                    key: "k".into(),
+                },
+            },
+            steps: Vec::<Step>::new(),
+        };
+        g.declare(&Declaration::Shape(shape), &declared)?;
+        let body = json!({"specversion": "1.0", "id": format!("{}:0", EventId::now()),
+            "source": "t", "type": "rannoch.node.a", "subject": "k",
+            "data": {"properties": {"n": "v"}}})
+        .to_string();
+        for landed in g.commit(&[&body], &[])? {
+            landed?;
+        }
+        g.fill()?;
+        let queue = Arc::new(Queue::open(g, Duration::from_secs(3_600))?);
+        let relays = Relays::open(dir.path().join("relays"), queue, &path, &KEY)?;
+        let query = json!({"specversion": "1.0", "id": EventId::now().to_string(), "source": "app",
+                           "type": "rannoch.query", "data": {"shape": "s"}})
+        .to_string();
+        let answer: serde_json::Value = serde_json::from_str(&relays.answer(&query)?)?;
+        let id = answer["data"]["result"]["relay"].as_str().ok_or("relay")?;
+        let reads = |relays: &Relays| lock(&relays.inner.state).relays[id].warm.reads;
+        let before = reads(&relays);
+        for _ in 0..1_000 {
+            let set = relays.read(id).ok_or("the relay")?;
+            assert_eq!(set.by("n", &Value::from("v")).len(), 1);
+        }
+        assert_eq!(reads(&relays), before);
+        Ok(())
+    }
 }
