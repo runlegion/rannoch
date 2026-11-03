@@ -119,7 +119,7 @@ Reads take a `View { axis, known }`: an optional axis point and an optional know
 | `find_as_of(class, key, date, view)` | the version valid on `date`, among those the view sees |
 | `hearings(node)` | every account of the node, each with its source, axis point, known-at, valid time and identity |
 | `seen(node)` | first and last heard, first recorded, first true, and how many hearings |
-| `link_state_at(rel, from, to, view)` | the link's version in the view, and whether it had ended; an amendment or rename known later is not in it |
+| `link_state_at(rel, from, to, view)` | the link's version in the view, and whether it does not hold there (`ended`: it ended or was found wrong); an amendment or rename known later is not in it |
 | `link_hearings`, `link_seen`, `link_end` | as for nodes; `link_end` says whether it ended or was found wrong |
 | `links(node, rel, direction, view)` | the links of `rel` from the node (`Direction::Out`) or to it that hold in the view (a version, not ended), each as the other end's key and the link's version, in the other end's key order |
 | `nodes(class, filter, view)` | the class's nodes in the view, each as its key and version, in key order; `filter` maps indexed properties to values |
