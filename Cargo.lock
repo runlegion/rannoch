@@ -428,6 +428,7 @@ dependencies = [
  "rannoch-cloudevents",
  "rannoch-queue",
  "rannoch-store",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

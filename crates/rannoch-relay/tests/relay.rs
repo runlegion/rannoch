@@ -923,3 +923,39 @@ fn a_change_carries_a_propertys_before_and_after_once_per_commit() -> Result {
     assert_eq!(deltas[0]["after"], json!("a"));
     Ok(())
 }
+
+#[test]
+fn an_event_whose_fill_is_retried_reaches_the_relay_as_a_change() -> Result {
+    let world = World::new(vec![chain_shape()])?;
+    world.write(&cycle(3))?;
+    let (id, _) = world.query("app", "chain", &json!({}))?;
+    world.settled(&id)?;
+    let fault = rusqlite::Connection::open(path(world.dir.path()))?;
+    fault.execute_batch(
+        "CREATE TRIGGER no_q1 BEFORE INSERT ON _hearings WHEN NEW.key = 'q1' \
+         BEGIN SELECT RAISE(ABORT, 'the disk is full'); END;",
+    )?;
+    world.write(&[node("quest", "q1", "late")])?;
+    let set = world.settled(&id)?;
+    let q1 = NodeRef::new("quest", "q1");
+    let title = |set: &WarmSet| {
+        set.nodes()
+            .iter()
+            .find(|(n, _)| ***n == q1)
+            .and_then(|(_, v)| v.properties.get("title").cloned())
+    };
+    assert_eq!(title(&set), Some(Value::from("t")), "the fill failed");
+    assert!(world.changes.lock().map_err(|_| "lock")?.is_empty());
+
+    fault.execute_batch("DROP TRIGGER no_q1;")?;
+    world.write(&[node("schematic", "drives-a-fill", "t")])?;
+    let set = world.settled(&id)?;
+    assert_eq!(title(&set), Some(Value::from("late")));
+    assert_eq!(warm(&set), world.cold("chain", &View::default())?);
+    let changes = world.changes.lock().map_err(|_| "lock")?.clone();
+    assert_eq!(changes.len(), 1, "{changes:?}");
+    let delta = &changes[0]["data"]["changed"][0];
+    assert_eq!(delta["node"]["key"], json!("q1"));
+    assert_eq!(delta["after"], json!("late"));
+    Ok(())
+}
