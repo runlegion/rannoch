@@ -228,6 +228,22 @@ impl Relation {
     }
 }
 
+/// A node named by its class and natural key.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct NodeRef {
+    pub class: String,
+    pub key: String,
+}
+
+impl NodeRef {
+    pub fn new(class: impl Into<String>, key: impl Into<String>) -> Self {
+        NodeRef {
+            class: class.into(),
+            key: key.into(),
+        }
+    }
+}
+
 /// A shape: a named neighbourhood, walked from its roots one step at a time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Shape {
@@ -241,7 +257,7 @@ pub struct Shape {
 #[serde(untagged)]
 pub enum Roots {
     /// One node.
-    Node { node: Anchor },
+    Node { node: NodeRef },
     /// The nodes of a class that have every value in `filter`, each an indexed property.
     Class {
         class: String,
@@ -250,25 +266,18 @@ pub enum Roots {
     },
 }
 
-/// The one node a shape's walk starts from.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Anchor {
-    pub class: String,
-    pub key: String,
-}
-
 /// One step of a shape: the links it follows, what it keeps of the nodes they reach, and how many
 /// it takes. A step with no cap is exact.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Step {
     /// A relation with its direction in its name: `r` forward, `r<-` backward, `r<->` either.
     pub relation: String,
     /// A reached node stays only if it has every one of these values.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub keep: Option<BTreeMap<String, Value>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub keep: BTreeMap<String, Value>,
     /// A reached node goes if it has every one of these values.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub drop: Option<BTreeMap<String, Value>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub drop: BTreeMap<String, Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cap: Option<usize>,
 }
@@ -282,17 +291,6 @@ pub enum Way {
 }
 
 impl Step {
-    /// A step along `relation`, named with its direction, with no filter and no cap.
-    #[must_use]
-    pub fn new(relation: impl Into<String>) -> Step {
-        Step {
-            relation: relation.into(),
-            keep: None,
-            drop: None,
-            cap: None,
-        }
-    }
-
     /// The relation's name without its direction, and the direction.
     #[must_use]
     pub fn way(&self) -> (&str, Way) {
@@ -311,8 +309,7 @@ impl Step {
         let has = |wanted: &BTreeMap<String, Value>| {
             wanted.iter().all(|(p, v)| properties.get(p) == Some(v))
         };
-        self.keep.as_ref().is_none_or(&has)
-            && self.drop.as_ref().is_none_or(|d| d.is_empty() || !has(d))
+        has(&self.keep) && (self.drop.is_empty() || !has(&self.drop))
     }
 }
 
@@ -408,7 +405,7 @@ impl Ontology {
                     shape.name, step.relation
                 )));
             }
-            for property in step.keep.iter().chain(&step.drop).flat_map(BTreeMap::keys) {
+            for property in step.keep.keys().chain(step.drop.keys()) {
                 let declared = next.iter().any(|class| {
                     self.classes
                         .get(*class)
@@ -546,7 +543,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        Anchor, Class, Declaration, Ontology, Relation, Roots, Shape, Step, Value, ValueType, Way,
+        Class, Declaration, NodeRef, Ontology, Relation, Roots, Shape, Step, Value, ValueType, Way,
     };
 
     fn declared() -> Ontology {
@@ -582,11 +579,18 @@ mod tests {
         );
     }
 
+    fn along(relation: &str) -> Step {
+        Step {
+            relation: relation.into(),
+            ..Step::default()
+        }
+    }
+
     #[test]
     fn a_step_reads_its_direction_from_its_name() {
-        assert_eq!(Step::new("wrote").way(), ("wrote", Way::Forward));
-        assert_eq!(Step::new("wrote<-").way(), ("wrote", Way::Backward));
-        assert_eq!(Step::new("wrote<->").way(), ("wrote", Way::Either));
+        assert_eq!(along("wrote").way(), ("wrote", Way::Forward));
+        assert_eq!(along("wrote<-").way(), ("wrote", Way::Backward));
+        assert_eq!(along("wrote<->").way(), ("wrote", Way::Either));
     }
 
     #[test]
@@ -595,14 +599,11 @@ mod tests {
             Declaration::Shape(Shape {
                 name: "s".into(),
                 roots,
-                steps: steps.iter().map(|s| Step::new(*s)).collect(),
+                steps: steps.iter().map(|s| along(s)).collect(),
             })
         };
         let author = || Roots::Node {
-            node: Anchor {
-                class: "author".into(),
-                key: "a1".into(),
-            },
+            node: NodeRef::new("author", "a1"),
         };
         let mut ontology = declared();
         let books = shape(author(), &["wrote", "wrote<-"]);
@@ -638,8 +639,8 @@ mod tests {
             name: "f".into(),
             roots: author(),
             steps: vec![Step {
-                keep: Some(BTreeMap::from([("pages".to_string(), Value::Integer(1))])),
-                ..Step::new("wrote")
+                keep: BTreeMap::from([("pages".to_string(), Value::Integer(1))]),
+                ..along("wrote")
             }],
         });
         assert!(fresh.check(&filtered).is_err_and(|r| r.0.contains("pages")));
