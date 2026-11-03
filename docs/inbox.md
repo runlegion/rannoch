@@ -89,6 +89,7 @@ fn drain(queue: &Queue, worker: &str) -> Result<usize, rannoch_store::Error> {
 - `done(worker, cursor)` and `failed(worker, cursor, reason)` close it. Closing an event that is not in progress for that worker is refused. The cursor moves past every closed event at its front, so an event still open holds it back.
 - `state(worker, cursor)` says where an event stands for a worker: `Waiting`, `InProgress`, `Done` or `Failed(reason)`, closes not yet saved included.
 - `join(worker)` returns where a worker stands, joining it at the committed watermark when it has no place, for a worker that reads the tables first and needs only what follows.
+- `commit()` commits what is held now, without waiting for the heartbeat, and leaves every failure for the app to take, for a worker whose answer someone is waiting on.
 - Workers are independent. Two workers on one queue each get every event; one falling behind holds no other back.
 - A worker name is any string except `rannoch.fill`, which fill uses for itself.
 

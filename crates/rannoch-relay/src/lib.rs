@@ -49,7 +49,7 @@ impl From<rannoch_cloudevents::Error> for Error {
 }
 
 /// The worker that takes `rannoch.query` events carrying `shape`.
-pub const QUERIES: &str = "rannoch.relay";
+const QUERIES: &str = "rannoch.relay";
 /// How often a relay's file is replaced, at most.
 const SAVE_EVERY: Duration = Duration::from_secs(1);
 /// How long the relays' thread sleeps with no commit, so a file due is still saved.
@@ -208,7 +208,7 @@ impl Relays {
     /// Answers the `rannoch.query` event `query`, carrying `shape` and `view`, with the body of a
     /// `rannoch.answer` event acknowledging the relay of that shape and view, seeded now unless
     /// one is held already. The query's `source` holds the relay. A query in the inbox is answered
-    /// by the worker [`QUERIES`] the same way, its answer accepted back into the inbox.
+    /// by the worker `rannoch.relay` the same way, its answer accepted back into the inbox.
     ///
     /// # Errors
     /// [`Error::Refused`] when `query` is not a `rannoch.query` carrying `shape`, or the shape is
