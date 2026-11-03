@@ -34,3 +34,10 @@ A relay of about 1,000 nodes (a planet-sized shape on real game data) seeds in u
 - The planet shape: every object with a location in its fqn (86,784 of them) is a `thing` with `kind` and an indexed `logname` (string id << 32, kessel's seed for warden's toy). Steps: `on<-` dropping `kind` Spawn, then `targets` (quest to objective target, from `quest_objectives`). Hutta takes about 860 at the first step. Spawns are in the graph and filtered, so the keep/drop path runs on real data.
 - Applying an event: the time from the commit's subscriber call to read()'s cursor passing it, one link per commit, on the Hutta relay: the wake, the fold, the walk over about 1,000 nodes and the publish. I expect under 1 ms at p50, and p99 to carry a file save (at most one a second).
 - The memory a capped step costs at the largest hub (#151): the process's resident size before and after seeding the 703-schematic relay, and its file's bytes. No prediction was made for this; it is reported.
+
+## Changes from issue #151, 2026-11-03, before this rerun
+
+The apps' predictions above stay as written. The operator changed two measures:
+
+- The importer's round trip is judged at the median: under 40 ms. p95 and p99 are stated. Expected from the earlier runs: p50 about 28 ms, p95 about 50 ms, p99 about 85 ms.
+- Applying an event is the fold plus the walk, under 1 ms at the median, on the Hutta relay, with one link per commit. Expected from the walk measurement (WALKS-RESULTS.md): p50 about 0.4 to 0.5 ms, on any run, no longer split by core placement as much, since the wake is out of the measure. If it still splits by run, it is the thread and not the wake.
