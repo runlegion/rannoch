@@ -479,6 +479,15 @@ fn a_hub_cut_is_deterministic_and_boundary_churn_is_one_event() -> Result {
     };
     assert!(named("entered").contains(&"s00".to_string()));
     assert!(named("left").contains(&"s14".to_string()));
+    let graph = open(path(world.dir.path()), &KEY)?;
+    assert!(
+        !graph
+            .events()
+            .since(rannoch_store::Cursor::START)?
+            .iter()
+            .any(|e| e.body.contains("rannoch.relay.changed")),
+        "a change event is not logged"
+    );
     Ok(())
 }
 
