@@ -4,6 +4,8 @@ Run 2026-11-03 on `feat/151-relay` at 969e62b, release build, default 20 ms hear
 
 Two predictions do not hold as written: the query round trip at its tail, and applying an event on most runs. Everything else holds.
 
+The predictions were committed before any run, at 22:48 on 2026-11-02 (commit ca68d86, the same author date as 08766e5). A later rebase onto the feature branch put them after 969e62b, a fix the first run prompted, so this branch's order alone does not show it: read the author date. The numbers above and below each say which build they came from when it was not the last.
+
 ## The importer's
 
 | Prediction | Result |
