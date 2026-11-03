@@ -318,6 +318,7 @@ dependencies = [
  "rannoch-relay",
  "rannoch-store",
  "rusqlite",
+ "serde",
  "serde_json",
  "tempfile",
 ]
