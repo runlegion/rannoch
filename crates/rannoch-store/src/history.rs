@@ -1157,7 +1157,8 @@ fn decode(json: Option<&str>) -> Result<BTreeMap<String, Value>, Error> {
 }
 
 /// Milliseconds since the Unix epoch, negative before it.
-pub(crate) fn millis(time: SystemTime) -> i64 {
+#[must_use]
+pub fn millis(time: SystemTime) -> i64 {
     let ms = |d: Duration| i64::try_from(d.as_millis()).unwrap_or(i64::MAX);
     match time.duration_since(UNIX_EPOCH) {
         Ok(after) => ms(after),

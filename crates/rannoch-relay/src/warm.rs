@@ -3,11 +3,12 @@
 //! and the walk runs again over what is held in memory.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::{Arc, OnceLock};
 
 use rannoch_cloudevents::{Conclusion, Fact, LinkFact, NodeFact, NodeRef, ValidTime};
-use rannoch_store::{Cursor, Direction, Graph, Ontology, Roots, Shape, Value, Version, View, Way};
+use rannoch_store::{
+    Cursor, Direction, Graph, Ontology, REFILLED, Roots, Shape, Value, Version, View, Way, millis,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
 
@@ -21,16 +22,25 @@ pub struct WarmSet {
     held: Arc<Held>,
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default)]
 struct Held {
     nodes: HashMap<Id, Arc<Version>>,
-    roots: Vec<Id>,
     steps: Vec<StepSet>,
     ontology: Arc<Ontology>,
     /// Each node in the set by a property its class indexes, and the value's text. Built once per
     /// set, after the set is published and its change told.
     indexed: OnceLock<HashMap<String, HashMap<String, Vec<Id>>>>,
 }
+
+/// Two sets are equal when they hold the same nodes and steps, whether or not either has built its
+/// index.
+impl PartialEq for Held {
+    fn eq(&self, other: &Held) -> bool {
+        self.nodes == other.nodes && self.steps == other.steps
+    }
+}
+
+impl Eq for Held {}
 
 impl Held {
     fn index(&self) -> &HashMap<String, HashMap<String, Vec<Id>>> {
@@ -50,6 +60,9 @@ impl Held {
                     }
                 }
             }
+            for nodes in indexed.values_mut().flat_map(HashMap::values_mut) {
+                nodes.sort_by(key_order);
+            }
             indexed
         })
     }
@@ -58,35 +71,11 @@ impl Held {
 /// A node's name, shared by everything that holds it, so walking copies no text.
 type Id = Arc<NodeRef>;
 
-/// A quick hash for the walk, which hashes every name several times over. Names are the app's own
-/// and stay in this process, so nothing here needs to resist a chosen key.
-#[derive(Default)]
-struct Quick(u64);
-
-impl Hasher for Quick {
-    fn write(&mut self, bytes: &[u8]) {
-        for chunk in bytes.chunks(8) {
-            let mut word = [0u8; 8];
-            word[..chunk.len()].copy_from_slice(chunk);
-            self.0 = (self.0.rotate_left(5) ^ u64::from_le_bytes(word))
-                .wrapping_mul(0x517c_c1b7_2722_0a95);
-        }
-    }
-
-    fn finish(&self) -> u64 {
-        self.0
-    }
-}
-
-type Fast = BuildHasherDefault<Quick>;
-
 /// What one step of a walk took.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StepSet {
     /// The distinct nodes it took, in key order.
     pub nodes: Vec<Arc<NodeRef>>,
-    /// Whether its cap cut anything.
-    pub cut: bool,
     /// How many distinct unvisited nodes its cap dropped.
     pub dropped: usize,
 }
@@ -99,8 +88,7 @@ impl WarmSet {
     }
 
     /// The latest known-at among the facts the walk read, or the view's own known-at.
-    #[must_use]
-    pub fn known(&self) -> Option<i64> {
+    pub(crate) fn known(&self) -> Option<i64> {
         self.known
     }
 
@@ -108,12 +96,6 @@ impl WarmSet {
     #[must_use]
     pub fn nodes(&self) -> &HashMap<Arc<NodeRef>, Arc<Version>> {
         &self.held.nodes
-    }
-
-    /// The roots, in key order.
-    #[must_use]
-    pub fn roots(&self) -> &[Arc<NodeRef>] {
-        &self.held.roots
     }
 
     /// What each step took, in the shape's order.
@@ -142,7 +124,7 @@ impl WarmSet {
         Json::Array(
             self.steps()
                 .iter()
-                .map(|step| json!({"nodes": step.nodes.len(), "cut": step.cut, "dropped": step.dropped}))
+                .map(|step| json!({"nodes": step.nodes.len(), "cut": step.dropped > 0, "dropped": step.dropped}))
                 .collect(),
         )
     }
@@ -156,7 +138,7 @@ fn value_text(value: &Value) -> String {
 }
 
 /// The other ends of the links that hold, per node, for one relation and direction.
-type Ends = HashMap<Id, BTreeSet<Id>, Fast>;
+type Ends = HashMap<Id, BTreeSet<Id>>;
 
 /// What is read of one relation: its links from a node, and to it.
 #[derive(Debug, Default)]
@@ -183,7 +165,7 @@ pub(crate) struct Warm {
     /// The class of root nodes chosen by a filter, whose every node event may change them.
     roots: BTreeSet<Id>,
     /// Every node the walk reached, cut ones too; `None` before its first version in the view.
-    versions: HashMap<Id, Option<Arc<Version>>, Fast>,
+    versions: HashMap<Id, Option<Arc<Version>>>,
     /// Every list of links the walk has read, by relation.
     adjacent: HashMap<String, Read>,
     /// The latest valid time an event in this batch gave a link, per end.
@@ -227,7 +209,7 @@ impl Warm {
     }
 
     fn empty(shape: Shape, view: View, cursor: Cursor) -> Warm {
-        let known = view.known.map(crate::millis);
+        let known = view.known.map(millis);
         Warm {
             shape,
             view,
@@ -316,8 +298,7 @@ impl Warm {
         self.moved = true;
         match &self.shape.roots {
             Roots::Node { node } => {
-                self.roots
-                    .insert(Arc::new(NodeRef::new(node.class.clone(), node.key.clone())));
+                self.roots.insert(Arc::new(node.clone()));
             }
             Roots::Class { class, filter } => {
                 self.reads += 1;
@@ -349,7 +330,7 @@ impl Warm {
             return;
         };
         // An amendment can move anything, and a retried fill was folded before it held.
-        if attributes.ty == "rannoch.amended" || attributes.ty == "rannoch.refilled" {
+        if attributes.ty == "rannoch.amended" || attributes.ty == REFILLED {
             self.stale = true;
             return;
         }
@@ -493,9 +474,9 @@ impl Warm {
             ..Held::default()
         };
         // Every node marked: those taken, and those this step has already looked at.
-        let mut visited: HashSet<Id, Fast> =
-            HashSet::with_capacity_and_hasher(size, Fast::default());
+        let mut visited: HashSet<Id> = HashSet::with_capacity(size);
         self.walked += self.roots.len() as u64;
+        let mut frontier = Vec::with_capacity(self.roots.len());
         for root in &self.roots {
             if let Some(version) = version_of(
                 graph,
@@ -505,12 +486,11 @@ impl Warm {
                 root,
             )? {
                 held.nodes.insert(Arc::clone(root), version);
-                held.roots.push(Arc::clone(root));
+                frontier.push(Arc::clone(root));
                 visited.insert(Arc::clone(root));
             }
         }
-        held.roots.sort_by(key_order);
-        let mut frontier = held.roots.clone();
+        frontier.sort_by(key_order);
         for index in 0..self.shape.steps.len() {
             frontier =
                 self.take_step(graph, ontology, index, &frontier, &mut visited, &mut held)?;
@@ -526,7 +506,7 @@ impl Warm {
         ontology: &Ontology,
         index: usize,
         frontier: &[Id],
-        visited: &mut HashSet<Id, Fast>,
+        visited: &mut HashSet<Id>,
         held: &mut Held,
     ) -> Result<Vec<Id>, Error> {
         let fixed = self.view.known.is_some();
@@ -607,13 +587,11 @@ impl Warm {
             held.nodes.insert(Arc::clone(&node), version);
             taken.push(node);
         }
-        let found = taken;
         held.steps.push(StepSet {
-            nodes: found.clone(),
-            cut: dropped > 0,
+            nodes: taken.clone(),
             dropped,
         });
-        Ok(found)
+        Ok(taken)
     }
 
     /// Brings the set up to what was folded, and returns the deltas as a change's data, or `None`
@@ -656,7 +634,6 @@ impl Warm {
                 None => {
                     entered.push(json!({"node": **node, "valid": self.moved_valid(node, version)}));
                 }
-                Some(before) if Arc::ptr_eq(before, version) || before == version => {}
                 Some(before) => {
                     let names: BTreeSet<&String> = before
                         .properties
@@ -711,7 +688,7 @@ impl Warm {
 /// Moves `known` up to `version`'s, unless the view fixed it.
 fn raise(known: &mut Option<i64>, version: &Version, fixed: bool) {
     if !fixed {
-        let at = crate::millis(version.known);
+        let at = millis(version.known);
         if known.is_none_or(|k| k < at) {
             *known = Some(at);
         }
@@ -722,7 +699,7 @@ fn raise(known: &mut Option<i64>, version: &Version, fixed: bool) {
 fn version_of(
     graph: &Graph,
     view: &View,
-    versions: &mut HashMap<Id, Option<Arc<Version>>, Fast>,
+    versions: &mut HashMap<Id, Option<Arc<Version>>>,
     (known, reads): (&mut Option<i64>, &mut u64),
     node: &Id,
 ) -> Result<Option<Arc<Version>>, Error> {
@@ -745,7 +722,7 @@ fn key_order(a: &Id, b: &Id) -> std::cmp::Ordering {
 #[cfg(test)]
 mod tests {
     use rannoch_cloudevents::EventId;
-    use rannoch_store::{Anchor, Class, Cursor, Declaration, Relation, Step, open};
+    use rannoch_store::{Class, Cursor, Declaration, Relation, Step, open};
     use serde_json::json;
 
     use super::*;
@@ -820,17 +797,18 @@ mod tests {
         Shape {
             name: "hub".into(),
             roots: Roots::Node {
-                node: Anchor {
-                    class: "material".into(),
-                    key: "m".into(),
-                },
+                node: NodeRef::new("material", "m"),
             },
             steps: vec![
                 Step {
                     cap,
-                    ..Step::new("uses<-")
+                    relation: "uses<-".into(),
+                    ..Step::default()
                 },
-                Step::new("crafts"),
+                Step {
+                    relation: "crafts".into(),
+                    ..Step::default()
+                },
             ],
         }
     }
@@ -890,6 +868,57 @@ mod tests {
             "source": "rannoch", "type": "rannoch.refilled", "data": {"cursor": 1}})
         .to_string();
         assert_eq!(reads_to_fold(&mut warm, &mut g, &[told])?, seeded);
+        Ok(())
+    }
+
+    #[test]
+    fn equal_sets_are_equal_whether_or_not_their_index_is_built() -> Result {
+        let dir = tempfile::tempdir()?;
+        let g = hub(&dir, 10)?;
+        let one = Warm::seed(&g, shape(None), View::default(), Cursor::START)?;
+        let two = Warm::seed(&g, shape(None), View::default(), Cursor::START)?;
+        assert_eq!(one.set, two.set);
+        one.set.prepare();
+        assert_eq!(one.set, two.set, "one index built");
+        two.set.prepare();
+        assert_eq!(one.set, two.set, "both built");
+        Ok(())
+    }
+
+    #[test]
+    fn by_answers_in_key_order() -> Result {
+        let dir = tempfile::tempdir()?;
+        let mut g = open(dir.path().join("graph"), &KEY)?;
+        let declared = json!({"specversion": "1.0", "id": "d", "source": "rannoch:t",
+                              "type": "rannoch.declared.x"})
+        .to_string();
+        let mut class = Class::new("a", ["title"]);
+        class.indexed = BTreeSet::from(["title".to_string()]);
+        g.declare(&Declaration::Class(class), &declared)?;
+        let bodies: Vec<String> = (0..50)
+            .rev()
+            .map(|i| node("a", &format!("k{i:02}"), "same"))
+            .collect();
+        apply(&mut g, &bodies)?;
+        let every = Shape {
+            name: "all".into(),
+            roots: Roots::Class {
+                class: "a".into(),
+                filter: std::collections::BTreeMap::new(),
+            },
+            steps: Vec::new(),
+        };
+        let warm = Warm::seed(&g, every, View::default(), Cursor::START)?;
+        let found: Vec<&str> = warm
+            .set
+            .by("title", &Value::from("same"))
+            .iter()
+            .map(|n| n.key.as_str())
+            .collect();
+        let mut sorted = found.clone();
+        sorted.sort_unstable();
+        assert_eq!(found.len(), 50);
+        assert_eq!(found, sorted);
         Ok(())
     }
 

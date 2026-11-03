@@ -18,14 +18,14 @@ mod queries;
 mod read;
 
 pub use fact::check;
-pub use history::{End, Hearing, Seen, Version, View};
-pub use inbox::{FILL, Place, State};
+pub use history::{End, Hearing, Seen, Version, View, millis};
+pub use inbox::{FILL, Place, REFILLED, State};
 pub use log::{Cursor, Event, Events};
 pub use rannoch_cloudevents::{Date, EventId, NodeRef, ValidTime};
 pub use rannoch_ontology::{
-    Anchor, Class, Declaration, Ontology, Relation, Roots, Shape, Step, Value, ValueType, Way,
+    Class, Declaration, Ontology, Relation, Roots, Shape, Step, Value, ValueType, Way,
 };
-pub use read::{Counts, Description, Direction, Node};
+pub use read::{Counts, Description, Direction, Node, ViewData};
 
 use crate::handles::{Handles, Run};
 use crate::history::{
@@ -369,20 +369,20 @@ impl Graph {
             match attempt(&run, &ontology, &self.key, &event, &mut Flags::read(&run)?)? {
                 Ok(()) => {
                     run.with(Sql::DoneRetry, |s| s.execute(params![FILL, seq]))?;
-                    // A reader past this event has no other way to hear that it now holds.
                     let id = EventId::now();
                     let body = serde_json::json!({
                         "specversion": "1.0",
                         "id": id.to_string(),
                         "source": "rannoch",
-                        "type": "rannoch.refilled",
+                        "type": REFILLED,
                         "data": {"cursor": seq},
                     });
                     store(&run, id, None, &body.to_string())?;
-                    1
                 }
-                Err(cause) => tried(&run, seq, &cause)?,
-            };
+                Err(cause) => {
+                    tried(&run, seq, &cause)?;
+                }
+            }
         }
         history::keep_noted(&run)?;
         drop(run);

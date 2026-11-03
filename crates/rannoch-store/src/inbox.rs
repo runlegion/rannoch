@@ -17,6 +17,10 @@ use crate::{Error, Graph};
 /// are the events fill could not fill. A worker of an app must not take this name.
 pub const FILL: &str = "rannoch.fill";
 
+/// The type of the event fill appends when a retry succeeds, as a reader past that event has no
+/// other way to hear that it now holds.
+pub const REFILLED: &str = "rannoch.refilled";
+
 /// Where a committed event stands for one worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum State {

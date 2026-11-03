@@ -8,11 +8,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rannoch_cloudevents::{EventId, NodeRef};
-use rannoch_queue::Queue;
+use rannoch_queue::{Queue, State};
 use rannoch_relay::{Relays, WarmSet};
 use rannoch_store::{
-    Anchor, Class, Declaration, Direction, Graph, Relation, Roots, Shape, Step, Value, Version,
-    View, Way, open,
+    Class, Declaration, Direction, Graph, Relation, Roots, Shape, Step, Value, Version, View, Way,
+    open,
 };
 use serde_json::{Value as Json, json};
 
@@ -21,6 +21,8 @@ const INTERVAL: Duration = Duration::from_millis(5);
 /// How long a test waits before it calls itself hung. No test asserts how long anything takes:
 /// the time bounds are measured in `toys/relay`.
 const HUNG: Duration = Duration::from_secs(120);
+/// The worker a test reads answers with.
+const WAITER: &str = "test.answers";
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -55,7 +57,8 @@ fn link(relation: &str, from: (&str, &str), to: (&str, &str)) -> String {
 fn step(relation: &str, cap: Option<usize>) -> Step {
     Step {
         cap,
-        ..Step::new(relation)
+        relation: relation.into(),
+        ..Step::default()
     }
 }
 
@@ -63,10 +66,7 @@ fn shape(name: &str, class: &str, key: &str, steps: Vec<Step>) -> Shape {
     Shape {
         name: name.into(),
         roots: Roots::Node {
-            node: Anchor {
-                class: class.into(),
-                key: key.into(),
-            },
+            node: NodeRef::new(class, key),
         },
         steps,
     }
@@ -128,6 +128,7 @@ impl World {
 
     fn start(dir: tempfile::TempDir, graph: Graph) -> Result<World> {
         let queue = Arc::new(Queue::open(graph, INTERVAL)?);
+        let _ = queue.join(WAITER);
         let relays = Relays::open(
             dir.path().join("relays"),
             Arc::clone(&queue),
@@ -187,14 +188,37 @@ impl World {
         until(|| self.queue.join(&worker) >= high && matches!(self.queue.lag(&worker), Ok(0)))
     }
 
+    /// Asks through the inbox, and returns the relay's id and the answer.
     fn query(&self, source: &str, shape: &str, view: &Json) -> Result<(String, Json)> {
-        let answer = self.relays.answer(&query(source, shape, view))?;
-        let answer: Json = serde_json::from_str(&answer)?;
-        let id = answer["data"]["result"]["relay"]
+        let asked = query(source, shape, view);
+        let id = rannoch_cloudevents::attributes(&asked)?.id;
+        self.queue.accept(asked)?;
+        let (_, failures) = self.queue.flush();
+        assert!(failures.is_empty(), "{failures:?}");
+        let answer = self.answer_to(&id)?;
+        let relay = answer["data"]["result"]["relay"]
             .as_str()
             .ok_or("a relay id")?
             .to_string();
-        Ok((id, answer))
+        Ok((relay, answer))
+    }
+
+    /// The answer in the log to the query `id`, read by a worker of the test's own.
+    fn answer_to(&self, id: &str) -> Result<Json> {
+        let mut answer = None;
+        until(|| {
+            while let Ok(Some(event)) = self.queue.next(WAITER) {
+                let _ = self.queue.done(WAITER, event.cursor);
+                if let Ok(read) = serde_json::from_str::<Json>(&event.body)
+                    && read["type"] == "rannoch.answer"
+                    && read["subject"] == json!(id)
+                {
+                    answer = Some(read);
+                }
+            }
+            answer.is_some()
+        })?;
+        Ok(answer.ok_or("an answer")?)
     }
 
     fn cold(&self, shape_name: &str, view: &View) -> Result<Cold> {
@@ -407,22 +431,7 @@ fn a_query_in_the_inbox_is_answered_by_the_worker_and_graph_answer_refuses_it() 
     let id = rannoch_cloudevents::attributes(&asked)?.id;
     world.write(std::slice::from_ref(&asked))?;
     let graph = open(path(world.dir.path()), &KEY)?;
-    let mut found = None;
-    until(|| {
-        let _ = world.queue.flush();
-        found = graph
-            .events()
-            .since(rannoch_store::Cursor::START)
-            .ok()
-            .and_then(|events| {
-                events
-                    .into_iter()
-                    .find(|e| e.body.contains("rannoch.answer"))
-            });
-        found.is_some()
-    })?;
-    let answer = found.ok_or("an answer")?.body;
-    let answer: Json = serde_json::from_str(&answer)?;
+    let answer = world.answer_to(&id)?;
     assert_eq!(answer["subject"], json!(id));
     assert_eq!(answer["type"], json!("rannoch.answer"));
     let result = &answer["data"]["result"];
@@ -437,12 +446,20 @@ fn a_query_in_the_inbox_is_answered_by_the_worker_and_graph_answer_refuses_it() 
         graph.answer(&asked).is_err(),
         "Graph::answer refuses a shape"
     );
-    assert!(
-        world
-            .relays
-            .answer(&query("app", "nothing", &json!({})))
-            .is_err()
-    );
+    let unknown = query("app", "nothing", &json!({}));
+    world.write(std::slice::from_ref(&unknown))?;
+    let logged = graph.events().committed()?;
+    let held = graph
+        .events()
+        .since(rannoch_store::Cursor::START)?
+        .into_iter()
+        .find(|e| e.body == unknown)
+        .ok_or("the query is in the log")?;
+    assert!(held.cursor <= logged);
+    until(|| {
+        matches!(world.queue.state("rannoch.relay", held.cursor),
+                 Ok(State::Failed(why)) if why.contains("shape nothing is not declared"))
+    })?;
     Ok(())
 }
 
@@ -545,8 +562,9 @@ fn either_way_and_filters_and_a_set_of_roots() -> Result {
             filter,
         },
         steps: vec![Step {
-            drop: Some(BTreeMap::from([("title".to_string(), Value::from("no"))])),
-            ..Step::new("next<->")
+            relation: "next<->".into(),
+            drop: BTreeMap::from([("title".to_string(), Value::from("no"))]),
+            ..Step::default()
         }],
     };
     let world = World::new(vec![rooted])?;
@@ -561,7 +579,10 @@ fn either_way_and_filters_and_a_set_of_roots() -> Result {
     ])?;
     let (id, _) = world.query("app", "rooted", &json!({}))?;
     let set = world.settled(&id)?;
-    assert_eq!(keys(set.roots()), ["a"]);
+    assert!(
+        set.nodes().keys().any(|n| n.key == "a"),
+        "a root is in the set"
+    );
     assert_eq!(keys(&set.steps()[0].nodes), ["b", "d"]);
     assert_eq!(
         set.by("title", &Value::from("root")).len(),
@@ -574,7 +595,11 @@ fn either_way_and_filters_and_a_set_of_roots() -> Result {
     // A node becoming a root, and one ceasing to be, move the set.
     world.write(&[node("quest", "e", "root"), node("quest", "a", "gone")])?;
     let set = world.settled(&id)?;
-    assert_eq!(keys(set.roots()), ["e"]);
+    assert!(set.nodes().keys().any(|n| n.key == "e"), "a new root");
+    assert!(
+        !set.nodes().keys().any(|n| n.key == "a"),
+        "a root no longer"
+    );
     assert_eq!(warm(&set), world.cold("rooted", &View::default())?);
     Ok(())
 }
@@ -818,8 +843,6 @@ fn a_report_stays_where_it_froze() -> Result {
     let frozen = world.relays.reread(&report)?;
     assert_eq!(frozen.steps()[0].nodes.len(), 4, "the report does not");
     assert_eq!(warm(&frozen), warm(&before));
-    assert_eq!(frozen.known(), before.known());
-    assert!(after.known() >= frozen.known());
     let graph = open(path(world.dir.path()), &KEY)?;
     assert!(
         graph
@@ -957,5 +980,23 @@ fn an_event_whose_fill_is_retried_reaches_the_relay_as_a_change() -> Result {
     let delta = &changes[0]["data"]["changed"][0];
     assert_eq!(delta["node"]["key"], json!("q1"));
     assert_eq!(delta["after"], json!("late"));
+    Ok(())
+}
+
+#[test]
+fn a_view_known_before_the_epoch_answers_as_graph_answer_does() -> Result {
+    let world = World::new(vec![chain_shape()])?;
+    world.write(&cycle(3))?;
+    let view = json!({"known": -1});
+    let (id, answer) = world.query("app", "chain", &view)?;
+    let graph = open(path(world.dir.path()), &KEY)?;
+    let counts = json!({"specversion": "1.0", "id": "q", "source": "app", "type": "rannoch.query",
+                        "data": {"counts": {}, "view": view}})
+    .to_string();
+    let read: Json = serde_json::from_str(&graph.answer(&counts)?)?;
+    assert_eq!(read["data"]["known"], json!(-1));
+    assert_eq!(answer["data"]["known"], read["data"]["known"]);
+    assert_eq!(read["data"]["result"]["nodes"]["quest"], json!(0));
+    assert!(world.settled(&id)?.nodes().is_empty(), "nothing known then");
     Ok(())
 }

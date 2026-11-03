@@ -347,11 +347,25 @@ struct Query {
     view: ViewData,
 }
 
-/// A view as a query states it: an axis point, and a known-at in milliseconds since the epoch.
-#[derive(Deserialize, Default)]
-struct ViewData {
-    axis: Option<Vec<i64>>,
-    known: Option<i64>,
+/// A view as an event states it: an axis point, and a known-at in milliseconds since the epoch,
+/// negative before it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ViewData {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub axis: Option<Vec<i64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known: Option<i64>,
+}
+
+impl ViewData {
+    /// The view it states.
+    #[must_use]
+    pub fn view(&self) -> View {
+        View {
+            axis: self.axis.clone(),
+            known: self.known.map(time),
+        }
+    }
 }
 
 #[derive(Deserialize)]

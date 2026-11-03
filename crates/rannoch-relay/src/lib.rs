@@ -3,19 +3,20 @@
 //! process and hears of its changes as events. Everything here can be rebuilt from the log: a
 //! relay's file only saves time.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock, Weak};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
-use rannoch_cloudevents::{EventId, attributes};
+use rannoch_cloudevents::{Attributes, EventId, attributes};
 use rannoch_queue::Queue;
-use rannoch_store::{Cursor, Declaration, Graph, Shape, View, open};
+use rannoch_store::{Cursor, Declaration, Graph, REFILLED, Shape, ViewData, open};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value as Json, json};
 
 use warm::{Saved, Warm};
 pub use warm::{StepSet, WarmSet};
@@ -40,6 +41,12 @@ pub enum Error {
     /// A subscriber panicked, with the panic's text.
     #[error("a relay's subscriber panicked: {0}")]
     Subscriber(String),
+    /// The relays' thread panicked, with the panic's text, and stopped.
+    #[error("the relays' thread panicked: {0}")]
+    Thread(String),
+    /// This many older failures were dropped before they were taken.
+    #[error("{0} older failures were dropped before they were taken")]
+    Lost(u64),
 }
 
 impl From<rannoch_cloudevents::Error> for Error {
@@ -60,35 +67,10 @@ const ANSWER: &str = "rannoch.answer";
 const REPORT: &str = "rannoch.report";
 const CHANGED: &str = "rannoch.relay.changed";
 const REPLAY_CHUNK: usize = 4096;
+/// How many failures wait to be taken. Past this the oldest go, and are counted.
+const MAX_FAILURES: usize = 256;
 
 type Subscriber = Box<dyn FnMut(&str) + Send>;
-
-/// A view as an event or the manifest states it: an axis point, and a known-at in milliseconds.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-struct ViewData {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    axis: Option<Vec<i64>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    known: Option<i64>,
-}
-
-impl ViewData {
-    fn view(&self) -> View {
-        View {
-            axis: self.axis.clone(),
-            known: self
-                .known
-                .and_then(|known| u64::try_from(known).ok())
-                .map(|known| UNIX_EPOCH + Duration::from_millis(known)),
-        }
-    }
-}
-
-pub(crate) fn millis(at: SystemTime) -> i64 {
-    at.duration_since(UNIX_EPOCH).map_or(0, |since| {
-        i64::try_from(since.as_millis()).unwrap_or(i64::MAX)
-    })
-}
 
 /// One relay as the manifest holds it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,6 +96,14 @@ struct State {
     relays: HashMap<String, Live>,
 }
 
+/// What failed on the relays' thread and has not been taken: the newest [`MAX_FAILURES`], and how
+/// many older ones went.
+#[derive(Default)]
+struct Failures {
+    newest: VecDeque<Error>,
+    lost: u64,
+}
+
 struct Wake {
     pending: bool,
     stop: bool,
@@ -128,9 +118,12 @@ struct Inner {
     /// What `read` answers from: taking it never waits on a fold or touches the graph.
     published: RwLock<HashMap<String, WarmSet>>,
     subscribers: Mutex<Vec<Subscriber>>,
-    failures: Mutex<Vec<Error>>,
+    failures: Mutex<Failures>,
     wake: Mutex<Wake>,
     woken: Condvar,
+    /// Makes the next pump panic, so a test can see the panic surface from `close`.
+    #[cfg(test)]
+    panic_next: std::sync::atomic::AtomicBool,
 }
 
 /// An app's relays: their worker thread, their directory and the warm sets.
@@ -188,12 +181,14 @@ impl Relays {
             state: Mutex::new(State { graph, relays }),
             published: RwLock::new(published),
             subscribers: Mutex::new(Vec::new()),
-            failures: Mutex::new(Vec::new()),
+            failures: Mutex::default(),
             wake: Mutex::new(Wake {
                 pending: true,
                 stop: false,
             }),
             woken: Condvar::new(),
+            #[cfg(test)]
+            panic_next: std::sync::atomic::AtomicBool::new(false),
         });
         let told = Arc::downgrade(&inner);
         inner.queue.subscribe(move |_| notify(&told));
@@ -203,18 +198,6 @@ impl Relays {
             inner,
             thread: Some(thread),
         })
-    }
-
-    /// Answers the `rannoch.query` event `query`, carrying `shape` and `view`, with the body of a
-    /// `rannoch.answer` event acknowledging the relay of that shape and view, seeded now unless
-    /// one is held already. The query's `source` holds the relay. A query in the inbox is answered
-    /// by the worker `rannoch.relay` the same way, its answer accepted back into the inbox.
-    ///
-    /// # Errors
-    /// [`Error::Refused`] when `query` is not a `rannoch.query` carrying `shape`, or the shape is
-    /// not declared; the view does not fit the shape, or the graph cannot be read.
-    pub fn answer(&self, query: &str) -> Result<String, Error> {
-        self.inner.answer(query)
     }
 
     /// The warm set of relay `id`, read without touching the graph.
@@ -233,7 +216,29 @@ impl Relays {
     /// # Errors
     /// [`Error::Refused`] when no relay has that id; the directory or graph cannot be written.
     pub fn release(&self, id: &str, app: &str) -> Result<(), Error> {
-        self.inner.release(id, app)
+        let inner = &*self.inner;
+        let mut state = lock(&inner.state);
+        let relays = &mut state.relays;
+        let live = relays
+            .get_mut(id)
+            .ok_or_else(|| Error::Refused(format!("no relay has the id {id}")))?;
+        live.entry.holders.remove(app);
+        if live.entry.holders.is_empty() {
+            relays.remove(id);
+            inner
+                .published
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(id);
+            inner.queue.remove_worker(&worker_name(id))?;
+            match fs::remove_file(relay_file(&inner.dir, id)) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(error.into());
+                }
+                _ => {}
+            }
+        }
+        write_manifest(&inner.dir, relays)
     }
 
     /// Calls `subscriber` with the body of each `rannoch.relay.changed` event, from the relays'
@@ -248,7 +253,23 @@ impl Relays {
     /// # Errors
     /// [`Error::Refused`] when no relay has that id; the event is not accepted.
     pub fn report(&self, id: &str) -> Result<String, Error> {
-        self.inner.report(id)
+        let state = lock(&self.inner.state);
+        let live = state
+            .relays
+            .get(id)
+            .ok_or_else(|| Error::Refused(format!("no relay has the id {id}")))?;
+        let body = cloud_event(
+            REPORT,
+            id,
+            &json!({
+                "shape": live.entry.shape,
+                "view": live.entry.view,
+                "cursor": live.warm.set.cursor(),
+            }),
+        );
+        drop(state);
+        self.inner.queue.accept(body.clone())?;
+        Ok(body)
     }
 
     /// The warm set a `rannoch.report` event froze: the log up to its cursor is replayed into a
@@ -258,25 +279,49 @@ impl Relays {
     /// [`Error::Refused`] when `report` is no report or names a shape not declared; the graph or
     /// the temporary graph cannot be read or written.
     pub fn reread(&self, report: &str) -> Result<WarmSet, Error> {
-        self.inner.reread(report)
+        #[derive(Deserialize)]
+        struct Reported {
+            shape: String,
+            #[serde(default)]
+            view: ViewData,
+            cursor: Cursor,
+        }
+        let inner = &*self.inner;
+        let data: Reported = read_event(report)?.of_type(REPORT)?;
+        let source = open(&inner.path, &inner.key)?;
+        let shape = shape_of(&source, &data.shape)?;
+        let temporary = Temporary(inner.dir.join(format!("report-{}.db", EventId::now())));
+        let mut replayed = open(&temporary.0, &inner.key)?;
+        replay(&source, &mut replayed, data.cursor)?;
+        let warm = Warm::seed(&replayed, shape, data.view.view(), data.cursor)?;
+        Ok(warm.set)
     }
 
-    /// Takes what failed on the relays' thread, oldest first. A relay that fails to read the graph
-    /// reseeds on its next wake, so nothing here means a warm set is wrong for long.
+    /// Takes what failed on the relays' thread, oldest first, so a long-running app need not wait
+    /// for [`Relays::close`]. A relay that fails to read the graph reseeds on its next wake, so
+    /// nothing here means a warm set is wrong for long. At most 256 wait: past that the oldest go,
+    /// and an [`Error::Lost`] comes first, saying how many.
     #[must_use]
     pub fn take_failures(&self) -> Vec<Error> {
-        std::mem::take(&mut lock(&self.inner.failures))
+        let taken = std::mem::take(&mut *lock(&self.inner.failures));
+        (taken.lost > 0)
+            .then_some(Error::Lost(taken.lost))
+            .into_iter()
+            .chain(taken.newest)
+            .collect()
     }
 
     fn stop(&mut self) {
         lock(&self.inner.wake).stop = true;
         self.inner.woken.notify_all();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        if let Some(thread) = self.thread.take()
+            && let Err(panic) = thread.join()
+        {
+            self.inner.failed(Error::Thread(panic_text(&*panic)));
         }
     }
 
-    /// Stops the relays' thread, and returns what failed. A file not due is not saved: its events
+    /// Stops the relays' thread, and returns what failed, a panic of that thread included. A file not due is not saved: its events
     /// are handed again after a restart, which costs a moment and no truth.
     #[must_use]
     pub fn close(mut self) -> Vec<Error> {
@@ -360,16 +405,59 @@ fn save(dir: &Path, live: &mut Live) -> Result<(), Error> {
     Ok(())
 }
 
+/// An event with its data read as `D`, from one parse of its body.
 #[derive(Deserialize)]
-struct Asked {
-    data: AskedData,
+struct Read<D> {
+    #[serde(flatten)]
+    attributes: Attributes,
+    data: D,
+}
+
+fn read_event<D: DeserializeOwned>(body: &str) -> Result<Read<D>, Error> {
+    Ok(serde_json::from_str(body)?)
+}
+
+impl<D> Read<D> {
+    /// Its data, when it is a `CloudEvents` 1.0 event of type `ty`.
+    fn of_type(self, ty: &str) -> Result<D, Error> {
+        let event = self.attributes;
+        if event.specversion != "1.0" || event.ty != ty {
+            return Err(Error::Refused(format!(
+                "event {} is of type {}, not {ty}",
+                event.id, event.ty
+            )));
+        }
+        Ok(self.data)
+    }
 }
 
 #[derive(Deserialize)]
-struct AskedData {
+struct Asked {
     shape: String,
     #[serde(default)]
     view: ViewData,
+}
+
+/// A `CloudEvent` from rannoch, under a fresh id.
+fn cloud_event(ty: &str, subject: &str, data: &Json) -> String {
+    json!({
+        "specversion": "1.0",
+        "id": EventId::now(),
+        "source": "rannoch",
+        "type": ty,
+        "subject": subject,
+        "data": data,
+    })
+    .to_string()
+}
+
+/// The text a panic carried, when it carried text.
+fn panic_text(panic: &(dyn std::any::Any + Send)) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(ToString::to_string)
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_default()
 }
 
 impl Inner {
@@ -393,11 +481,21 @@ impl Inner {
     }
 
     fn failed(&self, error: Error) {
-        lock(&self.failures).push(error);
+        let mut failures = lock(&self.failures);
+        if failures.newest.len() == MAX_FAILURES {
+            failures.newest.pop_front();
+            failures.lost += 1;
+        }
+        failures.newest.push_back(error);
     }
 
     /// Answers the queries in the inbox, then brings every relay up to the watermark.
     fn pump(&self) {
+        #[cfg(test)]
+        assert!(
+            !self.panic_next.load(std::sync::atomic::Ordering::SeqCst),
+            "the pump panics"
+        );
         if let Err(error) = self.pump_queries() {
             self.failed(error);
         }
@@ -430,20 +528,18 @@ impl Inner {
     fn pump_queries(&self) -> Result<(), Error> {
         let mut answered = false;
         while let Some(event) = self.queue.next(QUERIES)? {
-            if is_shape_query(&event.body) {
-                match self.answer(&event.body) {
-                    Ok(answer) => {
-                        self.queue.accept(answer)?;
-                        self.queue.done(QUERIES, event.cursor)?;
-                        answered = true;
-                    }
-                    Err(error) => {
-                        self.queue
-                            .failed(QUERIES, event.cursor, &error.to_string())?;
-                    }
+            let asked = shape_query(&event.body);
+            match asked.map(|(id, source, data)| self.answer(&id, &source, data)) {
+                Some(Ok(answer)) => {
+                    self.queue.accept(answer)?;
+                    self.queue.done(QUERIES, event.cursor)?;
+                    answered = true;
                 }
-            } else {
-                self.queue.done(QUERIES, event.cursor)?;
+                Some(Err(error)) => {
+                    self.queue
+                        .failed(QUERIES, event.cursor, &error.to_string())?;
+                }
+                None => self.queue.done(QUERIES, event.cursor)?,
             }
         }
         // Someone is waiting: the answer does not wait for the next heartbeat.
@@ -471,17 +567,7 @@ impl Inner {
             live.dirty = true;
             match live.warm.settle(graph) {
                 Ok(Some(data)) => {
-                    change = Some(
-                        json!({
-                            "specversion": "1.0",
-                            "id": EventId::now(),
-                            "source": "rannoch",
-                            "type": CHANGED,
-                            "subject": live.entry.id,
-                            "data": data,
-                        })
-                        .to_string(),
-                    );
+                    change = Some(cloud_event(CHANGED, &live.entry.id, &data));
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -512,61 +598,44 @@ impl Inner {
         for change in changes {
             for subscriber in subscribers.iter_mut() {
                 if let Err(panic) = catch_unwind(AssertUnwindSafe(|| subscriber(change))) {
-                    let text = panic
-                        .downcast_ref::<&str>()
-                        .map(ToString::to_string)
-                        .or_else(|| panic.downcast_ref::<String>().cloned())
-                        .unwrap_or_default();
-                    self.failed(Error::Subscriber(text));
+                    self.failed(Error::Subscriber(panic_text(&*panic)));
                 }
             }
         }
     }
 
-    fn answer(&self, query: &str) -> Result<String, Error> {
-        let event = attributes(query)?;
-        if event.ty != QUERY {
-            return Err(Error::Refused(format!(
-                "event {} is of type {}, not {QUERY}",
-                event.id, event.ty
-            )));
-        }
-        if !is_shape_query(query) {
-            return Err(Error::Refused(format!("query {} names no shape", event.id)));
-        }
-        let Asked { data } = serde_json::from_str(query)?;
+    /// The `rannoch.answer` for query `id` from `source`: the relay of that shape and view, seeded
+    /// now unless one is held already. `source` holds it.
+    fn answer(&self, id: &str, source: &str, data: Json) -> Result<String, Error> {
+        let asked: Asked = serde_json::from_value(data)?;
         let mut state = lock(&self.state);
         let State { graph, relays } = &mut *state;
         let shared = relays
             .values_mut()
-            .find(|live| live.entry.shape == data.shape && live.entry.view == data.view);
-        let (id, set) = if let Some(live) = shared {
-            if live.entry.holders.insert(event.source.clone()) {
+            .find(|live| live.entry.shape == asked.shape && live.entry.view == asked.view);
+        let (relay, set) = if let Some(live) = shared {
+            let found = (live.entry.id.clone(), live.warm.set.clone());
+            if live.entry.holders.insert(source.to_string()) {
                 write_manifest(&self.dir, relays)?;
             }
-            let live = relays
-                .values()
-                .find(|live| live.entry.shape == data.shape && live.entry.view == data.view)
-                .ok_or_else(|| Error::Refused("the relay went".to_string()))?;
-            (live.entry.id.clone(), live.warm.set.clone())
+            found
         } else {
-            let id = EventId::now().to_string();
-            let shape = shape_of(graph, &data.shape)?;
-            let at = self.queue.join(&worker_name(&id));
-            let seeded = Warm::seed(graph, shape, data.view.view(), at);
-            let warm = match seeded {
+            let relay = EventId::now().to_string();
+            let shape = shape_of(graph, &asked.shape)?;
+            let at = self.queue.join(&worker_name(&relay));
+            let warm = match Warm::seed(graph, shape, asked.view.view(), at) {
                 Ok(warm) => warm,
                 Err(error) => {
-                    self.queue.remove_worker(&worker_name(&id))?;
+                    self.queue.remove_worker(&worker_name(&relay))?;
                     return Err(error);
                 }
             };
             let mut live = Live {
                 entry: Entry {
-                    id: id.clone(),
-                    shape: data.shape,
-                    view: data.view,
-                    holders: BTreeSet::from([event.source.clone()]),
+                    id: relay.clone(),
+                    shape: asked.shape,
+                    view: asked.view,
+                    holders: BTreeSet::from([source.to_string()]),
                 },
                 warm,
                 unsaved: Vec::new(),
@@ -575,117 +644,33 @@ impl Inner {
             };
             save(&self.dir, &mut live)?;
             let set = live.warm.set.clone();
-            live.warm.set.prepare();
+            set.prepare();
             let _ = self.publish(&live);
-            relays.insert(id.clone(), live);
+            relays.insert(relay.clone(), live);
             write_manifest(&self.dir, relays)?;
-            (id, set)
+            (relay, set)
         };
-        Ok(json!({
-            "specversion": "1.0",
-            "id": EventId::now(),
-            "source": "rannoch",
-            "type": ANSWER,
-            "subject": event.id,
-            "data": {
-                "result": {"relay": id, "cursor": set.cursor(), "steps": set.counts()},
+        Ok(cloud_event(
+            ANSWER,
+            id,
+            &json!({
+                "result": {"relay": relay, "cursor": set.cursor(), "steps": set.counts()},
                 "known": set.known(),
-            },
-        })
-        .to_string())
-    }
-
-    fn release(&self, id: &str, app: &str) -> Result<(), Error> {
-        let mut state = lock(&self.state);
-        let relays = &mut state.relays;
-        let live = relays
-            .get_mut(id)
-            .ok_or_else(|| Error::Refused(format!("no relay has the id {id}")))?;
-        live.entry.holders.remove(app);
-        if live.entry.holders.is_empty() {
-            relays.remove(id);
-            self.published
-                .write()
-                .unwrap_or_else(PoisonError::into_inner)
-                .remove(id);
-            self.queue.remove_worker(&worker_name(id))?;
-            match fs::remove_file(relay_file(&self.dir, id)) {
-                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-                    return Err(error.into());
-                }
-                _ => {}
-            }
-        }
-        write_manifest(&self.dir, relays)
-    }
-
-    fn report(&self, id: &str) -> Result<String, Error> {
-        let state = lock(&self.state);
-        let live = state
-            .relays
-            .get(id)
-            .ok_or_else(|| Error::Refused(format!("no relay has the id {id}")))?;
-        let body = json!({
-            "specversion": "1.0",
-            "id": EventId::now(),
-            "source": "rannoch",
-            "type": REPORT,
-            "subject": id,
-            "data": {
-                "shape": live.entry.shape,
-                "view": live.entry.view,
-                "cursor": live.warm.set.cursor(),
-            },
-        })
-        .to_string();
-        drop(state);
-        self.queue.accept(body.clone())?;
-        Ok(body)
-    }
-
-    fn reread(&self, report: &str) -> Result<WarmSet, Error> {
-        #[derive(Deserialize)]
-        struct Reported {
-            data: ReportedData,
-        }
-        #[derive(Deserialize)]
-        struct ReportedData {
-            shape: String,
-            #[serde(default)]
-            view: ViewData,
-            cursor: Cursor,
-        }
-        let event = attributes(report)?;
-        if event.ty != REPORT {
-            return Err(Error::Refused(format!(
-                "event {} is of type {}, not {REPORT}",
-                event.id, event.ty
-            )));
-        }
-        let Reported { data } = serde_json::from_str(report)?;
-        let source = open(&self.path, &self.key)?;
-        let shape = shape_of(&source, &data.shape)?;
-        let temporary = Temporary(self.dir.join(format!("report-{}.db", EventId::now())));
-        let mut replayed = open(&temporary.0, &self.key)?;
-        replay(&source, &mut replayed, data.cursor)?;
-        let warm = Warm::seed(&replayed, shape, data.view.view(), data.cursor)?;
-        Ok(warm.set)
+            }),
+        ))
     }
 }
 
-/// Whether `body` is a `rannoch.query` event whose data names a shape.
-fn is_shape_query(body: &str) -> bool {
-    #[derive(Deserialize)]
-    struct Probe {
-        #[serde(rename = "type")]
-        ty: String,
-        #[serde(default)]
-        data: Option<serde_json::Value>,
+/// The id, source and data of `body` when it is a `rannoch.query` event whose data names a shape,
+/// from one parse of it.
+fn shape_query(body: &str) -> Option<(String, String, Json)> {
+    if !body.contains(QUERY) {
+        return None;
     }
-    body.contains(QUERY)
-        && serde_json::from_str::<Probe>(body).is_ok_and(|probe| {
-            probe.ty == QUERY && probe.data.is_some_and(|data| data.get("shape").is_some())
-        })
+    let event: Read<Option<Json>> = read_event(body).ok()?;
+    let (id, source) = (event.attributes.id.clone(), event.attributes.source.clone());
+    let data = event.of_type(QUERY).ok()??;
+    data.get("shape").is_some().then_some((id, source, data))
 }
 
 /// The manifest: every relay's shape, view and holders.
@@ -742,7 +727,7 @@ fn replay(source: &Graph, into: &mut Graph, until: Cursor) -> Result<(), Error> 
                 attributes(body).is_ok_and(|event| {
                     !event.ty.starts_with("rannoch.declared.")
                         && !event.ty.starts_with("rannoch.closed.")
-                        && event.ty != "rannoch.refilled"
+                        && event.ty != REFILLED
                 })
             })
             .collect();
@@ -756,15 +741,18 @@ fn replay(source: &Graph, into: &mut Graph, until: Cursor) -> Result<(), Error> 
 
 #[cfg(test)]
 mod tests {
-    use rannoch_store::{Anchor, Class, Roots, Step, Value};
-    use serde_json::json;
+    use std::sync::atomic::Ordering;
+
+    use rannoch_store::{Class, NodeRef, Roots, Value};
 
     use super::*;
 
-    #[test]
-    fn read_makes_no_graph_read() -> Result<(), Box<dyn std::error::Error>> {
-        const KEY: [u8; 32] = [4; 32];
-        let dir = tempfile::tempdir()?;
+    const KEY: [u8; 32] = [4; 32];
+    type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+    /// Relays on a graph with one node of an indexed class and a shape rooted on it, and the id of
+    /// the relay a query through the inbox made.
+    fn relay(dir: &tempfile::TempDir) -> Result<(Arc<Queue>, Relays, String)> {
         let path = dir.path().join("graph");
         let mut g = open(&path, &KEY)?;
         let declared = json!({"specversion": "1.0", "id": "d", "source": "t",
@@ -776,40 +764,141 @@ mod tests {
         let shape = Shape {
             name: "s".into(),
             roots: Roots::Node {
-                node: Anchor {
-                    class: "a".into(),
-                    key: "k".into(),
-                },
+                node: NodeRef::new("a", "k"),
             },
-            steps: Vec::<Step>::new(),
+            steps: Vec::new(),
         };
         g.declare(&Declaration::Shape(shape), &declared)?;
-        let body = json!({"specversion": "1.0", "id": format!("{}:0", EventId::now()),
-            "source": "t", "type": "rannoch.node.a", "subject": "k",
-            "data": {"properties": {"n": "v"}}})
-        .to_string();
+        let body = node("v");
         for landed in g.commit(&[&body], &[])? {
             landed?;
         }
         g.fill()?;
         let queue = Arc::new(Queue::open(g, Duration::from_secs(3_600))?);
-        let relays = Relays::open(dir.path().join("relays"), queue, &path, &KEY)?;
-        let query = json!({"specversion": "1.0", "id": EventId::now().to_string(), "source": "app",
-                           "type": "rannoch.query", "data": {"shape": "s"}})
-        .to_string();
-        let answer: serde_json::Value = serde_json::from_str(&relays.answer(&query)?)?;
-        let id = answer["data"]["result"]["relay"].as_str().ok_or("relay")?;
+        let relays = Relays::open(dir.path().join("relays"), Arc::clone(&queue), &path, &KEY)?;
+        queue.accept(
+            json!({"specversion": "1.0", "id": EventId::now().to_string(), "source": "app",
+                   "type": "rannoch.query", "data": {"shape": "s"}})
+            .to_string(),
+        )?;
+        let _ = queue.flush();
+        let id = until(|| lock(&relays.inner.state).relays.keys().next().cloned())?;
+        Ok((queue, relays, id))
+    }
+
+    fn node(value: &str) -> String {
+        json!({"specversion": "1.0", "id": format!("{}:0", EventId::now()),
+            "source": "t", "type": "rannoch.node.a", "subject": "k",
+            "data": {"properties": {"n": value}}})
+        .to_string()
+    }
+
+    /// Waits for `found`, and fails only when the test is hung.
+    fn until<T>(mut found: impl FnMut() -> Option<T>) -> Result<T> {
+        let hung = Instant::now() + Duration::from_secs(120);
+        loop {
+            if let Some(value) = found() {
+                return Ok(value);
+            }
+            if Instant::now() > hung {
+                return Err("hung".into());
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn read_makes_no_graph_read() -> Result {
+        let dir = tempfile::tempdir()?;
+        let (_queue, relays, id) = relay(&dir)?;
         let reads = |relays: &Relays| {
             let state = lock(&relays.inner.state);
-            let warm = &state.relays[id].warm;
+            let warm = &state.relays[&id].warm;
             (warm.reads, warm.walked)
         };
         let before = reads(&relays);
         for _ in 0..1_000 {
-            let set = relays.read(id).ok_or("the relay")?;
+            let set = relays.read(&id).ok_or("the relay")?;
             assert_eq!(set.by("n", &Value::from("v")).len(), 1);
         }
         assert_eq!(reads(&relays), before);
         Ok(())
+    }
+
+    #[test]
+    fn take_failures_drains_what_failed_while_the_relays_run() -> Result {
+        let dir = tempfile::tempdir()?;
+        let (queue, relays, id) = relay(&dir)?;
+        relays.subscribe(|_| panic!("the subscriber panics"));
+        queue.accept(node("w"))?;
+        let _ = queue.flush();
+        let taken = until(|| {
+            let taken = relays.take_failures();
+            (!taken.is_empty()).then_some(taken)
+        })?;
+        assert!(
+            matches!(&taken[..], [Error::Subscriber(text)] if text == "the subscriber panics"),
+            "{taken:?}"
+        );
+        assert!(relays.take_failures().is_empty(), "taken once");
+        assert_eq!(
+            relays
+                .read(&id)
+                .ok_or("the relay")?
+                .by("n", &Value::from("w"))
+                .len(),
+            1,
+            "the relays run on"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failures_waiting_are_bounded_and_say_how_many_went() -> Result {
+        let dir = tempfile::tempdir()?;
+        let (_queue, relays, _) = relay(&dir)?;
+        for i in 0..MAX_FAILURES + 10 {
+            relays.inner.failed(Error::Refused(i.to_string()));
+        }
+        let taken = relays.take_failures();
+        assert_eq!(taken.len(), MAX_FAILURES + 1);
+        assert!(matches!(taken[0], Error::Lost(10)), "{:?}", taken[0]);
+        assert_eq!(taken[1].to_string(), "10", "the oldest kept");
+        assert_eq!(
+            taken[MAX_FAILURES].to_string(),
+            (MAX_FAILURES + 9).to_string()
+        );
+        assert!(relays.take_failures().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_panic_of_the_relays_thread_surfaces_from_close() -> Result {
+        let dir = tempfile::tempdir()?;
+        let (_queue, relays, _) = relay(&dir)?;
+        relays.inner.panic_next.store(true, Ordering::SeqCst);
+        notify(&Arc::downgrade(&relays.inner));
+        let failures = relays.close();
+        assert!(
+            matches!(&failures[..], [Error::Thread(text)] if text == "the pump panics"),
+            "{failures:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_query_with_no_shape_is_left_to_graph_answer() {
+        let reads = json!({"specversion": "1.0", "id": "q", "source": "a", "type": "rannoch.query",
+                           "data": {"counts": {}}})
+        .to_string();
+        assert!(shape_query(&reads).is_none());
+        let other = json!({"specversion": "1.0", "id": "q", "source": "a",
+                           "type": "app.rannoch.query", "data": {"shape": "s"}})
+        .to_string();
+        assert!(shape_query(&other).is_none());
+        let asked = json!({"specversion": "1.0", "id": "q", "source": "a", "type": "rannoch.query",
+                           "data": {"shape": "s"}})
+        .to_string();
+        assert!(shape_query(&asked).is_some());
     }
 }
