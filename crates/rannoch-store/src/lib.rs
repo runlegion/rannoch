@@ -22,7 +22,9 @@ pub use history::{End, Hearing, Seen, Version, View};
 pub use inbox::{FILL, Place, State};
 pub use log::{Cursor, Event, Events};
 pub use rannoch_cloudevents::{Date, EventId, NodeRef, ValidTime};
-pub use rannoch_ontology::{Class, Declaration, Ontology, Relation, Value, ValueType};
+pub use rannoch_ontology::{
+    Anchor, Class, Declaration, Ontology, Relation, Roots, Shape, Step, Value, ValueType, Way,
+};
 pub use read::{Counts, Description, Direction, Node};
 
 use crate::handles::{Handles, Run};
@@ -140,7 +142,10 @@ impl Graph {
     /// The ontology the file holds now. Another handle may have declared since this one last
     /// loaded, and a read must answer from the file's own stream; checking the schema version
     /// first keeps a plain data write elsewhere from costing a reload.
-    pub(crate) fn current_ontology(&self) -> Result<Arc<Ontology>, Error> {
+    ///
+    /// # Errors
+    /// The graph file cannot be read.
+    pub fn current_ontology(&self) -> Result<Arc<Ontology>, Error> {
         let version = schema_version(&self.conn)?;
         {
             let fresh = self.fresh.borrow();
@@ -181,7 +186,7 @@ impl Graph {
         Events { conn: &self.conn }
     }
 
-    /// Declares a class, a relation or a property, as one event whose body is the declaration's
+    /// Declares a class, a relation, a shape or a property, as one event whose body is the declaration's
     /// `CloudEvent`. The event, what the declaration needs and its place in the ontology land
     /// together or not at all. A declaration identical to the ontology as it is now writes
     /// nothing and returns `Ok(None)`.

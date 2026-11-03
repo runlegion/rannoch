@@ -243,7 +243,7 @@ impl Queue {
                 Some(held) => held,
                 None => workers
                     .entry(worker.to_string())
-                    .or_insert_with(Worker::joining),
+                    .or_insert_with(|| Worker::joining(Cursor::START)),
             };
             if let Some(event) = held.take() {
                 return Ok(Some(event));
@@ -263,6 +263,18 @@ impl Queue {
         };
         held.read(from, events);
         Ok(held.take())
+    }
+
+    /// Where `worker` stands: its cursor when it has a place, otherwise it joins at the committed
+    /// watermark, so everything committed before now is never handed to it. A worker that reads
+    /// the tables first has no need of the log behind them.
+    #[must_use]
+    pub fn join(&self, worker: &str) -> Cursor {
+        let watermark = lock(&self.shared.state).watermark;
+        lock(&self.shared.workers)
+            .entry(worker.to_string())
+            .or_insert_with(|| Worker::joining(watermark))
+            .cursor()
     }
 
     /// Closes the event at `cursor`, in progress for `worker`, as done, in memory.

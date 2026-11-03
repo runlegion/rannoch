@@ -14,6 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rannoch_ontology::{Class, Ontology, Value};
 use rusqlite::{Connection, OptionalExtension, ToSql, TransactionBehavior, params};
+use serde::{Deserialize, Serialize};
 
 use rannoch_cloudevents::{Conclusion, EventId, Fact, LinkFact, NodeFact, NodeRef, ValidTime};
 
@@ -1223,7 +1224,7 @@ pub struct View {
 }
 
 /// One version of a node or a link: the hearing that held at a point, by its class's order.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Version {
     /// The event it is named by: the smallest id it arrived under.
     pub event: EventId,

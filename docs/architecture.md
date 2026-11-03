@@ -18,13 +18,14 @@ It keeps every change as an event in an append-only log and never changes an eve
 | `rannoch-cloudevents` | Reading a CloudEvents 1.0 body into the fact it states: a node, a link, a link's ending or correction, a declaration, or no fact. Event ids and dates. No I/O. | Built |
 | `rannoch-store` | The graph file: the log, the ontology tables, fill, hearings, amendments and renames, the tables kept for speed, reads, the inbox's places and work rows, fill retries, `copy_to`. | Built |
 | `rannoch-queue` | The inbox in memory: accepting events, the heartbeat that commits them, producers' positions, each worker's cursor and the group commit that saves them, lag, failures, subscribers. | Built |
+| `rannoch-relay` | Declared shapes kept warm in memory: a worker per relay folding the log, the warm set read without touching the graph, change events, reports. | Built |
 | `rannoch-probe` | Measuring a host's memory and how fast a directory takes durable writes. | Built |
 | `rannoch-worker` | Reading a worker file and checking it against the ontology. | Designed, not built |
 | `rannoch-harness` | Running worker files. | Designed, not built |
 | `rannoch-processor` | The contract every step meets. | Designed, not built |
 | `rannoch-processor-*` (after, approve, bin, branch, count, emit, host, lookup, onnx, store, wait) | One kind of step each. | Designed, not built |
 
-The root `Cargo.toml` is a workspace with no package of its own. Apps depend on `rannoch-store` and `rannoch-queue`.
+The root `Cargo.toml` is a workspace with no package of its own. Apps depend on `rannoch-store` and `rannoch-queue`, and on `rannoch-relay` for relays.
 
 ## How an event moves
 
@@ -56,7 +57,7 @@ All in one file. rannoch's own tables start with `_`.
 | Table | Holds |
 |---|---|
 | `_events` | The log: place, log id, body. |
-| `_ontology` | Every declared class and relation. |
+| `_ontology` | Every declared class, relation and shape. |
 | `_hearings` | Every hearing of a node or link: its identity, entity, key (and a link's target key), event, place, source, valid time, axis point, receipt stamp (`recorded`), properties, and its known window (`known`, `until`) and the place of the event it amends (`amended`). |
 | `_aliases` | Other events that arrived with a hearing's identical content. |
 | `_ends`, `_endings`, `_corrections` | A link's latest conclusion by known-at (ended or found wrong), every ending at its axis point and known-at, and every correction at its known-at. |
@@ -147,8 +148,23 @@ Each worker reads with its own cursor, held in the queue's memory: every event a
 
 `copy_to(path)` runs SQLite's `VACUUM INTO` inside one read transaction and returns the cursor the copy holds, read from the copy itself. It takes no write lock and records nothing in the store. It refuses a path that exists and removes its file if the copy fails. The copy is not flushed durably; the snapshot tool that does that is designed in #154 and not built.
 
+## Relays
+
+A shape is declared in the ontology: `Declaration::Shape`, `{name, roots: {node} | {class, filter}, steps: [{relation, keep?, drop?, cap?}]}`. A step's relation carries its direction in its name (`r` forward, `r<-` backward, `r<->` either). `keep` and `drop` are property-equals maps on the reached node. `Relays` (in `rannoch-relay`) holds an app's relays in one directory.
+
+- **Asking.** A `rannoch.query` whose data is `{shape, view}` is answered by a `rannoch.answer` with subject the query's id and data `{result: {relay, cursor, steps: [{nodes, cut, dropped}]}, known}`, not the nodes. The worker `rannoch.relay` takes these from the inbox and accepts its answer back; `Relays::answer` is the same call in process. `Graph::answer` refuses them. A relay id is a `UUIDv7`; a relay of the same shape and view is shared. A holder is the query's `source`; `release` removes one, and a relay no app holds is dropped with its worker and file.
+- **The walk.** Each step takes the distinct unvisited nodes its links reach that have a version in the view and pass its filters, in key order, up to its cap. A taken node is marked, so a cycle never repeats it. A node a cap cuts is neither marked nor expanded, so a later step may reach it. Every node reached and every list of links read stays in memory, cut ones too, so boundary churn needs no list read again.
+- **The fold.** A relay is the worker `rannoch.relay.<id>`, joined at the watermark. It takes everything past its cursor as one batch, reads again only the node or link an event named, and walks again in memory. An amendment, or a key the graph no longer answers to, makes it read everything again. It emits at most one change for a batch.
+- **Reading.** `Relays::read` answers from memory and never touches the graph: `nodes`, `roots`, `steps`, and `by(property, value)` for properties the class indexes.
+- **Change events.** Type `rannoch.relay.changed`, subject the relay's id, data `{cursor, changed: [{node, property, before, after, valid}], entered: [{node, valid}], left: [{node, valid}]}`, delivered to `Relays::subscribe` and not logged, since the log can rebuild them. A node's `valid` when it comes or goes is that of the link that moved it, or of the last link in the batch when it moved downstream of one.
+- **The directory.** `relays.json` holds each relay's shape, view and holders. `<id>.json` holds its warm set and cursor, replaced by atomic rename at most once a second. The file's cursor is the one that counts: a relay closes events only after saving, so its cursor in `_places` is never ahead of the file, and a file missing, unreadable or behind is reseeded from the graph. After a restart a relay is handed again what it had not closed; what is at or before its file's cursor it closes unread.
+- **Reports.** `Relays::report` accepts a `rannoch.report` event, data `{shape, view, cursor}`, nothing inlined. `Relays::reread` replays the log up to the cursor into a temporary graph through fill, under the ontology declared now, and walks there, so it takes as long as the log is.
+
+A view is one `View`, read as every read does: a class with no axis reads an axis point as a known-at in milliseconds, so a shape viewed at a point needs its classes and relations on the same axis.
+
 ## Limits
 
+- **An event fill fails and later retries is not folded again.** A relay folds an event once, and a fill that succeeds on a later try logs nothing new, so a relay's warm set misses that event's fact until something else reads it again or the relay reseeds.
 - **No public lookup from a CloudEvent id to a log id.** Fill resolves an amendment's target by source and id itself; issue #164 exposes that lookup to apps, and is not built.
 - **At-least-once, no dedupe by CloudEvent id.** The log mints a fresh log id for every event, and the queue accepts a body it has accepted before. A repeat under the same CloudEvent id records nothing in the graph. A repeat under a new id is an alias of its hearing at the repeat's own known-at; on an undeclared axis, if that is newer than the current version, the repeated (older) content becomes current through it. The log holds both events and every worker is handed both, so workers must be idempotent.
 - **The queue owns its graph.** `Queue::open` takes the `Graph` by value. An app with a queue open reads, and calls `stopped`, `retry`, `set_try_limit` and `copy_to`, through a second handle (`rannoch_store::open`).
@@ -175,10 +191,6 @@ Erasing a fact from the store and its WAL, with a standing rule that refuses it 
 ### Trim
 
 Retention declared per class, such as dropping raw events once processed. No issue is filed.
-
-### Relay (#151)
-
-Neighbourhoods kept warm outside the store.
 
 ### Snapshot tool (#154)
 

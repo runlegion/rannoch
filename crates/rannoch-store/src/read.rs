@@ -548,6 +548,35 @@ mod tests {
     }
 
     #[test]
+    fn a_shape_is_declared_by_name_and_another_handle_sees_it() -> Result {
+        let path = temp("shape");
+        let mut g = open(&path, &KEY)?;
+        let reader = open(&path, &KEY)?;
+        assert!(reader.current_ontology()?.shapes.is_empty());
+        for declaration in [
+            Declaration::Class(Class::new("author", ["name"])),
+            Declaration::Class(Class::new("book", ["title"])),
+            Declaration::Relation(Relation::new("wrote", "author", "book", false)),
+        ] {
+            g.declare(
+                &declaration,
+                r#"{"specversion":"1.0","id":"d","source":"app","type":"rannoch.declared.x"}"#,
+            )?;
+        }
+        let shape: crate::Shape = serde_json::from_str(
+            r#"{"name":"books","roots":{"class":"author"},"steps":[{"relation":"wrote","cap":3}]}"#,
+        )?;
+        let body =
+            r#"{"specversion":"1.0","id":"d","source":"app","type":"rannoch.declared.books"}"#;
+        let declared = Declaration::Shape(shape.clone());
+        assert!(g.declare(&declared, body)?.is_some());
+        assert!(g.declare(&declared, body)?.is_none(), "identical");
+        assert_eq!(reader.current_ontology()?.shape("books"), Ok(&shape));
+        assert_eq!(open(&path, &KEY)?.ontology().shape("books"), Ok(&shape));
+        Ok(())
+    }
+
+    #[test]
     fn links_out_and_in_hold_in_the_view_in_key_order() -> Result {
         let g = filled("links", &events())?;
         let a1 = NodeRef::new("author", "a1");
