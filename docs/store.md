@@ -54,7 +54,7 @@ Every event is a CloudEvents 1.0 JSON object. rannoch reads the `rannoch.*` type
 | `rannoch.node.<class>` | the node's natural key | `{"properties": {...}, "valid"?: ..., "axis"?: {...}}` |
 | `rannoch.link.<relation>` | (any) | `{"from": {"class", "key"}, "to": {"class", "key"}, "valid"?: ..., "axis"?: {...}}` |
 | `rannoch.ended.<relation>` | (any) | `{"from", "to", "valid"?: ..., "axis"?: {...}}`: the link stopped holding |
-| `rannoch.corrected.<relation>` | (any) | `{"from", "to"}`: the link was wrong |
+| `rannoch.corrected.<relation>` | (any) | `{"from", "to"}`: the link was wrong, and does not hold from this event's known-at on |
 | `rannoch.amended` | (any) | `{"target": {"source", "id"}, "patch": {...}}`: a JSON Merge Patch of the target |
 | `rannoch.declared.<name>` | (any) | none; made with `declare`, never accepted |
 
@@ -119,7 +119,7 @@ Reads take a `View { axis, known }`: an optional axis point and an optional know
 | `find_as_of(class, key, date, view)` | the version valid on `date`, among those the view sees |
 | `hearings(node)` | every account of the node, each with its source, axis point, known-at, valid time and identity |
 | `seen(node)` | first and last heard, first recorded, first true, and how many hearings |
-| `link_state_at(rel, from, to, view)` | the link's version in the view, and whether it had ended; an amendment or rename known later is not in it |
+| `link_state_at(rel, from, to, view)` | the link's version in the view, and whether it does not hold there (`ended`: it ended or was found wrong); an amendment or rename known later is not in it |
 | `link_hearings`, `link_seen`, `link_end` | as for nodes; `link_end` says whether it ended or was found wrong |
 | `links(node, rel, direction, view)` | the links of `rel` from the node (`Direction::Out`) or to it that hold in the view (a version, not ended), each as the other end's key and the link's version, in the other end's key order |
 | `nodes(class, filter, view)` | the class's nodes in the view, each as its key and version, in key order; `filter` maps indexed properties to values |
@@ -132,7 +132,7 @@ None of these reads drops a version whose valid time is unknown: it is returned 
 
 A read can be asked as an event. A `rannoch.query` event's data is one read and its view: `{"links": {"node": {"class", "key"}, "relation", "direction": "out" | "in"}}`, `{"nodes": {"class", "filter": {...}}}`, `{"counts": {}}` or `{"describe": {"node": {...}}}`, with `"view": {"axis": [...], "known": <ms>}`, each part optional. `answer` returns a `rannoch.answer` event whose subject is the query's id and whose data is `{"result", "known"}`: the read's result and the known-at it was read at. A view with no known-at is read at the highest known-at ever filled, which reads all the store knows, so asking again with that known-at gives the same answer on the same log. Fill keeps it as a high-water mark: after an amendment filled later makes an earlier one redundant, it can exceed the greatest known-at the store's facts hold now. The state read is the same either way; only the answer's `known` differs. Both events can be logged and filled like any other; they fill no table.
 
-A version that arrives late answers at its own point; it does not change what is current unless it is newer on the axis. A link's latest conclusion (ending or correction) is chosen by known-at, then event id, never by arrival. Reading the same log in any order, or after a rebuild, gives the same answers; only `Node.recorded` and `Seen.first_recorded`, which name this store's own receipt, may differ.
+A version that arrives late answers at its own point; it does not change what is current unless it is newer on the axis. A link's latest conclusion (ending or correction) is chosen by known-at, then event id, never by arrival. A link found wrong does not hold in any view from the correction's known-at on, across the whole axis, even when a later conclusion replaces it as the latest. A live hearing reopens it only when it is the newest occurrence in the view and its event id sorts after the correction's: a later build holds from that build, an earlier build stays not holding, a re-send at the same build reopens that build, and a late hearing at an earlier build holds at that build only. `link_state_at` returns such a link as a version with `ended: true`: `ended` on a version means the link does not hold, whether it ended or was found wrong. `link_end` returns `Corrected`, and none once reopened. Reading the same log in any order, or after a rebuild, gives the same answers; only `Node.recorded` and `Seen.first_recorded`, which name this store's own receipt, may differ.
 
 ```rust
 let book = g.find("book", "b1")?.ok_or("b1 is there")?;

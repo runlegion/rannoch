@@ -33,7 +33,7 @@ app ──accept──▶ Queue (memory) ──heartbeat, every 20 ms──▶ _
                                                               │
                                               fill (worker rannoch.fill)
                                                               ▼
-                              _hearings, _aliases, _ends, _endings, _amendments, _renames, _open
+                              _hearings, _aliases, _ends, _endings, _corrections, _amendments, _renames, _open
                                                               │
                                            tables kept for speed: class:<name>, relation:<name>,
                                            _seen
@@ -59,7 +59,7 @@ All in one file. rannoch's own tables start with `_`.
 | `_ontology` | Every declared class and relation. |
 | `_hearings` | Every hearing of a node or link: its identity, entity, key (and a link's target key), event, place, source, valid time, axis point, receipt stamp (`recorded`), properties, and its known window (`known`, `until`) and the place of the event it amends (`amended`). |
 | `_aliases` | Other events that arrived with a hearing's identical content. |
-| `_ends`, `_endings` | A link's latest conclusion by known-at (ended or found wrong), and every ending at its axis point and known-at. |
+| `_ends`, `_endings`, `_corrections` | A link's latest conclusion by known-at (ended or found wrong), every ending at its axis point and known-at, and every correction at its known-at. |
 | `_amendments` | Each amendment by target place, known-at and event. |
 | `_renames` | Each rename: entity, old key, new key, known-at, event. |
 | `_waiting` | Each amendment waiting for its target: the target's source and id, the amendment's known-at, event and place. |
@@ -72,7 +72,7 @@ All in one file. rannoch's own tables start with `_`.
 | `_fill` | Fill's try limit (3 unless set). |
 | `_check` | The check value of the app's key. |
 
-The tables kept for speed are `class:<name>`, `relation:<name>` and `_seen`; fill keeps them current. Reads answer from `_hearings`, `_aliases`, `_ends`, `_endings` and `_seen`. The class and relation tables serve the app's own SQL. `find` returns `None` for a key renamed away. A link of the wrong classes cannot exist in a relation table, since both ends are foreign keys.
+The tables kept for speed are `class:<name>`, `relation:<name>` and `_seen`; fill keeps them current. Reads answer from `_hearings`, `_aliases`, `_ends`, `_endings`, `_corrections` and `_seen`. The class and relation tables serve the app's own SQL. `find` returns `None` for a key renamed away. A link of the wrong classes cannot exist in a relation table, since both ends are foreign keys.
 
 ## Three times
 
@@ -88,12 +88,12 @@ Reads take a `View`: an optional axis point and an optional known-at, each defau
 
 - **Now** (`find`, `hearings`, `seen`, `link_seen`, `link_end`): hearings with no `until`, the newest on the axis. A version that arrives late answers at its own point and becomes current only if it is the newest on the axis.
 - **In a view** (`state_at`, `link_state_at`): the newest version at or before the view's point among the hearings known at its known-at (`known` at or before it, `until` after it or absent). None needs a valid date. An amendment or rename known later is not in the answer.
-- **Listed in a view** (`links`, `nodes`, `counts`, `describe`, and `answer` for a `rannoch.query` event): every node `state_at` reads in the view, and every link `link_state_at` reads there that has not ended and has a hearing in the view (a link never heard, with an ending and then a correction, is read by `link_state_at` but not listed). `links` and `nodes` are one statement over the history tables; `counts` runs one per class and per relation, and `describe` one for the node and one per relation and direction. `nodes` filters only on properties the class declares `indexed`, through a partial index on `_hearings` made when the class is declared; links to a node are found through `_hearings_to`, which holds link hearings only.
+- **Listed in a view** (`links`, `nodes`, `counts`, `describe`, and `answer` for a `rannoch.query` event): every node `state_at` reads in the view, and every link `link_state_at` reads there as a version with `ended` false, which is a link with a hearing in the view. `ended` on a version means the link does not hold there, whether it ended or was found wrong. `links` and `nodes` are one statement over the history tables; `counts` runs one per class and per relation, and `describe` one for the node and one per relation and direction. `nodes` filters only on properties the class declares `indexed`, through a partial index on `_hearings` made when the class is declared; links to a node are found through `_hearings_to`, which holds link hearings only.
 - **As of a valid date, in a view** (`find_as_of(class, key, date, view)`): the version valid on that date among those the view sees.
 
 **Identity.** A hearing's identity is its content together with its source, hashed with BLAKE3 under the app's 32-byte key. Identical content from the same source is one hearing: a repeat under the same CloudEvent id records nothing; a repeat under a new id becomes an alias, an occurrence of the hearing at the repeat's own known-at. A declared axis point is content; known-at is not. The key is held in memory only; the file keeps a check value, and opening it under another key returns `Error::KeyDiffers`.
 
-**Links.** A link's hearings and endings carry axis points through the same path as nodes: the same link heard at two builds is two hearings, each at its build. Its endings sit beside its hearings at their own points. A live hearing at a later point reopens a link that ended. A correction records that the link was wrong, which is not an ending. The latest conclusion, ending or correction, is chosen by known-at and then event id, never by arrival. A link that names a node that has not arrived waits in `_open`. When the node arrives, fill moves the link into its relation's table and appends one event to the log: type `rannoch.closed.<relation>`, source `rannoch`, a bare `UUIDv7` id, subject the link's from-key, data `{from, to, valid}`. Every worker is handed these events; a worker that does not care about them closes them as done.
+**Links.** A link's hearings and endings carry axis points through the same path as nodes: the same link heard at two builds is two hearings, each at its build. Its endings sit beside its hearings at their own points. A live hearing at a later point reopens a link that ended. A correction records that the link was wrong, which is not an ending, and the link does not hold from the correction's known-at on. A correction has no axis point: it applies across the whole axis, and it stays in force in every view from its known-at even when a later conclusion replaces it as the latest. A hearing reopens the link only when it is the newest live occurrence in the view and its event id sorts after the correction's, so a later build holds from that build, an earlier build stays not holding, a re-send at the same build reopens that build, and a late hearing at an earlier build holds at that build only. The latest conclusion, ending or correction, is chosen by known-at and then event id, never by arrival, and `link_end` reports it: `Corrected` unless reopened. A link that names a node that has not arrived waits in `_open`. When the node arrives, fill moves the link into its relation's table and appends one event to the log: type `rannoch.closed.<relation>`, source `rannoch`, a bare `UUIDv7` id, subject the link's from-key, data `{from, to, valid}`. Every worker is handed these events; a worker that does not care about them closes them as done.
 
 ## Amend and rename
 
