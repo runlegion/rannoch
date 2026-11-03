@@ -41,3 +41,9 @@ The apps' predictions above stay as written. The operator changed two measures:
 
 - The importer's round trip is judged at the median: under 40 ms. p95 and p99 are stated. Expected from the earlier runs: p50 about 28 ms, p95 about 50 ms, p99 about 85 ms.
 - Applying an event is the fold plus the walk, under 1 ms at the median, on the Hutta relay, with one link per commit. Expected from the walk measurement (WALKS-RESULTS.md): p50 about 0.4 to 0.5 ms, on any run, no longer split by core placement as much, since the wake is out of the measure. If it still splits by run, it is the thread and not the wake.
+
+## After the simplify findings, 2026-11-03, before this rerun
+
+The crate changed: `Quick` is gone, so the walk uses the default hasher, and a relay is only asked through the inbox. Expected: every target still holds and 0 differences. Fold plus walk at Hutta should rise by 10 to 30%, to about 0.55 to 0.65 ms at the median, still under 1 ms. If it does not hold without `Quick`, the results say so. "Seeds under 1 s" now runs through the inbox (a heartbeat and two commits on top of the seed).
+
+Kessel's "at the old known-at" is now read from the ack's `known` for the first answer, and from the newest known-at of the nodes a report holds for the report, since `WarmSet::known` is no longer public.
