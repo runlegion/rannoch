@@ -21,7 +21,7 @@ use crate::handles::Run;
 use crate::log::Cursor;
 use crate::ontology::{CLASS, RELATION};
 use crate::queries::{
-    ALIASES_OF, CHECK, CORRECTED, SET_CHECK, Sql, Stmt, ended_sql, hearings, link_ending,
+    ALIASES_OF, CHECK, SET_CHECK, Sql, Stmt, ended_sql, hearings, link_correction, link_ending,
     link_state, seen_sql,
 };
 use crate::{Error, Graph};
@@ -538,10 +538,9 @@ fn edges(
 }
 
 /// Records how a link came to an end, when `conclusion` is an ending (at its point on its
-/// relation's axis, with its valid time) or a correction (with neither). Every ending is kept,
-/// and counts as a fact of the link; the latest conclusion by known-at and then event id replaces
-/// any before it, whatever order they arrive in, so a correction that is latest masks the
-/// endings.
+/// relation's axis, with its valid time) or a correction (with neither). Every ending and every
+/// correction is kept, and an ending counts as a fact of the link; the latest conclusion by
+/// known-at and then event id replaces any before it, whatever order they arrive in.
 pub(crate) fn conclude(
     tx: &impl Run,
     ontology: &Ontology,
@@ -590,6 +589,9 @@ pub(crate) fn conclude(
                 s.execute(params![entity, from, to, by, source, at, valid, known])
             })?;
             let Some(at) = &at else {
+                tx.with(Sql::Correction, |s| {
+                    s.execute(params![entity, from, to, known, by, source])
+                })?;
                 continue;
             };
             let new = tx.with(Sql::Ending, |s| {
@@ -890,6 +892,9 @@ fn rename_ends(
             s.execute(params![of, old, new, target])
         })?;
         tx.with(Sql::RenameEnds, |s| {
+            s.execute(params![of, old, new, target])
+        })?;
+        tx.with(Sql::RenameCorrections, |s| {
             s.execute(params![of, old, new, target])
         })?;
     }
@@ -1230,8 +1235,8 @@ pub struct Version {
     pub known: SystemTime,
     /// A node's properties as that version holds them; a link has none.
     pub properties: BTreeMap<String, Value>,
-    /// Whether a link had ended by the point read, or, as [`Seen`] names a link's fact, whether
-    /// that fact is one of its endings; a node never has.
+    /// Whether a link does not hold at the point read, because it ended or was found wrong, or,
+    /// as [`Seen`] names a link's fact, whether that fact is one of its endings; a node never has.
     pub ended: bool,
 }
 
@@ -1397,14 +1402,20 @@ pub(crate) fn link_in_view(
         .prepare_cached(link_state())?
         .query_row(
             params![link_entity(relation), from, to, axis, known],
-            |row| Ok((columns(row, 0)?, row.get::<_, bool>(6)?)),
+            |row| {
+                Ok((
+                    columns(row, 0)?,
+                    row.get::<_, bool>(6)?,
+                    row.get::<_, bool>(7)?,
+                ))
+            },
         )
         .optional()?;
-    let Some((columns, ending)) = newest else {
+    let Some((columns, ending, corrected)) = newest else {
         return Ok(None);
     };
     let mut version = version_of(columns, ending)?;
-    version.ended = ended(conn, relation, (from, to), (axis.as_deref(), known), None)?;
+    version.ended = corrected || ended(conn, relation, (from, to), (axis.as_deref(), known), None)?;
     Ok(Some(version))
 }
 
@@ -1413,24 +1424,21 @@ type EndingRow = (String, String, Vec<u8>, i64, Option<String>);
 
 impl Graph {
     /// How the link of `relation` from the node keyed `from` to the node keyed `to` came to an
-    /// end: found wrong, when a correction is its latest conclusion by known-at; else its ending,
-    /// the earliest after its last live hearing by axis point, known-at and then event id; `None`
-    /// while it has neither ended nor been found wrong, and once heard live after its endings.
+    /// end: found wrong, when a correction no newer live hearing follows is its latest conclusion
+    /// by known-at or it has no ending; else its ending, the earliest after its last live hearing
+    /// by axis point, known-at and then event id; `None` while it has neither ended nor been found
+    /// wrong, and once heard live after its endings and corrections.
     ///
     /// # Errors
     /// The relation is not declared, or the graph file cannot be read.
     pub fn link_end(&self, relation: &str, from: &str, to: &str) -> Result<Option<End>, Error> {
         let relation = self.current_ontology()?.relation(relation)?.name.clone();
         let link = params![link_entity(&relation), from, to];
-        let corrected: Option<(String, String)> = self
+        let corrected: Option<(String, String, bool)> = self
             .conn
-            .prepare_cached(CORRECTED)?
-            .query_row(link, |row| Ok((row.get(0)?, row.get(1)?)))
+            .prepare_cached(link_correction())?
+            .query_row(link, |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
             .optional()?;
-        if let Some((event, source)) = corrected {
-            let event = serde_json::from_value(event.into())?;
-            return Ok(Some(End::Corrected { source, event }));
-        }
         let row: Option<EndingRow> = self
             .conn
             .prepare_cached(link_ending())?
@@ -1444,6 +1452,12 @@ impl Graph {
                 ))
             })
             .optional()?;
+        if let Some((event, source, latest)) = corrected
+            && (latest || row.is_none())
+        {
+            let event = serde_json::from_value(event.into())?;
+            return Ok(Some(End::Corrected { source, event }));
+        }
         let Some((event, source, axis, known, valid)) = row else {
             return Ok(None);
         };
@@ -1542,7 +1556,9 @@ impl Graph {
 
     /// The version of the link of `relation` from the node keyed `from` to the node keyed `to`
     /// in `view`: the newest of its live hearings and endings at or before the view's point and
-    /// known at its known-at, and whether the link had ended by then. `None` before its first
+    /// known at its known-at, and whether the link had ended or been found wrong by then. A
+    /// correction known in the view holds across the whole axis until a live hearing whose event
+    /// follows it is the newest in the view. `None` before its first
     /// version. An amendment or rename known after the view's known-at is not in it.
     ///
     /// # Errors

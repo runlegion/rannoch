@@ -475,8 +475,8 @@ mod tests {
         )
     }
 
-    /// The link of `wrote` from author `from` to book `to` (`kind` `link`), or its ending
-    /// (`ended`), known at `seconds`.
+    /// The link of `wrote` from author `from` to book `to` (`kind` `link`), its ending (`ended`)
+    /// or its correction (`corrected`), known at `seconds`.
     fn wrote(seconds: u64, kind: &str, from: &str, to: &str) -> String {
         format!(
             r#"{{"specversion":"1.0","id":"{}","source":"rannoch:shop","type":"rannoch.{kind}.wrote","data":{{"from":{{"class":"author","key":"{from}"}},"to":{{"class":"book","key":"{to}"}}}}}}"#,
@@ -746,6 +746,216 @@ mod tests {
             assert_eq!(every_read(&reversed, &view)?, expected, "{view:?}");
             assert_eq!(every_read(&rebuilt, &view)?, expected, "{view:?}");
         }
+        Ok(())
+    }
+
+    /// Whether a1 wrote b1 in `view`, asked of every read, which must agree.
+    fn wrote_holds(
+        g: &Graph,
+        view: &View,
+    ) -> std::result::Result<bool, Box<dyn std::error::Error>> {
+        let (a1, b1) = (NodeRef::new("author", "a1"), NodeRef::new("book", "b1"));
+        let holds = keys(&g.links(&a1, "wrote", Out, view)?) == ["b1"];
+        assert_eq!(keys(&g.links(&b1, "wrote", In, view)?) == ["a1"], holds);
+        assert_eq!(g.counts(view)?.links["wrote"], u64::from(holds));
+        let described = g.describe(&a1, view)?.map(|d| d.links);
+        assert_eq!(
+            described.is_some_and(|links| links.contains_key(&("wrote".to_string(), Out))),
+            holds
+        );
+        let state = g.link_state_at("wrote", "a1", "b1", view)?;
+        assert_eq!(state.is_some_and(|v| !v.ended), holds);
+        Ok(holds)
+    }
+
+    /// `facts` about a1 and b1, filled in order, in reverse and replayed from the log: each
+    /// `(seconds, holds)` in `reads` is asked of all three.
+    fn found_wrong(name: &str, facts: &[String], reads: &[(u64, bool)]) -> Result {
+        let mut events = vec![
+            book(1, "b1", "One", "fiction", r#""unknown""#),
+            author(1, "a1"),
+        ];
+        events.extend_from_slice(facts);
+        let ordered = filled(&format!("{name}-ordered"), &events)?;
+        let logged: Vec<String> = ordered
+            .events()
+            .since(crate::Cursor::START)?
+            .into_iter()
+            .map(|event| event.body)
+            .filter(|body| !body.contains("rannoch.declared"))
+            .collect();
+        let rebuilt = filled(&format!("{name}-rebuilt"), &logged)?;
+        events.reverse();
+        let reversed = filled(&format!("{name}-reversed"), &events)?;
+        for g in [&ordered, &rebuilt, &reversed] {
+            for (seconds, holds) in reads {
+                assert_eq!(
+                    wrote_holds(g, &at(*seconds))?,
+                    *holds,
+                    "{name} at {seconds}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_link_found_wrong_does_not_hold_from_the_corrections_known_at() -> Result {
+        found_wrong(
+            "wrong",
+            &[
+                wrote(13, "link", "a1", "b1"),
+                wrote(20, "corrected", "a1", "b1"),
+            ],
+            &[(15, true), (20, false), (25, false)],
+        )?;
+        let g = filled(
+            "wrong-now",
+            &[
+                book(1, "b1", "One", "fiction", r#""unknown""#),
+                author(1, "a1"),
+                wrote(13, "link", "a1", "b1"),
+                wrote(20, "corrected", "a1", "b1"),
+            ],
+        )?;
+        assert!(!wrote_holds(&g, &View::default())?);
+        assert!(
+            g.link_state_at("wrote", "a1", "b1", &View::default())?
+                .is_some_and(|v| v.ended)
+        );
+        assert!(matches!(
+            g.link_end("wrote", "a1", "b1")?,
+            Some(crate::End::Corrected { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn a_link_ended_then_found_wrong_does_not_come_back() -> Result {
+        found_wrong(
+            "ended-wrong",
+            &[
+                wrote(13, "link", "a1", "b1"),
+                wrote(14, "ended", "a1", "b1"),
+                wrote(20, "corrected", "a1", "b1"),
+            ],
+            &[(13, true), (17, false), (20, false), (25, false)],
+        )
+    }
+
+    #[test]
+    fn a_later_hearing_reopens_a_link_found_wrong() -> Result {
+        let again = wrote(30, "link", "a1", "b1");
+        found_wrong(
+            "reopened",
+            &[
+                wrote(13, "link", "a1", "b1"),
+                wrote(20, "corrected", "a1", "b1"),
+                again.clone(),
+            ],
+            &[(15, true), (25, false), (35, true)],
+        )?;
+        let g = filled(
+            "reopened-now",
+            &[
+                book(1, "b1", "One", "fiction", r#""unknown""#),
+                author(1, "a1"),
+                wrote(13, "link", "a1", "b1"),
+                wrote(20, "corrected", "a1", "b1"),
+                again,
+            ],
+        )?;
+        assert!(
+            g.link_end("wrote", "a1", "b1")?.is_none(),
+            "none once reopened"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_correction_stays_in_force_after_a_later_conclusion() -> Result {
+        found_wrong(
+            "then-ended",
+            &[
+                wrote(10, "link", "a1", "b1"),
+                wrote(20, "corrected", "a1", "b1"),
+                wrote(25, "ended", "a1", "b1"),
+            ],
+            &[(15, true), (22, false), (30, false)],
+        )?;
+        found_wrong(
+            "reopened-then-ended",
+            &[
+                wrote(10, "link", "a1", "b1"),
+                wrote(20, "corrected", "a1", "b1"),
+                wrote(30, "link", "a1", "b1"),
+                wrote(40, "ended", "a1", "b1"),
+            ],
+            &[(15, true), (25, false), (35, true), (45, false)],
+        )
+    }
+
+    #[test]
+    fn an_amendment_or_rename_does_not_reopen_a_link_found_wrong() -> Result {
+        let link = wrote(13, "link", "a1", "b1");
+        let target = book(1, "b1", "One", "fiction", r#""unknown""#);
+        let events = [
+            target.clone(),
+            author(1, "a1"),
+            link.clone(),
+            wrote(20, "corrected", "a1", "b1"),
+            amending(30, &link, r#"{"source":"rannoch:editor"}"#)?,
+            amending(40, &target, r#"{"subject":"b9"}"#)?,
+        ];
+        let g = filled("not-reopened", &events)?;
+        assert!(
+            !wrote_holds(&g, &at(35))?,
+            "the amendment is no new hearing"
+        );
+        let a1 = NodeRef::new("author", "a1");
+        assert_eq!(
+            keys(&g.links(&a1, "wrote", Out, &View::default())?),
+            Vec::<&str>::new()
+        );
+        assert!(
+            g.link_state_at("wrote", "a1", "b9", &View::default())?
+                .is_some_and(|v| v.ended),
+            "the correction follows the rename"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_store_with_a_correction_from_before_keeps_it_when_opened() -> Result {
+        let path = temp("seeded");
+        {
+            let mut g = open(path.clone(), &KEY)?;
+            g.declare(
+                &Declaration::Class(Class::new("author", ["name"])),
+                r#"{"specversion":"1.0","id":"d-author","source":"rannoch:shop","type":"rannoch.declared.author"}"#,
+            )?;
+            g.declare(
+                &Declaration::Class(Class::new("book", ["title", "genre"])),
+                r#"{"specversion":"1.0","id":"d-book","source":"rannoch:shop","type":"rannoch.declared.book"}"#,
+            )?;
+            g.declare(
+                &Declaration::Relation(Relation::new("wrote", "author", "book", false)),
+                r#"{"specversion":"1.0","id":"d-wrote","source":"rannoch:shop","type":"rannoch.declared.wrote"}"#,
+            )?;
+            let events = [
+                book(1, "b1", "One", "fiction", r#""unknown""#),
+                author(1, "a1"),
+                wrote(13, "link", "a1", "b1"),
+                wrote(20, "corrected", "a1", "b1"),
+            ];
+            let refs: Vec<&str> = events.iter().map(String::as_str).collect();
+            g.commit(&refs, &[])?;
+            g.fill()?;
+            g.conn.execute_batch("DROP TABLE _corrections")?;
+        }
+        let g = open(path, &KEY)?;
+        assert!(!wrote_holds(&g, &View::default())?);
+        assert!(wrote_holds(&g, &at(15))?);
         Ok(())
     }
 

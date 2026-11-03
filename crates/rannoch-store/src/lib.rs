@@ -1055,7 +1055,7 @@ mod tests {
     }
 
     #[test]
-    fn a_correction_masks_an_ending() -> Result<(), Box<dyn std::error::Error>> {
+    fn a_correction_is_not_an_ending() -> Result<(), Box<dyn std::error::Error>> {
         let mut g = graph("masks")?;
         g.commit(
             &[
@@ -2558,6 +2558,66 @@ mod tests {
             g.link_end("ships", "k1", "r1")?,
             Some(crate::End::Ended { ref axis, .. }) if axis == &[14]
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn a_correction_holds_across_the_axis_until_a_newer_hearing_follows_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let corrected = format!(
+            r#"{{"specversion":"1.0","id":"{}","source":"rannoch:shop","type":"rannoch.corrected.ships","data":{{"from":{{"class":"run","key":"k1"}},"to":{{"class":"release","key":"r1"}}}}}}"#,
+            id_at(1_020)
+        );
+        let holds = |g: &crate::Graph, build: i64, known: Option<u64>| {
+            let found = g.link_state_at("ships", "k1", "r1", &view(Some(&[build]), known))?;
+            Ok::<_, crate::Error>(found.is_some_and(|v| !v.ended))
+        };
+        let nodes = [
+            on_axis(1_000, "run", "k1", r#"{"build":1,"step":0}"#, "k"),
+            on_axis(1_000, "release", "r1", r#"{"build":1}"#, "r"),
+        ];
+        let first = ships(1_010, "link", ("k1", "r1"), r#"{"build":3}"#);
+        for (name, later, reads, end_none) in [
+            // A hearing at a later build holds from that build; the earlier stays not holding.
+            (
+                "later-build",
+                ships(1_030, "link", ("k1", "r1"), r#"{"build":4}"#),
+                [(3, false), (4, true)],
+                true,
+            ),
+            // A re-send at the same build reopens that build.
+            (
+                "same-build",
+                ships(1_030, "link", ("k1", "r1"), r#"{"build":3}"#),
+                [(2, false), (3, true)],
+                true,
+            ),
+            // A late hearing at an earlier build holds at that build only.
+            (
+                "earlier-build",
+                ships(1_030, "link", ("k1", "r1"), r#"{"build":2}"#),
+                [(2, true), (3, false)],
+                false,
+            ),
+        ] {
+            for order in [
+                [&nodes[0], &nodes[1], &first, &corrected, &later],
+                [&later, &corrected, &first, &nodes[1], &nodes[0]],
+            ] {
+                let mut g = graph_on_axes(&format!("axis-{name}-{}", order[0].len()))?;
+                feed(&mut g, &order)?;
+                for (build, holding) in reads {
+                    assert_eq!(holds(&g, build, None)?, holding, "{name} at build {build}");
+                }
+                assert!(
+                    !holds(&g, 3, Some(1_025))?,
+                    "{name}: known after the correction"
+                );
+                assert!(holds(&g, 3, Some(1_015))?, "{name}: known before it");
+                let end = g.link_end("ships", "k1", "r1")?;
+                assert_eq!(end.is_none(), end_none, "{name}: {end:?}");
+            }
+        }
         Ok(())
     }
 

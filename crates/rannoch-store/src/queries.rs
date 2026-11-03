@@ -156,8 +156,9 @@ pub(crate) const RESET_TRIES: &str =
 /// known-at when no axis is declared), `known` when it became known, and `properties` holds a
 /// node's. Then the other ids each arrived under, each an occurrence of its hearing at its own
 /// known-at; the latest conclusion by known-at for each link that ended or was found wrong
-/// (`axis` null for a correction, which masks its endings); every ending of a link, at its point
-/// (`valid` null when unknown); what is kept of when each node and link was seen; the
+/// (`axis` null for a correction); every ending of a link, at its point (`valid` null when
+/// unknown); every correction of a link, seeded from the conclusions when a store first has this
+/// table; what is kept of when each node and link was seen; the
 /// amendments waiting for their target; the check value of the graph's key; and the highest
 /// known-at ever filled, a high-water mark seeded by one scan when a store first has none kept.
 ///
@@ -196,6 +197,13 @@ pub(crate) const HISTORY_TABLES: &str = "
         key TEXT NOT NULL, to_key TEXT NOT NULL, axis BLOB NOT NULL, known INTEGER NOT NULL,
         event TEXT NOT NULL, source TEXT NOT NULL, valid TEXT,
         UNIQUE(entity, line, key, to_key, axis, event));
+    CREATE TABLE IF NOT EXISTS _corrections(
+        entity TEXT NOT NULL, line TEXT NOT NULL DEFAULT 'main', key TEXT NOT NULL,
+        to_key TEXT NOT NULL, known INTEGER NOT NULL, event TEXT NOT NULL, source TEXT NOT NULL,
+        PRIMARY KEY(entity, line, key, to_key, known, event)) WITHOUT ROWID;
+    INSERT OR IGNORE INTO _corrections(entity, line, key, to_key, known, event, source)
+        SELECT entity, line, key, to_key, known, event, source FROM _ends
+        WHERE axis IS NULL AND NOT EXISTS (SELECT 1 FROM _corrections);
     CREATE TABLE IF NOT EXISTS _seen(
         entity TEXT NOT NULL, line TEXT NOT NULL DEFAULT 'main', key TEXT NOT NULL,
         to_key TEXT NOT NULL, first_hearing INTEGER, first_ending INTEGER,
@@ -302,6 +310,13 @@ pub(crate) const RENAME_ENDINGS: &str = "INSERT OR IGNORE INTO _endings(entity, 
 pub(crate) const RENAME_ENDS: &str = "INSERT OR IGNORE INTO _ends(entity, line, key, to_key, \
      event, source, axis, known, valid) SELECT entity, line, CASE WHEN ?4 THEN key ELSE ?3 END, \
      CASE WHEN ?4 THEN ?3 ELSE to_key END, event, source, axis, known, valid FROM _ends \
+     WHERE entity = ?1 AND line = 'main' AND CASE WHEN ?4 THEN to_key = ?2 ELSE key = ?2 END";
+
+/// Copies the corrections of the links of `?1` keyed `?2` at one end onto `?3`, as
+/// [`RENAME_ENDINGS`] does for endings.
+pub(crate) const RENAME_CORRECTIONS: &str = "INSERT OR IGNORE INTO _corrections(entity, line, \
+     key, to_key, known, event, source) SELECT entity, line, CASE WHEN ?4 THEN key ELSE ?3 END, \
+     CASE WHEN ?4 THEN ?3 ELSE to_key END, known, event, source FROM _corrections \
      WHERE entity = ?1 AND line = 'main' AND CASE WHEN ?4 THEN to_key = ?2 ELSE key = ?2 END";
 
 pub(crate) const PLACES_NAMING: &str = "SELECT DISTINCT seq FROM _hearings WHERE line = 'main' \
@@ -507,8 +522,7 @@ pub(crate) fn seen_keep() -> &'static str {
 /// (SQL expressions, each NULL for no bound) when given, and that its valid time is on or before
 /// `day`, NULL unknown. Its ending in that view is the earliest ending, by axis point, known-at
 /// and then event id, after its last live hearing in it; there is none once a live hearing comes
-/// after every ending, or while a correction is its latest conclusion. Only the endings after
-/// that hearing are read, never its history.
+/// after every ending. Only the endings after that hearing are read, never its history.
 pub(crate) fn ending_sql(
     e: &str,
     (entity, from, to): (&str, &str, &str),
@@ -537,21 +551,16 @@ pub(crate) fn ending_sql(
             order("DESC")
         )
     };
-    let corrected = view.map_or(String::new(), |(_, known)| {
-        format!(" AND ({known} IS NULL OR c.known <= {known})")
-    });
     (
         format!(
             "{e}.id = (SELECT x.id FROM _endings x \
              WHERE {link_x}{by_x} AND (x.axis, x.known, x.event) > ({}, {}, {}) \
-             ORDER BY x.axis, x.known, x.event LIMIT 1) \
-             AND NOT EXISTS (SELECT 1 FROM _ends c WHERE {link_c} AND c.axis IS NULL{corrected})",
+             ORDER BY x.axis, x.known, x.event LIMIT 1)",
             live("axis", "X''"),
             live("known", &i64::MIN.to_string()),
             live("event", "''"),
             link_x = link("x"),
             by_x = by("x"),
-            link_c = link("c"),
         ),
         format!("{} <= {day}", valid_day(&format!("{e}.valid"))),
     )
@@ -560,7 +569,8 @@ pub(crate) fn ending_sql(
 /// The one read of what is seen of `?1`, `?2`, `?3` (its target key `''` for a node): its kept
 /// row, with the facts it names, each a hearing joined by when it arrived or an ending by its
 /// id; or, for a node or link with one fact, which keeps no row, that fact. Then when a link
-/// ended: count, first true, the axis point it ended at, then first heard, last heard and first
+/// ended, which it has not while a correction is its latest conclusion: count, first true, the
+/// axis point it ended at, then first heard, last heard and first
 /// recorded as event, source, valid time, axis point, known-at, properties and whether an ending.
 pub(crate) fn seen_sql() -> &'static str {
     built!({
@@ -579,6 +589,10 @@ pub(crate) fn seen_sql() -> &'static str {
             )
         };
         let (ending, _) = ending_sql("n", ("?1", "?2", "?3"), None, "NULL");
+        let ending = format!(
+            "{ending} AND NOT EXISTS (SELECT 1 FROM _ends c WHERE c.entity = ?1 \
+             AND c.line = 'main' AND c.key = ?2 AND c.to_key = ?3 AND c.axis IS NULL)"
+        );
         // A node or link with one fact, a hearing or an ending, keeps no row: that fact is read.
         let one = |fact: &str, from: &str, to: &str| {
             format!(
@@ -676,8 +690,8 @@ fn keys_by_property(class: &str, property: &str) -> String {
 /// The links of the relation entity `?1` at the node keyed `?4`, from it (`out`) or to it, that
 /// hold in the view `?2`, `?3`, in the other end's key order: the other end's key, then the
 /// columns of the newest of each one's live hearings and endings, as [`link_state`] reads it.
-/// A link holds when it has a hearing in the view and has not ended there: its newest fact is a
-/// hearing, or a correction masks its endings, as [`ended_sql`] decides.
+/// A link holds when its newest fact in the view is a live hearing and no correction known in
+/// the view follows that hearing's event.
 pub(crate) fn links_in_view(out: bool) -> &'static str {
     if out {
         built!(holding("key = ?4", "to_key", "key = ?4"))
@@ -702,34 +716,37 @@ pub(crate) fn links_counted(out: bool) -> &'static str {
 }
 
 /// How many links of the relation entity `?1` hold in the view `?2`, `?3`, as
-/// [`links_in_view`] decides: those heard in it, less those of them it reads as ended, which
-/// only a link with an ending in the view can be.
+/// [`links_in_view`] decides: those heard in it, less those it reads as ended or found wrong,
+/// which only a link with an ending or a correction in the view can be.
 pub(crate) fn link_count() -> &'static str {
     built!({
         let ended = "IN (SELECT key, to_key FROM _endings WHERE entity = ?1 AND line = 'main' \
-             AND (?2 IS NULL OR axis <= ?2) AND (?3 IS NULL OR known <= ?3))";
+             AND (?2 IS NULL OR axis <= ?2) AND (?3 IS NULL OR known <= ?3) \
+             UNION SELECT key, to_key FROM _corrections WHERE entity = ?1 AND line = 'main' \
+             AND (?3 IS NULL OR known <= ?3))";
         format!(
             "SELECT (SELECT count(*) FROM (SELECT DISTINCT key, to_key FROM _hearings \
-             WHERE entity = ?1 AND {IN_VIEW})) - (SELECT count(*) FROM ({}) f WHERE ending = 1 AND NOT {} AND {})",
+             WHERE entity = ?1 AND {IN_VIEW})) - (SELECT count(*) FROM ({}) f \
+             WHERE (ending = 1 AND {}) OR (ending = 0 AND {CORRECTED_IN_VIEW}))",
             newest_each(
                 &link_facts(
                     &format!("(h.key, h.to_key) {ended}"),
                     &format!("(key, to_key) {ended}")
                 ),
                 "key, to_key",
-                "key, to_key, ending"
+                "key, to_key, event, ending"
             ),
-            CORRECTED_IN_VIEW,
             heard_in_view()
         )
     })
 }
 
-/// Whether a correction known in the view masks the endings of the link of `?1` named by the
-/// row `f`.
-const CORRECTED_IN_VIEW: &str = "EXISTS (SELECT 1 FROM _ends c WHERE c.entity = ?1 \
-     AND c.line = 'main' AND c.key = f.key AND c.to_key = f.to_key AND c.axis IS NULL \
-     AND (?3 IS NULL OR c.known <= ?3))";
+/// Whether a correction known in the view follows the event of the row `f`, the newest fact in
+/// the view of a link of `?1`. A correction has no axis point: it holds across the whole axis
+/// from its known-at, until a newer hearing's event follows it.
+const CORRECTED_IN_VIEW: &str = "EXISTS (SELECT 1 FROM _corrections c WHERE c.entity = ?1 \
+     AND c.line = 'main' AND c.key = f.key AND c.to_key = f.to_key \
+     AND (?3 IS NULL OR c.known <= ?3) AND c.event > f.event)";
 
 /// Whether the link of `?1` named by the row `f` has a hearing in the view `?2`, `?3`.
 fn heard_in_view() -> String {
@@ -762,13 +779,12 @@ fn link_facts(heard: &str, ends: &str) -> String {
 fn holding(heard: &str, other: &str, ends: &str) -> String {
     format!(
         "SELECT {other}, name, source, valid, axis, known, properties FROM ({}) f \
-         WHERE ending = 0 OR ({CORRECTED_IN_VIEW} AND {}) ORDER BY {other}",
+         WHERE ending = 0 AND NOT {CORRECTED_IN_VIEW} ORDER BY {other}",
         newest_each(
             &link_facts(&format!("h.{heard}"), ends),
             "key, to_key",
-            "key, to_key, name, source, valid, axis, known, properties, ending"
-        ),
-        heard_in_view()
+            "key, to_key, name, source, valid, axis, known, properties, event, ending"
+        )
     )
 }
 
@@ -789,15 +805,20 @@ pub(crate) const KEEP_NEWEST: &str =
 
 /// The newest of the live hearings and endings of the link `?1`, `?2`, `?3` in the view of the
 /// axis bound `?4` and the known-at `?5`: event, source, valid, axis point, known-at, properties,
-/// whether an ending.
+/// whether an ending, whether a correction known in the view follows that fact's own event.
 pub(crate) fn link_state() -> &'static str {
     built!({
         format!(
-            "SELECT event, source, valid, axis, known, properties, ending FROM ( \
-             SELECT name AS event, source, valid, axis, known, properties, 0 AS ending FROM {} \
-             UNION ALL SELECT event, source, valid, axis, known, NULL, 1 \
+            "SELECT event, source, valid, axis, known, properties, ending, \
+             EXISTS (SELECT 1 FROM _corrections c WHERE c.entity = ?1 AND c.line = 'main' \
+             AND c.key = ?2 AND c.to_key = ?3 AND (?5 IS NULL OR c.known <= ?5) \
+             AND c.event > occurrence) FROM ( \
+             SELECT name AS event, source, valid, axis, known, properties, 0 AS ending, \
+             event AS occurrence FROM {} \
+             UNION ALL SELECT event, source, valid, axis, known, NULL, 1, event \
              FROM _endings WHERE entity = ?1 AND line = 'main' AND key = ?2 AND to_key = ?3 \
-             AND (?4 IS NULL OR axis <= ?4) AND (?5 IS NULL OR known <= ?5)) ORDER BY {} LIMIT 1",
+             AND (?4 IS NULL OR axis <= ?4) AND (?5 IS NULL OR known <= ?5)) \
+             ORDER BY {}, occurrence DESC LIMIT 1",
             in_view(OF, ("?4", "?5")),
             order("DESC")
         )
@@ -828,9 +849,23 @@ pub(crate) const CONCLUDE: &str = "INSERT INTO _ends(entity, key, to_key, event,
 pub(crate) const ENDING: &str = "INSERT OR IGNORE INTO _endings(entity, key, to_key, axis, \
      event, source, valid, known) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)";
 
-/// The correction of the link `?1`, `?2`, `?3`, when one is its latest conclusion: event, source.
-pub(crate) const CORRECTED: &str = "SELECT event, source FROM _ends \
-     WHERE entity = ?1 AND line = 'main' AND key = ?2 AND to_key = ?3 AND axis IS NULL";
+/// Keeps the correction of the link `?1`, `?2`, `?3`, known at `?4`, in the event `?5` from `?6`.
+pub(crate) const CORRECTION: &str = "INSERT OR IGNORE INTO _corrections(entity, key, to_key, \
+     known, event, source) VALUES (?1, ?2, ?3, ?4, ?5, ?6)";
+
+/// The newest correction of the link `?1`, `?2`, `?3` that no newer live hearing's event follows:
+/// event, source, whether a correction is its latest conclusion.
+pub(crate) fn link_correction() -> &'static str {
+    built!(format!(
+        "SELECT c.event, c.source, EXISTS (SELECT 1 FROM _ends e WHERE e.entity = ?1 \
+         AND e.line = 'main' AND e.key = ?2 AND e.to_key = ?3 AND e.axis IS NULL) \
+         FROM _corrections c WHERE c.entity = ?1 AND c.line = 'main' AND c.key = ?2 \
+         AND c.to_key = ?3 AND c.event > coalesce((SELECT event FROM {} WHERE true \
+         ORDER BY {} LIMIT 1), '') ORDER BY c.known DESC, c.event DESC LIMIT 1",
+        occurrences_of(),
+        order("DESC")
+    ))
+}
 
 /// The ending of the link `?1`, `?2`, `?3`: event, source, axis point, known-at, valid.
 pub(crate) fn link_ending() -> &'static str {
@@ -1253,6 +1288,7 @@ fixed! {
     LastEnding => built!(edge_ending("DESC")),
     Conclude => CONCLUDE,
     Ending => ENDING,
+    Correction => CORRECTION,
     EventByCloudevent => EVENT_BY_CLOUDEVENT,
     Wait => WAIT,
     Amendment => AMENDMENT,
@@ -1264,6 +1300,7 @@ fixed! {
     PlacesNaming => PLACES_NAMING,
     RenameEndings => RENAME_ENDINGS,
     RenameEnds => RENAME_ENDS,
+    RenameCorrections => RENAME_CORRECTIONS,
     EventAt => EVENT_AT,
     AmendedOf => AMENDED_OF,
     DropAmended => DROP_AMENDED,
