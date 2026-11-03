@@ -412,6 +412,12 @@ impl Queue {
         (state.committed, std::mem::take(&mut state.failed))
     }
 
+    /// Commits everything held now, without waiting for the heartbeat, and leaves every failure
+    /// for the app to take: for a worker whose answer someone is waiting on.
+    pub fn commit(&self) {
+        self.shared.commit();
+    }
+
     /// Takes the failures the app has not yet taken, oldest first; the queue keeps none of them
     /// after.
     #[must_use]

@@ -2,8 +2,9 @@
 //! true as events arrive. An event names what it touched; only that is read again from the graph,
 //! and the walk runs again over what is held in memory.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::Arc;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::hash::{BuildHasherDefault, Hasher};
+use std::sync::{Arc, OnceLock};
 
 use rannoch_cloudevents::{Conclusion, Fact, LinkFact, NodeFact, NodeRef, ValidTime};
 use rannoch_store::{Cursor, Direction, Graph, Ontology, Roots, Shape, Value, Version, View, Way};
@@ -22,18 +23,68 @@ pub struct WarmSet {
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Held {
-    nodes: BTreeMap<NodeRef, Arc<Version>>,
-    roots: Vec<NodeRef>,
+    nodes: HashMap<Id, Arc<Version>>,
+    roots: Vec<Id>,
     steps: Vec<StepSet>,
-    /// Each node in the set by a property its class indexes, and the value's text.
-    indexed: HashMap<(String, String), Vec<NodeRef>>,
+    ontology: Arc<Ontology>,
+    /// Each node in the set by a property its class indexes, and the value's text. Built once per
+    /// set, after the set is published and its change told.
+    indexed: OnceLock<HashMap<String, HashMap<String, Vec<Id>>>>,
 }
+
+impl Held {
+    fn index(&self) -> &HashMap<String, HashMap<String, Vec<Id>>> {
+        self.indexed.get_or_init(|| {
+            let mut indexed: HashMap<String, HashMap<String, Vec<Id>>> = HashMap::new();
+            for (node, version) in &self.nodes {
+                if let Some(class) = self.ontology.classes.get(&node.class) {
+                    for property in &class.indexed {
+                        if let Some(value) = version.properties.get(property) {
+                            indexed
+                                .entry(property.clone())
+                                .or_default()
+                                .entry(value_text(value))
+                                .or_default()
+                                .push(Arc::clone(node));
+                        }
+                    }
+                }
+            }
+            indexed
+        })
+    }
+}
+
+/// A node's name, shared by everything that holds it, so walking copies no text.
+type Id = Arc<NodeRef>;
+
+/// A quick hash for the walk, which hashes every name several times over. Names are the app's own
+/// and stay in this process, so nothing here needs to resist a chosen key.
+#[derive(Default)]
+struct Quick(u64);
+
+impl Hasher for Quick {
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut word = [0u8; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            self.0 = (self.0.rotate_left(5) ^ u64::from_le_bytes(word))
+                .wrapping_mul(0x517c_c1b7_2722_0a95);
+        }
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+type Fast = BuildHasherDefault<Quick>;
 
 /// What one step of a walk took.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StepSet {
     /// The distinct nodes it took, in key order.
-    pub nodes: Vec<NodeRef>,
+    pub nodes: Vec<Arc<NodeRef>>,
     /// Whether its cap cut anything.
     pub cut: bool,
     /// How many distinct unvisited nodes its cap dropped.
@@ -55,13 +106,13 @@ impl WarmSet {
 
     /// Every node in the set, roots included, each once, with its version in the relay's view.
     #[must_use]
-    pub fn nodes(&self) -> &BTreeMap<NodeRef, Arc<Version>> {
+    pub fn nodes(&self) -> &HashMap<Arc<NodeRef>, Arc<Version>> {
         &self.held.nodes
     }
 
     /// The roots, in key order.
     #[must_use]
-    pub fn roots(&self) -> &[NodeRef] {
+    pub fn roots(&self) -> &[Arc<NodeRef>] {
         &self.held.roots
     }
 
@@ -73,11 +124,17 @@ impl WarmSet {
 
     /// The nodes in the set whose class indexes `property` and whose value of it is `value`.
     #[must_use]
-    pub fn by(&self, property: &str, value: &Value) -> &[NodeRef] {
+    pub fn by(&self, property: &str, value: &Value) -> &[Arc<NodeRef>] {
         self.held
-            .indexed
-            .get(&(property.to_string(), value_text(value)))
+            .index()
+            .get(property)
+            .and_then(|values| values.get(&value_text(value)))
             .map_or(&[], Vec::as_slice)
+    }
+
+    /// Builds what [`WarmSet::by`] reads, so no reader waits on it.
+    pub(crate) fn prepare(&self) {
+        self.held.index();
     }
 
     /// The acknowledgement's `steps`.
@@ -98,7 +155,24 @@ fn value_text(value: &Value) -> String {
     }
 }
 
-type Adjacent = (String, Direction, NodeRef);
+/// The other ends of the links that hold, per node, for one relation and direction.
+type Ends = HashMap<Id, BTreeSet<Id>, Fast>;
+
+/// What is read of one relation: its links from a node, and to it.
+#[derive(Debug, Default)]
+struct Read {
+    out: Ends,
+    to: Ends,
+}
+
+impl Read {
+    fn of(&mut self, direction: Direction) -> &mut Ends {
+        match direction {
+            Direction::Out => &mut self.out,
+            Direction::In => &mut self.to,
+        }
+    }
+}
 
 /// A relay's fold: the walk's result, and every node and link list the walk has read.
 #[derive(Debug)]
@@ -107,11 +181,11 @@ pub(crate) struct Warm {
     view: View,
     pub(crate) set: WarmSet,
     /// The class of root nodes chosen by a filter, whose every node event may change them.
-    roots: BTreeSet<NodeRef>,
+    roots: BTreeSet<Id>,
     /// Every node the walk reached, cut ones too; `None` before its first version in the view.
-    versions: HashMap<NodeRef, Option<Arc<Version>>>,
-    /// The other end's key of every link that holds, per node, relation and direction read.
-    adjacent: HashMap<Adjacent, BTreeSet<String>>,
+    versions: HashMap<Id, Option<Arc<Version>>, Fast>,
+    /// Every list of links the walk has read, by relation.
+    adjacent: HashMap<String, Read>,
     /// The latest valid time an event in this batch gave a link, per end.
     via: HashMap<NodeRef, ValidTime>,
     last_via: Option<ValidTime>,
@@ -128,7 +202,7 @@ pub(crate) struct Saved {
     known: Option<i64>,
     roots: Vec<NodeRef>,
     versions: Vec<(NodeRef, Option<Version>)>,
-    adjacent: Vec<(Adjacent, BTreeSet<String>)>,
+    adjacent: Vec<(String, Direction, NodeRef, Vec<NodeRef>)>,
 }
 
 impl Warm {
@@ -156,7 +230,7 @@ impl Warm {
                 held: Arc::default(),
             },
             roots: BTreeSet::new(),
-            versions: HashMap::new(),
+            versions: HashMap::default(),
             adjacent: HashMap::new(),
             via: HashMap::new(),
             last_via: None,
@@ -174,13 +248,19 @@ impl Warm {
     ) -> Result<Warm, Error> {
         let mut warm = Warm::empty(shape, view, saved.cursor);
         warm.set.known = saved.known;
-        warm.roots = saved.roots.into_iter().collect();
+        warm.roots = saved.roots.into_iter().map(Arc::new).collect();
         warm.versions = saved
             .versions
             .into_iter()
-            .map(|(node, version)| (node, version.map(Arc::new)))
+            .map(|(node, version)| (Arc::new(node), version.map(Arc::new)))
             .collect();
-        warm.adjacent = saved.adjacent.into_iter().collect();
+        for (relation, direction, node, others) in saved.adjacent {
+            warm.adjacent
+                .entry(relation)
+                .or_default()
+                .of(direction)
+                .insert(Arc::new(node), others.into_iter().map(Arc::new).collect());
+        }
         warm.moved = true;
         warm.settle(graph)?;
         Ok(warm)
@@ -191,16 +271,29 @@ impl Warm {
         Saved {
             cursor: self.set.cursor,
             known: self.set.known,
-            roots: self.roots.iter().cloned().collect(),
+            roots: self.roots.iter().map(|node| (**node).clone()).collect(),
             versions: self
                 .versions
                 .iter()
-                .map(|(node, version)| (node.clone(), version.as_deref().cloned()))
+                .map(|(node, version)| ((**node).clone(), version.as_deref().cloned()))
                 .collect(),
             adjacent: self
                 .adjacent
                 .iter()
-                .map(|(key, keys)| (key.clone(), keys.clone()))
+                .flat_map(|(relation, read)| {
+                    [(Direction::Out, &read.out), (Direction::In, &read.to)]
+                        .into_iter()
+                        .flat_map(move |(direction, ends)| {
+                            ends.iter().map(move |(node, others)| {
+                                (
+                                    relation.clone(),
+                                    direction,
+                                    (**node).clone(),
+                                    others.iter().map(|o| (**o).clone()).collect(),
+                                )
+                            })
+                        })
+                })
                 .collect(),
         }
     }
@@ -215,14 +308,15 @@ impl Warm {
         match &self.shape.roots {
             Roots::Node { node } => {
                 self.roots
-                    .insert(NodeRef::new(node.class.clone(), node.key.clone()));
+                    .insert(Arc::new(NodeRef::new(node.class.clone(), node.key.clone())));
             }
             Roots::Class { class, filter } => {
                 let listed = graph.nodes(class, filter, &self.view)?;
                 for (key, version) in listed {
-                    let node = NodeRef::new(class.clone(), key);
+                    let node = Arc::new(NodeRef::new(class.clone(), key));
                     raise(&mut self.set.known, &version, self.view.known.is_some());
-                    self.versions.insert(node.clone(), Some(Arc::new(version)));
+                    self.versions
+                        .insert(Arc::clone(&node), Some(Arc::new(version)));
                     self.roots.insert(node);
                 }
             }
@@ -259,10 +353,10 @@ impl Warm {
     fn touch(&mut self, graph: &Graph, fact: &Fact) -> Result<(), Error> {
         match fact {
             Fact::Node(NodeFact { class, key, .. }) => {
-                let node = NodeRef::new(class.clone(), key.clone());
+                let node = Arc::new(NodeRef::new(class.clone(), key.clone()));
                 let root_class =
                     matches!(&self.shape.roots, Roots::Class { class: c, .. } if c == class);
-                if root_class || self.versions.contains_key(&node) {
+                if root_class || self.versions.contains_key(&*node) {
                     self.read_node(graph, node)?;
                 }
             }
@@ -287,7 +381,7 @@ impl Warm {
 
     /// Reads a node an event named again. A node the graph knows under no name it was just heard
     /// by has been renamed: only reading everything again finds where it went.
-    fn read_node(&mut self, graph: &Graph, node: NodeRef) -> Result<(), Error> {
+    fn read_node(&mut self, graph: &Graph, node: Id) -> Result<(), Error> {
         let version = graph.state_at(&node, &self.view)?;
         if version.is_none() && graph.state_at(&node, &View::default())?.is_none() {
             self.stale = true;
@@ -347,14 +441,15 @@ impl Warm {
         }
         let holds = version.as_ref().is_some_and(|v| !v.ended);
         let mut changed = false;
-        for (direction, end, other) in [(Direction::Out, from, to), (Direction::In, to, from)] {
-            let key = (relation.to_string(), direction, end.clone());
-            if let Some(keys) = self.adjacent.get_mut(&key) {
-                changed |= if holds {
-                    keys.insert(other.key.clone())
-                } else {
-                    keys.remove(&other.key)
-                };
+        if let Some(read) = self.adjacent.get_mut(relation) {
+            for (direction, end, other) in [(Direction::Out, from, to), (Direction::In, to, from)] {
+                if let Some(others) = read.of(direction).get_mut::<NodeRef>(end) {
+                    changed |= if holds {
+                        others.insert(Arc::new(other.clone()))
+                    } else {
+                        others.remove::<NodeRef>(other)
+                    };
+                }
             }
         }
         if let Some(version) = version
@@ -369,131 +464,135 @@ impl Warm {
         Ok(())
     }
 
-    /// The links of `step`'s `relation` at `node`, read once.
-    fn adjacent_keys(
-        &mut self,
-        graph: &Graph,
-        relation: &str,
-        direction: Direction,
-        node: &NodeRef,
-    ) -> Result<&BTreeSet<String>, Error> {
-        let key = (relation.to_string(), direction, node.clone());
-        if !self.adjacent.contains_key(&key) {
-            let mut keys = BTreeSet::new();
-            for (other, version) in graph.links(node, relation, direction, &self.view)? {
-                raise(&mut self.set.known, &version, self.view.known.is_some());
-                keys.insert(other);
-            }
-            self.adjacent.insert(key.clone(), keys);
-        }
-        Ok(&self.adjacent[&key])
-    }
-
-    /// `node`'s version in the view, read once.
-    fn version(&mut self, graph: &Graph, node: &NodeRef) -> Result<Option<Arc<Version>>, Error> {
-        if let Some(version) = self.versions.get(node) {
-            return Ok(version.clone());
-        }
-        let version = graph.state_at(node, &self.view)?.map(Arc::new);
-        if let Some(version) = &version {
-            raise(&mut self.set.known, version, self.view.known.is_some());
-        }
-        self.versions.insert(node.clone(), version.clone());
-        Ok(version)
-    }
-
     /// Walks the shape over what is held, reading what is not. Inside a step, nodes are taken in
     /// key order; a node taken once is marked, so a cycle never repeats it. A node a cap cuts is
     /// not marked or expanded.
-    fn walk(&mut self, graph: &Graph, ontology: &Ontology) -> Result<Held, Error> {
-        let mut held = Held::default();
-        let roots: Vec<NodeRef> = self.roots.iter().cloned().collect();
-        for root in &roots {
-            if let Some(version) = self.version(graph, root)? {
-                held.nodes.insert(root.clone(), version);
-                held.roots.push(root.clone());
+    fn walk(&mut self, graph: &Graph, ontology: &Arc<Ontology>) -> Result<Held, Error> {
+        let size = self.set.held.nodes.len() + 16;
+        let mut held = Held {
+            nodes: HashMap::with_capacity(size),
+            ontology: Arc::clone(ontology),
+            ..Held::default()
+        };
+        // Every node marked: those taken, and those this step has already looked at.
+        let mut visited: HashSet<Id, Fast> =
+            HashSet::with_capacity_and_hasher(size, Fast::default());
+        for root in &self.roots {
+            if let Some(version) = version_of(
+                graph,
+                &self.view,
+                &mut self.versions,
+                &mut self.set.known,
+                root,
+            )? {
+                held.nodes.insert(Arc::clone(root), version);
+                held.roots.push(Arc::clone(root));
+                visited.insert(Arc::clone(root));
             }
         }
         held.roots.sort_by(key_order);
         let mut frontier = held.roots.clone();
-        for step in self.shape.steps.clone() {
-            let (name, way) = step.way();
-            let relation = ontology
-                .relation(name)
-                .map_err(|refused| Error::Refused(refused.0))?;
-            let mut found = BTreeSet::new();
-            for node in &frontier {
-                for (direction, end, other, followed) in [
-                    (
-                        Direction::Out,
-                        &relation.from,
-                        &relation.to,
-                        way != Way::Backward,
-                    ),
-                    (
-                        Direction::In,
-                        &relation.to,
-                        &relation.from,
-                        way != Way::Forward,
-                    ),
-                ] {
-                    if !followed || *end != node.class {
-                        continue;
-                    }
-                    let keys: Vec<String> = self
-                        .adjacent_keys(graph, name, direction, node)?
-                        .iter()
-                        .cloned()
-                        .collect();
-                    for key in keys {
-                        let reached = NodeRef {
-                            class: other.clone(),
-                            key,
-                        };
-                        if held.nodes.contains_key(&reached) {
-                            continue;
-                        }
-                        let passes = self
-                            .version(graph, &reached)?
-                            .is_some_and(|v| step.passes(&v.properties));
-                        if passes {
-                            found.insert((reached.key, reached.class));
-                        }
-                    }
-                }
-            }
-            let cap = step.cap.unwrap_or(usize::MAX);
-            let dropped = found.len().saturating_sub(cap);
-            let taken: Vec<NodeRef> = found
-                .into_iter()
-                .take(cap)
-                .map(|(key, class)| NodeRef { class, key })
-                .collect();
-            for node in &taken {
-                if let Some(version) = self.version(graph, node)? {
-                    held.nodes.insert(node.clone(), version);
-                }
-            }
-            frontier.clone_from(&taken);
-            held.steps.push(StepSet {
-                nodes: taken,
-                cut: dropped > 0,
-                dropped,
-            });
-        }
-        for (node, version) in &held.nodes {
-            if let Ok(class) = ontology.class(&node.class) {
-                for property in &class.indexed {
-                    if let Some(value) = version.properties.get(property) {
-                        held.indexed
-                            .entry((property.clone(), value_text(value)))
-                            .or_default()
-                            .push(node.clone());
-                    }
-                }
-            }
+        for index in 0..self.shape.steps.len() {
+            frontier =
+                self.take_step(graph, ontology, index, &frontier, &mut visited, &mut held)?;
         }
         Ok(held)
+    }
+
+    /// Takes step `index` of the shape from `frontier`: what it reached goes into `held`, and what
+    /// it took is the next frontier.
+    fn take_step(
+        &mut self,
+        graph: &Graph,
+        ontology: &Ontology,
+        index: usize,
+        frontier: &[Id],
+        visited: &mut HashSet<Id, Fast>,
+        held: &mut Held,
+    ) -> Result<Vec<Id>, Error> {
+        let fixed = self.view.known.is_some();
+        let step = &self.shape.steps[index];
+        let (name, way) = step.way();
+        let relation = ontology
+            .relation(name)
+            .map_err(|refused| Error::Refused(refused.0))?;
+        let read = self.adjacent.entry(name.to_string()).or_default();
+        let mut found: Vec<(Id, Arc<Version>)> = Vec::new();
+        let mut looked: Vec<Id> = Vec::new();
+        for node in frontier {
+            for (direction, end, other, followed) in [
+                (
+                    Direction::Out,
+                    &relation.from,
+                    &relation.to,
+                    way != Way::Backward,
+                ),
+                (
+                    Direction::In,
+                    &relation.to,
+                    &relation.from,
+                    way != Way::Forward,
+                ),
+            ] {
+                if !followed || *end != node.class {
+                    continue;
+                }
+                let ends = read.of(direction);
+                if !ends.contains_key(&**node) {
+                    let mut others = BTreeSet::new();
+                    for (key, version) in graph.links(node, name, direction, &self.view)? {
+                        raise(&mut self.set.known, &version, fixed);
+                        others.insert(Arc::new(NodeRef::new(other.clone(), key)));
+                    }
+                    ends.insert(Arc::clone(node), others);
+                }
+                let Some(others) = ends.get(&**node) else {
+                    continue;
+                };
+                for reached in others {
+                    if !visited.insert(Arc::clone(reached)) {
+                        continue;
+                    }
+                    let version = version_of(
+                        graph,
+                        &self.view,
+                        &mut self.versions,
+                        &mut self.set.known,
+                        reached,
+                    )?;
+                    match version {
+                        Some(v) if step.passes(&v.properties) => {
+                            found.push((Arc::clone(reached), v));
+                        }
+                        _ => looked.push(Arc::clone(reached)),
+                    }
+                }
+            }
+        }
+        // Already in key order when one node's list reached them all.
+        found.sort_by(|a, b| key_order(&a.0, &b.0));
+        let cap = step.cap.unwrap_or(usize::MAX);
+        let dropped = found.len().saturating_sub(cap);
+        // A node filtered out or cut is not marked: a later step may reach it.
+        for (node, _) in found.iter().skip(cap) {
+            visited.remove(node);
+        }
+        for node in &looked {
+            visited.remove(node);
+        }
+        found.truncate(cap);
+        let mut taken = Vec::with_capacity(found.len());
+        for (node, version) in found {
+            held.nodes.insert(Arc::clone(&node), version);
+            taken.push(node);
+        }
+        let found = taken;
+        held.steps.push(StepSet {
+            nodes: found.clone(),
+            cut: dropped > 0,
+            dropped,
+        });
+        Ok(found)
     }
 
     /// Brings the set up to what was folded, and returns the deltas as a change's data, or `None`
@@ -508,9 +607,7 @@ impl Warm {
         let ontology = graph.current_ontology()?;
         let held = self.walk(graph, &ontology)?;
         let change = self.delta(&held);
-        if change.is_some() || held != *self.set.held {
-            self.set.held = Arc::new(held);
-        }
+        self.set.held = Arc::new(held);
         self.moved = false;
         self.via.clear();
         self.last_via = None;
@@ -523,10 +620,20 @@ impl Warm {
         let mut changed = Vec::new();
         let mut entered = Vec::new();
         let mut left = Vec::new();
-        for (node, version) in &new.nodes {
+        // Only what differs, in key order, so the same log tells the same change.
+        let mut in_order: Vec<(&Id, &Arc<Version>)> = new
+            .nodes
+            .iter()
+            .filter(|(node, version)| {
+                old.get(*node)
+                    .is_none_or(|before| !Arc::ptr_eq(before, version))
+            })
+            .collect();
+        in_order.sort_by(|a, b| key_order(a.0, b.0));
+        for (node, version) in in_order {
             match old.get(node) {
                 None => {
-                    entered.push(json!({"node": node, "valid": self.moved_valid(node, version)}));
+                    entered.push(json!({"node": **node, "valid": self.moved_valid(node, version)}));
                 }
                 Some(before) if Arc::ptr_eq(before, version) || before == version => {}
                 Some(before) => {
@@ -542,7 +649,7 @@ impl Warm {
                         );
                         if was != is {
                             changed.push(json!({
-                                "node": node, "property": property,
+                                "node": **node, "property": property,
                                 "before": was, "after": is, "valid": version.valid,
                             }));
                         }
@@ -550,10 +657,13 @@ impl Warm {
                 }
             }
         }
-        for (node, version) in old {
-            if !new.nodes.contains_key(node) {
-                left.push(json!({"node": node, "valid": self.moved_valid(node, version)}));
-            }
+        let mut gone: Vec<(&Id, &Arc<Version>)> = old
+            .iter()
+            .filter(|(node, _)| !new.nodes.contains_key(*node))
+            .collect();
+        gone.sort_by(|a, b| key_order(a.0, b.0));
+        for (node, version) in gone {
+            left.push(json!({"node": **node, "valid": self.moved_valid(node, version)}));
         }
         if changed.is_empty() && entered.is_empty() && left.is_empty() {
             return None;
@@ -568,9 +678,9 @@ impl Warm {
 
     /// The valid time of a node's coming or going: of the link that moved it, or of the last link
     /// that moved anything when it moved downstream of one; else of its own version.
-    fn moved_valid(&self, node: &NodeRef, version: &Version) -> ValidTime {
+    fn moved_valid(&self, node: &Id, version: &Version) -> ValidTime {
         self.via
-            .get(node)
+            .get(&**node)
             .or(self.last_via.as_ref())
             .unwrap_or(&version.valid)
             .clone()
@@ -587,6 +697,25 @@ fn raise(known: &mut Option<i64>, version: &Version, fixed: bool) {
     }
 }
 
-fn key_order(a: &NodeRef, b: &NodeRef) -> std::cmp::Ordering {
+/// `node`'s version in `view`, read once.
+fn version_of(
+    graph: &Graph,
+    view: &View,
+    versions: &mut HashMap<Id, Option<Arc<Version>>, Fast>,
+    known: &mut Option<i64>,
+    node: &Id,
+) -> Result<Option<Arc<Version>>, Error> {
+    if let Some(version) = versions.get(node) {
+        return Ok(version.clone());
+    }
+    let version = graph.state_at(node, view)?.map(Arc::new);
+    if let Some(version) = &version {
+        raise(known, version, view.known.is_some());
+    }
+    versions.insert(Arc::clone(node), version.clone());
+    Ok(version)
+}
+
+fn key_order(a: &Id, b: &Id) -> std::cmp::Ordering {
     (&a.key, &a.class).cmp(&(&b.key, &b.class))
 }

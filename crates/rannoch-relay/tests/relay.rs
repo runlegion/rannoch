@@ -286,17 +286,22 @@ fn warm(set: &WarmSet) -> Cold {
         nodes: set
             .nodes()
             .iter()
-            .map(|(node, version)| (node.clone(), (**version).clone()))
+            .map(|(node, version)| ((**node).clone(), (**version).clone()))
             .collect(),
         steps: set
             .steps()
             .iter()
-            .map(|step| (step.nodes.clone(), step.dropped))
+            .map(|step| {
+                (
+                    step.nodes.iter().map(|n| (**n).clone()).collect(),
+                    step.dropped,
+                )
+            })
             .collect(),
     }
 }
 
-fn keys(nodes: &[NodeRef]) -> Vec<&str> {
+fn keys(nodes: &[Arc<NodeRef>]) -> Vec<&str> {
     nodes.iter().map(|n| n.key.as_str()).collect()
 }
 

@@ -404,25 +404,38 @@ impl Inner {
         let mut state = lock(&self.state);
         let State { graph, relays } = &mut *state;
         let mut changes = Vec::new();
+        let mut retired = Vec::new();
         for live in relays.values_mut() {
             match self.pump_relay(graph, live) {
-                Ok(Some(change)) => changes.push(change),
-                Ok(None) => {}
-                Err(error) => self.failed(error),
+                Ok(Some(change)) => {
+                    changes.push(change);
+                    retired.extend(self.publish(live));
+                    retired.push(live.warm.set.clone());
+                }
+                Ok(None) => retired.extend(self.publish(live)),
+                Err(error) => {
+                    self.failed(error);
+                    retired.extend(self.publish(live));
+                }
             }
-            self.publish(live);
         }
         drop(state);
         self.emit(&changes);
+        // After the change is told: indexing the new sets and freeing the old ones wait for nobody.
+        for set in retired {
+            set.prepare();
+        }
     }
 
     fn pump_queries(&self) -> Result<(), Error> {
+        let mut answered = false;
         while let Some(event) = self.queue.next(QUERIES)? {
             if is_shape_query(&event.body) {
                 match self.answer(&event.body) {
                     Ok(answer) => {
                         self.queue.accept(answer)?;
                         self.queue.done(QUERIES, event.cursor)?;
+                        answered = true;
                     }
                     Err(error) => {
                         self.queue
@@ -432,6 +445,10 @@ impl Inner {
             } else {
                 self.queue.done(QUERIES, event.cursor)?;
             }
+        }
+        // Someone is waiting: the answer does not wait for the next heartbeat.
+        if answered {
+            self.queue.commit();
         }
         Ok(())
     }
@@ -482,11 +499,12 @@ impl Inner {
         Ok(change)
     }
 
-    fn publish(&self, live: &Live) {
+    /// Publishes `live`'s set, and returns the one it replaces for the caller to drop.
+    fn publish(&self, live: &Live) -> Option<WarmSet> {
         self.published
             .write()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(live.entry.id.clone(), live.warm.set.clone());
+            .insert(live.entry.id.clone(), live.warm.set.clone())
     }
 
     fn emit(&self, changes: &[String]) {
@@ -557,7 +575,8 @@ impl Inner {
             };
             save(&self.dir, &mut live)?;
             let set = live.warm.set.clone();
-            self.publish(&live);
+            live.warm.set.prepare();
+            let _ = self.publish(&live);
             relays.insert(id.clone(), live);
             write_manifest(&self.dir, relays)?;
             (id, set)
