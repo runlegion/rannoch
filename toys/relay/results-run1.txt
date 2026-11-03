@@ -1,0 +1,48 @@
+
+# importer T1: cycles and exact counts
+loaded 54339 events in 1.228565125s
+PASS | count is 216 | Some(216)
+PASS | known-at is present and not later than the load | known 1793736354778, load finished 1793736356024
+PASS | round trip under 40 ms at the median, inbox answer | p50 24.206541ms, p95 48.272958ms, p99 70.797292ms, the first, which seeds, 44.047334ms
+PASS | under 2 ms in process | 216 links in 1.091875ms
+PASS | the report still says 216 at the old known-at | 216 at Some(1793736354778) (first answer Some(1793736354778)), reread in 1.503393334s
+PASS | a fresh count says 266 | 266
+PASS | the warm set equals the SQL closure | 25 warm, 25 closure
+PASS | each node once, not cut | 24 over the hops + 1 root, 25 distinct
+PASS | no change events while nothing commits | 1 before, 1 after 500 ms idle
+
+# importer T2: hub cut and determinism
+PASS | hop 1 cut, 703 found, 203 dropped | {"cut":true,"dropped":203,"nodes":500}
+PASS | the warm set holds the 500 lowest keys | 500 keys, first Some("itm.schem.gen.armormech.dps.ilvl_0103.artifact.armor_chest")
+PASS | one shared relay for the same shape | 01a1a304-c166-72b3-ae05-53f8485c14be
+PASS | a second relay on the same definition holds identical nodes in the same order | 513 and 513 nodes
+memory at the largest hub (703 found, 513 held in the walk): resident 235920 kB -> 237312 kB, file 423030 bytes, seed 10.439667ms
+PASS | one change event carries both moves | 1 event(s), in ["aaa.toy.below_the_cut"], out true
+PASS | dropped becomes 204, the warm step stays at 500, the old 500th left | dropped 204, nodes 500
+
+# importer T3: two builds, as change events
+v26 724 links, 7.9.a 3304 links, 2580 new, 0 gone
+root ac5c3c6808611467: 3 before, 36 after, 34 in, 1 out; ended link (synthetic) ("096fe47015e806fc", "29260cb6d246ab14")
+PASS | two views are two relays | 
+PASS | at the old build the warm set is the old closure | 3
+PASS | the change events equal the SQL diff | 34 in / 34 predicted, 1 out / 1 predicted, 1 event(s)
+PASS | 7.9's valid time on each | in true, out true
+PASS | the ended link is out of the latest warm set | 36 nodes
+PASS | the 7.8.1 relay emits nothing and holds the old closure | 0 event(s), 3 nodes
+PASS | both warm sets equal a cold recompute | 36 and 3
+
+# recorder: the planet relay (stand-in: rooted on the importer's own planet key)
+loaded 177676 events (86784 things, 44 planets) in 5.055925375s
+ack: [{"cut":false,"dropped":0,"nodes":860},{"cut":false,"dropped":0,"nodes":41}]
+PASS | about 1,000 nodes | 902
+PASS | the Hutta relay seeds under 1 s | 21.287333ms
+PASS | it equals a cold recompute and the SQL | 902 warm, 902 cold, 901 SQL things
+PASS | read() under 0.05 ms | p50 41ns, p99 42ns
+PASS | read() by logname under 0.05 ms | p50 83ns, p99 125ns
+PASS | applying an event, the fold plus the walk, under 1 ms at the median | p50 981.917µs, p99 2.524ms, over 300 commits, 902 nodes
+PASS | line to overlay change event under 60 ms p99 with 4 workers running | p50 18.676083ms, p99 25.972041ms, max 35.676958ms, 400 lines
+PASS | after the burst it equals a cold recompute | 902
+PASS | nothing failed on the relays' thread | []
+PASS | with its file gone the relay rebuilds to a cold recompute | reopened in 29.473542ms; its file was 839930 bytes
+
+0 failed

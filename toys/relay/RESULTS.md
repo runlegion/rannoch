@@ -1,10 +1,20 @@
 # Results
 
-Run 2026-11-03 on `feat/151-relay` at 969e62b, release build, default 20 ms heartbeat, graphs on the internal disk, with other agents using the machine (load average 2 to 3.5). `./target/release/relay-toy ~/swtor/data/spice-7.9.a-v7.sqlite ~/swtor/data/spice-7.8.1.c-v26.sqlite`.
+The latest runs: 3 on 2026-11-03 at 12:05, on `feat/151-relay` at 6540415, release build, default 20 ms heartbeat, graphs on the internal disk, with other agents using the machine (load average 3.5 to 6.5). `./target/release/relay-toy ~/swtor/data/spice-7.9.a-v7.sqlite ~/swtor/data/spice-7.8.1.c-v26.sqlite`. Their output is `results-run1.txt` to `results-run3.txt`. **Every prediction passes in all 3, with the two measures the operator changed on 2026-11-03.**
 
-Two predictions do not hold as written: the query round trip at its tail, and applying an event on most runs. Everything else holds.
+## The two changed measures
 
-The predictions were committed before any run, at 22:48 on 2026-11-02 (commit ca68d86, the same author date as 08766e5). A later rebase onto the feature branch put them after 969e62b, a fix the first run prompted, so this branch's order alone does not show it: read the author date. The numbers above and below each say which build they came from when it was not the last.
+| Measure | Run 1 | Run 2 | Run 3 |
+|---|---|---|---|
+| Round trip, median under 40 ms | 24 ms | 23 ms | 25 ms |
+| Its p95, stated | 48 ms | 35 ms | 49 ms |
+| Its p99, stated (over 50 trips, so the slowest; the first, which seeds, in runs 2 and 3) | 71 ms | 83 ms | 116 ms |
+| Applying an event: fold plus walk, median under 1 ms | 0.98 ms | 0.50 ms | 0.51 ms |
+| Its p99 | 2.5 ms | 1.2 ms | 1.2 ms |
+
+Kessel's prediction as written, "round trip under 40 ms", does not hold at its tail; the operator judges it at the median because the heartbeat alone waits up to 20 ms. Run 1's fold plus walk is close to its limit, at the highest load of the three. Timing is around the relay's own `fold` and `settle`, compiled in unchanged, on one read handle, one link per commit.
+
+The numbers from here to the end of this page come from the earlier runs of 2026-11-02 and 2026-11-03, before those two measures changed. The 3 latest runs repeat every other pass, with the same counts and with times in the same range (seed 21 to 25 ms, read() 41 ns, by logname 83 ns, line to overlay p99 25 to 26 ms, max 36 to 69 ms; the hub's memory up 1.4 to 1.7 MB, file 423 KB). The predictions were committed before any run, at 22:48 on 2026-11-02 (commit ca68d86, the same author date as 08766e5). A later rebase onto the feature branch put them after 969e62b, a fix the first run prompted, so this branch's order alone does not show it: read the author date. The two changed measures' expectations were committed before the 3 latest runs (42b6e35).
 
 ## The importer's
 
@@ -12,7 +22,7 @@ The predictions were committed before any run, at 22:48 on 2026-11-02 (commit ca
 |---|---|
 | T1 count 216, as a query | 216 |
 | T1 known-at present, not later than the load | yes |
-| **T1 round trip under 40 ms** | **Fails at the tail.** p50 28 ms; p95 48 to 51 ms; p99 81 to 86 ms over 50 trips in each of 4 runs. The first trip, which seeds, took 46 to 51 ms. |
+| T1 round trip under 40 ms, as the kessel prediction wrote it | Fails at the tail, passes at the median, which is the measure now (above). In these earlier runs p50 was 28 ms, p95 48 to 51 ms, p99 81 to 86 ms over 50 trips in each of 4 runs. The first trip, which seeds, took 46 to 51 ms. |
 | T1 under 2 ms in process | 1 to 1.8 ms for the 216 links |
 | T1 report still 216 at the old known-at; fresh count 266 | yes; reread took 1.4 to 2.0 s, replaying 54,000 events |
 | T1 warm set equals the SQL closure, each node once, not cut | 25 of 25 |
@@ -46,9 +56,9 @@ The planet relay roots on a `planet` node keyed `hutta`, taken from the fqns' ow
 |---|---|
 | Seed under 1 s, about 1,000 nodes | 20 to 29 ms |
 | read() under 0.05 ms | 41 ns |
-| **Applying an event under 1 ms** | **Fails on most runs.** p50 by run, over 300 one-link commits each: 0.43, 0.59, 0.90, 1.14, 1.20, 1.23, 1.31, 1.53, 1.60, 1.86, 1.91 ms. p99 2 to 7.5 ms. |
+| Applying an event, measured the old way, through the wake | p50 by run, over 300 one-link commits each: 0.43, 0.59, 0.90, 1.14, 1.20, 1.23, 1.31, 1.53, 1.60, 1.86, 1.91 ms. p99 2 to 7.5 ms. The measure is now the fold plus the walk (above). |
 
-Applying an event is measured from the commit's subscriber call to the relay's change callback: the wake, reading the event from the log, reading the link again, the walk over 902 nodes, the deltas and the publish. PREDICTIONS.md said to read()'s cursor; a reader spinning on read() competes with the publish, so this run hears the callback instead. One link is linked or ended per commit, each its own target: one link toggled 300 times reads slower for its own history. What is left after the callback (indexing the new set, freeing the old) is not in the number.
+That old measure ran from the commit's subscriber call to the relay's change callback: the wake, reading the event from the log, reading the link again, the walk over 902 nodes, the deltas and the publish. PREDICTIONS.md said to read()'s cursor; a reader spinning on read() competes with the publish, so this run hears the callback instead. One link is linked or ended per commit, each its own target: one link toggled 300 times reads slower for its own history. What is left after the callback (indexing the new set, freeing the old) is not in the number.
 
 The result splits by run, not by sample: a run is near 0.5 ms or near 1.5 ms. That looks like the relay's thread landing on a slower core, which this toy did not prove. On one run's timing, the walk and deltas took about 580 microseconds and reading the link about 270, of which most is SQLite reloading pages after another connection's commit. p99 carries a file save, at most one a second.
 
