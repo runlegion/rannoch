@@ -47,3 +47,9 @@ The apps' predictions above stay as written. The operator changed two measures:
 The crate changed: `Quick` is gone, so the walk uses the default hasher, and a relay is only asked through the inbox. Expected: every target still holds and 0 differences. Fold plus walk at Hutta should rise by 10 to 30%, to about 0.55 to 0.65 ms at the median, still under 1 ms. If it does not hold without `Quick`, the results say so. "Seeds under 1 s" now runs through the inbox (a heartbeat and two commits on top of the seed).
 
 Kessel's "at the old known-at" is now read from the ack's `known` for the first answer, and from the newest known-at of the nodes a report holds for the report, since `WarmSet::known` is no longer public.
+
+## After #193, 2026-11-04, before this rerun
+
+The operator's decisions on #193 change how two measures are treated, and no number here. Applying an event, the fold plus the walk, is reported at the median and p99 and not judged. Kessel's "under 2 ms in-process" is reported and not judged, and the results say that this prediction did not hold; its count of 216 stays a check. The toy prints both as REPORT lines, so neither can fail a run.
+
+Expected from #193's evidence: fold plus walk at the median anywhere from about 0.55 to 2.4 ms, split by run; the in-process read over 2 ms on about half of runs; every other line passes with 0 differences.

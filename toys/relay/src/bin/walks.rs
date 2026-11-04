@@ -6,11 +6,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use rannoch_cloudevents::{EventId, NodeRef};
 use rannoch_store::{
-    Anchor, Class, Cursor, Declaration, Direction, Graph, Relation, Roots, Shape, Step, Value,
+    Class, Cursor, Declaration, Direction, Graph, Relation, Roots, Shape, Step, Value,
     ValueType, Version, View, Way, open,
 };
 use rusqlite::Connection;
@@ -41,11 +41,6 @@ impl std::fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
-
-pub(crate) fn millis(at: SystemTime) -> i64 {
-    at.duration_since(UNIX_EPOCH)
-        .map_or(0, |since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX))
-}
 
 const KEY: [u8; 32] = [11; 32];
 const SOURCE: &str = "rannoch:toy";
@@ -83,19 +78,19 @@ fn amended(target: &str, patch: &Json) -> String {
 }
 
 fn step(relation: &str, cap: Option<usize>) -> Step {
-    Step { cap, ..Step::new(relation) }
+    Step { relation: relation.into(), cap, ..Step::default() }
 }
 
 fn anchored(name: &str, class: &str, key: &str, steps: Vec<Step>) -> Shape {
     Shape {
         name: name.into(),
-        roots: Roots::Node { node: Anchor { class: class.into(), key: key.into() } },
+        roots: Roots::Node { node: NodeRef::new(class, key) },
         steps,
     }
 }
 
-fn no_spawn() -> Option<BTreeMap<String, Value>> {
-    Some(BTreeMap::from([("kind".to_string(), Value::from("Spawn"))]))
+fn no_spawn() -> BTreeMap<String, Value> {
+    BTreeMap::from([("kind".to_string(), Value::from("Spawn"))])
 }
 
 // --- Loading ---
@@ -266,7 +261,7 @@ fn build(spice: &Connection, path: &Path) -> Res<(Graph, Vec<Shape>)> {
         anchored(name, "quest", root, (0..50).map(|_| step("next_in_arc", Some(1000))).collect())
     };
     let planet_steps = || {
-        vec![Step { drop: no_spawn(), ..Step::new("on<-") }, Step::new("targets")]
+        vec![Step { relation: "on<-".into(), drop: no_spawn(), ..Step::default() }, step("targets", None)]
     };
     let shapes = vec![
         walk("small closure", &small),
@@ -480,6 +475,20 @@ fn first_step(world: &World, shape: &Shape) -> Res<(String, bool, String)> {
     })
 }
 
+/// A root of `shape`: its one node, or the lowest of its class in `set`.
+fn root_of(set: &WarmSet, shape: &Shape) -> NodeRef {
+    match &shape.roots {
+        Roots::Node { node } => node.clone(),
+        Roots::Class { class, .. } => set
+            .nodes()
+            .keys()
+            .filter(|node| node.class == *class)
+            .map(|node| (**node).clone())
+            .min()
+            .unwrap_or_else(|| NodeRef::new(class.clone(), "")),
+    }
+}
+
 fn properties(class: &str, key: &str) -> Json {
     if class == "thing" {
         json!({"kind": "Toy", "fqn": key})
@@ -524,7 +533,7 @@ fn measure_kinds(probe: &mut Probe<'_>, shape: &Shape, table: &mut Vec<String>) 
     let mut warm = Warm::seed(&probe.world.short, shape.clone(), View::default(), Cursor::START)?;
     let size = warm.set.nodes().len();
     let n = reps(size);
-    let root: NodeRef = (*warm.set.roots()[0]).clone();
+    let root = root_of(&warm.set, shape);
     let name = &shape.name;
     println!("## {name}: {size} nodes, {n} samples per kind");
     let mut tag = 0usize;
@@ -620,7 +629,7 @@ fn measure_bursts(probe: &mut Probe<'_>, shape: &Shape, burst_kind: &str, table:
     let (relation, from_root, reached) = first_step(probe.world, shape)?;
     let probe_warm = Warm::seed(&probe.world.short, shape.clone(), View::default(), Cursor::START)?;
     let size = probe_warm.set.nodes().len();
-    let root: NodeRef = (*probe_warm.set.roots()[0]).clone();
+    let root = root_of(&probe_warm.set, shape);
     let name = &shape.name;
     let mut tag = 0usize;
     let mut cross = Crossing::default();
