@@ -1729,12 +1729,9 @@ mod tests {
         let writer = open(&path, &KEY)?;
         writer.conn.execute_batch("BEGIN IMMEDIATE")?;
         crate::log::append(&writer.conn, &node("book", "b2", "yo"))?;
-        let started = std::time::Instant::now();
+        // The writer holds its lock until the copy has returned: a copy that waited for it would
+        // run out of retries and fail.
         let at = g.copy_to(temp("busy-copy"))?;
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(1),
-            "the copy did not wait"
-        );
         writer.conn.execute_batch("COMMIT")?;
         assert_eq!(
             at, before,
@@ -2016,6 +2013,23 @@ mod tests {
             ran.push(statements(g, crate::Graph::fill)?.len());
         }
         Ok(ran[1] - ran[0])
+    }
+
+    #[test]
+    fn a_chunk_is_one_statement_however_many_events_it_holds()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = graph("chunk")?;
+        books(&mut g, 0..20)?;
+        let high = g.events().committed()?;
+        for limit in [10, 20] {
+            let ran = statements(&mut g, |g| {
+                let events = g.events().chunk(crate::Cursor::START, high, limit)?;
+                assert_eq!(events.len(), limit);
+                Ok(high)
+            })?;
+            assert_eq!(ran.len(), 1, "{ran:?}");
+        }
+        Ok(())
     }
 
     #[test]
