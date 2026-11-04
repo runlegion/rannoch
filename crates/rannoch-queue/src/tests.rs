@@ -9,8 +9,7 @@ use super::{CHUNK, Failure, Queue, State, Ticket, lock};
 
 const KEY: [u8; 32] = [7; 32];
 const HOUR: Duration = Duration::from_secs(3_600);
-/// How long a test waits before it calls itself hung. This guard is the one clock a test reads:
-/// it fails a test that never finishes, and says nothing about how fast anything is.
+/// How long a test waits before it calls itself hung and fails.
 const HUNG: Duration = Duration::from_secs(120);
 
 /// A graph at `path` with class `item`, property `v`.
