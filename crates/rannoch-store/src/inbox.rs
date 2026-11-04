@@ -21,6 +21,9 @@ pub const FILL: &str = "rannoch.fill";
 /// other way to hear that it now holds.
 pub const REFILLED: &str = "rannoch.refilled";
 
+/// The type of an event that amends an earlier one.
+pub const AMENDED: &str = "rannoch.amended";
+
 /// Where a committed event stands for one worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum State {

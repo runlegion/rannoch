@@ -7,7 +7,8 @@ use std::sync::{Arc, OnceLock};
 
 use rannoch_cloudevents::{Conclusion, Fact, LinkFact, NodeFact, NodeRef, ValidTime};
 use rannoch_store::{
-    Cursor, Direction, Graph, Ontology, REFILLED, Roots, Shape, Value, Version, View, Way, millis,
+    AMENDED, Cursor, Direction, Graph, Ontology, REFILLED, Roots, Shape, Value, Version, View, Way,
+    has_all, millis,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
@@ -130,11 +131,9 @@ impl WarmSet {
     }
 }
 
+/// `value` as an index's key: its wire form, which tells one type from another.
 fn value_text(value: &Value) -> String {
-    match value {
-        Value::Text(text) | Value::Decimal(text) => text.clone(),
-        other => serde_json::to_string(other).unwrap_or_default(),
-    }
+    serde_json::to_string(value).unwrap_or_default()
 }
 
 /// The other ends of the links that hold, per node, for one relation and direction.
@@ -320,25 +319,24 @@ impl Warm {
         self.stale = true;
     }
 
+    /// Whether the next settle must read everything again, so what is held cannot be trusted.
+    pub(crate) fn is_stale(&self) -> bool {
+        self.stale
+    }
+
     /// Folds one event. An event of nothing this relay holds costs its parse.
     pub(crate) fn fold(&mut self, graph: &Graph, cursor: Cursor, body: &str) {
         self.set.cursor = cursor;
         if self.stale {
             return;
         }
-        let Ok(attributes) = rannoch_cloudevents::attributes(body) else {
-            return;
-        };
-        // An amendment can move anything, and a retried fill was folded before it held.
-        if attributes.ty == "rannoch.amended" || attributes.ty == REFILLED {
-            self.stale = true;
-            return;
-        }
-        let Ok(fact) = rannoch_cloudevents::read(body) else {
-            return;
-        };
-        if self.touch(graph, &fact).is_err() {
-            self.stale = true;
+        match rannoch_cloudevents::read(body) {
+            Ok(Fact::None) | Err(_) => {
+                // An amendment can move anything, and a retried fill was folded before it held.
+                self.stale |= rannoch_cloudevents::attributes(body)
+                    .is_ok_and(|event| event.ty == AMENDED || event.ty == REFILLED);
+            }
+            Ok(fact) => self.stale |= self.touch(graph, &fact).is_err(),
         }
     }
 
@@ -384,13 +382,11 @@ impl Warm {
             }
         }
         let root = match &self.shape.roots {
-            Roots::Class { class, filter } if *class == node.class => {
-                Some(version.as_ref().is_some_and(|v| {
-                    filter
-                        .iter()
-                        .all(|(p, value)| v.properties.get(p) == Some(value))
-                }))
-            }
+            Roots::Class { class, filter } if *class == node.class => Some(
+                version
+                    .as_ref()
+                    .is_some_and(|v| has_all(&v.properties, filter)),
+            ),
             _ => None,
         };
         // A node of the root class that is no root and was never reached is nothing to this relay.
@@ -883,6 +879,14 @@ mod tests {
         two.set.prepare();
         assert_eq!(one.set, two.set, "both built");
         Ok(())
+    }
+
+    #[test]
+    fn an_index_tells_a_text_from_a_decimal_of_the_same_digits() {
+        assert_ne!(
+            value_text(&Value::Text("1.5".into())),
+            value_text(&Value::Decimal("1.5".into()))
+        );
     }
 
     #[test]

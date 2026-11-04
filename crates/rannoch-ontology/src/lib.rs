@@ -306,11 +306,15 @@ impl Step {
     /// Whether a reached node with `properties` passes this step's filters.
     #[must_use]
     pub fn passes(&self, properties: &BTreeMap<String, Value>) -> bool {
-        let has = |wanted: &BTreeMap<String, Value>| {
-            wanted.iter().all(|(p, v)| properties.get(p) == Some(v))
-        };
-        has(&self.keep) && (self.drop.is_empty() || !has(&self.drop))
+        has_all(properties, &self.keep)
+            && (self.drop.is_empty() || !has_all(properties, &self.drop))
     }
+}
+
+/// Whether `properties` holds every property of `wanted`, each at its value.
+#[must_use]
+pub fn has_all(properties: &BTreeMap<String, Value>, wanted: &BTreeMap<String, Value>) -> bool {
+    wanted.iter().all(|(p, v)| properties.get(p) == Some(v))
 }
 
 /// One declaration on a graph's stream.
