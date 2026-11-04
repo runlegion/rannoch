@@ -23,13 +23,13 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # Refuse before anything is released: the tag must name the version in
-      # Cargo.toml.
-      - name: Check tag matches package version
+      # Refuse before anything is released: the tag must name the workspace
+      # version in Cargo.toml.
+      - name: Check tag matches workspace version
         run: |
-          version="$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "rannoch") | .version')"
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
           if [ "$GITHUB_REF_NAME" != "v$version" ]; then
-            echo "::error::tag $GITHUB_REF_NAME does not match package version v$version"
+            echo "::error::tag $GITHUB_REF_NAME does not match workspace version v$version"
             exit 1
           fi
           echo "VERSION=$version" >> "$GITHUB_ENV"

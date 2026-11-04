@@ -8,8 +8,8 @@ use serde::Serialize;
 
 use crate::Error;
 use crate::queries::{
-    LOAD_ONTOLOGY, SAVE_ONTOLOGY, add_property_column, concat, create_class_table,
-    create_relation_table, property_column,
+    LOAD_ONTOLOGY, SAVE_ONTOLOGY, TOUCH_SCHEMA, add_property_column, concat, create_class_table,
+    create_property_index, create_relation_table, property_column,
 };
 
 impl From<Refused> for Error {
@@ -25,12 +25,19 @@ pub(crate) fn load(conn: &Connection) -> Result<Ontology, Error> {
     let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
         let body: String = row.get(1)?;
-        if row.get::<_, String>(0)? == CLASS {
-            let class: rannoch_ontology::Class = serde_json::from_str(&body)?;
-            ontology.classes.insert(class.name.clone(), class);
-        } else {
-            let relation: rannoch_ontology::Relation = serde_json::from_str(&body)?;
-            ontology.relations.insert(relation.name.clone(), relation);
+        match row.get::<_, String>(0)?.as_str() {
+            CLASS => {
+                let class: rannoch_ontology::Class = serde_json::from_str(&body)?;
+                ontology.classes.insert(class.name.clone(), class);
+            }
+            SHAPE => {
+                let shape: rannoch_ontology::Shape = serde_json::from_str(&body)?;
+                ontology.shapes.insert(shape.name.clone(), shape);
+            }
+            _ => {
+                let relation: rannoch_ontology::Relation = serde_json::from_str(&body)?;
+                ontology.relations.insert(relation.name.clone(), relation);
+            }
         }
     }
     Ok(ontology)
@@ -38,6 +45,7 @@ pub(crate) fn load(conn: &Connection) -> Result<Ontology, Error> {
 
 pub(crate) const CLASS: &str = "class";
 pub(crate) const RELATION: &str = "relation";
+pub(crate) const SHAPE: &str = "shape";
 
 /// A value bound as a parameter. Text and decimals are held as text, so a decimal keeps every
 /// digit; a float vector as its floats' little-endian bytes.
@@ -90,6 +98,9 @@ pub(crate) fn build(
                 format!(", {} {}", property_column(p), column(*of))
             });
             tx.execute_batch(&create_class_table(&class.name, &columns))?;
+            for property in &class.indexed {
+                tx.execute_batch(&create_property_index(&class.name, property))?;
+            }
             save(tx, CLASS, &class.name, class)?;
         }
         Declaration::Relation(relation) => {
@@ -99,6 +110,12 @@ pub(crate) fn build(
                 &relation.to,
             ))?;
             save(tx, RELATION, &relation.name, relation)?;
+        }
+        Declaration::Shape(shape) => {
+            // A shape needs no table, but an unchanged schema version means an unchanged ontology
+            // to every other handle, so declaring one moves it.
+            tx.execute_batch(TOUCH_SCHEMA)?;
+            save(tx, SHAPE, &shape.name, shape)?;
         }
         Declaration::Property {
             class,

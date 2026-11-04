@@ -1086,9 +1086,9 @@ fixture_git "$REL" config user.email t@t
 fixture_git "$REL" config user.name t
 cp "${DIR}/release.sh" "${DIR}/sync-version.sh" "${REL}/scripts/"
 cp "${DIR}/../release.toml" "${REL}/release.toml"
-# rannoch is one crate, so the fixture manifest is a [package] at 0.1.1, matching
-# release.toml's `field = "package.version"`.
-printf '[package]\nname = "rannoch"\nversion = "0.1.1"\nedition = "2024"\n' >"${REL}/Cargo.toml"
+# rannoch is a virtual workspace, so the fixture manifest is a [workspace.package] at
+# 0.1.1, matching release.toml's `field = "workspace.package.version"`.
+printf '[workspace]\nresolver = "3"\nmembers = []\n\n[workspace.package]\nversion = "0.1.1"\n' >"${REL}/Cargo.toml"
 cp "${REL}/Cargo.toml" "${REL_TMP}/Cargo.before"
 printf '# Changelog\n\n## 0.1.1\n\nThe previous release.\n' >"${REL}/CHANGELOG.md"
 fixture_git "$REL" add .
