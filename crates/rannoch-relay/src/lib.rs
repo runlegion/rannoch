@@ -518,9 +518,12 @@ impl Inner {
         let mut answered = false;
         while let Some(event) = self.queue.next(QUERIES)? {
             let asked = shape_query(&event.body);
-            match asked.map(|(id, source, data)| self.answer(&id, &source, data)) {
-                Some(Ok(answer)) => {
-                    self.queue.accept(answer)?;
+            let accepted = asked.map(|(id, source, data)| {
+                let answer = self.answer(&id, &source, data)?;
+                Ok::<_, Error>(self.queue.accept(answer)?)
+            });
+            match accepted {
+                Some(Ok(_)) => {
                     self.queue.done(QUERIES, event.cursor)?;
                     answered = true;
                 }
