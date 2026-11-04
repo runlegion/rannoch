@@ -1,40 +1,40 @@
 # Results
 
-The latest runs: 3 on 2026-11-04 from 03:45 UTC, on `feat/151-relay` at 2eca053 (the toy at a163d18), release build, default 20 ms heartbeat, graphs on the internal disk, load average 3.0 to 3.6 with other agents on the machine. `./target/release/relay-toy ~/swtor/data/spice-7.9.a-v7.sqlite ~/swtor/data/spice-7.8.1.c-v26.sqlite`. Their output is `results-run1.txt` to `results-run3.txt`. **Every judged line passes in all 3, 0 failed and exit 0.** Two measures are reported and not judged, by the operator's call on #193.
+The latest runs: 3 on 2026-11-04 from 03:50 UTC, on `feat/151-relay` at e72d7c7 (the toy at 2bf6c22), release build, default 20 ms heartbeat, graphs on the internal disk, with other agents on the machine: load average 6.3, 4.4 and 3.0 at the start of runs 1, 2 and 3. `./target/release/relay-toy ~/swtor/data/spice-7.9.a-v7.sqlite ~/swtor/data/spice-7.8.1.c-v26.sqlite`. Their output is `results-run1.txt` to `results-run3.txt`. **Every judged line passes in all 3, 0 failed and exit 0.** Two measures are reported and not judged, by the operator's call on #193.
 
 ## The round trip and the two reported measures
 
 | Measure | Run 1 | Run 2 | Run 3 |
 |---|---|---|---|
-| Round trip, median under 40 ms (judged) | 28.8 ms | 28.2 ms | 31.5 ms |
-| Its p95, stated | 49.3 ms | 49.3 ms | 53.5 ms |
-| Its p99, stated (over 50 trips, so the slowest two) | 81.2 ms | 64.3 ms | 83.7 ms |
-| Applying an event: fold plus walk, median (reported) | 0.51 ms | 0.52 ms | 0.59 ms |
-| Its p99 (reported) | 1.70 ms | 1.88 ms | 2.39 ms |
-| Kessel's in-process read of 216 links, one reading a run (reported) | 1.49 ms | 2.27 ms | 1.16 ms |
+| Round trip, median under 40 ms (judged) | 28.2 ms | 28.0 ms | 26.9 ms |
+| Its p95, stated | 49.3 ms | 48.3 ms | 48.2 ms |
+| Its p99, stated (over 50 trips, so the slowest two; the first, which seeds, in run 2) | 71.3 ms | 111.2 ms | 63.0 ms |
+| Applying an event: fold plus walk, median (reported) | 0.83 ms | 0.64 ms | 0.53 ms |
+| Its p99 (reported) | 2.15 ms | 2.70 ms | 1.94 ms |
+| Kessel's in-process read of 216 links, one reading a run (reported) | 2.80 ms | 0.88 ms | 0.93 ms |
 
-**Kessel's "under 2 ms in-process" did not hold.** Run 2 read 2.27 ms, and #193's full runs on the same data met it in 6 of 9 before the first simplify and 8 of 17 after it. It is one reading a run, and the cause of the swing is not known.
+**Kessel's "under 2 ms in-process" did not hold.** Run 1 read 2.80 ms, and #193's full runs on the same data met it in 6 of 9 before the first simplify and 8 of 17 after it. It is one reading a run, and the cause of the swing is not known.
 
 Kessel's "round trip under 40 ms", as written, does not hold at its tail; the operator judges it at the median because the heartbeat alone waits up to 20 ms.
 
-Fold plus walk is around the relay's own `fold` and `settle`, compiled in unchanged, on one read handle, one link per commit. These 3 runs sit near the low end of what #193 recorded after the first simplify (0.55 to 2.38 ms at the median over 16 runs). Three runs do not narrow that range; the swing between runs is still not explained.
+Fold plus walk is around the relay's own `fold` and `settle`, compiled in unchanged, on one read handle, one link per commit. In these 3 runs it fell as the load fell, which three runs do not establish as the cause; #193's range after the first simplify was 0.55 to 2.38 ms at the median over 16 runs, and a `taskpolicy` clamp did not steady it. The swing between runs is still not explained.
 
-What was expected before these runs (PREDICTIONS.md, a163d18):
+What was expected before these runs (PREDICTIONS.md, a163d18 and 2bf6c22):
 - "0 failed and every count as before": held.
-- Fold plus walk "no higher than the last 3 runs' 0.49 to 0.54 ms at the median, unless the load differs": runs 1 and 2 held. Run 3 was higher at 0.59 ms, with the load higher than those runs' 2.5 to 2.8. As predicted, the parse saved cannot be told from the swing.
-- By logname "stays about 83 ns": held.
+- Fold plus walk "no higher than the last 3 runs' 0.49 to 0.54 ms at the median, unless the load differs": only run 3 is in that range. The load did differ, and the second gate's and the cursor's costs cannot be told from the swing, as predicted.
+- By logname "stays about 83 ns": held at the median, 83 to 84 ns.
 - The first simplify's "rise by 10 to 30%, to about 0.55 to 0.65 ms" did not show on its own build (0.49 to 0.54 ms at bf016b8), and #193's alternating A/B found that build not slower.
 - Kessel's "at the old known-at", read from the ack's `known` and from the newest known-at a report holds: holds in all 3.
 
-The failure paths the second simplify gate changed (a failed read or save) are not taken by these runs. Workspace tests cover them.
+The failure paths the second simplify gate changed (a failed read or save, and the cursor held while reads fail) are not taken by these runs. Workspace tests cover them.
 
-The other judged lines in these runs: seed 42 to 45 ms through the inbox, up from 20 to 29 ms before the inbox was on the path; read() p50 41 ns, p99 42 ns; by logname p50 83 ns, p99 125 ns; line to overlay p50 19 to 20 ms, p99 26 to 39 ms, max 40 to 60 ms; rebuild with the file gone 21 ms; the report's reread 1.31 to 1.35 s; the hub's memory up 1.4 to 1.5 MB, file 423 KB.
+The other judged lines in these runs: seed 44 to 46 ms through the inbox, up from 20 to 29 ms before the inbox was on the path; read() p50 41 ns, p99 42 ns; by logname p99 166 to 208 ns; line to overlay p50 18 to 19 ms, p99 26 to 29 ms, max 64 to 67 ms; rebuild with the file gone 24 to 25 ms; the report's reread 1.39 to 1.51 s; the hub's memory up 1.8 to 2.0 MB, file 423 KB.
 
 `src/bin/walks` was moved to the simplified API and builds, and was not rerun, so WALKS-RESULTS.md is the build it names. Its comparison with "under 1 ms" predates #193.
 
 ## How this page is dated
 
-The numbers from here to the end of this page come from the earlier runs of 2026-11-02 and 2026-11-03, before the simplify and before #193. The predictions were committed before any run, at 22:48 on 2026-11-02 (commit ca68d86, the same author date as 08766e5). A later rebase onto the feature branch put them after 969e62b, a fix the first run prompted, so this branch's order alone does not show it: read the author date. Later expectations were each committed before their rerun: 42b6e35, f382a54, 3e0526d and a163d18.
+The numbers from here to the end of this page come from the earlier runs of 2026-11-02 and 2026-11-03, before the simplify and before #193. The predictions were committed before any run, at 22:48 on 2026-11-02 (commit ca68d86, the same author date as 08766e5). A later rebase onto the feature branch put them after 969e62b, a fix the first run prompted, so this branch's order alone does not show it: read the author date. Later expectations were each committed before their rerun: 42b6e35, f382a54, 3e0526d, a163d18 and 2bf6c22.
 
 ## The importer's
 
