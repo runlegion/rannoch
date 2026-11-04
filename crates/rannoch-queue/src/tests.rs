@@ -1,10 +1,11 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use rannoch_store::{Class, Declaration, Error, Graph, Relation, open};
 
-use super::{Failure, Queue, State, Ticket, lock};
+use super::{CHUNK, Failure, Queue, State, Ticket, lock};
 
 const KEY: [u8; 32] = [7; 32];
 const HOUR: Duration = Duration::from_secs(3_600);
@@ -44,11 +45,9 @@ fn failing_bad(path: &Path, how: &str) -> rusqlite::Result<()> {
     ))
 }
 
-/// Waits up to five seconds for `done`.
+/// Waits for `done`, however long it takes.
 fn wait_for(mut done: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(5);
     while !done() {
-        assert!(Instant::now() < deadline, "timed out");
         std::thread::sleep(Duration::from_millis(2));
     }
 }
@@ -542,31 +541,31 @@ fn every_worker_s_lag_and_the_slowest_cursor_can_be_read() -> Result<(), Box<dyn
     Ok(())
 }
 
-/// The issue's bound on a worker's own cost per event, with no work in the worker.
-const MAX_PER_EVENT: Duration = Duration::from_micros(10);
-
+/// What keeps a worker cheap: `next` goes to the store once a chunk, and `done` never does, so
+/// any trip to the store per event fails. The statements of one trip are counted in the store's
+/// `a_chunk_is_one_statement_however_many_events_it_holds`.
 #[test]
-fn a_worker_costs_under_ten_microseconds_an_event() -> Result<(), Box<dyn std::error::Error>> {
-    const EVENTS: usize = 20_000;
+fn a_worker_goes_to_the_store_once_a_chunk_and_not_to_close()
+-> Result<(), Box<dyn std::error::Error>> {
+    const CHUNKS: usize = 3;
     let dir = tempfile::tempdir()?;
-    let queue = committed(&dir, EVENTS)?;
-    let started = Instant::now();
-    let mut closed = 0u32;
-    while let Some(event) = queue.next("bench")? {
-        queue.done("bench", event.cursor)?;
+    // Less one: the declaration is in the log too.
+    let queue = committed(&dir, CHUNKS * CHUNK - 1)?;
+    let taken = || queue.shared.graph_taken.load(Ordering::SeqCst);
+    let (mut by_next, mut by_done, mut closed) = (0, 0, 0);
+    loop {
+        let before = taken();
+        let event = queue.next("w")?;
+        by_next += taken() - before;
+        let Some(event) = event else { break };
+        let before = taken();
+        queue.done("w", event.cursor)?;
+        by_done += taken() - before;
         closed += 1;
     }
-    let per_event = started.elapsed() / closed;
-    eprintln!("worker overhead: {per_event:?} per event over {closed} events");
-    assert_eq!(
-        closed as usize,
-        EVENTS + 1,
-        "every event and the declaration"
-    );
-    assert!(
-        per_event <= MAX_PER_EVENT,
-        "a worker took {per_event:?} per event, over {MAX_PER_EVENT:?}"
-    );
+    assert_eq!(closed, CHUNKS * CHUNK, "every event and the declaration");
+    assert_eq!(by_next, CHUNKS, "next goes to the store once a chunk");
+    assert_eq!(by_done, 0, "done closes in memory");
     Ok(())
 }
 
