@@ -61,12 +61,12 @@ impl Worker {
         }
     }
 
-    /// A worker on its first call, at the start of the log.
-    pub(crate) fn joining() -> Worker {
+    /// A worker on its first call, at `cursor`: the start of the log, unless it joined later.
+    pub(crate) fn joining(cursor: Cursor) -> Worker {
         let mut worker = Worker::resumed(
             &Place {
                 worker: String::new(),
-                cursor: Cursor::START,
+                cursor,
                 kept: None,
             },
             Cursor::START,

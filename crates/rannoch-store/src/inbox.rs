@@ -17,6 +17,19 @@ use crate::{Error, Graph};
 /// are the events fill could not fill. A worker of an app must not take this name.
 pub const FILL: &str = "rannoch.fill";
 
+/// The type of the event fill appends when a retry succeeds, as a reader past that event has no
+/// other way to hear that it now holds.
+pub const REFILLED: &str = "rannoch.refilled";
+
+/// The type of an event that amends an earlier one.
+pub const AMENDED: &str = "rannoch.amended";
+
+/// What the type of an event that declares something starts with.
+pub const DECLARED_PREFIX: &str = "rannoch.declared.";
+
+/// What the type of an event fill appends for a link it closes starts with.
+pub const CLOSED_PREFIX: &str = "rannoch.closed.";
+
 /// Where a committed event stands for one worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum State {

@@ -18,12 +18,14 @@ mod queries;
 mod read;
 
 pub use fact::check;
-pub use history::{End, Hearing, Seen, Version, View};
-pub use inbox::{FILL, Place, State};
+pub use history::{End, Hearing, Seen, Version, View, millis};
+pub use inbox::{AMENDED, CLOSED_PREFIX, DECLARED_PREFIX, FILL, Place, REFILLED, State};
 pub use log::{Cursor, Event, Events};
 pub use rannoch_cloudevents::{Date, EventId, NodeRef, ValidTime};
-pub use rannoch_ontology::{Class, Declaration, Ontology, Relation, Value, ValueType};
-pub use read::{Counts, Description, Direction, Node};
+pub use rannoch_ontology::{
+    Class, Declaration, Ontology, Relation, Roots, Shape, Step, Value, ValueType, Way, has_all,
+};
+pub use read::{ANSWER, Counts, Description, Direction, Node, QUERY, ViewData};
 
 use crate::handles::{Handles, Run};
 use crate::history::{
@@ -140,7 +142,10 @@ impl Graph {
     /// The ontology the file holds now. Another handle may have declared since this one last
     /// loaded, and a read must answer from the file's own stream; checking the schema version
     /// first keeps a plain data write elsewhere from costing a reload.
-    pub(crate) fn current_ontology(&self) -> Result<Arc<Ontology>, Error> {
+    ///
+    /// # Errors
+    /// The graph file cannot be read.
+    pub fn current_ontology(&self) -> Result<Arc<Ontology>, Error> {
         let version = schema_version(&self.conn)?;
         {
             let fresh = self.fresh.borrow();
@@ -181,7 +186,7 @@ impl Graph {
         Events { conn: &self.conn }
     }
 
-    /// Declares a class, a relation or a property, as one event whose body is the declaration's
+    /// Declares a class, a relation, a shape or a property, as one event whose body is the declaration's
     /// `CloudEvent`. The event, what the declaration needs and its place in the ontology land
     /// together or not at all. A declaration identical to the ontology as it is now writes
     /// nothing and returns `Ok(None)`.
@@ -362,9 +367,22 @@ impl Graph {
                 continue;
             };
             match attempt(&run, &ontology, &self.key, &event, &mut Flags::read(&run)?)? {
-                Ok(()) => run.with(Sql::DoneRetry, |s| s.execute(params![FILL, seq]))?,
-                Err(cause) => tried(&run, seq, &cause)?,
-            };
+                Ok(()) => {
+                    run.with(Sql::DoneRetry, |s| s.execute(params![FILL, seq]))?;
+                    let id = EventId::now();
+                    let body = serde_json::json!({
+                        "specversion": "1.0",
+                        "id": id.to_string(),
+                        "source": "rannoch",
+                        "type": REFILLED,
+                        "data": {"cursor": seq},
+                    });
+                    store(&run, id, None, &body.to_string())?;
+                }
+                Err(cause) => {
+                    tried(&run, seq, &cause)?;
+                }
+            }
         }
         history::keep_noted(&run)?;
         drop(run);
@@ -698,9 +716,9 @@ fn fill_link(
     Ok(())
 }
 
-/// Whether `body` is an amendment: type `rannoch.amended`.
+/// Whether `body` is an amendment.
 fn amendment(body: &str) -> bool {
-    rannoch_cloudevents::attributes(body).is_ok_and(|event| event.ty == "rannoch.amended")
+    rannoch_cloudevents::attributes(body).is_ok_and(|event| event.ty == AMENDED)
 }
 
 /// Folds `event` when it is an amendment, and puts what it touched into the tables kept for
@@ -926,7 +944,7 @@ fn arrived(
                     "specversion": "1.0",
                     "id": id.to_string(),
                     "source": "rannoch",
-                    "type": format!("rannoch.closed.{}", relation.name),
+                    "type": format!("{CLOSED_PREFIX}{}", relation.name),
                     "subject": from_key,
                     "data": {
                         "from": {"class": relation.from, "key": from_key},
@@ -1832,6 +1850,12 @@ mod tests {
         declare_film(&mut late)?;
         late.fill()?;
         assert_eq!(late.state(crate::FILL, f1)?, crate::State::Done);
+        let told = late.events().since(f1)?;
+        assert!(
+            told.iter()
+                .any(|e| e.body.contains("rannoch.refilled") && e.body.contains(r#""cursor":"#)),
+            "a retry that succeeds is told in the log"
+        );
         let mut first = graph("first-film")?;
         declare_film(&mut first)?;
         first.commit(&[&body], &[])?;

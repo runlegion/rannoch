@@ -14,6 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rannoch_ontology::{Class, Ontology, Value};
 use rusqlite::{Connection, OptionalExtension, ToSql, TransactionBehavior, params};
+use serde::{Deserialize, Serialize};
 
 use rannoch_cloudevents::{Conclusion, EventId, Fact, LinkFact, NodeFact, NodeRef, ValidTime};
 
@@ -1156,7 +1157,8 @@ fn decode(json: Option<&str>) -> Result<BTreeMap<String, Value>, Error> {
 }
 
 /// Milliseconds since the Unix epoch, negative before it.
-pub(crate) fn millis(time: SystemTime) -> i64 {
+#[must_use]
+pub fn millis(time: SystemTime) -> i64 {
     let ms = |d: Duration| i64::try_from(d.as_millis()).unwrap_or(i64::MAX);
     match time.duration_since(UNIX_EPOCH) {
         Ok(after) => ms(after),
@@ -1223,7 +1225,7 @@ pub struct View {
 }
 
 /// One version of a node or a link: the hearing that held at a point, by its class's order.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Version {
     /// The event it is named by: the smallest id it arrived under.
     pub event: EventId,

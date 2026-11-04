@@ -41,6 +41,7 @@ g.declare(
 - A class may index properties: `indexed` names the properties its nodes can be listed by. Each one gets an index when the class is declared; a class that indexes nothing adds none, so a write pays for an index only where one is declared.
 - `Declaration::Property` adds a property to a declared class. Older nodes read without it; nothing is default-filled.
 - `Relation::new(name, from, to, containment)`: the last argument says the source is part of the target. Set `axis` to declare one.
+- `Declaration::Shape` names a neighbourhood a relay keeps warm: see [architecture.md](architecture.md#relays).
 - An identical declaration writes nothing and returns `Ok(None)`. A conflicting one is refused with a reason in ontology terms.
 
 Declare before opening a queue on the graph: the queue checks events against the ontology it took when it opened.
@@ -205,4 +206,3 @@ let at = g.copy_to(dir.join("shop-copy.rannoch"))?;
 
 - Purge (erasure of a fact from the store, with a rule that refuses it coming back): #148.
 - Trim (retention declared per class, such as dropping raw rows once processed): no issue yet.
-- Relays: #151.

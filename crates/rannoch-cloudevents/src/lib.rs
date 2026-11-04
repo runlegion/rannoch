@@ -18,6 +18,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+pub use rannoch_ontology::NodeRef;
 use rannoch_ontology::Value;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -197,22 +198,6 @@ impl ValidTime {
             date.parts()?;
         }
         Ok(())
-    }
-}
-
-/// A node named by its class and natural key.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct NodeRef {
-    pub class: String,
-    pub key: String,
-}
-
-impl NodeRef {
-    pub fn new(class: impl Into<String>, key: impl Into<String>) -> Self {
-        NodeRef {
-            class: class.into(),
-            key: key.into(),
-        }
     }
 }
 

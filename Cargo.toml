@@ -6,6 +6,7 @@ members = [
     "crates/rannoch-cloudevents",
     "crates/rannoch-ontology",
     "crates/rannoch-queue",
+    "crates/rannoch-relay",
     "crates/rannoch-worker",
     "crates/rannoch-harness",
     "crates/rannoch-processor",

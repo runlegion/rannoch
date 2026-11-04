@@ -944,6 +944,9 @@ pub(crate) const ROLLBACK_TO: &str = "ROLLBACK TO event; RELEASE event";
 
 pub(crate) const SCHEMA_VERSION: &str = "PRAGMA schema_version";
 
+/// Moves `PRAGMA schema_version` without leaving anything behind.
+pub(crate) const TOUCH_SCHEMA: &str = "CREATE TABLE _touched(x); DROP TABLE _touched;";
+
 pub(crate) const LOAD_ONTOLOGY: &str = "SELECT kind, body FROM _ontology";
 
 pub(crate) const SAVE_ONTOLOGY: &str =

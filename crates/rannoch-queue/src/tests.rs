@@ -589,3 +589,21 @@ fn a_saved_failure_ahead_of_the_cursor_still_reads_as_failed()
     assert_eq!(queue.state("w", failing)?, State::Failed("bad".to_string()));
     Ok(())
 }
+
+#[test]
+fn a_worker_joins_at_the_watermark_and_is_handed_only_what_follows()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let queue = committed(&dir, 3)?;
+    let at = queue.join("late");
+    assert_eq!(queue.next("late")?.map(|e| e.cursor), None);
+    queue.accept(item("after"))?;
+    let _ = queue.flush();
+    let handed = queue.next("late")?.ok_or("the event after joining")?;
+    assert!(handed.cursor > at);
+    assert!(handed.body.contains("after"));
+    assert_eq!(queue.join("late"), at, "a worker with a place stays at it");
+    queue.done("late", handed.cursor)?;
+    assert_eq!(queue.join("late"), handed.cursor);
+    Ok(())
+}

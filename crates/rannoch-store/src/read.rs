@@ -329,9 +329,9 @@ fn keyed_versions(
 }
 
 /// The type of an event that asks a read.
-const QUERY: &str = "rannoch.query";
+pub const QUERY: &str = "rannoch.query";
 /// The type of an event that answers one.
-const ANSWER: &str = "rannoch.answer";
+pub const ANSWER: &str = "rannoch.answer";
 
 #[derive(Deserialize)]
 struct Envelope {
@@ -347,11 +347,25 @@ struct Query {
     view: ViewData,
 }
 
-/// A view as a query states it: an axis point, and a known-at in milliseconds since the epoch.
-#[derive(Deserialize, Default)]
-struct ViewData {
-    axis: Option<Vec<i64>>,
-    known: Option<i64>,
+/// A view as an event states it: an axis point, and a known-at in milliseconds since the epoch,
+/// negative before it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ViewData {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub axis: Option<Vec<i64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known: Option<i64>,
+}
+
+impl ViewData {
+    /// The view it states.
+    #[must_use]
+    pub fn view(&self) -> View {
+        View {
+            axis: self.axis.clone(),
+            known: self.known.map(time),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -545,6 +559,35 @@ mod tests {
 
     fn keys(rows: &[(String, crate::Version)]) -> Vec<&str> {
         rows.iter().map(|(key, _)| key.as_str()).collect()
+    }
+
+    #[test]
+    fn a_shape_is_declared_by_name_and_another_handle_sees_it() -> Result {
+        let path = temp("shape");
+        let mut g = open(&path, &KEY)?;
+        let reader = open(&path, &KEY)?;
+        assert!(reader.current_ontology()?.shapes.is_empty());
+        for declaration in [
+            Declaration::Class(Class::new("author", ["name"])),
+            Declaration::Class(Class::new("book", ["title"])),
+            Declaration::Relation(Relation::new("wrote", "author", "book", false)),
+        ] {
+            g.declare(
+                &declaration,
+                r#"{"specversion":"1.0","id":"d","source":"app","type":"rannoch.declared.x"}"#,
+            )?;
+        }
+        let shape: crate::Shape = serde_json::from_str(
+            r#"{"name":"books","roots":{"class":"author"},"steps":[{"relation":"wrote","cap":3}]}"#,
+        )?;
+        let body =
+            r#"{"specversion":"1.0","id":"d","source":"app","type":"rannoch.declared.books"}"#;
+        let declared = Declaration::Shape(shape.clone());
+        assert!(g.declare(&declared, body)?.is_some());
+        assert!(g.declare(&declared, body)?.is_none(), "identical");
+        assert_eq!(reader.current_ontology()?.shape("books"), Ok(&shape));
+        assert_eq!(open(&path, &KEY)?.ontology().shape("books"), Ok(&shape));
+        Ok(())
     }
 
     #[test]
