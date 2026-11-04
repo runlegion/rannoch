@@ -913,6 +913,12 @@ mod tests {
         let _ = queue.flush();
         failures_of(&relays)?;
         assert!(!holds(&relays, &id, "w"), "nothing could be read");
+        let committed = open(dir.path().join("graph"), &KEY)?.events().committed()?;
+        // Taking the state waits out the pump that failed.
+        let state = lock(&relays.inner.state);
+        let claimed = relays.read(&id).ok_or("the relay")?.cursor();
+        assert!(claimed < committed, "it claims no cursor it has not read");
+        drop(state);
         lock(&relays.inner.state).graph = real;
         // Nothing more commits: only the relay's own wake can bring it back.
         until(|| holds(&relays, &id, "w").then_some(()))?;
@@ -931,9 +937,9 @@ mod tests {
         {
             // Taking the state waits out the pump that failed, and any save it would make.
             let mut state = lock(&relays.inner.state);
-            let cursor = state.relays[&id].warm.set.cursor();
+            let committed = open(dir.path().join("graph"), &KEY)?.events().committed()?;
             assert!(
-                file_cursor(&relays, &id)? < cursor,
+                file_cursor(&relays, &id)? < committed,
                 "the file does not take a cursor it does not hold the truth of"
             );
             assert!(queue.lag(&worker)? > 0, "its events stay open");
