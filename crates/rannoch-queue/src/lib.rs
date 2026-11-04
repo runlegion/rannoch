@@ -94,6 +94,7 @@ struct Shared {
     /// reported and the batch kept.
     #[cfg(test)]
     panic_beat: std::sync::atomic::AtomicBool,
+    /// How many times the graph has been taken, so a test can count the queue's trips to the store.
     #[cfg(test)]
     graph_taken: std::sync::atomic::AtomicUsize,
 }
