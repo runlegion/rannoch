@@ -65,3 +65,7 @@ Folding no longer moves the published cursor; a settle that succeeds does. It ad
 ## At the head that ships, 388ecf4, 2026-11-04, before this rerun
 
 `raise` asks the view the same question it was passed, and the prefixes are the same strings, so nothing on a measured path changes. Expected: 0 failed and every count as before, with times inside the swing already reported.
+
+## At the head that ships, f1fd2df, 2026-11-04, before this rerun
+
+Since 388ecf4 the head has a refused answer failing its query, a path these runs do not take, and #192's test changes from main. Expected: 0 failed and every count as before, with times inside the swing already reported.
