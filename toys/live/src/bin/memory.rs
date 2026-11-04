@@ -2,9 +2,9 @@
 //! used (kept local, never committed), checks the live sets and follows links, then amends and
 //! renames real linked reflections and checks reads before and after.
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
-use rannoch_store::{At, Class, Declaration, Graph, HistoryKey, Relation, open};
+use rannoch_store::{Class, Declaration, Graph, NodeRef, Relation, View, open};
 use serde_json::{Value, json};
 
 const KEY: [u8; 32] = [42; 32];
@@ -43,27 +43,28 @@ fn ev(id: &str, ty: &str, subject: &str, data: Value) -> String {
         .to_string()
 }
 
+fn amended(target: &str, patch: Value) -> String {
+    let id = format!("{}:0", uuid::Uuid::now_v7());
+    ev(&id, "rannoch.amended", target, json!({"target":{"source":"legion:memory","id":target},"patch":patch}))
+}
+
 fn link(id: &str, rel: &str, from: (&str, &str), to: (&str, &str)) -> String {
     ev(id, &format!("rannoch.link.{rel}"), from.1, json!({"from":{"class":from.0,"key":from.1},"to":{"class":to.0,"key":to.1},"valid":"unknown"}))
 }
 
-fn text(g: &Graph, key: &str, at: Option<At>) -> Option<String> {
-    let node = match at {
-        None => g.find("reflection", key).expect("find"),
-        Some(at) => {
-            let day = rannoch_store::Date::day(2026, 12, 31);
-            g.find_as_of("reflection", key, &day, Some(at)).expect("as of")
-        }
+fn text(g: &Graph, key: &str, view: Option<&View>) -> Option<String> {
+    let properties = match view {
+        None => g.find("reflection", key).expect("find").map(|n| n.properties),
+        Some(view) => g.state_at(&NodeRef::new("reflection", key), view).expect("as of").map(|v| v.properties),
     };
-    node.and_then(|n| n.properties.get("text").cloned()).map(|v| match v {
+    properties.and_then(|mut p| p.remove("text")).map(|v| match v {
         rannoch_store::Value::Text(t) => t,
         o => format!("{o:?}"),
     })
 }
 
 fn live(g: &Graph, rel: &str, from: &str, to: &str) -> Option<bool> {
-    let far = At::Time(UNIX_EPOCH + Duration::from_secs(9_000_000_000));
-    g.link_state_at(rel, from, to, far).expect("link").map(|v| !v.ended)
+    g.link_state_at(rel, from, to, &View::default()).expect("link").map(|v| !v.ended)
 }
 
 fn main() {
@@ -84,7 +85,7 @@ fn main() {
     let mut g = open(&path, &KEY).expect("open");
     g.declare(&Declaration::Class(Class::new("repo", ["name"])), &decl("repo")).expect("repo");
     g.declare(
-        &Declaration::Class(Class { history: HistoryKey::Time, ..Class::new("reflection", ["text", "domain"]) }),
+        &Declaration::Class(Class::new("reflection", ["text", "domain"])),
         &decl("reflection"),
     )
     .expect("reflection");
@@ -103,7 +104,7 @@ fn main() {
     for r in &rows {
         let c = ms(&r.created_at);
         bodies.push(ev(&id_at_ms(c), "rannoch.node.reflection", &r.id,
-            json!({"properties":{"text":r.text,"domain":r.domain},"valid":{"on":&r.created_at[0..10]},"time":c})));
+            json!({"properties":{"text":r.text,"domain":r.domain},"valid":{"on":&r.created_at[0..10]}})));
         bodies.push(link(&id_at_ms(c), "in", ("reflection", &r.id), ("repo", &r.repo)));
         if let Some(p) = r.parent.as_deref().filter(|p| ids.contains(p)) {
             bodies.push(link(&id_at_ms(c), "follows", ("reflection", &r.id), ("reflection", p)));
@@ -111,7 +112,7 @@ fn main() {
         if let Some(a) = &r.archived_at {
             let at = ms(a);
             bodies.push(ev(&id_at_ms(at), "rannoch.ended.in", &r.id,
-                json!({"from":{"class":"reflection","key":r.id},"to":{"class":"repo","key":r.repo},"at":at,"valid":"unknown"})));
+                json!({"from":{"class":"reflection","key":r.id},"to":{"class":"repo","key":r.repo},"valid":"unknown"})));
         }
     }
     let mut refused = 0;
@@ -164,19 +165,19 @@ fn main() {
         .filter_map(|e| {
             let v: Value = serde_json::from_str(&e.body).ok()?;
             let subject = v["subject"].as_str()?.to_owned();
-            (v["type"] == "rannoch.node.reflection").then(|| (subject, e.id.to_string()))
+            (v["type"] == "rannoch.node.reflection").then(|| (subject, v["id"].as_str().unwrap_or("").to_owned()))
         })
         .collect();
-    let before = At::Time(SystemTime::now());
+    let before = View { axis: None, known: Some(SystemTime::now()) };
     std::thread::sleep(Duration::from_millis(20));
     let (amend, rename): (Vec<&str>, Vec<&str>) = (parents.iter().take(200).copied().collect(), parents.iter().skip(200).take(100).copied().collect());
     let mut am: Vec<String> = Vec::new();
     for k in &amend {
         let patch = json!({"data":{"properties":{"text":format!("amended: {k}")}}});
-        am.push(ev(&format!("{}:0", uuid::Uuid::now_v7()), "rannoch.amended", &log[*k], patch));
+        am.push(amended(&log[*k], patch));
     }
     for k in &rename {
-        am.push(ev(&format!("{}:0", uuid::Uuid::now_v7()), "rannoch.amended", &log[*k], json!({"subject": format!("renamed-{k}")})));
+        am.push(amended(&log[*k], json!({"subject": format!("renamed-{k}")})));
     }
     let t1 = Instant::now();
     for chunk in am.chunks(50) {
@@ -190,7 +191,7 @@ fn main() {
         if text(&g, k, None) != Some(format!("amended: {k}")) {
             bad.push(format!("amend now {k}"));
         }
-        if text(&g, k, Some(before)).as_deref() != Some(by_id[k].text.as_str()) {
+        if text(&g, k, Some(&before)).as_deref() != Some(by_id[k].text.as_str()) {
             bad.push(format!("amend before {k}"));
         }
     }
@@ -203,7 +204,7 @@ fn main() {
         if text(&g, k, None).is_some() {
             bad.push(format!("rename old key answers {k}"));
         }
-        if text(&g, k, Some(before)).as_deref() != Some(row.text.as_str()) {
+        if text(&g, k, Some(&before)).as_deref() != Some(row.text.as_str()) {
             bad.push(format!("rename before {k}"));
         }
         if live(&g, "in", &new, &row.repo) != Some(row.archived_at.is_none()) {
@@ -215,7 +216,7 @@ fn main() {
             if live(&g, "follows", c, &new) != Some(true) || live(&g, "follows", c, k).is_some() {
                 bad.push(format!("rename follows {c}->{k}"));
             }
-            if g.link_known_at("follows", c0, k, before).expect("k").is_none() {
+            if g.link_state_at("follows", c0, k, &before).expect("k").is_none() {
                 bad.push(format!("rename follows known before {c}->{k}"));
             }
         }
@@ -232,7 +233,7 @@ fn main() {
         println!("  {b}");
     }
     let probe = parents[500];
-    println!("  probe unamended {probe}: now {:?} | as of before {:?}", text(&g, probe, None).map(|t| t.len()), text(&g, probe, Some(before)).map(|t| t.len()));
+    println!("  probe unamended {probe}: now {:?} | as of before {:?}", text(&g, probe, None).map(|t| t.len()), text(&g, probe, Some(&before)).map(|t| t.len()));
     let k = amend[0];
-    println!("  probe amended {k}: as of before {:?} | as of now {:?}", text(&g, k, Some(before)).map(|t| t.chars().take(30).collect::<String>()), text(&g, k, Some(At::Time(SystemTime::now()))).map(|t| t.chars().take(30).collect::<String>()));
+    println!("  probe amended {k}: as of before {:?} | as of now {:?}", text(&g, k, Some(&before)).map(|t| t.chars().take(30).collect::<String>()), text(&g, k, Some(&View::default())).map(|t| t.chars().take(30).collect::<String>()));
 }

@@ -2,10 +2,10 @@
 //! (valid ones and ones fill must refuse) fed the same way, each resumable after kill -9, and a
 //! check against an oracle the script generator computes from its own plan, never from rannoch.
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, UNIX_EPOCH};
 
 use rannoch_queue::Queue;
-use rannoch_store::{At, Class, Cursor, Date, Declaration, Graph, HistoryKey, Relation, open};
+use rannoch_store::{Class, Cursor, Declaration, Graph, NodeRef, Relation, View, open};
 use serde_json::{Value, json};
 
 const KEY: [u8; 32] = [7; 32];
@@ -30,15 +30,12 @@ fn graph(path: &str) -> Graph {
     g.declare(&Declaration::Class(Class::new("book", ["title"])), &declared("book"))
         .expect("book");
     g.declare(
-        &Declaration::Class(Class { history: HistoryKey::Time, ..Class::new("entry", ["title"]) }),
+        &Declaration::Class(Class { axis: vec!["time".into()], ..Class::new("entry", ["title"]) }),
         &declared("entry"),
     )
     .expect("entry");
     g.declare(
-        &Declaration::Class(Class {
-            history: HistoryKey::Integer,
-            ..Class::new("counter", ["title"])
-        }),
+        &Declaration::Class(Class { axis: vec!["n".into()], ..Class::new("counter", ["title"]) }),
         &declared("counter"),
     )
     .expect("counter");
@@ -62,15 +59,15 @@ fn link(id: &str, from: &str, to: &str) -> String {
     )
 }
 
-fn ended(id: &str, from: &str, to: &str, at_ms: u64) -> String {
+fn ended(id: &str, from: &str, to: &str) -> String {
     format!(
-        r#"{{"specversion":"1.0","id":"{id}","source":"rannoch:seed","type":"rannoch.ended.wrote","subject":"{from}","data":{{"from":{{"class":"author","key":"{from}"}},"to":{{"class":"book","key":"{to}"}},"at":{at_ms},"valid":"unknown"}}}}"#
+        r#"{{"specversion":"1.0","id":"{id}","source":"rannoch:seed","type":"rannoch.ended.wrote","subject":"{from}","data":{{"from":{{"class":"author","key":"{from}"}},"to":{{"class":"book","key":"{to}"}},"valid":"unknown"}}}}"#
     )
 }
 
 fn amended(id: &str, target: &str, patch: &str) -> String {
     format!(
-        r#"{{"specversion":"1.0","id":"{id}","source":"rannoch:fixer","type":"rannoch.amended","subject":"{target}","data":{patch}}}"#
+        r#"{{"specversion":"1.0","id":"{id}","source":"rannoch:fixer","type":"rannoch.amended","data":{{"target":{{"source":"rannoch:seed","id":"{target}"}},"patch":{patch}}}}}"#
     )
 }
 
@@ -87,12 +84,12 @@ fn seed_bodies(n: u64) -> Vec<String> {
         out.push(node(&id_at(t + 1), "book", &format!("b{i}"), &format!("b{i}"), ""));
         out.push(link(&id_at(t + 2), &format!("a{i}"), &format!("b{i}")));
         if i % 10 == 3 {
-            out.push(ended(&id_at(t + 3), &format!("a{i}"), &format!("b{i}"), (t + 3) * 1000));
+            out.push(ended(&id_at(t + 3), &format!("a{i}"), &format!("b{i}")));
         }
         if i % 50 == 0 {
             let time = (5_000_000 + 10 * i) * 1000;
-            out.push(node(&id_at(t + 4), "entry", &format!("e{i}"), &format!("e{i}"), &format!(r#","time":{time}"#)));
-            out.push(node(&id_at(t + 5), "counter", &format!("c{i}"), &format!("c{i}"), &format!(r#","integer":{i}"#)));
+            out.push(node(&id_at(t + 4), "entry", &format!("e{i}"), &format!("e{i}"), &format!(r#","axis":{{"time":{time}}}"#)));
+            out.push(node(&id_at(t + 5), "counter", &format!("c{i}"), &format!("c{i}"), &format!(r#","axis":{{"n":{i}}}"#)));
             out.push(format!(
                 r#"{{"specversion":"1.0","id":"{}","source":"rannoch:seed","type":"app.ping","subject":"p{i}","data":{{}}}}"#,
                 id_at(t + 6)
@@ -124,9 +121,11 @@ fn feed(path: &str, producer: &str, bodies: &[String]) {
     );
 }
 
-fn subject_of(body: &str) -> (String, String) {
+/// An event's type and subject, and its own `CloudEvent` id: what an amendment names it by.
+fn subject_of(body: &str) -> ((String, String), String) {
     let v: Value = serde_json::from_str(body).expect("json");
-    (v["type"].as_str().unwrap_or("").to_owned(), v["subject"].as_str().unwrap_or("").to_owned())
+    let key = (v["type"].as_str().unwrap_or("").to_owned(), v["subject"].as_str().unwrap_or("").to_owned());
+    (key, v["id"].as_str().unwrap_or("").to_owned())
 }
 
 /// The script and the oracle, from the seeded log's event ids and the plan alone.
@@ -134,7 +133,8 @@ fn script(path: &str, n: u64) -> (Vec<Value>, Value) {
     let g = open(path, &KEY).expect("open");
     let mut ids: BTreeMap<(String, String), String> = BTreeMap::new();
     for e in g.events().since(Cursor::START).expect("events") {
-        ids.entry(subject_of(&e.body)).or_insert_with(|| e.id.to_string());
+        let (key, id) = subject_of(&e.body);
+        ids.entry(key).or_insert(id);
     }
     let target = |ty: &str, subject: &str| {
         ids.get(&(ty.to_owned(), subject.to_owned()))
@@ -144,6 +144,7 @@ fn script(path: &str, n: u64) -> (Vec<Value>, Value) {
     let mut lines = Vec::new();
     let mut books = serde_json::Map::new();
     let mut entries = serde_json::Map::new();
+    let mut counters = serde_json::Map::new();
     let mut push = |body: String, refuse: bool, why: &str| {
         lines.push(json!({"body": body, "refuse": refuse, "why": why}));
     };
@@ -156,7 +157,7 @@ fn script(path: &str, n: u64) -> (Vec<Value>, Value) {
             0 => {
                 push(amended(&id_at(p0 + 1), &b, &title_patch(&format!("t1-{i}"))), false, "patch");
                 push(amended(&id_at(p0 + 3), &b, &title_patch(&format!("t2-{i}"))), false, "stacked");
-                push(amended(&id_at(p0 + 2), &b, &title_patch(&format!("late-{i}"))), true, "before latest");
+                push(amended(&id_at(p0 + 2), &b, &title_patch(&format!("late-{i}"))), false, "arrives after a later one");
                 expect["title"] = json!(format!("t2-{i}"));
             }
             1 => {
@@ -174,7 +175,7 @@ fn script(path: &str, n: u64) -> (Vec<Value>, Value) {
                 push(node(&id_at(p0 + 4), "author", &format!("x{i}"), &format!("x{i}"), ""), false, "late author");
                 push(link(&id_at(p0 + 5), &format!("x{i}"), &format!("b{i}")), false, "late link, old key");
                 if i % 8 == 7 {
-                    push(ended(&id_at(p0 + 6), &format!("a{i}"), &format!("b{i}"), (p0 + 6) * 1000), false, "ending after rename, old key");
+                    push(ended(&id_at(p0 + 6), &format!("a{i}"), &format!("b{i}")), false, "ending after rename, old key");
                     expect["ended"] = json!(true);
                 }
                 expect["key"] = json!(format!("r{i}"));
@@ -183,30 +184,31 @@ fn script(path: &str, n: u64) -> (Vec<Value>, Value) {
             }
         }
         if i % 100 == 0 {
-            let unknown = rannoch_store::EventId::now().to_string();
-            push(amended(&id_at(p0 + 7), &unknown, &title_patch("nobody")), true, "unknown target");
+            let unknown = format!("{}:0", rannoch_store::EventId::now());
+            push(amended(&id_at(p0 + 7), &unknown, &title_patch("nobody")), false, "unknown target waits");
         }
         if i % 50 == 0 {
             let e = target("rannoch.node.entry", &format!("e{i}"));
-            push(amended(&id_at(4_000_000 + 10 * i), &e, &title_patch("early")), true, "before own time");
+            push(amended(&id_at(4_000_000 + 10 * i), &e, &title_patch("early")), false, "before its axis point");
             push(amended(&id_at(6_000_000 + 10 * i), &e, &title_patch(&format!("e-late-{i}"))), false, "after own time");
             entries.insert(format!("e{i}"), json!(format!("e-late-{i}")));
             let c = target("rannoch.node.counter", &format!("c{i}"));
-            push(amended(&id_at(p0 + 8), &c, &title_patch("x")), true, "integer-keyed");
+            push(amended(&id_at(p0 + 8), &c, &title_patch("x")), false, "class with an axis");
+            counters.insert(format!("c{i}"), json!("x"));
             let p = target("app.ping", &format!("p{i}"));
             push(amended(&id_at(p0 + 9), &p, &title_patch("x")), true, "no hearing");
         }
         books.insert(format!("{i}"), expect);
     }
-    (lines, json!({"n": n, "books": books, "entries": entries}))
+    (lines, json!({"n": n, "books": books, "entries": entries, "counters": counters}))
 }
 
-fn known(secs: u64) -> At {
-    At::Time(UNIX_EPOCH + Duration::from_secs(secs))
+fn known(secs: u64) -> View {
+    View { axis: None, known: Some(UNIX_EPOCH + Duration::from_secs(secs)) }
 }
 
-fn title(node: Option<rannoch_store::Node>) -> Option<String> {
-    node.and_then(|n| n.properties.get("title").cloned()).map(|v| match v {
+fn title(properties: Option<BTreeMap<String, rannoch_store::Value>>) -> Option<String> {
+    properties.and_then(|mut p| p.remove("title")).map(|v| match v {
         rannoch_store::Value::Text(s) => s,
         other => format!("{other:?}"),
     })
@@ -228,25 +230,24 @@ fn check(path: &str, oracle: &Value, lines: &[Value]) {
     for _ in 0..5 {
         g.fill().expect("fill");
     }
-    let day = Date::day(2024, 1, 1);
-    let far = known(9_000_000_000);
+    let now = View::default();
     let mut bad: Vec<String> = Vec::new();
     let mut checked = 0u64;
     for (i, e) in oracle["books"].as_object().expect("books") {
         let key = e["key"].as_str().expect("key");
         let want = e["title"].as_str().map(str::to_owned);
-        let got = title(g.find("book", key).expect("find"));
+        let got = title(g.find("book", key).expect("find").map(|n| n.properties));
         if got != want {
             bad.push(format!("title {key}: want {want:?} got {got:?}"));
         }
         let kb = e["known_before"].as_u64().expect("kb");
         let orig = format!("b{i}");
-        let before = title(g.find_as_of("book", &orig, &day, Some(known(kb))).expect("as of"));
+        let before = title(g.state_at(&NodeRef::new("book", orig.as_str()), &known(kb)).expect("as of").map(|v| v.properties));
         if before.as_deref() != Some(orig.as_str()) {
             bad.push(format!("known before {orig}: got {before:?}"));
         }
         let a = format!("a{i}");
-        match g.link_state_at("wrote", &a, key, far).expect("link") {
+        match g.link_state_at("wrote", &a, key, &now).expect("link") {
             None => bad.push(format!("link {a}->{key} missing")),
             Some(v) if v.ended != e["ended"].as_bool().expect("ended") => {
                 bad.push(format!("link {a}->{key} ended {} want {}", v.ended, e["ended"]))
@@ -257,24 +258,26 @@ fn check(path: &str, oracle: &Value, lines: &[Value]) {
             if g.find("book", old).expect("find").is_some() {
                 bad.push(format!("old key {old} still answers"));
             }
-            if g.link_known_at("wrote", &a, old, known(kb)).expect("k").is_none() {
+            if g.link_state_at("wrote", &a, old, &known(kb)).expect("k").is_none() {
                 bad.push(format!("link {a}->{old} not known before the rename"));
             }
-            if g.link_known_at("wrote", &a, key, known(kb)).expect("k").is_some() {
+            if g.link_state_at("wrote", &a, key, &known(kb)).expect("k").is_some() {
                 bad.push(format!("link {a}->{key} known before the rename"));
             }
             let x = e["late_link"].as_str().expect("x");
-            match g.link_state_at("wrote", x, key, far).expect("late") {
+            match g.link_state_at("wrote", x, key, &now).expect("late") {
                 Some(v) if !v.ended => {}
                 other => bad.push(format!("late link {x}->{key}: {other:?}")),
             }
         }
         checked += 1;
     }
-    for (k, want) in oracle["entries"].as_object().expect("entries") {
-        let got = title(g.find("entry", k).expect("find"));
-        if got.as_deref() != want.as_str() {
-            bad.push(format!("entry {k}: want {want} got {got:?}"));
+    for (class, plural) in [("entry", "entries"), ("counter", "counters")] {
+        for (k, want) in oracle[plural].as_object().expect("class") {
+            let got = title(g.find(class, k).expect("find").map(|n| n.properties));
+            if got.as_deref() != want.as_str() {
+                bad.push(format!("{class} {k}: want {want} got {got:?}"));
+            }
         }
     }
     // Refused bodies by their own CloudEvent id, mapped to log cursors.
@@ -407,5 +410,4 @@ fn main() {
         }
         _ => panic!("mode"),
     }
-    let _ = SystemTime::now();
 }
