@@ -152,6 +152,11 @@ impl World {
 
     /// Stops everything and opens it again on the same files.
     fn restart(self) -> Result<World> {
+        self.restart_after(|_| Ok(()))
+    }
+
+    /// Stops everything, does `change` to the relays' directory, and opens it all again.
+    fn restart_after(self, change: impl FnOnce(&Path) -> Result) -> Result<World> {
         let World {
             dir,
             queue,
@@ -159,7 +164,9 @@ impl World {
             changes: _,
         } = self;
         assert!(relays.close().is_empty());
+        let _ = queue.flush();
         drop(queue);
+        change(&dir.path().join("relays"))?;
         let graph = open(path(dir.path()), &KEY)?;
         World::start(dir, graph)
     }
@@ -672,23 +679,15 @@ fn read_equals_a_cold_recompute_after_writes_an_amendment_a_rename_and_a_full_re
     same(&world)?;
 
     // A full replay: the relay's file gone, and the relay built again.
-    let World {
-        dir,
-        queue,
-        relays,
-        changes,
-    } = world;
-    assert!(relays.close().is_empty());
-    drop(queue);
-    for file in std::fs::read_dir(dir.path().join("relays"))? {
-        let file = file?.path();
-        if file.file_name().is_some_and(|name| name != "relays.json") {
-            std::fs::remove_file(file)?;
+    let world = world.restart_after(|relays| {
+        for file in std::fs::read_dir(relays)? {
+            let file = file?.path();
+            if file.file_name().is_some_and(|name| name != "relays.json") {
+                std::fs::remove_file(file)?;
+            }
         }
-    }
-    let graph = open(path(dir.path()), &KEY)?;
-    drop(changes);
-    let world = World::start(dir, graph)?;
+        Ok(())
+    })?;
     same(&world)?;
     Ok(())
 }
@@ -714,18 +713,10 @@ fn a_restart_resumes_and_a_file_behind_reseeds() -> Result {
     // The file put back behind its worker's cursor: the relay does not trust it.
     world.write(&[node("quest", "q1", "after")])?;
     world.closed(&id)?;
-    let World {
-        dir,
-        queue,
-        relays,
-        changes: _,
-    } = world;
-    assert!(relays.close().is_empty());
-    let _ = queue.flush();
-    drop(queue);
-    std::fs::write(dir.path().join("relays").join(format!("{id}.json")), &early)?;
-    let graph = open(path(dir.path()), &KEY)?;
-    let world = World::start(dir, graph)?;
+    let world = world.restart_after(|relays| {
+        std::fs::write(relays.join(format!("{id}.json")), &early)?;
+        Ok(())
+    })?;
     let set = world.settled(&id)?;
     assert_eq!(warm(&set), world.cold("chain", &View::default())?);
     Ok(())

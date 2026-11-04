@@ -329,9 +329,9 @@ fn keyed_versions(
 }
 
 /// The type of an event that asks a read.
-const QUERY: &str = "rannoch.query";
+pub const QUERY: &str = "rannoch.query";
 /// The type of an event that answers one.
-const ANSWER: &str = "rannoch.answer";
+pub const ANSWER: &str = "rannoch.answer";
 
 #[derive(Deserialize)]
 struct Envelope {

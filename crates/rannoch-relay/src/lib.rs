@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use rannoch_cloudevents::{Attributes, EventId, attributes};
 use rannoch_queue::Queue;
-use rannoch_store::{Cursor, Declaration, Graph, REFILLED, Shape, ViewData, open};
+use rannoch_store::{ANSWER, Cursor, Declaration, Graph, QUERY, REFILLED, Shape, ViewData, open};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
@@ -49,12 +49,6 @@ pub enum Error {
     Lost(u64),
 }
 
-impl From<rannoch_cloudevents::Error> for Error {
-    fn from(error: rannoch_cloudevents::Error) -> Error {
-        Error::Store(error.into())
-    }
-}
-
 /// The worker that takes `rannoch.query` events carrying `shape`.
 const QUERIES: &str = "rannoch.relay";
 /// How often a relay's file is replaced, at most.
@@ -62,8 +56,6 @@ const SAVE_EVERY: Duration = Duration::from_secs(1);
 /// How long the relays' thread sleeps with no commit, so a file due is still saved.
 const IDLE: Duration = Duration::from_millis(250);
 const MANIFEST: &str = "relays.json";
-const QUERY: &str = "rannoch.query";
-const ANSWER: &str = "rannoch.answer";
 const REPORT: &str = "rannoch.report";
 const CHANGED: &str = "rannoch.relay.changed";
 const REPLAY_CHUNK: usize = 4096;
@@ -87,8 +79,17 @@ struct Live {
     /// Events folded and not yet closed: a relay closes them only once its file is saved.
     unsaved: Vec<Cursor>,
     saved_at: Option<Instant>,
-    /// Folded since the file was last saved.
-    dirty: bool,
+}
+
+impl Live {
+    fn new(entry: Entry, warm: Warm) -> Live {
+        Live {
+            entry,
+            warm,
+            unsaved: Vec::new(),
+            saved_at: None,
+        }
+    }
 }
 
 struct State {
@@ -369,20 +370,11 @@ fn resume(dir: &Path, queue: &Queue, graph: &Graph, entry: Entry) -> Result<Live
         .and_then(|bytes| serde_json::from_slice::<Saved>(&bytes).ok())
         .filter(|saved| saved.cursor >= place);
     let view = entry.view.view();
-    let (warm, fresh) = match saved {
-        Some(saved) => (Warm::restored(graph, shape, view, saved)?, false),
-        None => (Warm::seed(graph, shape, view, place)?, true),
-    };
-    let mut live = Live {
-        entry,
-        warm,
-        unsaved: Vec::new(),
-        saved_at: None,
-        dirty: fresh,
-    };
-    if fresh {
-        save(dir, &mut live)?;
+    if let Some(saved) = saved {
+        return Ok(Live::new(entry, Warm::restored(graph, shape, view, saved)?));
     }
+    let mut live = Live::new(entry, Warm::seed(graph, shape, view, place)?);
+    save(dir, &mut live)?;
     Ok(live)
 }
 
@@ -401,7 +393,6 @@ fn save(dir: &Path, live: &mut Live) -> Result<(), Error> {
         &serde_json::to_vec(&live.warm.saved())?,
     )?;
     live.saved_at = Some(Instant::now());
-    live.dirty = false;
     Ok(())
 }
 
@@ -505,17 +496,12 @@ impl Inner {
         let mut retired = Vec::new();
         for live in relays.values_mut() {
             match self.pump_relay(graph, live) {
-                Ok(Some(change)) => {
-                    changes.push(change);
-                    retired.extend(self.publish(live));
-                    retired.push(live.warm.set.clone());
-                }
-                Ok(None) => retired.extend(self.publish(live)),
-                Err(error) => {
-                    self.failed(error);
-                    retired.extend(self.publish(live));
-                }
+                Ok(Some(change)) => changes.push(change),
+                Ok(None) => {}
+                Err(error) => self.failed(error),
             }
+            retired.extend(self.publish(live));
+            retired.push(live.warm.set.clone());
         }
         drop(state);
         self.emit(&changes);
@@ -552,7 +538,6 @@ impl Inner {
     /// Folds everything past `live`'s cursor as one batch, so one commit makes at most one change.
     fn pump_relay(&self, graph: &Graph, live: &mut Live) -> Result<Option<String>, Error> {
         let worker = worker_name(&live.entry.id);
-        let mut folded = false;
         while let Some(event) = self.queue.next(&worker)? {
             if event.cursor <= live.warm.set.cursor() {
                 self.queue.done(&worker, event.cursor)?;
@@ -560,29 +545,35 @@ impl Inner {
             }
             live.warm.fold(graph, event.cursor, &event.body);
             live.unsaved.push(event.cursor);
-            folded = true;
         }
-        let mut change = None;
-        if folded {
-            live.dirty = true;
-            match live.warm.settle(graph) {
-                Ok(Some(data)) => {
-                    change = Some(cloud_event(CHANGED, &live.entry.id, &data));
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    live.warm.mark_stale();
-                    self.failed(error);
-                }
+        // Costs nothing with nothing folded, and a relay that failed to read tries again here.
+        let change = match live.warm.settle(graph) {
+            Ok(data) => data.map(|data| cloud_event(CHANGED, &live.entry.id, &data)),
+            Err(error) => {
+                live.warm.mark_stale();
+                self.failed(error);
+                None
             }
-        }
-        if live.dirty && live.saved_at.is_none_or(|at| at.elapsed() >= SAVE_EVERY) {
-            save(&self.dir, live)?;
-            for cursor in live.unsaved.drain(..) {
-                self.queue.done(&worker, cursor)?;
-            }
+        };
+        // The set has moved whether or not the file can say so: the change is still told.
+        if let Err(error) = self.save_due(&worker, live) {
+            self.failed(error);
         }
         Ok(change)
+    }
+
+    /// Saves `live`'s file when one is due and closes what it now holds. A stale relay is not
+    /// saved: its file would claim a cursor whose truth it has not read.
+    fn save_due(&self, worker: &str, live: &mut Live) -> Result<(), Error> {
+        let due = live.saved_at.is_none_or(|at| at.elapsed() >= SAVE_EVERY);
+        if live.unsaved.is_empty() || !due || live.warm.is_stale() {
+            return Ok(());
+        }
+        save(&self.dir, live)?;
+        for cursor in live.unsaved.drain(..) {
+            self.queue.done(worker, cursor)?;
+        }
+        Ok(())
     }
 
     /// Publishes `live`'s set, and returns the one it replaces for the caller to drop.
@@ -623,26 +614,24 @@ impl Inner {
             let relay = EventId::now().to_string();
             let shape = shape_of(graph, &asked.shape)?;
             let at = self.queue.join(&worker_name(&relay));
-            let warm = match Warm::seed(graph, shape, asked.view.view(), at) {
-                Ok(warm) => warm,
+            let seeded = Warm::seed(graph, shape, asked.view.view(), at).and_then(|warm| {
+                let entry = Entry {
+                    id: relay.clone(),
+                    shape: asked.shape,
+                    view: asked.view,
+                    holders: BTreeSet::from([source.to_string()]),
+                };
+                let mut live = Live::new(entry, warm);
+                save(&self.dir, &mut live)?;
+                Ok(live)
+            });
+            let live = match seeded {
+                Ok(live) => live,
                 Err(error) => {
                     self.queue.remove_worker(&worker_name(&relay))?;
                     return Err(error);
                 }
             };
-            let mut live = Live {
-                entry: Entry {
-                    id: relay.clone(),
-                    shape: asked.shape,
-                    view: asked.view,
-                    holders: BTreeSet::from([source.to_string()]),
-                },
-                warm,
-                unsaved: Vec::new(),
-                saved_at: None,
-                dirty: true,
-            };
-            save(&self.dir, &mut live)?;
             let set = live.warm.set.clone();
             set.prepare();
             let _ = self.publish(&live);
@@ -883,6 +872,116 @@ mod tests {
             matches!(&failures[..], [Error::Thread(text)] if text == "the pump panics"),
             "{failures:?}"
         );
+        Ok(())
+    }
+
+    /// Swaps the graph the relays read for an empty one, so each read of the shape fails, and
+    /// returns the real one. A relay's file comes due at once.
+    fn break_reads(dir: &tempfile::TempDir, relays: &Relays, id: &str) -> Result<Graph> {
+        let empty = open(dir.path().join("empty"), &KEY)?;
+        let mut state = lock(&relays.inner.state);
+        if let Some(live) = state.relays.get_mut(id) {
+            live.saved_at = None;
+        }
+        Ok(std::mem::replace(&mut state.graph, empty))
+    }
+
+    fn file_cursor(relays: &Relays, id: &str) -> Result<Cursor> {
+        let bytes = fs::read(relay_file(&relays.inner.dir, id))?;
+        Ok(serde_json::from_slice::<Saved>(&bytes)?.cursor)
+    }
+
+    fn holds(relays: &Relays, id: &str, value: &str) -> bool {
+        relays
+            .read(id)
+            .is_some_and(|set| set.by("n", &Value::from(value)).len() == 1)
+    }
+
+    fn failures_of(relays: &Relays) -> Result<Vec<Error>> {
+        until(|| {
+            let taken = relays.take_failures();
+            (!taken.is_empty()).then_some(taken)
+        })
+    }
+
+    #[test]
+    fn a_failed_settle_reseeds_with_no_new_event() -> Result {
+        let dir = tempfile::tempdir()?;
+        let (queue, relays, id) = relay(&dir)?;
+        let real = break_reads(&dir, &relays, &id)?;
+        queue.accept(node("w"))?;
+        let _ = queue.flush();
+        failures_of(&relays)?;
+        assert!(!holds(&relays, &id, "w"), "nothing could be read");
+        lock(&relays.inner.state).graph = real;
+        // Nothing more commits: only the relay's own wake can bring it back.
+        until(|| holds(&relays, &id, "w").then_some(()))?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_stale_relay_saves_nothing_and_closes_nothing_until_it_reseeds() -> Result {
+        let dir = tempfile::tempdir()?;
+        let (queue, relays, id) = relay(&dir)?;
+        let real = break_reads(&dir, &relays, &id)?;
+        queue.accept(node("w"))?;
+        let _ = queue.flush();
+        failures_of(&relays)?;
+        let worker = worker_name(&id);
+        {
+            // Taking the state waits out the pump that failed, and any save it would make.
+            let mut state = lock(&relays.inner.state);
+            let cursor = state.relays[&id].warm.set.cursor();
+            assert!(
+                file_cursor(&relays, &id)? < cursor,
+                "the file does not take a cursor it does not hold the truth of"
+            );
+            assert!(queue.lag(&worker)? > 0, "its events stay open");
+            state.graph = real;
+        }
+        until(|| {
+            let set = relays.read(&id)?;
+            (holds(&relays, &id, "w")
+                && file_cursor(&relays, &id).is_ok_and(|saved| saved == set.cursor())
+                && matches!(queue.lag(&worker), Ok(0)))
+            .then_some(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_save_still_tells_the_change_and_saves_later() -> Result {
+        let dir = tempfile::tempdir()?;
+        let (queue, relays, id) = relay(&dir)?;
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let hearing = Arc::clone(&heard);
+        relays.subscribe(move |change: &str| lock(&hearing).push(change.to_string()));
+        // A directory where the save writes its temporary file: the save fails, and only the save.
+        let blocker = relay_file(&relays.inner.dir, &id).with_extension("tmp");
+        fs::create_dir(&blocker)?;
+        lock(&relays.inner.state)
+            .relays
+            .get_mut(&id)
+            .ok_or("the relay")?
+            .saved_at = None;
+        queue.accept(node("w"))?;
+        let _ = queue.flush();
+        until(|| (!lock(&heard).is_empty()).then_some(()))?;
+        assert_eq!(lock(&heard).len(), 1, "the change is told once");
+        assert!(lock(&heard)[0].contains("\"after\":\"w\""), "{heard:?}");
+        let failures = failures_of(&relays)?;
+        assert!(matches!(failures[0], Error::Io(_)), "{failures:?}");
+
+        let worker = worker_name(&id);
+        assert!(queue.lag(&worker)? > 0, "not closed while unsaved");
+        fs::remove_dir(&blocker)?;
+        until(|| {
+            let set = relays.read(&id)?;
+            (file_cursor(&relays, &id).is_ok_and(|saved| saved == set.cursor())
+                && matches!(queue.lag(&worker), Ok(0)))
+            .then_some(())
+        })?;
+        assert_eq!(lock(&heard).len(), 1, "the retry tells nothing again");
         Ok(())
     }
 

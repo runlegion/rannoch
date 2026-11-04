@@ -19,13 +19,13 @@ mod read;
 
 pub use fact::check;
 pub use history::{End, Hearing, Seen, Version, View, millis};
-pub use inbox::{FILL, Place, REFILLED, State};
+pub use inbox::{AMENDED, FILL, Place, REFILLED, State};
 pub use log::{Cursor, Event, Events};
 pub use rannoch_cloudevents::{Date, EventId, NodeRef, ValidTime};
 pub use rannoch_ontology::{
-    Class, Declaration, Ontology, Relation, Roots, Shape, Step, Value, ValueType, Way,
+    Class, Declaration, Ontology, Relation, Roots, Shape, Step, Value, ValueType, Way, has_all,
 };
-pub use read::{Counts, Description, Direction, Node, ViewData};
+pub use read::{ANSWER, Counts, Description, Direction, Node, QUERY, ViewData};
 
 use crate::handles::{Handles, Run};
 use crate::history::{
@@ -716,9 +716,9 @@ fn fill_link(
     Ok(())
 }
 
-/// Whether `body` is an amendment: type `rannoch.amended`.
+/// Whether `body` is an amendment.
 fn amendment(body: &str) -> bool {
-    rannoch_cloudevents::attributes(body).is_ok_and(|event| event.ty == "rannoch.amended")
+    rannoch_cloudevents::attributes(body).is_ok_and(|event| event.ty == AMENDED)
 }
 
 /// Folds `event` when it is an amendment, and puts what it touched into the tables kept for
