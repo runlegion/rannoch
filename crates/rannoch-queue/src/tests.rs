@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rannoch_store::{Class, Declaration, Error, Graph, Relation, open};
 
@@ -9,6 +9,8 @@ use super::{CHUNK, Failure, Queue, State, Ticket, lock};
 
 const KEY: [u8; 32] = [7; 32];
 const HOUR: Duration = Duration::from_secs(3_600);
+/// How long a test waits before it calls itself hung. No test asserts how long anything takes.
+const HUNG: Duration = Duration::from_secs(120);
 
 /// A graph at `path` with class `item`, property `v`.
 fn graph(path: &Path) -> Result<Graph, Error> {
@@ -45,11 +47,16 @@ fn failing_bad(path: &Path, how: &str) -> rusqlite::Result<()> {
     ))
 }
 
-/// Waits for `done`, however long it takes.
-fn wait_for(mut done: impl FnMut() -> bool) {
+/// Waits for `done`, and fails only when the test is hung.
+fn wait_for(mut done: impl FnMut() -> bool) -> Result<(), Box<dyn std::error::Error>> {
+    let hung = Instant::now() + HUNG;
     while !done() {
+        if Instant::now() > hung {
+            return Err("hung".into());
+        }
         std::thread::sleep(Duration::from_millis(2));
     }
+    Ok(())
 }
 
 /// The tickets of `failures`, each an event that failed at commit.
@@ -105,7 +112,7 @@ fn the_heartbeat_commits_and_fills_then_tells_subscribers() -> Result<(), Box<dy
     let into = Arc::clone(&heard);
     queue.subscribe(move |cursor| lock(&into).push(cursor));
     let ticket = queue.accept(item("i1"))?;
-    wait_for(|| !lock(&heard).is_empty());
+    wait_for(|| !lock(&heard).is_empty())?;
     assert!(queue.committed() >= Some(ticket));
     let reader = open(path(&dir), &KEY)?;
     let watermark = lock(&heard)[0];
@@ -268,7 +275,7 @@ fn a_batch_taken_by_a_panicking_heartbeat_is_kept() -> Result<(), Box<dyn std::e
     wait_for(|| {
         taken.extend(queue.take_failures());
         !taken.is_empty()
-    });
+    })?;
     assert!(
         matches!(&taken[..], [Failure::Heartbeat(m)] if m == "the heartbeat panics"),
         "{taken:?}"
@@ -323,7 +330,7 @@ fn a_subscriber_can_take_its_next_event_from_the_queue() -> Result<(), Box<dyn s
         }
     });
     queue.accept(item("i1"))?;
-    wait_for(|| !lock(&taken).is_empty());
+    wait_for(|| !lock(&taken).is_empty())?;
     Ok(())
 }
 
@@ -443,7 +450,7 @@ fn a_heartbeat_with_only_worker_changes_commits_them() -> Result<(), Box<dyn std
     wait_for(|| {
         reader.state("a", last).ok() == Some(State::Done)
             && reader.state("b", other).ok() == Some(State::Done)
-    });
+    })?;
     Ok(())
 }
 
