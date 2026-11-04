@@ -61,3 +61,7 @@ The crate changed on paths a healthy run seldom takes: a failed read or save now
 ## After holding the cursor until a settle succeeds, 2026-11-04, before this rerun
 
 Folding no longer moves the published cursor; a settle that succeeds does. It adds one assignment per fold and per settle, so the expectations above stand: 0 failed and every count as before, with nothing here that can be told from the swing between runs. A healthy run takes the same reads and walks.
+
+## At the head that ships, 388ecf4, 2026-11-04, before this rerun
+
+`raise` asks the view the same question it was passed, and the prefixes are the same strings, so nothing on a measured path changes. Expected: 0 failed and every count as before, with times inside the swing already reported.
