@@ -57,3 +57,7 @@ Expected from #193's evidence: fold plus walk at the median anywhere from about 
 ## After the second simplify gate, 2026-11-04, before this rerun
 
 The crate changed on paths a healthy run seldom takes: a failed read or save now recovers on the relay's own wake. On the path these runs measure, a fact is parsed once instead of twice, and an index key is always the value's wire form. Expected: 0 failed and every count as before. Fold plus walk no higher than the last 3 runs' 0.49 to 0.54 ms at the median, unless the load differs, and the parse saved is too small to tell from the swing between runs. By logname stays about 83 ns, because its values were already serialized. Nothing here is expected to fix or explain that swing.
+
+## After holding the cursor until a settle succeeds, 2026-11-04, before this rerun
+
+Folding no longer moves the published cursor; a settle that succeeds does. It adds one assignment per fold and per settle, so the expectations above stand: 0 failed and every count as before, with nothing here that can be told from the swing between runs. A healthy run takes the same reads and walks.
