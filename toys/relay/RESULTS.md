@@ -28,7 +28,7 @@ Fold plus walk is around the relay's own `fold` and `settle`, compiled in unchan
 | 5 | 0.48 ms | 0.48 ms |
 | 6 | 0.45 ms | 0.51 ms |
 
-Both builds sit near 1.8 ms in some runs and near 0.5 ms in others, and nothing separates them. Six more recorder runs of this head alone at load average about 2 read 1.03 to 1.81 ms, and those pairs at 0.5 ms ran at load average 2.8 to 6.3. So in these runs the slow readings came at the lower load, not the higher, which was not predicted, and the earlier run's fall with load does not hold as a pattern. The two values are not explained: this toy did not measure core placement or frequency.
+Both builds sit near 1.8 ms in some runs and near 0.5 ms in others, and nothing separates them. Six more recorder runs of this head alone, before those pairs, at load average about 2, read 1.03 to 1.81 ms. Load does not separate the two values: slow readings came at load average 1.9 to 4.8 and fast ones at 2.8 to 6.3, so a fall with load seen in one earlier set of runs does not hold as a pattern. The slow readings came in one stretch of about ten minutes across both builds, followed by the fast ones. The two values are not explained: this toy did not measure core placement or frequency.
 
 What was expected before these runs (PREDICTIONS.md, bafe7d7):
 - "0 failed and every count as before": held.
