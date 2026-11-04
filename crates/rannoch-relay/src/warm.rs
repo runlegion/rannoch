@@ -160,7 +160,10 @@ impl Read {
 pub(crate) struct Warm {
     shape: Shape,
     view: View,
+    /// Its cursor moves only when a settle has read what was folded, so it never claims more.
     pub(crate) set: WarmSet,
+    /// The last event folded.
+    folded: Cursor,
     /// The class of root nodes chosen by a filter, whose every node event may change them.
     roots: BTreeSet<Id>,
     /// Every node the walk reached, cut ones too; `None` before its first version in the view.
@@ -217,6 +220,7 @@ impl Warm {
                 known,
                 held: Arc::default(),
             },
+            folded: cursor,
             roots: BTreeSet::new(),
             versions: HashMap::default(),
             adjacent: HashMap::new(),
@@ -326,7 +330,7 @@ impl Warm {
 
     /// Folds one event. An event of nothing this relay holds costs its parse.
     pub(crate) fn fold(&mut self, graph: &Graph, cursor: Cursor, body: &str) {
-        self.set.cursor = cursor;
+        self.folded = cursor;
         if self.stale {
             return;
         }
@@ -597,12 +601,14 @@ impl Warm {
             self.reseed(graph)?;
         }
         if !self.moved {
+            self.set.cursor = self.folded;
             return Ok(None);
         }
         let ontology = graph.current_ontology()?;
         let held = self.walk(graph, &ontology)?;
         let change = self.delta(&held);
         self.set.held = Arc::new(held);
+        self.set.cursor = self.folded;
         self.moved = false;
         self.via.clear();
         self.last_via = None;
@@ -663,7 +669,7 @@ impl Warm {
             return None;
         }
         Some(json!({
-            "cursor": self.set.cursor,
+            "cursor": self.folded,
             "changed": changed,
             "entered": entered,
             "left": left,
