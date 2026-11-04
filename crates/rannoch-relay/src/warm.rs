@@ -308,7 +308,7 @@ impl Warm {
                 let listed = graph.nodes(class, filter, &self.view)?;
                 for (key, version) in listed {
                     let node = Arc::new(NodeRef::new(class.clone(), key));
-                    raise(&mut self.set.known, &version, self.view.known.is_some());
+                    raise(&mut self.set.known, &version, &self.view);
                     self.versions
                         .insert(Arc::clone(&node), Some(Arc::new(version)));
                     self.roots.insert(node);
@@ -402,7 +402,7 @@ impl Warm {
             return Ok(());
         }
         if let Some(version) = &version {
-            raise(&mut self.set.known, version, self.view.known.is_some());
+            raise(&mut self.set.known, version, &self.view);
         }
         self.moved = true;
         match root {
@@ -454,7 +454,7 @@ impl Warm {
         if let Some(version) = version
             && changed
         {
-            raise(&mut self.set.known, &version, self.view.known.is_some());
+            raise(&mut self.set.known, &version, &self.view);
             self.via.insert(from.clone(), version.valid.clone());
             self.via.insert(to.clone(), version.valid.clone());
             self.last_via = Some(version.valid);
@@ -509,7 +509,6 @@ impl Warm {
         visited: &mut HashSet<Id>,
         held: &mut Held,
     ) -> Result<Vec<Id>, Error> {
-        let fixed = self.view.known.is_some();
         let step = &self.shape.steps[index];
         let (name, way) = step.way();
         let relation = ontology
@@ -541,7 +540,7 @@ impl Warm {
                     let mut others = BTreeSet::new();
                     self.reads += 1;
                     for (key, version) in graph.links(node, name, direction, &self.view)? {
-                        raise(&mut self.set.known, &version, fixed);
+                        raise(&mut self.set.known, &version, &self.view);
                         others.insert(Arc::new(NodeRef::new(other.clone(), key)));
                     }
                     ends.insert(Arc::clone(node), others);
@@ -688,8 +687,8 @@ impl Warm {
 }
 
 /// Moves `known` up to `version`'s, unless the view fixed it.
-fn raise(known: &mut Option<i64>, version: &Version, fixed: bool) {
-    if !fixed {
+fn raise(known: &mut Option<i64>, version: &Version, view: &View) {
+    if view.known.is_none() {
         let at = millis(version.known);
         if known.is_none_or(|k| k < at) {
             *known = Some(at);
@@ -711,7 +710,7 @@ fn version_of(
     *reads += 1;
     let version = graph.state_at(node, view)?.map(Arc::new);
     if let Some(version) = &version {
-        raise(known, version, view.known.is_some());
+        raise(known, version, view);
     }
     versions.insert(Arc::clone(node), version.clone());
     Ok(version)

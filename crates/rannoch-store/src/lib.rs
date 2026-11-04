@@ -19,7 +19,7 @@ mod read;
 
 pub use fact::check;
 pub use history::{End, Hearing, Seen, Version, View, millis};
-pub use inbox::{AMENDED, FILL, Place, REFILLED, State};
+pub use inbox::{AMENDED, CLOSED_PREFIX, DECLARED_PREFIX, FILL, Place, REFILLED, State};
 pub use log::{Cursor, Event, Events};
 pub use rannoch_cloudevents::{Date, EventId, NodeRef, ValidTime};
 pub use rannoch_ontology::{
@@ -944,7 +944,7 @@ fn arrived(
                     "specversion": "1.0",
                     "id": id.to_string(),
                     "source": "rannoch",
-                    "type": format!("rannoch.closed.{}", relation.name),
+                    "type": format!("{CLOSED_PREFIX}{}", relation.name),
                     "subject": from_key,
                     "data": {
                         "from": {"class": relation.from, "key": from_key},

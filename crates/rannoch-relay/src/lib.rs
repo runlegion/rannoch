@@ -13,7 +13,10 @@ use std::time::{Duration, Instant};
 
 use rannoch_cloudevents::{Attributes, EventId, attributes};
 use rannoch_queue::Queue;
-use rannoch_store::{ANSWER, Cursor, Declaration, Graph, QUERY, REFILLED, Shape, ViewData, open};
+use rannoch_store::{
+    ANSWER, CLOSED_PREFIX, Cursor, DECLARED_PREFIX, Declaration, Graph, QUERY, REFILLED, Shape,
+    ViewData, open,
+};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
@@ -628,7 +631,10 @@ impl Inner {
             let live = match seeded {
                 Ok(live) => live,
                 Err(error) => {
-                    self.queue.remove_worker(&worker_name(&relay))?;
+                    // The cause is what the asker hears; a cleanup that also fails is told apart.
+                    if let Err(cleanup) = self.queue.remove_worker(&worker_name(&relay)) {
+                        self.failed(cleanup.into());
+                    }
                     return Err(error);
                 }
             };
@@ -689,7 +695,7 @@ fn replay(source: &Graph, into: &mut Graph, until: Cursor) -> Result<(), Error> 
     let declared = |name: &str| {
         json!({
             "specversion": "1.0", "id": format!("declared-{name}"),
-            "source": "rannoch", "type": format!("rannoch.declared.{name}"),
+            "source": "rannoch", "type": format!("{DECLARED_PREFIX}{name}"),
         })
         .to_string()
     };
@@ -714,8 +720,8 @@ fn replay(source: &Graph, into: &mut Graph, until: Cursor) -> Result<(), Error> 
             .map(|event| event.body.as_str())
             .filter(|body| {
                 attributes(body).is_ok_and(|event| {
-                    !event.ty.starts_with("rannoch.declared.")
-                        && !event.ty.starts_with("rannoch.closed.")
+                    !event.ty.starts_with(DECLARED_PREFIX)
+                        && !event.ty.starts_with(CLOSED_PREFIX)
                         && event.ty != REFILLED
                 })
             })
