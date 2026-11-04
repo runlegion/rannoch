@@ -94,6 +94,9 @@ struct Shared {
     /// reported and the batch kept.
     #[cfg(test)]
     panic_beat: std::sync::atomic::AtomicBool,
+    /// How many times the graph has been taken, so a test can count the queue's trips to the store.
+    #[cfg(test)]
+    graph_taken: std::sync::atomic::AtomicUsize,
 }
 
 /// The producer an event came from and the position in its source it reached.
@@ -156,6 +159,8 @@ impl Queue {
             handler: Mutex::new(None),
             #[cfg(test)]
             panic_beat: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            graph_taken: std::sync::atomic::AtomicUsize::new(0),
         });
         let beat = Arc::clone(&shared);
         let heartbeat = std::thread::spawn(move || {
@@ -226,7 +231,7 @@ impl Queue {
     /// # Errors
     /// The graph file cannot be read.
     pub fn position(&self, producer: &str) -> Result<Option<String>, Error> {
-        lock(&self.shared.graph).position(producer)
+        self.shared.graph().position(producer)
     }
 
     /// Hands out to worker `worker` its next committed event after its cursor, at or below the
@@ -254,9 +259,7 @@ impl Queue {
         if from >= watermark {
             return Ok(None);
         }
-        let events = lock(&self.shared.graph)
-            .events()
-            .chunk(from, watermark, CHUNK)?;
+        let events = self.shared.graph().events().chunk(from, watermark, CHUNK)?;
         let mut workers = lock(&self.shared.workers);
         let Some(held) = workers.get_mut(worker) else {
             return Ok(None);
@@ -341,7 +344,7 @@ impl Queue {
             .map(|held| held.state(cursor));
         match known {
             Some(Some(state)) => Ok(state),
-            _ => lock(&self.shared.graph).state(worker, cursor),
+            _ => self.shared.graph().state(worker, cursor),
         }
     }
 
@@ -355,7 +358,7 @@ impl Queue {
             .get(worker)
             .map_or(Cursor::START, Worker::cursor);
         let watermark = lock(&self.shared.state).watermark;
-        lock(&self.shared.graph).events().count(cursor, watermark)
+        self.shared.graph().events().count(cursor, watermark)
     }
 
     /// The slowest worker's cursor, the lowest of them, or `None` with no worker. A producer or a
@@ -389,7 +392,7 @@ impl Queue {
     /// # Errors
     /// The graph file cannot be written.
     pub fn remove_worker(&self, worker: &str) -> Result<(), Error> {
-        let mut graph = lock(&self.shared.graph);
+        let mut graph = self.shared.graph();
         lock(&self.shared.workers).remove(worker);
         graph.remove_worker(worker)
     }
@@ -475,6 +478,14 @@ impl Inbox {
 }
 
 impl Shared {
+    /// The graph, once it is free. Everything the queue does in the store goes through here.
+    fn graph(&self) -> MutexGuard<'_, Graph> {
+        #[cfg(test)]
+        self.graph_taken
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        lock(&self.graph)
+    }
+
     /// Keeps `failure` for the app to take.
     fn failed(&self, failure: Failure) {
         lock(&self.state).failed.push(failure);
@@ -485,7 +496,7 @@ impl Shared {
     /// subscribers. Commits never interleave; a subscriber that calls back into the queue finds
     /// the graph free.
     fn commit(&self) {
-        let mut graph = lock(&self.graph);
+        let mut graph = self.graph();
         let told = self.write(&mut graph);
         self.save(&mut graph);
         drop(graph);

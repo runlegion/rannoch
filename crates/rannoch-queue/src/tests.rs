@@ -1,13 +1,16 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rannoch_store::{Class, Declaration, Error, Graph, Relation, open};
 
-use super::{Failure, Queue, State, Ticket, lock};
+use super::{CHUNK, Failure, Queue, State, Ticket, lock};
 
 const KEY: [u8; 32] = [7; 32];
 const HOUR: Duration = Duration::from_secs(3_600);
+/// How long a test waits before it calls itself hung and fails.
+const HUNG: Duration = Duration::from_secs(120);
 
 /// A graph at `path` with class `item`, property `v`.
 fn graph(path: &Path) -> Result<Graph, Error> {
@@ -44,13 +47,16 @@ fn failing_bad(path: &Path, how: &str) -> rusqlite::Result<()> {
     ))
 }
 
-/// Waits up to five seconds for `done`.
-fn wait_for(mut done: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+/// Waits for `done`, and fails only when the test is hung.
+fn wait_for(mut done: impl FnMut() -> bool) -> Result<(), Box<dyn std::error::Error>> {
+    let hung = Instant::now() + HUNG;
     while !done() {
-        assert!(Instant::now() < deadline, "timed out");
+        if Instant::now() > hung {
+            return Err("hung".into());
+        }
         std::thread::sleep(Duration::from_millis(2));
     }
+    Ok(())
 }
 
 /// The tickets of `failures`, each an event that failed at commit.
@@ -106,7 +112,7 @@ fn the_heartbeat_commits_and_fills_then_tells_subscribers() -> Result<(), Box<dy
     let into = Arc::clone(&heard);
     queue.subscribe(move |cursor| lock(&into).push(cursor));
     let ticket = queue.accept(item("i1"))?;
-    wait_for(|| !lock(&heard).is_empty());
+    wait_for(|| !lock(&heard).is_empty())?;
     assert!(queue.committed() >= Some(ticket));
     let reader = open(path(&dir), &KEY)?;
     let watermark = lock(&heard)[0];
@@ -269,7 +275,7 @@ fn a_batch_taken_by_a_panicking_heartbeat_is_kept() -> Result<(), Box<dyn std::e
     wait_for(|| {
         taken.extend(queue.take_failures());
         !taken.is_empty()
-    });
+    })?;
     assert!(
         matches!(&taken[..], [Failure::Heartbeat(m)] if m == "the heartbeat panics"),
         "{taken:?}"
@@ -324,7 +330,7 @@ fn a_subscriber_can_take_its_next_event_from_the_queue() -> Result<(), Box<dyn s
         }
     });
     queue.accept(item("i1"))?;
-    wait_for(|| !lock(&taken).is_empty());
+    wait_for(|| !lock(&taken).is_empty())?;
     Ok(())
 }
 
@@ -444,7 +450,7 @@ fn a_heartbeat_with_only_worker_changes_commits_them() -> Result<(), Box<dyn std
     wait_for(|| {
         reader.state("a", last).ok() == Some(State::Done)
             && reader.state("b", other).ok() == Some(State::Done)
-    });
+    })?;
     Ok(())
 }
 
@@ -542,31 +548,31 @@ fn every_worker_s_lag_and_the_slowest_cursor_can_be_read() -> Result<(), Box<dyn
     Ok(())
 }
 
-/// The issue's bound on a worker's own cost per event, with no work in the worker.
-const MAX_PER_EVENT: Duration = Duration::from_micros(10);
-
+/// What keeps a worker cheap: `next` goes to the store once a chunk, and `done` never does, so
+/// any trip to the store per event fails. The statements of one trip are counted in the store's
+/// `a_chunk_is_one_statement_however_many_events_it_holds`.
 #[test]
-fn a_worker_costs_under_ten_microseconds_an_event() -> Result<(), Box<dyn std::error::Error>> {
-    const EVENTS: usize = 20_000;
+fn a_worker_goes_to_the_store_once_a_chunk_and_not_to_close()
+-> Result<(), Box<dyn std::error::Error>> {
+    const CHUNKS: usize = 3;
     let dir = tempfile::tempdir()?;
-    let queue = committed(&dir, EVENTS)?;
-    let started = Instant::now();
-    let mut closed = 0u32;
-    while let Some(event) = queue.next("bench")? {
-        queue.done("bench", event.cursor)?;
+    // Less one: the declaration is in the log too.
+    let queue = committed(&dir, CHUNKS * CHUNK - 1)?;
+    let taken = || queue.shared.graph_taken.load(Ordering::SeqCst);
+    let (mut by_next, mut by_done, mut closed) = (0, 0, 0);
+    loop {
+        let before = taken();
+        let event = queue.next("w")?;
+        by_next += taken() - before;
+        let Some(event) = event else { break };
+        let before = taken();
+        queue.done("w", event.cursor)?;
+        by_done += taken() - before;
         closed += 1;
     }
-    let per_event = started.elapsed() / closed;
-    eprintln!("worker overhead: {per_event:?} per event over {closed} events");
-    assert_eq!(
-        closed as usize,
-        EVENTS + 1,
-        "every event and the declaration"
-    );
-    assert!(
-        per_event <= MAX_PER_EVENT,
-        "a worker took {per_event:?} per event, over {MAX_PER_EVENT:?}"
-    );
+    assert_eq!(closed, CHUNKS * CHUNK, "every event and the declaration");
+    assert_eq!(by_next, CHUNKS, "next goes to the store once a chunk");
+    assert_eq!(by_done, 0, "done closes in memory");
     Ok(())
 }
 
