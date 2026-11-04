@@ -53,3 +53,7 @@ Kessel's "at the old known-at" is now read from the ack's `known` for the first 
 The operator's decisions on #193 change how two measures are treated, and no number here. Applying an event, the fold plus the walk, is reported at the median and p99 and not judged. Kessel's "under 2 ms in-process" is reported and not judged, and the results say that this prediction did not hold; its count of 216 stays a check. The toy prints both as REPORT lines, so neither can fail a run.
 
 Expected from #193's evidence: fold plus walk at the median anywhere from about 0.55 to 2.4 ms, split by run; the in-process read over 2 ms on about half of runs; every other line passes with 0 differences.
+
+## After the second simplify gate, 2026-11-04, before this rerun
+
+The crate changed on paths a healthy run seldom takes: a failed read or save now recovers on the relay's own wake. On the path these runs measure, a fact is parsed once instead of twice, and an index key is always the value's wire form. Expected: 0 failed and every count as before. Fold plus walk no higher than the last 3 runs' 0.49 to 0.54 ms at the median, unless the load differs, and the parse saved is too small to tell from the swing between runs. By logname stays about 83 ns, because its values were already serialized. Nothing here is expected to fix or explain that swing.
