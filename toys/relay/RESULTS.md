@@ -1,25 +1,25 @@
 # Results
 
-The latest runs: 3 on 2026-11-04 from 04:15 UTC, on `feat/151-relay` at 388ecf4, the head that ships (the toy at bafe7d7), release build, default 20 ms heartbeat, graphs on the internal disk, with other agents on the machine: load average 3.0, 2.2 and 2.0 at the start of runs 1, 2 and 3. `./target/release/relay-toy ~/swtor/data/spice-7.9.a-v7.sqlite ~/swtor/data/spice-7.8.1.c-v26.sqlite`. Their output is `results-run1.txt` to `results-run3.txt`. **Every judged line passes in all 3, 0 failed and exit 0.** Two measures are reported and not judged, by the operator's call on #193.
+The latest runs: 3 on 2026-11-04 from 07:36 UTC, on `feat/151-relay` at f1fd2df, the head that ships (the toy at 9759a69), release build, default 20 ms heartbeat, graphs on the internal disk, with other agents on the machine: load average 4.1, 2.8 and 11.8 at the start of runs 1, 2 and 3. `./target/release/relay-toy ~/swtor/data/spice-7.9.a-v7.sqlite ~/swtor/data/spice-7.8.1.c-v26.sqlite`. Their output is `results-run1.txt` to `results-run3.txt`. **Every judged line passes in all 3, 0 failed and exit 0.** Two measures are reported and not judged, by the operator's call on #193.
 
 ## The round trip and the two reported measures
 
 | Measure | Run 1 | Run 2 | Run 3 |
 |---|---|---|---|
-| Round trip, median under 40 ms (judged) | 28.2 ms | 27.0 ms | 28.2 ms |
-| Its p95, stated | 49.2 ms | 48.4 ms | 49.3 ms |
-| Its p99, stated (over 50 trips, so the slowest two) | 83.2 ms | 67.2 ms | 72.3 ms |
-| Applying an event: fold plus walk, median (reported) | 1.73 ms | 1.70 ms | 1.79 ms |
-| Its p99 (reported) | 2.81 ms | 2.58 ms | 2.73 ms |
-| Kessel's in-process read of 216 links, one reading a run (reported) | 1.88 ms | 3.03 ms | 3.11 ms |
+| Round trip, median under 40 ms (judged) | 28.2 ms | 28.3 ms | 27.2 ms |
+| Its p95, stated | 49.3 ms | 54.3 ms | 49.3 ms |
+| Its p99, stated (over 50 trips, so the slowest two) | 74.5 ms | 68.0 ms | 84.3 ms |
+| Applying an event: fold plus walk, median (reported) | 1.69 ms | 1.49 ms | 1.75 ms |
+| Its p99 (reported) | 3.09 ms | 2.94 ms | 2.49 ms |
+| Kessel's in-process read of 216 links, one reading a run (reported) | 2.28 ms | 0.91 ms | 2.43 ms |
 
-**Kessel's "under 2 ms in-process" did not hold.** Runs 2 and 3 read about 3 ms, and #193's full runs on the same data met it in 6 of 9 before the first simplify and 8 of 17 after it. It is one reading a run, and the cause of the swing is not known.
+**Kessel's "under 2 ms in-process" did not hold.** Runs 1 and 3 read over 2 ms, and #193's full runs on the same data met it in 6 of 9 before the first simplify and 8 of 17 after it. It is one reading a run, and the cause of the swing is not known.
 
 Kessel's "round trip under 40 ms", as written, does not hold at its tail; the operator judges it at the median because the heartbeat alone waits up to 20 ms.
 
-Fold plus walk is around the relay's own `fold` and `settle`, compiled in unchanged, on one read handle, one link per commit. These 3 runs are high in the range #193 recorded after the first simplify (0.55 to 2.38 ms at the median over 16 runs). The head did not cause it. Alternating the previous head's build (e72d7c7, at f78d487) with this one, recorder section only, load average 2.5 to 6.3:
+Fold plus walk is around the relay's own `fold` and `settle`, compiled in unchanged, on one read handle, one link per commit. These 3 runs are in the upper part of the range #193 recorded after the first simplify (0.55 to 2.38 ms at the median over 16 runs). An earlier head did not cause that either. Alternating e72d7c7's build (the toy at f78d487) with 388ecf4's, recorder section only, load average 2.5 to 6.3, and not repeated at f1fd2df:
 
-| Pair | Previous head, p50 | This head, p50 |
+| Pair | e72d7c7, p50 | 388ecf4, p50 |
 |---|---|---|
 | 1 | 1.94 ms | 1.72 ms |
 | 2 | 1.81 ms | 0.54 ms |
@@ -28,23 +28,23 @@ Fold plus walk is around the relay's own `fold` and `settle`, compiled in unchan
 | 5 | 0.48 ms | 0.48 ms |
 | 6 | 0.45 ms | 0.51 ms |
 
-Both builds sit near 1.8 ms in some runs and near 0.5 ms in others, and nothing separates them. Six more recorder runs of this head alone, before those pairs, at load average about 2, read 1.03 to 1.81 ms. Load does not separate the two values: slow readings came at load average 1.9 to 4.8 and fast ones at 2.8 to 6.3, so a fall with load seen in one earlier set of runs does not hold as a pattern. The slow readings came in one stretch of about ten minutes across both builds, followed by the fast ones. The two values are not explained: this toy did not measure core placement or frequency.
+Both builds sit near 1.8 ms in some runs and near 0.5 ms in others, and nothing separates them. Six more recorder runs of 388ecf4 alone, before those pairs, at load average about 2, read 1.03 to 1.81 ms. Load does not separate the two values: slow readings came at load average 1.9 to 4.8 and fast ones at 2.8 to 6.3, so a fall with load seen in one earlier set of runs does not hold as a pattern. The slow readings came in one stretch of about ten minutes across both builds, followed by the fast ones. The two values are not explained: this toy did not measure core placement or frequency.
 
-What was expected before these runs (PREDICTIONS.md, bafe7d7):
+What was expected before these runs (PREDICTIONS.md, 9759a69):
 - "0 failed and every count as before": held.
-- "Times inside the swing already reported": held, at the high end for fold plus walk. An in-process read of about 3 ms is above the toy's own earlier readings, and no number was reported for #193's misses to compare it with.
+- "Times inside the swing already reported": held for fold plus walk at the median. Its p99 of 3.09 ms is a little over the 2.81 ms these pages had reported since the first simplify.
 - The first simplify's "rise by 10 to 30%, to about 0.55 to 0.65 ms" did not show on its own build (0.49 to 0.54 ms at bf016b8), and #193's alternating A/B found that build not slower.
 - Kessel's "at the old known-at", read from the ack's `known` and from the newest known-at a report holds: holds in all 3.
 
 The failure paths the later simplify gates changed (a failed read or save, and the cursor held while reads fail) are not taken by these runs. Workspace tests cover them.
 
-The other judged lines in these runs: seed 44 to 45 ms through the inbox, up from 20 to 29 ms before the inbox was on the path; read() p50 41 ns, p99 42 ns; by logname p50 83 to 84 ns, p99 125 to 166 ns; line to overlay p50 19 to 20 ms, p99 24 to 25 ms, max 39 to 55 ms; rebuild with the file gone 20 to 21 ms; the report's reread 1.31 to 1.35 s; the hub's memory up 1.3 to 1.6 MB, file 423 KB.
+The other judged lines in these runs: seed 44 to 46 ms through the inbox, up from 20 to 29 ms before the inbox was on the path; read() p50 41 ns, p99 42 ns; by logname p50 83 ns, p99 125 to 167 ns; line to overlay p50 19 to 20 ms, p99 26 to 32 ms, max 57 to 60 ms; rebuild with the file gone 20 to 21 ms; the report's reread 1.33 to 1.97 s; the hub's memory up 1.3 to 1.6 MB, file 423 KB.
 
 `src/bin/walks` was moved to the simplified API and builds, and was not rerun, so WALKS-RESULTS.md is the build it names. Its comparison with "under 1 ms" predates #193.
 
 ## How this page is dated
 
-The numbers from here to the end of this page come from the earlier runs of 2026-11-02 and 2026-11-03, before the simplify and before #193. The predictions were committed before any run, at 22:48 on 2026-11-02 (commit ca68d86, the same author date as 08766e5). A later rebase onto the feature branch put them after 969e62b, a fix the first run prompted, so this branch's order alone does not show it: read the author date. Later expectations were each committed before their rerun: 42b6e35, f382a54, 3e0526d, a163d18, 2bf6c22 and bafe7d7.
+The numbers from here to the end of this page come from the earlier runs of 2026-11-02 and 2026-11-03, before the simplify and before #193. The predictions were committed before any run, at 22:48 on 2026-11-02 (commit ca68d86, the same author date as 08766e5). A later rebase onto the feature branch put them after 969e62b, a fix the first run prompted, so this branch's order alone does not show it: read the author date. Later expectations were each committed before their rerun: 42b6e35, f382a54, 3e0526d, a163d18, 2bf6c22, bafe7d7 and 9759a69.
 
 ## The importer's
 
