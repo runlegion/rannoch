@@ -196,7 +196,7 @@ assert_eq!(ask(&queue, "colleagues", &json!({}))?, relay);
 
 Close the relays before the queue. `Relays::open` brings back every relay in `relays.json`, under the same id and holders. Keep the id, or ask again: the same shape and view find the same relay.
 
-**After a purge** a relay holds nothing of what left, in memory or in its file:
+**After a purge** a relay holds nothing of what left, in memory or in its file, from the moment its `read` set's `cursor()` reaches the purge event's cursor. `Queue::purge` returns before that: wait for the cursor when it matters.
 
 - When its worker is handed the rule event, in the pump the purge wakes (`Queue::purge` tells the relays), the relay drops everything it holds and removes its file before it reads anything. It then reads the graph again and saves at once, not when a save next falls due. A read that fails, or a save that fails, leaves no file, and an empty set until a read succeeds. The change it tells has no value from before: what stays is told as entered.
 - A purge made while no relays run, or through another handle: `Relays::open` finds the rule event after a file's cursor, removes the file and seeds again before it returns. Purge through another handle while relays run is told only at the queue's next commit, so use `Queue::purge`.

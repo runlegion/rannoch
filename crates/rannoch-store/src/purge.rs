@@ -1311,19 +1311,33 @@ mod tests {
         let mut origin = store(&dir, "origin")?;
         let purge = origin.purge(&Target::Node(node("book", "b1")), "r", "app")?;
         let mut replica = store(&dir, "replica")?;
-        // Both reach the log in one batch, before the rule stands: fill takes it back out.
-        let late = book("b1", "late");
+        // In one batch: the rule stands from where it lands in the batch.
+        let late = book("b1", "a-late-title");
         let kept = book("b2", "kept");
         replica.commit(&[&purge.body, &late, &kept], &[])?;
+        assert!(
+            !holds(&file_bytes(&dir, "replica")?, b"a-late-title"),
+            "no byte of it reaches the file or its log"
+        );
         replica.fill()?;
         assert_eq!(title(&replica, "book", "b1")?, None);
         assert_eq!(title(&replica, "book", "b2")?, Some("kept".into()));
         assert!(
             logged(&replica)?
                 .iter()
-                .all(|body| !body.contains("\"late\""))
+                .all(|body| !body.contains("a-late-title"))
         );
         assert!(replica.commit(&[&book("b1", "later")], &[])?[0].is_err());
+        // Ahead of the rule in a log not yet filled: fill never stores it, and takes it out.
+        let mut unfilled = store(&dir, "unfilled")?;
+        unfilled.commit(&[&book("b1", "ahead-of-rule"), &purge.body], &[])?;
+        unfilled.fill()?;
+        assert_eq!(title(&unfilled, "book", "b1")?, None);
+        assert!(
+            logged(&unfilled)?
+                .iter()
+                .all(|body| !body.contains("ahead-of-rule"))
+        );
         // A rule event says what stands and removes nothing another store already holds.
         let mut holder = store(&dir, "holder")?;
         land(&mut holder, &[&book("b1", "held")])?;

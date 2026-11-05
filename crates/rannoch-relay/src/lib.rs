@@ -366,7 +366,7 @@ fn replace(path: &Path, bytes: &[u8]) -> Result<(), Error> {
 /// Removes relay `id`'s file and the temporary a save writes before it replaces the file.
 fn remove_files(dir: &Path, id: &str) -> Result<(), Error> {
     let file = relay_file(dir, id);
-    for path in [file.with_extension("tmp"), file] {
+    for path in [file.clone(), file.with_extension("tmp")] {
         match fs::remove_file(path) {
             Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
                 return Err(error.into());
@@ -595,8 +595,10 @@ impl Inner {
             live.unsaved.push(event.cursor);
             // The file goes before anything is read again, so a failed read or save leaves none
             // holding what left. A relay with no file only reseeds.
-            if live.warm.purged {
-                remove_files(&self.dir, &live.entry.id)?;
+            if live.warm.purged
+                && let Err(error) = remove_files(&self.dir, &live.entry.id)
+            {
+                self.failed(error);
             }
         }
         // Costs nothing with nothing folded, and a relay that failed to read tries again here.
@@ -1049,6 +1051,53 @@ mod tests {
             .then_some(())
         })?;
         assert_eq!(lock(&heard).len(), 1, "the retry tells nothing again");
+        Ok(())
+    }
+
+    fn k() -> rannoch_store::Target {
+        rannoch_store::Target::Node(NodeRef::new("a", "k"))
+    }
+
+    #[test]
+    fn a_read_that_fails_after_a_purge_leaves_no_file_and_an_empty_set() -> Result {
+        let dir = tempfile::tempdir()?;
+        let (queue, relays, id) = relay(&dir)?;
+        let file = relay_file(&relays.inner.dir, &id);
+        until(|| file.exists().then_some(()))?;
+        let real = break_reads(&dir, &relays, &id)?;
+        queue.purge(&k(), "r", "app")?;
+        failures_of(&relays)?;
+        // Taking the state waits out the pump that failed.
+        drop(lock(&relays.inner.state));
+        assert!(!file.exists(), "the file went before anything was read");
+        assert!(!holds(&relays, &id, "v"), "and the set holds nothing");
+        lock(&relays.inner.state).graph = real;
+        until(|| file.exists().then_some(()))?;
+        assert!(!fs::read_to_string(&file)?.contains("\"v\""));
+        Ok(())
+    }
+
+    #[test]
+    fn a_save_that_fails_after_a_purge_leaves_no_file() -> Result {
+        let dir = tempfile::tempdir()?;
+        let (queue, relays, id) = relay(&dir)?;
+        let file = relay_file(&relays.inner.dir, &id);
+        until(|| file.exists().then_some(()))?;
+        // A directory where the save writes its temporary file: the save fails, and only the save.
+        let blocker = file.with_extension("tmp");
+        fs::create_dir(&blocker)?;
+        let at = queue.purge(&k(), "r", "app")?.cursor;
+        until(|| {
+            relays
+                .read(&id)
+                .filter(|set| set.cursor() >= at)
+                .map(|_| ())
+        })?;
+        assert!(!file.exists());
+        assert!(!holds(&relays, &id, "v"));
+        fs::remove_dir(&blocker)?;
+        until(|| file.exists().then_some(()))?;
+        assert!(!fs::read_to_string(&file)?.contains("\"v\""));
         Ok(())
     }
 

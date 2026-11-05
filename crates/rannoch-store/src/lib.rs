@@ -258,7 +258,7 @@ impl Graph {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let rules: bool = tx.with(Sql::AnyRule, |s| s.query_row([], |row| row.get(0)))?;
+        let mut rules: bool = tx.with(Sql::AnyRule, |s| s.query_row([], |row| row.get(0)))?;
         let mut results = Vec::with_capacity(bodies.len());
         // Each producer's position as of its last body that landed, and whether one has failed.
         let mut reached: BTreeMap<&str, (Option<&str>, bool)> = BTreeMap::new();
@@ -286,6 +286,9 @@ impl Graph {
             tx.execute_batch(SAVEPOINT)?;
             let landed = append(&tx, body);
             tx.execute_batch(if landed.is_ok() { RELEASE } else { ROLLBACK_TO })?;
+            // A rule that lands here stands for the rest of the batch. One that cannot be read
+            // fails when fill reaches it.
+            rules |= landed.is_ok() && purge::heard_rule(&*tx, body).unwrap_or(false);
             if let Some(((held, stopped), _, position)) = producer {
                 if landed.is_ok() {
                     *held = Some(position);
