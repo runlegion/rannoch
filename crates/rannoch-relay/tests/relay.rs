@@ -1013,14 +1013,27 @@ fn holds(bytes: &[u8], text: &str) -> bool {
         .any(|window| window == text.as_bytes())
 }
 
-fn q1() -> rannoch_store::Target {
-    rannoch_store::Target::Node(NodeRef::new("quest", "q1"))
+/// The `rannoch.purge` event asking to purge the quest `q1`.
+fn purge_q1() -> String {
+    json!({"specversion": "1.0", "id": EventId::now().to_string(), "source": "rannoch:app",
+           "type": "rannoch.purge",
+           "data": {"target": {"kind": "node", "class": "quest", "key": "q1"},
+                    "rule": "erasure", "source": "app"}})
+    .to_string()
+}
+
+/// Asks `queue` for the purge of `q1` and commits it.
+fn purge_through(queue: &Queue) -> Result {
+    queue.accept(purge_q1())?;
+    let (_, failures) = queue.flush();
+    assert!(failures.is_empty(), "{failures:?}");
+    Ok(())
 }
 
 #[test]
 fn a_purge_through_the_queue_empties_a_relays_memory_and_its_file() -> Result {
     let (world, id, file) = purge_world()?;
-    world.queue.purge(&q1(), "erasure", "app")?;
+    purge_through(&world.queue)?;
     let set = world.settled(&id)?;
     assert_eq!(warm(&set), world.cold("chain", &View::default())?);
     // Saved at once, not when a save next falls due, and everything folded closes.
@@ -1053,7 +1066,7 @@ fn a_file_from_before_a_purge_is_gone_before_relays_open_returns() -> Result {
     // The purge lands while no relay runs, so nothing has told this relay's file of it.
     let world = world.restart_after(|_| {
         assert!(holds(&std::fs::read(&held)?, "a-purged-title"));
-        open(&path, &KEY)?.purge(&q1(), "erasure", "app")?;
+        open(&path, &KEY)?.commit(&[&purge_q1()], &[])?.remove(0)?;
         Ok(())
     })?;
     assert!(!holds(&std::fs::read(&file)?, "a-purged-title"));
@@ -1067,7 +1080,7 @@ fn a_reports_reread_after_a_purge_answers_without_what_left() -> Result {
     let (world, id, _) = purge_world()?;
     let report = world.relays.report(&id)?;
     let _ = world.queue.flush();
-    world.queue.purge(&q1(), "erasure", "app")?;
+    purge_through(&world.queue)?;
     let frozen = world.relays.reread(&report)?;
     assert_eq!(warm(&frozen), world.cold("chain", &View::default())?);
     let later = world.relays.report(&id)?;
