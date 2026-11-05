@@ -20,6 +20,7 @@ phase seed $A seed $D $N || exit 0
 phase feed $A feed $D runs/ak-script.jsonl || exit 0
 $A tries $D > runs/aktries-$(printf '%05d' $SNAP).txt
 echo "CHECK:"; $A check $D runs/ak-oracle.json runs/ak-script.jsonl
+SNAP=$((SNAP+1)); $A tries $D > runs/aktries-$(printf '%05d' $SNAP).txt
 python3 - <<'PY'
 import glob
 prev={}; down=over=0; snaps=sorted(glob.glob("runs/aktries-*.txt"))

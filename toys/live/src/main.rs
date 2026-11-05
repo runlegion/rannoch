@@ -98,6 +98,10 @@ fn main() {
                 let Some(event) = queue.next("w").expect("next") else { break };
                 let b = Instant::now();
                 queue.done("w", event.cursor).expect("done");
+                // A worker does work: without it a run ends before a kill can land.
+                if n % 50 == 0 {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
                 t_next += b - a;
                 t_done += b.elapsed();
                 n += 1;
