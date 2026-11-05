@@ -17,11 +17,11 @@ mod queries;
 mod read;
 
 pub use fact::check;
-pub use history::{At, End, Hearing, Seen, Version};
+pub use history::{End, Hearing, Seen, Version, View};
 pub use inbox::{FILL, State};
 pub use log::{Cursor, Event, Events};
 pub use rannoch_cloudevents::{Date, EventId, NodeRef, ValidTime};
-pub use rannoch_ontology::{Class, Declaration, HistoryKey, Ontology, Relation, Value, ValueType};
+pub use rannoch_ontology::{Class, Declaration, Ontology, Relation, Value, ValueType};
 pub use read::Node;
 
 use crate::history::{
@@ -541,7 +541,7 @@ fn fill_one(
         }
         fact::Fact::Link(link) => fill_link(tx, (ontology, store_key), stamp, &link, *renames)?,
         fact::Fact::Concluded(conclusion) => {
-            conclude(tx, &conclusion, *renames)?;
+            conclude(tx, ontology, &conclusion, *renames)?;
         }
         fact::Fact::None => {
             if amended(tx, ontology, store_key, event)? {
@@ -850,11 +850,11 @@ mod tests {
         link_with(&id(), from, to)
     }
 
-    /// The link from `from` to `to` ended at `at` milliseconds (`kind` `ended`), or was found
-    /// wrong (`kind` `corrected`).
-    fn concluded(id: &str, kind: &str, from: &str, to: &str, at: i64) -> String {
+    /// The link from `from` to `to` ended (`kind` `ended`), at its known-at on the undeclared
+    /// axis, or was found wrong (`kind` `corrected`).
+    fn concluded(id: &str, kind: &str, from: &str, to: &str) -> String {
         format!(
-            r#"{{"specversion":"1.0","id":"{id}","source":"rannoch:shop","type":"rannoch.{kind}.wrote","subject":"{from}","data":{{"from":{{"class":"author","key":"{from}"}},"to":{{"class":"book","key":"{to}"}},"at":{at},"valid":"unknown"}}}}"#
+            r#"{{"specversion":"1.0","id":"{id}","source":"rannoch:shop","type":"rannoch.{kind}.wrote","subject":"{from}","data":{{"from":{{"class":"author","key":"{from}"}},"to":{{"class":"book","key":"{to}"}}}}}}"#
         )
     }
 
@@ -933,13 +933,13 @@ mod tests {
             ],
             &[],
         )?;
-        g.commit(&[&concluded(&id(), "ended", "a1", "b1", i64::MAX / 2)], &[])?;
+        g.commit(&[&concluded(&id(), "ended", "a1", "b1")], &[])?;
         g.fill()?;
         assert!(matches!(
             g.link_end("wrote", "a1", "b1")?,
             Some(crate::End::Ended { .. })
         ));
-        g.commit(&[&concluded(&id(), "corrected", "a1", "b1", 0)], &[])?;
+        g.commit(&[&concluded(&id(), "corrected", "a1", "b1")], &[])?;
         g.fill()?;
         assert!(matches!(
             g.link_end("wrote", "a1", "b1")?,
@@ -981,7 +981,7 @@ mod tests {
             node_with(&id_at(1_500), "book", "b1", "one"),
             node_with(&id_at(3_000), "book", "b1", "two"),
             link_with(&id_at(500), "a1", "b1"),
-            concluded(&id_at(4_000), "ended", "a1", "b1", 2_000_000),
+            concluded(&id_at(4_000), "ended", "a1", "b1"),
         ];
         let answers = |name: &str, order: &[&String]| -> Result<_, Box<dyn std::error::Error>> {
             let mut g = graph(name)?;
@@ -991,14 +991,17 @@ mod tests {
             }
             let b1 = crate::NodeRef::new("book", "b1");
             let now = g.find("book", "b1")?.ok_or("b1 was heard")?;
-            let at = crate::At::Time(std::time::UNIX_EPOCH + std::time::Duration::from_secs(2_000));
+            let at = crate::View {
+                axis: Some(vec![2_000_000]),
+                known: None,
+            };
             let seen = g.seen(&b1)?.ok_or("b1 was heard")?;
             let link = g
                 .link_seen("wrote", "a1", "b1")?
                 .ok_or("the link was heard")?;
             Ok((
                 (now.properties, now.source, now.valid),
-                g.state_at(&b1, at)?,
+                g.state_at(&b1, &at)?,
                 (
                     seen.first_heard,
                     seen.last_heard,
@@ -1156,8 +1159,11 @@ mod tests {
         Ok(g.commit(&[body], &[])?.remove(0)?)
     }
 
-    fn known_at(seconds: u64) -> crate::At {
-        crate::At::Time(std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds))
+    fn known_at(seconds: u64) -> crate::View {
+        crate::View {
+            axis: None,
+            known: Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds)),
+        }
     }
 
     fn title_known(
@@ -1166,7 +1172,7 @@ mod tests {
         seconds: u64,
     ) -> Result<Option<crate::Value>, crate::Error> {
         let day = crate::Date::day(2024, 1, 1);
-        Ok(g.find_as_of("book", key, &day, Some(known_at(seconds)))?
+        Ok(g.find_as_of("book", key, &day, &known_at(seconds))?
             .and_then(|node| node.properties.get("title").cloned()))
     }
 
@@ -1359,7 +1365,7 @@ mod tests {
         to: &str,
         seconds: u64,
     ) -> Result<Option<crate::Version>, crate::Error> {
-        g.link_known_at("wrote", "a1", to, known_at(seconds))
+        g.link_state_at("wrote", "a1", to, &known_at(seconds))
     }
 
     #[test]
@@ -1433,10 +1439,7 @@ mod tests {
     fn an_ended_link_stays_ended_after_its_end_is_renamed() -> Result<(), Box<dyn std::error::Error>>
     {
         let (mut g, b1, _) = wrote_b1("rename-ended")?;
-        logged(
-            &mut g,
-            &concluded(&id_at(1_500), "ended", "a1", "b1", 1_500_000),
-        )?;
+        logged(&mut g, &concluded(&id_at(1_500), "ended", "a1", "b1"))?;
         g.commit(&[&amended(2_000, b1.id, r#"{"subject":"b9"}"#)], &[])?;
         g.fill()?;
         assert!(g.link_end("wrote", "a1", "b9")?.is_some(), "ended, new key");
@@ -1452,10 +1455,7 @@ mod tests {
         let (mut g, b1, _) = wrote_b1("rename-then-end")?;
         g.commit(&[&amended(2_000, b1.id, r#"{"subject":"b9"}"#)], &[])?;
         g.fill()?;
-        logged(
-            &mut g,
-            &concluded(&id_at(3_000), "ended", "a1", "b1", 3_000_000),
-        )?;
+        logged(&mut g, &concluded(&id_at(3_000), "ended", "a1", "b1"))?;
         g.fill()?;
         assert!(g.link_end("wrote", "a1", "b9")?.is_some());
         let now = known_link(&g, "b9", 3_500)?.ok_or("known at 3,500")?;
@@ -1468,43 +1468,30 @@ mod tests {
     }
 
     #[test]
-    fn an_amendment_before_the_events_own_time_is_refused() -> Result<(), Box<dyn std::error::Error>>
-    {
+    fn an_amendment_known_before_its_event_is_refused() -> Result<(), Box<dyn std::error::Error>> {
         let mut g = graph("own-time")?;
-        g.declare(
-            &Declaration::Class(Class {
-                history: crate::HistoryKey::Time,
-                ..Class::new("entry", ["title"])
-            }),
-            r#"{"specversion":"1.0","id":"d-entry","source":"rannoch:shop","type":"rannoch.declared.entry"}"#,
-        )?;
         g.set_try_limit(1)?;
-        let e1 = logged(
-            &mut g,
-            &format!(
-                r#"{{"specversion":"1.0","id":"{}","source":"rannoch:shop","type":"rannoch.node.entry","subject":"e1","data":{{"properties":{{"title":"one"}},"valid":"unknown","time":5000000}}}}"#,
-                id_at(1_000)
-            ),
-        )?;
+        let b1 = logged(&mut g, &book_at(1_000, "b1", "one"))?;
         let early = logged(
             &mut g,
-            &amended(2_000, e1.id, r#"{"data":{"properties":{"title":"early"}}}"#),
+            &amended(500, b1.id, r#"{"data":{"properties":{"title":"early"}}}"#),
         )?;
         logged(
             &mut g,
-            &amended(6_000, e1.id, r#"{"data":{"properties":{"title":"late"}}}"#),
+            &amended(2_000, b1.id, r#"{"data":{"properties":{"title":"late"}}}"#),
         )?;
         g.fill()?;
         let stopped: Vec<crate::Cursor> = g.stopped()?.into_iter().map(|(at, _)| at).collect();
         assert_eq!(
             stopped,
             [early.cursor],
-            "the one before the event's time is refused"
+            "the one known before the event is refused"
         );
-        let title = g
-            .find("entry", "e1")?
-            .and_then(|node| node.properties.get("title").cloned());
-        assert_eq!(title, Some("late".into()), "the one after it lands");
+        assert_eq!(
+            title(&g, "b1")?,
+            Some("late".into()),
+            "the one after it lands"
+        );
         Ok(())
     }
 
@@ -1520,7 +1507,7 @@ mod tests {
         assert!(g.link_seen("wrote", "a2", "b9")?.is_some());
         assert!(g.link_seen("wrote", "a2", "b1")?.is_none());
         assert!(
-            g.link_known_at("wrote", "a2", "b9", known_at(2_500))?
+            g.link_state_at("wrote", "a2", "b9", &known_at(2_500))?
                 .is_none(),
             "not known before it arrived"
         );
@@ -2025,10 +2012,7 @@ mod tests {
         logged(&mut g, &amended(2_000, b1.id, r#"{"subject":"b9"}"#))?;
         logged(&mut g, &book_at(3_000, "b1", "later"))?;
         logged(&mut g, &link_with(&id_at(3_000), "a2", "b1"))?;
-        logged(
-            &mut g,
-            &concluded(&id_at(3_000), "ended", "a1", "b1", 3_000_000),
-        )?;
+        logged(&mut g, &concluded(&id_at(3_000), "ended", "a1", "b1"))?;
         let high = g.events().committed()?;
         let from = crate::inbox::place(&g.conn, crate::FILL)?;
         assert_eq!(
@@ -2098,10 +2082,7 @@ mod tests {
         logged(&mut g, &node_with(&id_at(1_000), "author", "a1", "ann"))?;
         logged(&mut g, &book_at(1_000, "b1", "hi"))?;
         logged(&mut g, &link_with(&id_at(1_000), "a1", "b1"))?;
-        logged(
-            &mut g,
-            &concluded(&id_at(3_000), "ended", "a1", "b1", 3_000_000),
-        )?;
+        logged(&mut g, &concluded(&id_at(3_000), "ended", "a1", "b1"))?;
         let ran = statements(&mut g, crate::Graph::fill)?;
         let looked: Vec<&String> = ran
             .iter()
@@ -2112,6 +2093,315 @@ mod tests {
             g.link_end("wrote", "a1", "b1")?.is_some(),
             "the ending filled"
         );
+        Ok(())
+    }
+
+    /// A graph whose class `release` declares the axis (build), `run` declares (build, step),
+    /// and `book` declares none; the relation `ships` from run to release declares (build).
+    fn graph_on_axes(name: &str) -> Result<crate::Graph, crate::Error> {
+        let mut g = open(temp(name), &KEY)?;
+        let declared = |name: &str| {
+            format!(
+                r#"{{"specversion":"1.0","id":"d-{name}","source":"rannoch:shop","type":"rannoch.declared.{name}"}}"#
+            )
+        };
+        let axis = |parts: &[&str]| parts.iter().map(ToString::to_string).collect();
+        for (class, parts) in [
+            ("release", &["build"][..]),
+            ("run", &["build", "step"][..]),
+            ("book", &[][..]),
+        ] {
+            g.declare(
+                &Declaration::Class(Class {
+                    axis: axis(parts),
+                    ..Class::new(class, ["title"])
+                }),
+                &declared(class),
+            )?;
+        }
+        g.declare(
+            &Declaration::Relation(Relation {
+                axis: axis(&["build"]),
+                ..Relation::new("ships", "run", "release", false)
+            }),
+            &declared("ships"),
+        )?;
+        Ok(g)
+    }
+
+    /// A node of `class` keyed `key` known at `seconds`, at the point `axis` (JSON, or empty
+    /// for none), titled `title`, with no valid time.
+    fn on_axis(seconds: u64, class: &str, key: &str, axis: &str, title: &str) -> String {
+        let axis = if axis.is_empty() {
+            String::new()
+        } else {
+            format!(r#","axis":{axis}"#)
+        };
+        format!(
+            r#"{{"specversion":"1.0","id":"{}","source":"rannoch:shop","type":"rannoch.node.{class}","subject":"{key}","data":{{"properties":{{"title":"{title}"}}{axis}}}}}"#,
+            id_at(seconds)
+        )
+    }
+
+    /// A `ships` link (`kind` `link`) or its ending (`kind` `ended`) from the run `from` to the
+    /// release `to`, known at `seconds`, at the point `axis` (JSON).
+    fn ships(seconds: u64, kind: &str, (from, to): (&str, &str), axis: &str) -> String {
+        format!(
+            r#"{{"specversion":"1.0","id":"{}","source":"rannoch:shop","type":"rannoch.{kind}.ships","data":{{"from":{{"class":"run","key":"{from}"}},"to":{{"class":"release","key":"{to}"}},"axis":{axis}}}}}"#,
+            id_at(seconds)
+        )
+    }
+
+    /// A view of the axis point `axis` as known at `seconds`, each `None` for now.
+    fn view(axis: Option<&[i64]>, seconds: Option<u64>) -> crate::View {
+        crate::View {
+            axis: axis.map(<[i64]>::to_vec),
+            known: seconds.map(|s| std::time::UNIX_EPOCH + std::time::Duration::from_secs(s)),
+        }
+    }
+
+    /// The title of the node `class` `key` in `view`.
+    fn title_in(
+        g: &crate::Graph,
+        (class, key): (&str, &str),
+        view: &crate::View,
+    ) -> Result<Option<crate::Value>, crate::Error> {
+        Ok(g.state_at(&crate::NodeRef::new(class, key), view)?
+            .and_then(|v| v.properties.get("title").cloned()))
+    }
+
+    /// Commits each body and fills after each, in the order given.
+    fn feed(g: &mut crate::Graph, bodies: &[&String]) -> Result<(), crate::Error> {
+        for body in bodies {
+            g.commit(&[body.as_str()], &[])?;
+            g.fill()?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_correction_at_the_same_point_reads_by_known_at_in_every_kind_of_class()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let r_wrong = on_axis(1_000, "release", "r1", r#"{"build":12}"#, "tpyo");
+        let r_fixed = on_axis(2_000, "release", "r1", r#"{"build":12}"#, "typo");
+        let k_wrong = on_axis(1_000, "run", "k1", r#"{"build":12,"step":3}"#, "tpyo");
+        let k_fixed = on_axis(2_000, "run", "k1", r#"{"build":12,"step":3}"#, "typo");
+        for (name, order) in [
+            ("same-point", [&r_wrong, &r_fixed, &k_wrong, &k_fixed]),
+            (
+                "same-point-reversed",
+                [&k_fixed, &r_fixed, &k_wrong, &r_wrong],
+            ),
+        ] {
+            let mut g = graph_on_axes(name)?;
+            feed(&mut g, &order)?;
+            // On the undeclared axis a correction is an amendment, known from its own clock.
+            let book = logged(&mut g, &on_axis(1_000, "book", "b1", "", "tpyo"))?;
+            logged(
+                &mut g,
+                &amended(
+                    2_000,
+                    book.id,
+                    r#"{"data":{"properties":{"title":"typo"}}}"#,
+                ),
+            )?;
+            g.fill()?;
+            // The log's own receipt stamps are all now: reads known at 1,500 s and 2,500 s can
+            // only tell the two apart by each event's own clock.
+            for (of, point) in [
+                (("release", "r1"), Some(&[12][..])),
+                (("run", "k1"), Some(&[12, 3][..])),
+                (("book", "b1"), None),
+            ] {
+                let read = |known| title_in(&g, of, &view(point, known));
+                assert_eq!(read(Some(1_500))?, Some("tpyo".into()), "{name} {of:?}");
+                assert_eq!(read(Some(2_500))?, Some("typo".into()), "{name} {of:?}");
+                assert_eq!(read(None)?, Some("typo".into()), "{name} {of:?}");
+                assert_eq!(read(Some(500))?, None, "{name} {of:?}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_fact_minted_now_at_an_old_point_is_not_known_before_now()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = graph_on_axes("minted-now")?;
+        let late = on_axis(5_000, "release", "r1", r#"{"build":1}"#, "late");
+        feed(&mut g, &[&late])?;
+        let r1 = ("release", "r1");
+        assert_eq!(title_in(&g, r1, &view(Some(&[1]), Some(4_000)))?, None);
+        assert_eq!(
+            title_in(&g, r1, &view(Some(&[1]), Some(5_000)))?,
+            Some("late".into())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_partial_point_reads_the_top_of_its_prefix() -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = graph_on_axes("prefix")?;
+        let events = [
+            on_axis(1_000, "run", "k1", r#"{"build":12,"step":1}"#, "a"),
+            on_axis(1_001, "run", "k1", r#"{"build":12,"step":5}"#, "b"),
+            on_axis(1_002, "run", "k1", r#"{"build":13,"step":0}"#, "c"),
+        ];
+        feed(&mut g, &events.iter().collect::<Vec<_>>())?;
+        let at = |point: &[i64]| title_in(&g, ("run", "k1"), &view(Some(point), None));
+        assert_eq!(at(&[12])?, Some("b".into()));
+        assert_eq!(at(&[12, 1])?, Some("a".into()));
+        assert_eq!(at(&[13])?, Some("c".into()));
+        assert_eq!(at(&[11])?, None);
+        assert_eq!(at(&[])?, Some("c".into()));
+        assert!(
+            matches!(at(&[12, 1, 0]), Err(crate::Error::Refused(_))),
+            "a point longer than the axis is refused"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_axis_part_left_out_or_not_declared_is_refused() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let g = graph_on_axes("refused-parts")?;
+        let ontology = g.ontology();
+        for (body, names) in [
+            (on_axis(1, "release", "r1", "", "x"), "leaves out build"),
+            (
+                on_axis(1, "run", "k1", r#"{"build":1}"#, "x"),
+                "leaves out step",
+            ),
+            (
+                on_axis(1, "release", "r1", r#"{"build":1,"step":2}"#, "x"),
+                "part step",
+            ),
+            (
+                on_axis(1, "book", "b1", r#"{"build":1}"#, "x"),
+                "part build",
+            ),
+            (ships(1, "link", ("k1", "r1"), "{}"), "leaves out build"),
+            (ships(1, "ended", ("k1", "r1"), "{}"), "leaves out build"),
+        ] {
+            let Err(crate::Error::Refused(why)) = crate::check(&body, ontology) else {
+                panic!("{body} must be refused");
+            };
+            assert!(why.contains(names), "{why}");
+        }
+        assert!(
+            crate::check(
+                &on_axis(1, "release", "r1", r#"{"build":1}"#, "x"),
+                ontology
+            )
+            .is_ok()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_link_heard_at_two_builds_is_two_hearings_and_ends_at_its_own()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = graph_on_axes("link-builds")?;
+        let events = [
+            on_axis(1_000, "run", "k1", r#"{"build":12,"step":0}"#, "k"),
+            on_axis(1_000, "release", "r1", r#"{"build":12}"#, "r"),
+            ships(1_001, "link", ("k1", "r1"), r#"{"build":12}"#),
+            ships(1_002, "link", ("k1", "r1"), r#"{"build":13}"#),
+            ships(1_003, "ended", ("k1", "r1"), r#"{"build":14}"#),
+        ];
+        feed(&mut g, &events.iter().collect::<Vec<_>>())?;
+        let axes: Vec<Vec<i64>> = g
+            .link_hearings("ships", "k1", "r1")?
+            .into_iter()
+            .map(|h| h.axis)
+            .collect();
+        assert_eq!(
+            axes,
+            [vec![12], vec![13]],
+            "two hearings, each at its build"
+        );
+        let at = |build: i64| g.link_state_at("ships", "k1", "r1", &view(Some(&[build]), None));
+        assert!(!at(13)?.ok_or("held at 13")?.ended);
+        assert!(at(14)?.ok_or("ended at 14")?.ended);
+        assert!(at(11)?.is_none());
+        assert!(matches!(
+            g.link_end("ships", "k1", "r1")?,
+            Some(crate::End::Ended { ref axis, .. }) if axis == &[14]
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn a_links_latest_conclusion_is_chosen_by_known_at_not_arrival()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let link = link_with(&id_at(1_000), "a1", "b1");
+        let ended = concluded(&id_at(2_000), "ended", "a1", "b1");
+        let (late_fix, early_fix) = (
+            concluded(&id_at(3_000), "corrected", "a1", "b1"),
+            concluded(&id_at(1_500), "corrected", "a1", "b1"),
+        );
+        for (name, order, corrected) in [
+            ("ends-1", [&link, &ended, &late_fix], true),
+            ("ends-2", [&link, &late_fix, &ended], true),
+            ("ends-3", [&link, &early_fix, &ended], false),
+            ("ends-4", [&link, &ended, &early_fix], false),
+        ] {
+            let mut g = graph(name)?;
+            feed(&mut g, &order)?;
+            let end = g.link_end("wrote", "a1", "b1")?;
+            assert_eq!(
+                matches!(end, Some(crate::End::Corrected { .. })),
+                corrected,
+                "{name}: {end:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_log_replayed_in_any_order_gives_the_same_answers() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let events = [
+            on_axis(1_000, "run", "k1", r#"{"build":12,"step":0}"#, "k"),
+            on_axis(1_000, "release", "r1", r#"{"build":12}"#, "tpyo"),
+            on_axis(1_100, "release", "r1", r#"{"build":13}"#, "next"),
+            on_axis(1_200, "release", "r1", r#"{"build":12}"#, "typo"),
+            ships(1_300, "link", ("k1", "r1"), r#"{"build":12}"#),
+            ships(1_400, "ended", ("k1", "r1"), r#"{"build":13}"#),
+            on_axis(1_000, "book", "b1", "", "one"),
+            on_axis(1_500, "book", "b1", "", "two"),
+        ];
+        let answers = |name: &str, reversed: bool| -> Result<_, Box<dyn std::error::Error>> {
+            let mut g = graph_on_axes(name)?;
+            let mut order: Vec<&String> = events.iter().collect();
+            if reversed {
+                order.reverse();
+            }
+            feed(&mut g, &order)?;
+            let mut titles = Vec::new();
+            for of in [("release", "r1"), ("run", "k1"), ("book", "b1")] {
+                for point in [None, Some(&[12][..]), Some(&[13][..])] {
+                    for known in [None, Some(1_150), Some(1_250), Some(1_550)] {
+                        let point = if of.0 == "book" { None } else { point };
+                        titles.push(title_in(&g, of, &view(point, known))?);
+                    }
+                }
+            }
+            let seen = g
+                .seen(&crate::NodeRef::new("release", "r1"))?
+                .ok_or("seen")?;
+            Ok((
+                titles,
+                g.hearings(&crate::NodeRef::new("release", "r1"))?,
+                g.link_hearings("ships", "k1", "r1")?,
+                g.link_end("ships", "k1", "r1")?,
+                g.link_state_at("ships", "k1", "r1", &view(Some(&[12]), None))?,
+                // First recorded is this store's own receipt order, so it is left out.
+                (seen.first_heard, seen.last_heard, seen.count),
+            ))
+        };
+        let forward = answers("replay-in-order", false)?;
+        assert_eq!(answers("replay-again", false)?, forward, "a rebuild");
+        assert_eq!(answers("replay-reversed", true)?, forward, "reversed");
         Ok(())
     }
 }

@@ -35,7 +35,7 @@ g.declare(
 ```
 
 - `Class::new` gives every property the type text. Set `properties` to use `integer`, `decimal` (exact digits), `float` or `float_vector(n)`.
-- A class's history is ordered by `HistoryKey::Origin` (the record time of the store that first recorded each event) unless it declares `Time` (the writer supplies `data.time`, milliseconds since the Unix epoch) or `Integer` (the writer supplies `data.integer`). A node of a `Time` or `Integer` class that carries none is refused.
+- A class or relation may declare `axis`, an ordered list of named integer parts such as `["build"]` or `["build", "step"]`; each event then carries its point as `data.axis`, and one missing a part, or naming a part not declared, is refused. With no axis declared, a class's or relation's history is ordered by known-at, the millisecond in each event's id.
 - `Declaration::Property` adds a property to a declared class. Older nodes read without it; nothing is default-filled.
 - `Relation::new(name, from, to, containment)`: the last argument says the source is part of the target.
 - An identical declaration writes nothing and returns `Ok(None)`. A conflicting one is refused with a reason in ontology terms.
@@ -48,16 +48,16 @@ Every event is a CloudEvents 1.0 JSON object. rannoch reads the `rannoch.*` type
 
 | Type | Subject | `data` |
 |---|---|---|
-| `rannoch.node.<class>` | the node's natural key | `{"properties": {...}, "valid": ..., "time": ms?, "integer": n?}` |
-| `rannoch.link.<relation>` | (any) | `{"from": {"class", "key"}, "to": {"class", "key"}, "valid": ..., "time": ms?}` |
-| `rannoch.ended.<relation>` | (any) | `{"from", "to", "at": ms, "valid": ...}`: the link stopped holding |
+| `rannoch.node.<class>` | the node's natural key | `{"properties": {...}, "valid": ...?, "axis": {...}?}` |
+| `rannoch.link.<relation>` | (any) | `{"from": {"class", "key"}, "to": {"class", "key"}, "valid": ...?, "axis": {...}?}` |
+| `rannoch.ended.<relation>` | (any) | `{"from", "to", "valid": ...?, "axis": {...}?}`: the link stopped holding |
 | `rannoch.corrected.<relation>` | (any) | `{"from", "to"}`: the link was wrong |
 | `rannoch.amended` | the log id of the event it amends | a JSON Merge Patch of that event |
 | `rannoch.declared.<name>` | (any) | none; made with `declare`, never accepted |
 
-- `id` is `<uuid>:<fact>`: a `UUIDv7` for the origin's event, then which fact within it. The millisecond in the uuid is when the origin recorded the event, and it is that event's point unless the writer supplies `time`. `format!("{}:0", EventId::now())` makes one.
+- `id` is `<uuid>:<fact>`: a `UUIDv7` for the origin's event, then which fact within it. The millisecond in the uuid is the event's known-at: when it became known, by the clock of the host that minted it. `format!("{}:0", EventId::now())` makes one.
 - `source` names who wrote it. A source that starts with `rannoch:` is read back percent-decoded without the prefix; any other source (such as `importer/<run>`) is stored exactly as given.
-- `valid` is when the fact was true: `"unknown"`, or `{"on": "2026-10"}` or `{"on": "2026-10-31"}`. Unknown is never read as now.
+- `valid` is when the fact was true: left out or `"unknown"`, or `{"on": "2026-10"}` or `{"on": "2026-10-31"}`. Unknown is never read as now.
 - Property values: text is a bare string; other types are tagged: `{"integer": 5}`, `{"decimal": "1.20"}`, `{"float": 1.5}`, `{"float_vector": [0.1, 0.2]}`.
 
 ```rust
@@ -95,16 +95,15 @@ A hearing's identity is its content hashed under the store's key, so identical c
 | Call | Answers |
 |---|---|
 | `find(class, key)` | the node as it is now: its newest version on the class's axis, never just the last to arrive |
-| `find_as_of(class, key, date, known_at)` | the version valid on `date`, as the store knows it now or, given `known_at`, as it knew it then |
-| `state_at(node, at)` | the version that held at a point on the axis |
-| `hearings(node)` | every account of the node, each with its source, point, valid time and identity |
+| `find_as_of(class, key, date, view)` | the version valid on `date`, in `view` |
+| `state_at(node, view)` | the newest version in `view` |
+| `hearings(node)` | every account of the node, each with its source, axis point, known-at, valid time and identity |
 | `seen(node)` | first and last heard, first recorded, first true, and how many hearings |
-| `link_state_at(rel, from, to, at)` | the link's version at a point, and whether it had ended |
-| `link_known_at(rel, from, to, known)` | the link as known at `known`: an amendment or rename made later is not in it |
+| `link_state_at(rel, from, to, view)` | the link's newest version in `view`, and whether it had ended |
 | `link_hearings`, `link_seen`, `link_end` | as for nodes; `link_end` says whether it ended or was found wrong |
 | `events().since(cursor)`, `at(cursor)`, `committed()` | the log itself |
 
-`At` is `At::Time(SystemTime)`, or `At::Key(i64)` in an integer-keyed class. A version that arrives late answers at its own point; it does not change what is current unless it is newer on the axis.
+A `View { axis, known }` sees the versions at or before the axis point `axis` as known at `known`, each `None` for now; a point with fewer parts than the axis reads the top of its prefix, and on an undeclared axis a point is one part, a known-at in milliseconds. A correction at the same point reads as the original before its known-at and as the correction from it. A version that arrives late answers at its own point; it does not change what is current unless it is newer on the axis.
 
 ```rust
 let book = g.find("book", "b1")?.ok_or("b1 is there")?;
@@ -124,7 +123,7 @@ g.fill()?;
 ```
 
 - The amended event stays in the log as written. Read as known before the amendment, it reads as written; from the amendment's point on, it reads patched.
-- An amendment's point is the record time in its own CloudEvent id. Amendments stack in point order; at the same point, by event id.
+- An amendment's point is its known-at, the millisecond in its own CloudEvent id. Amendments stack in point order; at the same point, by event id.
 - **A rename is a patch of the subject.** It maps the old key to the new one from the amendment's point. The node and its links (live or ended) answer under the new key; a link or ending that arrives later naming the old key lands on the new one; a second rename maps on from the new key. Read as known before the rename, everything answers under the old key.
 - An app finds a log id in `commit`'s result, in `events().since(...)`, or in the `Event` a worker takes. There is no lookup from a CloudEvent id to a log id; issue #164 adds one, not built, that returns the first log id an event arrived under. It is for tracking down the event a mistake came from, and nothing else.
 
@@ -135,8 +134,7 @@ Amendments are the slow path: about 53 ms each on a 22,619-event store, measured
 Fill refuses an amendment that:
 
 - names an event that is not in the log;
-- has a point before the event's record time, its own point (its writer's `time`, else its record time), or its latest amendment already applied;
-- amends an event of an integer-keyed class;
+- is known before the event itself or its latest amendment already applied;
 - amends an event with no hearing of its own: a declaration, an app's own event, or content identical to an earlier hearing.
 
 A refused amendment never stops fill. It goes through fill retries, below.
