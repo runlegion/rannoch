@@ -57,3 +57,12 @@ Code under test: main ea94dae, with purge (#148) and the relay (#151), merged in
 - R12. After a restart, no byte that left is in the store's file, its write-ahead log or a relay's file. **Confidence 0.3.** A kill between a purge's commit and its truncate leaves the log holding bytes, and `open` does not truncate. A clean close would hide this, so the check after every restart and the last check die without one.
 - R13. After the last kill every body sent again is refused, the log does not grow, and the relay equals its cold walk. Confidence 0.9.
 - R14. The #187 suite holds as before on purge's merge, with one change expected: "a store with no rule pays one read per commit". Produce under kills, amendment run, worker run, memory import all hold; clean fill at or above 80,000 events a second and in any case over 50,000. Confidence 0.85.
+
+## The final runs on main 434326f, after #207 and #206, written before running them
+
+`purgekill` now asks for each purge with a `rannoch.purge` event through the queue (#206). `kg.sh` kills at 50 ms to 2.5 s, so a purge can finish as well as be hit, and stops when 200 kills land no target; its first form livelocked (144,248 kills, 4 of 140 targets), since a purge outlasted every 50-300 ms window. Three probes leave a purge committed and not truncated before the loop. A first pass of `kr.sh` on #207's code ran 760 kills with no violation.
+
+- R15. R8, R9 and R13 hold; R10 now holds: 0 stopped. Confidence 0.9.
+- R16. R11: every target all before or all after; the loop finishes without stalling. Confidence 0.8. Some random kills land inside a request, after it was accepted. Confidence 0.8.
+- R17. R12 now holds: after each restart, the three probes included, no purged text in the file, the write-ahead log or a relay's file. Confidence 0.85.
+- R18. R14 holds, fill at or over 50,000 events a second. Confidence 0.85. An older kill loop from the first form runs on the machine throughout and costs throughput.

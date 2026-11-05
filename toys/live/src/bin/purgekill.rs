@@ -16,7 +16,7 @@ use common::{KEY, amended, append, ask, declared, die, differs, fact, manifest, 
 use rannoch_queue::Queue;
 use rannoch_relay::Relays;
 use rannoch_store::{
-    Class, Cursor, Declaration, Error, Graph, NodeRef, Relation, Roots, Shape, Step, Target, open,
+    Class, Cursor, Declaration, Error, EventId, Graph, NodeRef, Relation, Roots, Shape, Step, open,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
@@ -59,27 +59,29 @@ fn rule(k: u64) -> String {
 }
 
 impl Planned {
-    fn target(&self) -> Target {
+    /// The target as a `rannoch.purge` request names it.
+    fn target(&self) -> Json {
         let k = self.k;
         let source = source(k);
         let author = format!("keep-author-{k}");
         match k % KINDS {
-            0 => Target::Node(NodeRef::new("book", &self.book)),
-            1 => Target::Stream { source },
-            2 => Target::Source { source },
-            3 => {
-                let hash = blake3::Hash::from_hex(&self.identity).expect("identity");
-                Target::Fact { identity: *hash.as_bytes() }
-            }
-            4 => Target::NodeWord { node: NodeRef::new("book", &self.book), source },
-            5 => Target::Link { relation: "wrote".to_string(), from: author, to: self.book.clone() },
-            _ => Target::LinkWord {
-                relation: "shelved".to_string(),
-                from: self.book.clone(),
-                to: "hub".to_string(),
-                source,
-            },
+            0 => json!({"kind": "node", "class": "book", "key": self.book}),
+            1 => json!({"kind": "stream", "source": source}),
+            2 => json!({"kind": "source", "source": source}),
+            3 => json!({"kind": "fact", "identity": self.identity}),
+            4 => json!({"kind": "node_word", "node": {"class": "book", "key": self.book}, "source": source}),
+            5 => json!({"kind": "link", "relation": "wrote", "from": author, "to": self.book}),
+            _ => json!({"kind": "link_word", "relation": "shelved", "from": self.book, "to": "hub",
+                        "source": source}),
         }
+    }
+
+    /// The app's request to purge the target under its rule.
+    fn request(&self) -> String {
+        json!({"specversion": "1.0", "id": EventId::now().to_string(), "source": "rannoch:privacy",
+               "type": "rannoch.purge",
+               "data": {"target": self.target(), "rule": rule(self.k), "source": "privacy"}})
+        .to_string()
     }
 
     /// What the store's reads say of the target now, each true before the purge and false after.
@@ -268,13 +270,15 @@ fn life(run: &Run) {
     for planned in plan.iter().filter(|planned| remaining.contains(&planned.k)) {
         let k = planned.k;
         append(&run.journal(), &format!("start {k}"));
-        match queue.purge(&planned.target(), &rule(k), "privacy") {
-            Ok(_) => {}
+        queue.accept_from(planned.request(), "purger", k.to_string()).expect("accept");
+        for failure in queue.flush().1 {
+            let why = format!("{failure:?}");
             // It committed, and a reader kept the write-ahead log from truncating.
-            Err(Error::Refused(why)) => {
+            if why.contains("write-ahead log") {
                 append(&run.dir.join("refused.txt"), &format!("{k} {why}"));
+            } else {
+                run.violation(&format!("purge {k}: {why}"));
             }
-            Err(error) => run.violation(&format!("purge {k}: {error}")),
         }
         append(&run.journal(), &format!("done {k}"));
     }
@@ -292,7 +296,7 @@ fn window(run: &Run, count: usize) {
     let reader = rusqlite::Connection::open(&run.graph).expect("reader");
     reader.execute_batch("BEGIN; SELECT count(*) FROM _events;").expect("read");
     for planned in plan.iter().filter(|planned| !rules.contains_key(&rule(planned.k)) && planned.k % KINDS < 5).take(count) {
-        match g.purge(&planned.target(), &rule(planned.k), "privacy") {
+        match &g.commit(&[&planned.request()], &[]).expect("commit")[0] {
             Err(Error::Refused(_)) => append(&run.dir.join("window.txt"), &format!("{} committed, not truncated", planned.k)),
             other => run.violation(&format!("window {}: {other:?}", planned.k)),
         }
