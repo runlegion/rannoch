@@ -40,3 +40,8 @@ Code under test: rannoch main 6606817 (#183, #185, #186, #151 and #192 merged). 
 - R3. Worker, 3,001 events under kill -9: every event done, none in progress. Confidence 0.95.
 - R4. Memory import, 22,619 events from legion's slice: 0 text mismatches of 9,682, live sets per repo exact, follows 808/808, 300 amendments and renames with 0 mismatches. Confidence 0.8.
 - R5. Clean fill of 306,000: 85,000-92,000 events/s on a quiet machine (#186 measured 90,455), at least 50,000 under the load this session has. Confidence 0.85 on the 50,000 floor, 0.6 on the range.
+
+## The rerun on main 63681e5, after the rename fix (#196), written before running it
+
+- R6. Amendment kill run: 0 mismatches, refused 40 = stopped 40, all 40 at tries 3 in a snapshot taken after the check, tries never down or over. Confidence 0.9.
+- R7. Produce under kills, worker (30,000 events, paced so kills land) and memory import hold as on 6606817; fill stays within 5% of 91,800 events/s, since the fix adds nothing to a store with no rename. Confidence 0.9.
