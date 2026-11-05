@@ -457,17 +457,6 @@ pub(crate) const LINKS_AT: &str = "SELECT DISTINCT key, to_key FROM _hearings WH
 /// column says whether a reader kept it from finishing.
 pub(crate) const TRUNCATE_LOG: &str = "PRAGMA wal_checkpoint(TRUNCATE)";
 
-/// The keys of the parts a containment link of `relation` holds to the whole keyed `?1`.
-pub(crate) fn part_keys(relation: &str, from: &str, to: &str) -> String {
-    format!(
-        "SELECT p.key FROM {} r JOIN {} p ON p.id = r.src JOIN {} w ON w.id = r.dst \
-         WHERE w.key = ?1",
-        relation_table(relation),
-        class_table(from),
-        class_table(to)
-    )
-}
-
 /// The order versions are chosen by, `DESC` putting the newest first: by axis point, then
 /// known-at, so a correction at the same point follows what it corrects, then event id.
 pub(crate) fn order(direction: &str) -> String {

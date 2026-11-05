@@ -223,7 +223,7 @@ g.purge(&Target::Node(NodeRef::new("book", "b1")), "erasure-2026-114", "privacy-
 |---|---|
 | `Fact { identity }` | one fact, every event it arrived under. An amended version's identity (from `hearings`) names the event it was heard from: that event and every amendment of it |
 | `Stream { source }` | every event with this source: its facts, an app's own events, its amendments |
-| `Node(node)` | the node under every key a rename connects it to, every node part of it by a containment link held now or waiting, and all their links |
+| `Node(node)` | the node under every key a rename connects it to, every node part of it by a containment link that holds now, its node arrived or not, and all their links. A former part, whose link ended or was found wrong, survives with no link to the whole, and is purged by its own rule |
 | `Link { relation, from, to }` | the link's hearings, endings and corrections, under every key its ends went by |
 | `NodeWord { node, source }` | that source's hearings of the node |
 | `LinkWord { relation, from, to, source }` | that source's hearings, endings and corrections of the link |

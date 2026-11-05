@@ -24,7 +24,7 @@ use crate::queries::{
     DROP_ENDINGS, DROP_ENDINGS_AT, DROP_ENDS, DROP_ENDS_AT, DROP_ENDS_OF, DROP_EVENT,
     DROP_HEARINGS, DROP_RENAMES, DROP_WAITING, DROP_WORK, HEARINGS_AT, IDENTITY_AT,
     LATEST_CONCLUSION, LINKS_AT, PLACES_OF_IDENTITY, RENAMES_BY, Sql, TARGET_OF, TRUNCATE_LOG,
-    UNCONCLUDED, part_keys,
+    UNCONCLUDED, links_in_view,
 };
 use crate::{Error, Graph, refresh};
 
@@ -357,7 +357,8 @@ fn names_of(tx: &impl Run, class: &str, key: &str) -> Result<Vec<String>, Error>
 }
 
 /// `whole` and every node part of it at any depth, each under every key it went by. A part is a
-/// node a containment link in its relation's table, or still waiting open, ties to the whole.
+/// node a containment link that holds now ties to the whole, whether the node has arrived or the
+/// link still waits for it. A link that ended or was found wrong no longer makes a part.
 fn with_parts(
     run: &Handles<'_>,
     ontology: &Ontology,
@@ -375,18 +376,22 @@ fn with_parts(
                 if !relation.containment || relation.to != node.class {
                     continue;
                 }
-                let held: Vec<String> = run
+                let parts: Vec<String> = run
                     .conn()
-                    .prepare_cached(&part_keys(&relation.name, &relation.from, &relation.to))?
-                    .query_map([&key], |row| row.get(0))?
+                    .prepare_cached(links_in_view(false))?
+                    .query_map(
+                        params![
+                            link_entity(&relation.name),
+                            None::<Vec<u8>>,
+                            None::<i64>,
+                            key
+                        ],
+                        |row| row.get(0),
+                    )?
                     .collect::<Result<_, _>>()?;
-                let open: Vec<String> = run.with(Sql::WaitingOnTarget, |s| {
-                    s.query_map(params![relation.name, key], |row| row.get(0))?
-                        .collect()
-                })?;
                 frontier.extend(
-                    held.into_iter()
-                        .chain(open)
+                    parts
+                        .into_iter()
                         .map(|part| NodeRef::new(&relation.from, part)),
                 );
             }
@@ -1154,6 +1159,47 @@ mod tests {
         // The part's rule stands too.
         let refused = g.commit(&[&node_from("shop", "chapter", "c1", "back")], &[])?;
         assert!(matches!(&refused[0], Err(Error::Purged { rule }) if rule == "r"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_former_part_survives_its_whole_and_is_purged_by_its_own_rule() -> Result {
+        let dir = tempfile::tempdir()?;
+        let mut g = store(&dir, "s")?;
+        let in_b1 = |kind: &str, chapter: &str| {
+            fact_from("shop", kind, "in", ("chapter", chapter), ("book", "b1"))
+        };
+        land(
+            &mut g,
+            &[
+                &book("b1", "whole"),
+                &node_from("shop", "chapter", "ended", "former"),
+                &in_b1("link", "ended"),
+                &in_b1("ended", "ended"),
+                &node_from("shop", "chapter", "wrong", "never"),
+                &in_b1("link", "wrong"),
+                &in_b1("corrected", "wrong"),
+                &node_from("shop", "chapter", "held", "part"),
+                &in_b1("link", "held"),
+                &in_b1("link", "waiting"),
+            ],
+        )?;
+        g.purge(&Target::Node(node("book", "b1")), "r", "app")?;
+        assert_eq!(title(&g, "chapter", "ended")?, Some("former".into()));
+        assert_eq!(title(&g, "chapter", "wrong")?, Some("never".into()));
+        assert_eq!(title(&g, "chapter", "held")?, None, "held now");
+        // No rule stands against a former part, and one still waiting is a part.
+        let again = node_from("shop", "chapter", "ended", "again");
+        assert!(g.commit(&[&again], &[])?[0].is_ok());
+        let waiting = node_from("shop", "chapter", "waiting", "late");
+        assert!(matches!(
+            &g.commit(&[&waiting], &[])?[0],
+            Err(Error::Purged { .. })
+        ));
+        // Its link to the whole left with the whole.
+        assert!(g.link_hearings("in", "ended", "b1")?.is_empty());
+        g.purge(&Target::Node(node("chapter", "ended")), "own", "app")?;
+        assert_eq!(title(&g, "chapter", "ended")?, None);
         Ok(())
     }
 
