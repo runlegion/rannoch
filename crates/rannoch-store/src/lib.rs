@@ -119,6 +119,7 @@ pub fn open(path: impl AsRef<Path>, key: &[u8; 32]) -> Result<Graph, Error> {
     conn.set_prepared_statement_cache_capacity(256);
     conn.execute_batch(OWN_TABLES)?;
     conn.execute_batch(HISTORY_TABLES)?;
+    purge::finish_at_open(&conn)?;
     let key = Key::new(key);
     take(&mut conn, &key)?;
     let schema_version = schema_version(&conn)?;
@@ -1686,6 +1687,34 @@ mod tests {
             "the ending naming the old key ended the renamed link"
         );
         assert!(!known_link(&g, "b9", 2_500)?.ok_or("known at 2,500")?.ended);
+        Ok(())
+    }
+
+    #[test]
+    fn a_fact_sent_again_under_a_renamed_key_leaves_no_row_there()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut g, b1, _) = wrote_b1("rename-sent-again")?;
+        logged(&mut g, &node_with(&id_at(1_000), "author", "a2", "bob"))?;
+        g.commit(&[&amended(2_000, &b1, r#"{"subject":"b9"}"#)], &[])?;
+        g.fill()?;
+        // Each one filled alone: the same content under a new id, naming the old key.
+        for body in [
+            link_with(&id_at(3_000), "a2", "b1"),
+            link_with(&id_at(3_001), "a2", "b1"),
+            node_with(&id_at(4_000), "book", "b1", "two"),
+            node_with(&id_at(4_001), "book", "b1", "two"),
+            node_with(&id_at(5_000), "book", "b1", "three"),
+        ] {
+            g.commit(&[&body], &[])?;
+            g.fill()?;
+        }
+        assert!(g.stopped()?.is_empty(), "{:?}", g.stopped()?);
+        assert!(g.find("book", "b1")?.is_none(), "the old key is gone");
+        let title = g
+            .find("book", "b9")?
+            .and_then(|found| found.properties.get("title").cloned());
+        assert_eq!(title, Some("three".into()));
+        assert_eq!(kept_links(&g)?, (2, 0), "both links, on the new key");
         Ok(())
     }
 

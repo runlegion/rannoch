@@ -445,6 +445,11 @@ pub(crate) fn heard(
                 return Ok(Heard::Held(held));
             }
             alias(tx, &held, of.event(), stamp.cursor)?;
+            // Sent again under a key a rename left: nothing is known here now, and the row stays
+            // on the new key.
+            if newest(tx, (&entity, from, to))?.is_none() {
+                return Ok(Heard::Older);
+            }
         }
         // Its only fact is its newest version.
         Recorded::New { alone: true } => return Ok(Heard::Newest),
