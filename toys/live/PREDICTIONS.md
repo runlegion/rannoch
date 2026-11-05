@@ -45,3 +45,15 @@ Code under test: rannoch main 6606817 (#183, #185, #186, #151 and #192 merged). 
 
 - R6. Amendment kill run: 0 mismatches, refused 40 = stopped 40, all 40 at tries 3 in a snapshot taken after the check, tries never down or over. Confidence 0.9.
 - R7. Produce under kills, worker (30,000 events, paced so kills land) and memory import hold as on 6606817; fill stays within 5% of 91,800 events/s, since the fix adds nothing to a store with no rename. Confidence 0.9.
+
+# Predictions, 2026-11-04: the release check (#205), written before any kill run of a relay or a purge
+
+Code under test: main ea94dae, with purge (#148) and the relay (#151), merged into the suite. Machine: Puck, M4, release build, stores on /Volumes/store, other agents running. Clean calibration runs of the two new programs came first (a relay life of 3,000 events; a purge life of 7 targets at about 140 ms each), and no kill.
+
+- R8. `kr.sh`: a relay under kill -9 every 50-300 ms with a producer writing, four relays (capped, exact, class-rooted, a fixed known-at), a check after every restart. Every relay equals a cold walk at every restart. Confidence 0.8. No told cursor is past the log; no told cursor is ahead of what `read` holds; no worker is ahead of its file, no file ahead of the log. Confidence 0.9. In the stepped run, each set equals a cold walk after each commit and each last change reads as told. Confidence 0.75: the walk's cut boundaries are the code most likely to diverge after a restored file.
+- R9. Producer under those kills: 0 missing, 0 doubled. Confidence 0.95.
+- R10. Stopped events, 0. **Expected to fail:** the calibration of `kr.sh`'s mix stopped three plain node events, from a known defect: after a rename, the same link sent twice under the old key leaves a row naming the old key, and the next node event at that key fails its foreign key. Confidence it shows: 0.95. A clean relay still equals its cold walk, since both read the same tables.
+- R11. `kg.sh`: 140 purges of the seven target kinds among 20,000 fillers, with a producer, under kill -9 every 50-300 ms. Each target is wholly before or wholly after, and after exactly when its rule landed. Confidence 0.95, since one transaction holds it. Kills land inside purge calls, both before and after commit; a run with none proves nothing. Confidence 0.7 that some land between commit and truncate.
+- R12. After a restart, no byte that left is in the store's file, its write-ahead log or a relay's file. **Confidence 0.3.** A kill between a purge's commit and its truncate leaves the log holding bytes, and `open` does not truncate. A clean close would hide this, so the check after every restart and the last check die without one.
+- R13. After the last kill every body sent again is refused, the log does not grow, and the relay equals its cold walk. Confidence 0.9.
+- R14. The #187 suite holds as before on purge's merge, with one change expected: "a store with no rule pays one read per commit". Produce under kills, amendment run, worker run, memory import all hold; clean fill at or above 80,000 events a second and in any case over 50,000. Confidence 0.85.

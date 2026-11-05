@@ -241,8 +241,10 @@ dependencies = [
 name = "rannoch-live"
 version = "0.0.0"
 dependencies = [
+ "blake3",
  "rannoch-cloudevents",
  "rannoch-queue",
+ "rannoch-relay",
  "rannoch-store",
  "rusqlite",
  "serde",
@@ -265,6 +267,18 @@ dependencies = [
  "rannoch-cloudevents",
  "rannoch-ontology",
  "rannoch-store",
+ "thiserror",
+]
+
+[[package]]
+name = "rannoch-relay"
+version = "0.1.0"
+dependencies = [
+ "rannoch-cloudevents",
+ "rannoch-queue",
+ "rannoch-store",
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 

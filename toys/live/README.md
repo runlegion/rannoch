@@ -48,3 +48,8 @@ Two defects these runs found, both fixed: tables left behind the log after a kil
 - `kp.sh`, `ka.sh`, `kw.sh`: the producer, amendment and worker kill loops. `kp.sh` and `ka.sh` resume, each call running at most `CAP` seconds.
 
 Predictions: PREDICTIONS.md. Results and the bugs they found: RESULTS.md.
+
+## Relay and purge runs (#205)
+
+- `target/release/relaykill setup|life|check|verify <dir> ...`: four relays, a producer, and `kr.sh`'s kill loop with a check after every restart. `--step` holds each set against a cold walk after each commit.
+- `target/release/purgekill setup|life|check|last <dir> ...`: 140 targets of the seven kinds, a producer, and `kg.sh`'s kill loop. Each check holds every target to all before or all after and scans the store's file, write-ahead log and relays' directory for what left. `check` and `life` die with no clean close, because a clean close removes the write-ahead log and would hide what a kill left in it.
