@@ -1,6 +1,6 @@
 # The store
 
-`rannoch-store` is one graph in one SQLite file. Every change is an event in its log; the tables are built from the log. The log only grows, so an app that wants raw data gone keeps it outside the store. This page follows `crates/rannoch-store/examples/store.rs`, which runs:
+`rannoch-store` is one graph in one SQLite file. Every change is an event in its log; the tables are built from the log. The log only grows, apart from [purge](#purge), which is rare and deliberate; an app that wants raw data gone routinely keeps it outside the store. This page follows `crates/rannoch-store/examples/store.rs`, which runs:
 
 ```sh
 cargo run -p rannoch-store --example store
