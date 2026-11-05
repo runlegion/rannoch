@@ -1,6 +1,6 @@
 # The store
 
-`rannoch-store` is one graph in one SQLite file. Every change is an event in its log; the tables are built from the log. This page follows `crates/rannoch-store/examples/store.rs`, which runs:
+`rannoch-store` is one graph in one SQLite file. Every change is an event in its log; the tables are built from the log. The log only grows, so an app that wants raw data gone keeps it outside the store. This page follows `crates/rannoch-store/examples/store.rs`, which runs:
 
 ```sh
 cargo run -p rannoch-store --example store
@@ -211,4 +211,3 @@ let at = g.copy_to(dir.join("shop-copy.rannoch"))?;
 ## Not built yet
 
 - Purge (erasure of a fact from the store, with a rule that refuses it coming back): #148.
-- Trim (retention declared per class, such as dropping raw rows once processed): no issue yet.
