@@ -23,8 +23,8 @@ use crate::queries::{
     CONCLUDED_BY, Catalogue, DROP_ALIASES, DROP_AMENDMENT, DROP_CORRECTIONS, DROP_CORRECTIONS_AT,
     DROP_ENDINGS, DROP_ENDINGS_AT, DROP_ENDS, DROP_ENDS_AT, DROP_ENDS_OF, DROP_EVENT,
     DROP_HEARINGS, DROP_RENAMES, DROP_WAITING, DROP_WORK, HEARINGS_AT, IDENTITY_AT,
-    LATEST_CONCLUSION, LINKS_AT, PLACES_OF_IDENTITY, RENAMES_BY, Sql, TARGET_OF, TRUNCATE_LOG,
-    UNCONCLUDED, links_in_view,
+    IS_PURGE_UNFINISHED, LATEST_CONCLUSION, LINKS_AT, PLACES_OF_IDENTITY, PURGE_FINISHED,
+    PURGE_UNFINISHED, RENAMES_BY, Sql, TARGET_OF, TRUNCATE_LOG, UNCONCLUDED, links_in_view,
 };
 use crate::{Error, Graph, refresh};
 
@@ -774,7 +774,7 @@ impl Graph {
     /// # Errors
     /// [`Error::Refused`] when the target's class or relation is not declared; [`Error::Refused`]
     /// when the purge committed but a reader still open kept the write-ahead log from truncating,
-    /// so it holds purged bytes until a checkpoint runs after the readers close; the graph file
+    /// so it holds purged bytes until the next open or purge after the readers close; the graph file
     /// cannot be read or written, and nothing is purged.
     pub fn purge(&mut self, target: &Target, rule: &str, source: &str) -> Result<Event, Error> {
         // So every part and rename the log holds is in the tables the purge reads them from.
@@ -837,20 +837,42 @@ impl Graph {
         let event = store(&run, id, None, &body)?;
         heard_rule(&run, &body)?;
         keep_noted(&run)?;
+        tx.prepare_cached(PURGE_UNFINISHED)?.execute([])?;
         drop(run);
         tx.commit()?;
-        truncate_log(&self.conn)?;
+        finish(&self.conn)?;
         Ok(event)
     }
 }
 
-/// Checkpoints the write-ahead log, truncating it, so no purged byte stays in it.
+/// Finishes a purge a kill or a reader left unfinished, so no purged byte stays in the write-ahead
+/// log after an open. A reader in the way leaves it for the next open or purge.
+pub(crate) fn finish_at_open(conn: &rusqlite::Connection) -> Result<(), Error> {
+    let unfinished: bool = conn.query_row(IS_PURGE_UNFINISHED, [], |row| row.get(0))?;
+    if !unfinished {
+        return Ok(());
+    }
+    match finish(conn) {
+        Err(Error::Refused(_)) => Ok(()),
+        finished => finished,
+    }
+}
+
+/// Checkpoints the write-ahead log, truncating it, so no purged byte stays in it, and only then
+/// takes the purge's mark away, in a commit of its own that the log holds until it is truncated too.
+fn finish(conn: &rusqlite::Connection) -> Result<(), Error> {
+    truncate_log(conn)?;
+    conn.prepare_cached(PURGE_FINISHED)?.execute([])?;
+    truncate_log(conn)
+}
+
+/// Checkpoints the write-ahead log, truncating it.
 fn truncate_log(conn: &rusqlite::Connection) -> Result<(), Error> {
     let busy: i64 = conn.query_row(TRUNCATE_LOG, [], |row| row.get(0))?;
     if busy != 0 {
         return Err(Error::Refused(
             "the purge committed, but a reader kept the write-ahead log from being truncated: it \
-             holds purged bytes until a checkpoint runs after the readers close"
+             holds purged bytes until the next open or purge after the readers close"
                 .to_string(),
         ));
     }
@@ -1733,6 +1755,27 @@ mod tests {
         assert!(g.commit(&[&body], &[])?[0].is_err());
         let refused = g.purge(&Target::Node(node("ghost", "g1")), "r", "app");
         assert!(matches!(refused, Err(Error::Refused(_))));
+        Ok(())
+    }
+
+    #[test]
+    fn the_next_open_finishes_a_purge_that_could_not_truncate_its_log() -> Result {
+        let dir = tempfile::tempdir()?;
+        let mut g = store(&dir, "s")?;
+        land(&mut g, &[&book("b1", "a-secret-title")])?;
+        let reader = rusqlite::Connection::open(dir.path().join("s"))?;
+        reader.execute_batch("BEGIN; SELECT count(*) FROM _events;")?;
+        // What a kill between the commit and the truncate leaves: committed, and still in the log.
+        let refused = g.purge(&Target::Node(node("book", "b1")), "r", "app");
+        assert!(matches!(refused, Err(Error::Refused(_))), "{refused:?}");
+        reader.execute_batch("COMMIT;")?;
+        // No close: a clean one would remove the log, as a kill does not.
+        std::mem::forget(g);
+        assert!(holds(&file_bytes(&dir, "s")?, b"a-secret-title"), "kept");
+        let g = open(dir.path().join("s"), &KEY)?;
+        assert!(!holds(&file_bytes(&dir, "s")?, b"a-secret-title"));
+        assert_eq!(std::fs::metadata(dir.path().join("s-wal"))?.len(), 0);
+        assert_eq!(rows(&g, "_purge_unfinished")?, 0, "finished");
         Ok(())
     }
 
