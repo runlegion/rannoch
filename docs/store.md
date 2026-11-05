@@ -41,7 +41,7 @@ g.declare(
 - A class may index properties: `indexed` names the properties its nodes can be listed by. Each one gets an index when the class is declared; a class that indexes nothing adds none, so a write pays for an index only where one is declared.
 - `Declaration::Property` adds a property to a declared class. Older nodes read without it; nothing is default-filled.
 - `Relation::new(name, from, to, containment)`: the last argument says the source is part of the target. Set `axis` to declare one.
-- `Declaration::Shape` names a neighbourhood a relay keeps warm: see [architecture.md](architecture.md#relays).
+- `Declaration::Shape` names a neighbourhood a relay keeps warm: see [relays.md](relays.md).
 - An identical declaration writes nothing and returns `Ok(None)`. A conflicting one is refused with a reason in ontology terms.
 
 Declare before opening a queue on the graph: the queue checks events against the ontology it took when it opened.
@@ -58,6 +58,9 @@ Every event is a CloudEvents 1.0 JSON object. rannoch reads the `rannoch.*` type
 | `rannoch.corrected.<relation>` | (any) | `{"from", "to"}`: the link was wrong, and does not hold from this event's known-at on |
 | `rannoch.amended` | (any) | `{"target": {"source", "id"}, "patch": {...}}`: a JSON Merge Patch of the target |
 | `rannoch.declared.<name>` | (any) | none; made with `declare`, never accepted |
+| `rannoch.query` | (any) | a read and its view, or a shape and its view: see [Read](#read) and [relays.md](relays.md) |
+
+Fill and the relays write the rest of rannoch's types, and every worker is handed them: `rannoch.closed.<relation>` when an arriving node closes a waiting link, `rannoch.refilled` when an event succeeds on retry, `rannoch.answer` for a query a relay answered, and `rannoch.report` from `Relays::report`. None of them fills a table.
 
 - `id` is `<uuid>:<fact>`: a `UUIDv7` for the origin's event, then which fact within it. The millisecond in the uuid is the event's known-at: when it became known. `format!("{}:0", EventId::now())` makes one.
 - `axis` is the event's point on its class's or relation's declared axis, `{"<part>": n, ...}`; left out when none is declared.
@@ -77,16 +80,18 @@ fn node(class: &str, key: &str, title: &str) -> String {
 ## Commit and fill
 
 ```rust
-let landed = g.commit(
-    &[
-        &node("author", "a1", "Ann"),
-        &node("book", "b1", "Teh Book"),
-        &wrote("a1", "b1"),
-    ],
+let book = node("book", "b1", "Teh Book");
+g.commit(
+    &[&node("author", "a1", "Ann"), &book, &wrote("a1", "b1")],
     &[],
 )?;
-let b1 = landed[1].as_ref().map_err(ToString::to_string)?.clone();
 g.fill()?;
+// An amendment names its target by the target's own CloudEvent source and id.
+let b1: serde_json::Value = serde_json::from_str(&book)?;
+let b1 = (
+    b1["source"].as_str().unwrap_or_default(),
+    b1["id"].as_str().unwrap_or_default(),
+);
 ```
 
 `commit` appends a batch in one transaction; each body that fails rolls back alone. It does not check bodies against the ontology: the queue does that when it accepts them. Each result is the event as logged (`Event { id, cursor, body }`) or why it did not land. `Event.id` is this store's receipt stamp: it orders the log and is never read as known-at.
@@ -190,6 +195,7 @@ let stopped = g.stopped()?;
 - The limit is 3 unless `set_try_limit(n)` sets another.
 - `stopped()` lists the events that reached the limit as `(cursor, last reason)` pairs.
 - `retry(cursor)` resets one event's tries, so the next fill tries it again.
+- An event that succeeds on retry reads as if it had filled the first time, and fill appends a `rannoch.refilled` event naming its place, which every worker is handed.
 - Fill counts its tries on its inbox row, as the worker `rannoch.fill` (`FILL`). Do not name a worker of your own `rannoch.fill`. The event in the log is never changed.
 
 Every failure counts as a try, including a storage fault inside one event's fill.

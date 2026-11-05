@@ -6,7 +6,7 @@
 cargo run -p rannoch-queue --example worker
 ```
 
-Workers today are code in your app. Worker files run by a harness are a design ([flows.md](flows.md)).
+Workers today are code in your app. Worker files run by a harness are a design ([flows.md](flows.md)). To keep a neighbourhood of the graph warm instead of writing a worker for it, see [relays.md](relays.md).
 
 ## Open a queue
 
@@ -68,7 +68,7 @@ Something that goes wrong after an event was accepted is a `Failure`, reported o
 
 ## Write a worker
 
-A worker is a name and a loop. Each worker has its own place in the log and sees every committed event, in order: declarations, nodes, links, endings, amendments, the `rannoch.closed.<relation>` events fill appends when an arriving node closes a waiting link, and the app's own event types. The worker decides what it cares about and closes everything else as done.
+A worker is a name and a loop. Each worker has its own place in the log and sees every committed event, in order: declarations, nodes, links, endings, amendments, the `rannoch.closed.<relation>` events fill appends when an arriving node closes a waiting link, the `rannoch.refilled` events it appends when an event succeeds on retry, `rannoch.query`, `rannoch.answer` and `rannoch.report` events, and the app's own event types. The worker decides what it cares about and closes everything else as done.
 
 ```rust
 fn drain(queue: &Queue, worker: &str) -> Result<usize, rannoch_store::Error> {
@@ -91,7 +91,7 @@ fn drain(queue: &Queue, worker: &str) -> Result<usize, rannoch_store::Error> {
 - `join(worker)` returns where a worker stands, joining it at the committed watermark when it has no place, for a worker that reads the tables first and needs only what follows.
 - `commit()` commits what is held now, without waiting for the heartbeat, and leaves every failure for the app to take, for a worker whose answer someone is waiting on.
 - Workers are independent. Two workers on one queue each get every event; one falling behind holds no other back.
-- A worker name is any string except `rannoch.fill`, which fill uses for itself.
+- A worker name is any string except `rannoch.fill`, which fill uses for itself, and, with relays open, `rannoch.relay` and `rannoch.relay.<id>`.
 
 A failed event is recorded with its reason and stays failed for that worker; the inbox does not retry an app's worker. Retry it in your own code if your work can succeed later.
 
@@ -139,10 +139,12 @@ queue.remove_worker("index")?;
 
 ## What was measured
 
-From `toys/live/RESULTS.md` on the `chore/live-test` branch, main 7fe3df9:
+From the [release check](https://github.com/runlegion/rannoch/blob/chore/187-release-check/toys/live/RESULTS.md) for v0.6.0, on main 63681e5:
 
-- 300,000 events produced under `kill -9` every 50-300 ms (1,621 kills): none missing, doubled or unfilled.
-- A worker over 3,001 events under 623 kills: every event done, none left in progress.
-- A clean produce of 300,000 events: 34,716-36,872 events a second, with another process holding a core. On a quiet machine, PR #161 measured about 44,000-45,000.
+- 300,000 events produced under `kill -9` every 50-300 ms (1,630 kills): none missing, doubled or unfilled.
+- A worker over 30,000 events under 105 kills: every event done, none left in progress.
+- A clean fill of 306,000 events: 88,294-91,381 events a second, with other agents on the machine.
+
+A clean produce through the queue was not measured again. On main 7fe3df9, before the fill work in this release, it ran at 34,716-36,872 events a second, with another process holding a core.
 
 Worker costs: `next` goes to the store once a chunk and `done` never does, which `a_worker_goes_to_the_store_once_a_chunk_and_not_to_close` in `crates/rannoch-queue/src/tests.rs` counts, so any trip to the store per event fails. Measured once, on an Apple-silicon laptop with an SSD, one worker taking and closing 20,001 events on a clean store, with no work in the worker, took 0.86 µs per event in the debug build and 0.20 µs in a release build. Before the worker contract, each `next` and each `done` was a durable commit: 5.4 ms per event, measured by an app on v0.5.0.
