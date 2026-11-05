@@ -22,7 +22,7 @@ pub use fact::check;
 pub use history::{End, Hearing, Seen, Version, View, millis};
 pub use inbox::{AMENDED, CLOSED_PREFIX, DECLARED_PREFIX, FILL, Place, REFILLED, State};
 pub use log::{Cursor, Event, Events};
-pub use purge::{PURGED, Target};
+pub use purge::{PURGE, PURGED};
 pub use rannoch_cloudevents::{Date, EventId, NodeRef, ValidTime};
 pub use rannoch_ontology::{
     Class, Declaration, Ontology, Relation, Roots, Shape, Step, Value, ValueType, Way, has_all,
@@ -238,8 +238,16 @@ impl Graph {
     /// it. The answer holds one result per body, in the same order: the event as logged, or why it
     /// did not land.
     ///
+    /// A `rannoch.purge` body ([`PURGE`]) is the app asking for a purge, and divides the batch:
+    /// what comes before it commits first, then the purge runs in a transaction of its own with
+    /// its producer's position, and what comes after commits in another. It is never stored; its
+    /// answer is the `rannoch.purged` event, or why the purge did not run. A purge that committed
+    /// but whose write-ahead log a reader kept from truncating answers [`Error::Refused`], and its
+    /// producer carries on past it.
+    ///
     /// # Errors
-    /// The graph file cannot be written; nothing of the batch lands, positions included.
+    /// The graph file cannot be written; nothing of the part of the batch in flight lands,
+    /// positions included.
     pub fn commit(
         &mut self,
         bodies: &[&str],
@@ -256,13 +264,85 @@ impl Graph {
             })?;
             *slot = Some((producer, position));
         }
+        let mut results = Vec::with_capacity(bodies.len());
+        // Each producer's position as of its last body that landed, and whether one has failed.
+        let mut reached: Reached<'_> = BTreeMap::new();
+        let mut start = 0;
+        while start < bodies.len() {
+            let requested = bodies[start..]
+                .iter()
+                .enumerate()
+                .find_map(|(at, body)| Some((start + at, purge::request(body)?)));
+            let end = requested.as_ref().map_or(bodies.len(), |(at, _)| *at);
+            if end > start {
+                self.append_batch(
+                    &bodies[start..end],
+                    &from[start..end],
+                    &mut reached,
+                    &mut results,
+                )?;
+            }
+            if let Some((at, request)) = requested {
+                let answer = self.requested(request, from[at], &mut reached)?;
+                results.push(answer);
+            }
+            start = end + 1;
+        }
+        Ok(results)
+    }
+
+    /// Runs the purge `request` asks for, from the producer and position `from`, and answers it.
+    fn requested<'b>(
+        &mut self,
+        request: Result<purge::Request, Error>,
+        from: Option<(&'b str, &'b str)>,
+        reached: &mut Reached<'b>,
+    ) -> Result<Result<Event, Error>, Error> {
+        let mut held = from.map(|(producer, position)| {
+            (
+                reached.entry(producer).or_insert((None, false)),
+                producer,
+                position,
+            )
+        });
+        if let Some(((_, true), producer, _)) = &held {
+            return Ok(Err(Error::Refused(format!(
+                "an earlier event from producer {producer} failed at commit"
+            ))));
+        }
+        let at = held
+            .as_ref()
+            .map(|(_, producer, position)| (*producer, *position));
+        match request.and_then(|request| self.purge(&request, at)) {
+            Ok((event, finished)) => {
+                if let Some(((position, _), _, at)) = &mut held {
+                    *position = Some(at);
+                }
+                Ok(finished.map(|()| event))
+            }
+            Err(error @ Error::Storage(_)) => Err(error),
+            Err(error) => {
+                if let Some(((_, stopped), ..)) = &mut held {
+                    *stopped = true;
+                }
+                Ok(Err(error))
+            }
+        }
+    }
+
+    /// Appends `bodies`, none a purge request, each from the producer and position in `from`, in
+    /// one transaction with every position `reached` holds, as [`Graph::commit`] does.
+    fn append_batch<'b>(
+        &mut self,
+        bodies: &[&str],
+        from: &[Option<(&'b str, &'b str)>],
+        reached: &mut Reached<'b>,
+        results: &mut Vec<Result<Event, Error>>,
+    ) -> Result<(), Error> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut rules: bool = tx.with(Sql::AnyRule, |s| s.query_row([], |row| row.get(0)))?;
-        let mut results = Vec::with_capacity(bodies.len());
-        // Each producer's position as of its last body that landed, and whether one has failed.
-        let mut reached: BTreeMap<&str, (Option<&str>, bool)> = BTreeMap::new();
         for (body, from) in bodies.iter().zip(from) {
             let producer = from.map(|(producer, position)| {
                 (
@@ -305,14 +385,14 @@ impl Graph {
             }
             results.push(landed);
         }
-        for (producer, (position, _)) in reached {
+        for (producer, (position, _)) in reached.iter() {
             if let Some(position) = position {
                 tx.prepare_cached(SET_POSITION)?
                     .execute([producer, position])?;
             }
         }
         tx.commit()?;
-        Ok(results)
+        Ok(())
     }
 
     /// Writes a copy of the store at one committed point into a new file at `path`, and returns
@@ -520,6 +600,9 @@ impl Graph {
         Ok(())
     }
 }
+
+/// Each producer's position in a batch as of its last body that landed, and whether one failed.
+type Reached<'b> = BTreeMap<&'b str, (Option<&'b str>, bool)>;
 
 /// How long fill works before it commits its first batch.
 pub const FILL_BUDGET: Duration = Duration::from_millis(25);

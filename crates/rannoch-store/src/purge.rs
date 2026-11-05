@@ -24,19 +24,28 @@ use crate::queries::{
     DROP_ENDINGS, DROP_ENDINGS_AT, DROP_ENDS, DROP_ENDS_AT, DROP_ENDS_OF, DROP_EVENT,
     DROP_HEARINGS, DROP_RENAMES, DROP_WAITING, DROP_WORK, HEARINGS_AT, IDENTITY_AT,
     IS_PURGE_UNFINISHED, LATEST_CONCLUSION, LINKS_AT, PLACES_OF_IDENTITY, PURGE_FINISHED,
-    PURGE_UNFINISHED, RENAMES_BY, Sql, TARGET_OF, TRUNCATE_LOG, UNCONCLUDED, links_in_view,
+    PURGE_UNFINISHED, RENAMES_BY, SET_POSITION, Sql, TARGET_OF, TRUNCATE_LOG, UNCONCLUDED,
+    links_in_view,
 };
 use crate::{Error, Graph, refresh};
 
 /// The type of the event a purge writes: its rule, its kind and its targets as keyed match values.
 pub const PURGED: &str = "rannoch.purged";
 
-/// What a purge names.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Target {
-    /// One fact, by its content identity. An amended version's identity names the event it was
-    /// heard from: that event and every amendment of it leave.
-    Fact { identity: [u8; 32] },
+/// The type of the event an app asks for a purge with: its `data` holds the target, the rule and
+/// the source of the purge event.
+pub const PURGE: &str = "rannoch.purge";
+
+/// What a purge names, as a request's `data.target` holds it: tagged by its `kind`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum Target {
+    /// One fact, by its content identity, in hex. An amended version's identity names the event it
+    /// was heard from: that event and every amendment of it leave.
+    Fact {
+        #[serde(deserialize_with = "from_hex")]
+        identity: [u8; 32],
+    },
     /// A write source's stream: every event with this source, an app's own events and amendments
     /// among them.
     Stream { source: String },
@@ -60,6 +69,37 @@ pub enum Target {
     },
     /// One source's word everywhere: its hearings, endings and corrections of every node and link.
     Source { source: String },
+}
+
+/// What a `rannoch.purge` event asks for.
+#[derive(Deserialize)]
+pub(crate) struct Request {
+    target: Target,
+    rule: String,
+    source: String,
+}
+
+/// The purge `body` asks for, when it is a `rannoch.purge` event; `None` when it is not one.
+pub(crate) fn request(body: &str) -> Option<Result<Request, Error>> {
+    #[derive(Deserialize)]
+    struct Body {
+        data: Request,
+    }
+    if !attributes(body).is_ok_and(|event| event.ty == PURGE) {
+        return None;
+    }
+    Some(
+        serde_json::from_str::<Body>(body)
+            .map(|body| body.data)
+            .map_err(Error::from),
+    )
+}
+
+fn from_hex<'de, D: serde::Deserializer<'de>>(text: D) -> Result<[u8; 32], D::Error> {
+    let text = String::deserialize(text)?;
+    blake3::Hash::from_hex(&text)
+        .map(|hash| *hash.as_bytes())
+        .map_err(serde::de::Error::custom)
 }
 
 /// What kind of thing a match value names.
@@ -758,25 +798,31 @@ fn drop_appended(
 }
 
 impl Graph {
-    /// Purges `target` under the app's own `rule`, from `source`: what it matches leaves the store
-    /// with no event body, hearing row, content identity or orphaned event id left, in one
-    /// immediate transaction under the connection's `secure_delete`, and the write-ahead log is
-    /// then truncated. An amendment naming a purged event leaves with it. Returns the purge event,
-    /// `rannoch.purged`, which holds its rule and kind plainly and each target only as a keyed
-    /// match value; a purge that matches nothing still writes it, and the rule stands. From then
-    /// on a matching event is never stored, on the write path or in fill.
-    ///
-    /// Copies outside the store (`copy_to`, replicas, backups) are the app's to purge. An event
-    /// of an app's own that mentions a purged value, a logged answer among them, leaves only with
-    /// its stream. With a queue open on the store, purge through it (`Queue::purge`): this handle
-    /// cannot reach what a queue has read ahead.
+    /// Purges what `request` names under its rule, from its source, for a `rannoch.purge` event
+    /// [`Graph::commit`] reached; `at` is the producer and position it took, which commit with the
+    /// purge. What it matches leaves the store with no event body, hearing row, content identity
+    /// or orphaned event id left, in one immediate transaction under the connection's
+    /// `secure_delete`, and the write-ahead log is then truncated. The request is never stored. An
+    /// amendment naming a purged event leaves with it. Returns the purge event, `rannoch.purged`,
+    /// which holds its rule and kind plainly and each target only as a keyed match value, with
+    /// whether the log truncated; a purge that matches nothing still writes it, and the rule
+    /// stands. From then on a matching event is never stored, on the write path or in fill.
     ///
     /// # Errors
-    /// [`Error::Refused`] when the target's class or relation is not declared; [`Error::Refused`]
+    /// [`Error::Refused`] when the target's class or relation is not declared; the graph file
+    /// cannot be read or written, and nothing is purged. The inner result is [`Error::Refused`]
     /// when the purge committed but a reader still open kept the write-ahead log from truncating,
-    /// so it holds purged bytes until the next open or purge after the readers close; the graph file
-    /// cannot be read or written, and nothing is purged.
-    pub fn purge(&mut self, target: &Target, rule: &str, source: &str) -> Result<Event, Error> {
+    /// so it holds purged bytes until the next open or purge after the readers close.
+    pub(crate) fn purge(
+        &mut self,
+        request: &Request,
+        at: Option<(&str, &str)>,
+    ) -> Result<(Event, Result<(), Error>), Error> {
+        let Request {
+            target,
+            rule,
+            source,
+        } = request;
         // So every part and rename the log holds is in the tables the purge reads them from.
         self.fill()?;
         let tx = self
@@ -821,7 +867,7 @@ impl Graph {
             .collect();
         let id = EventId::now();
         let data = Purged {
-            rule: rule.to_string(),
+            rule: rule.clone(),
             kind: primary.0,
             value: hex(&primary.1),
             also,
@@ -838,10 +884,13 @@ impl Graph {
         heard_rule(&run, &body)?;
         keep_noted(&run)?;
         tx.prepare_cached(PURGE_UNFINISHED)?.execute([])?;
+        if let Some((producer, position)) = at {
+            tx.prepare_cached(SET_POSITION)?
+                .execute([producer, position])?;
+        }
         drop(run);
         tx.commit()?;
-        finish(&self.conn)?;
-        Ok(event)
+        Ok((event, finish(&self.conn)))
     }
 }
 
@@ -885,8 +934,8 @@ mod tests {
     use rannoch_ontology::{Class, Declaration, NodeRef, Relation};
     use serde_json::json;
 
-    use super::{PURGED, Target};
-    use crate::{Cursor, Error, Graph, View, open};
+    use super::{PURGE, PURGED, Target, hex};
+    use crate::{Cursor, Error, Event, Graph, View, open};
 
     const KEY: [u8; 32] = [9; 32];
     type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -957,6 +1006,47 @@ mod tests {
         .to_string())
     }
 
+    /// `target` as a `rannoch.purge` event's `data.target` holds it.
+    fn target_data(target: &Target) -> serde_json::Value {
+        match target {
+            Target::Fact { identity } => json!({"kind": "fact", "identity": hex(identity)}),
+            Target::Stream { source } => json!({"kind": "stream", "source": source}),
+            Target::Source { source } => json!({"kind": "source", "source": source}),
+            Target::Node(node) => json!({"kind": "node", "class": node.class, "key": node.key}),
+            Target::Link { relation, from, to } => {
+                json!({"kind": "link", "relation": relation, "from": from, "to": to})
+            }
+            Target::NodeWord { node, source } => json!({"kind": "node_word", "node": node,
+                                                        "source": source}),
+            Target::LinkWord {
+                relation,
+                from,
+                to,
+                source,
+            } => json!({"kind": "link_word", "relation": relation, "from": from, "to": to,
+                        "source": source}),
+        }
+    }
+
+    /// The `rannoch.purge` event asking to purge `target` under `rule`, from `source`.
+    fn request(target: &Target, rule: &str, source: &str) -> String {
+        json!({"specversion": "1.0", "id": id(), "source": "rannoch:app", "type": PURGE,
+               "data": {"target": target_data(target), "rule": rule, "source": source}})
+        .to_string()
+    }
+
+    /// Asks `g` for a purge as an app does, by committing the request, and returns its answer.
+    fn purge(
+        g: &mut Graph,
+        target: &Target,
+        rule: &str,
+        source: &str,
+    ) -> std::result::Result<Event, Error> {
+        g.commit(&[&request(target, rule, source)], &[])?
+            .pop()
+            .ok_or_else(|| Error::Refused("no answer".to_string()))?
+    }
+
     fn land(g: &mut Graph, bodies: &[&String]) -> Result {
         let bodies: Vec<&str> = bodies.iter().map(|body| body.as_str()).collect();
         for landed in g.commit(&bodies, &[])? {
@@ -990,6 +1080,13 @@ mod tests {
             .collect())
     }
 
+    /// Whether the log holds no `rannoch.purge` event.
+    fn no_request(g: &Graph) -> Result<bool> {
+        Ok(logged(g)?.iter().all(|body| {
+            rannoch_cloudevents::attributes(body).map_or(true, |event| event.ty != PURGE)
+        }))
+    }
+
     /// The store's file and its write-ahead log as bytes.
     fn file_bytes(dir: &tempfile::TempDir, name: &str) -> Result<Vec<u8>> {
         let mut bytes = std::fs::read(dir.path().join(name))?;
@@ -1017,7 +1114,12 @@ mod tests {
         let identity = g.hearings(&node("book", "secret-key"))?[0].identity;
         let event = rannoch_cloudevents::attributes(&gone)?.id;
         assert!(holds(&file_bytes(&dir, "s")?, b"a-secret-title"), "written");
-        g.purge(&Target::Node(node("book", "secret-key")), "erasure", "app")?;
+        purge(
+            &mut g,
+            &Target::Node(node("book", "secret-key")),
+            "erasure",
+            "app",
+        )?;
         assert_eq!(
             g.conn
                 .query_row("PRAGMA secure_delete", [], |row| row.get::<_, i64>(0))?,
@@ -1046,10 +1148,97 @@ mod tests {
     }
 
     #[test]
+    fn a_request_leaves_no_byte_of_its_target_and_the_rule_event_is_the_record() -> Result {
+        let dir = tempfile::tempdir()?;
+        let mut g = store(&dir, "s")?;
+        land(&mut g, &[&book("requested-key", "one")])?;
+        let request = json!({"specversion": "1.0", "id": id(), "source": "rannoch:desk",
+                             "type": "rannoch.purge",
+                             "data": {"target": {"kind": "node", "class": "book",
+                                                 "key": "requested-key"},
+                                      "rule": "erasure-9", "source": "privacy-desk"}})
+        .to_string();
+        let answer = g.commit(&[&request], &[])?;
+        let event = answer.into_iter().next().ok_or("an answer")??;
+        let body: serde_json::Value = serde_json::from_str(&event.body)?;
+        assert_eq!(body["type"], PURGED);
+        assert_eq!(body["source"], "privacy-desk");
+        assert_eq!(body["data"]["rule"], "erasure-9");
+        assert!(!holds(&file_bytes(&dir, "s")?, b"requested-key"));
+        assert!(no_request(&g)?, "the request is never stored");
+        assert!(g.commit(&[&book("requested-key", "back")], &[])?[0].is_err());
+        // A fact by its identity in hex.
+        land(&mut g, &[&book("b2", "two")])?;
+        let identity = g.hearings(&node("book", "b2"))?[0].identity;
+        let request = json!({"specversion": "1.0", "id": id(), "source": "rannoch:desk",
+                             "type": "rannoch.purge",
+                             "data": {"target": {"kind": "fact", "identity": hex(&identity)},
+                                      "rule": "r", "source": "desk"}})
+        .to_string();
+        assert!(g.commit(&[&request], &[])?[0].is_ok());
+        assert_eq!(title(&g, "book", "b2")?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn a_request_divides_its_batch_and_its_position_lands_with_the_purge() -> Result {
+        let dir = tempfile::tempdir()?;
+        let mut g = store(&dir, "s")?;
+        let feed = Target::Stream {
+            source: "feed".to_string(),
+        };
+        let asked = request(&feed, "r", "app");
+        let before = node_from("feed", "book", "b1", "before");
+        let after = node_from("feed", "book", "b2", "after");
+        let kept = book("b3", "kept");
+        let answer = g.commit(
+            &[&before, &asked, &after, &kept],
+            &[(0, "p", "1"), (1, "p", "2"), (2, "p", "3"), (3, "p", "4")],
+        )?;
+        assert!(answer[0].is_ok() && answer[1].is_ok() && answer[3].is_ok());
+        assert!(
+            matches!(&answer[2], Err(Error::Purged { .. })),
+            "the rule stands after it"
+        );
+        g.fill()?;
+        assert_eq!(title(&g, "book", "b1")?, None, "what came before it left");
+        assert_eq!(title(&g, "book", "b3")?, Some("kept".into()));
+        assert_eq!(g.position("p")?.as_deref(), Some("4"));
+        // Alone, its position lands with it.
+        g.commit(&[&request(&feed, "r", "app")], &[(0, "q", "9")])?;
+        assert_eq!(g.position("q")?.as_deref(), Some("9"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_request_that_does_not_run_leaves_nothing_in_effect() -> Result {
+        let dir = tempfile::tempdir()?;
+        let mut g = store(&dir, "s")?;
+        let ghost = request(&Target::Node(node("ghost", "g1")), "r", "app");
+        let malformed = json!({"specversion": "1.0", "id": id(), "source": "rannoch:app",
+                               "type": PURGE, "data": {"rule": "r"}})
+        .to_string();
+        let later = book("b1", "later");
+        let answer = g.commit(
+            &[&book("b0", "zero"), &ghost, &later, &malformed],
+            &[(0, "p", "1"), (1, "p", "2"), (2, "p", "3")],
+        )?;
+        assert!(answer[0].is_ok());
+        assert!(matches!(&answer[1], Err(Error::Refused(_))));
+        assert!(answer[2].is_err(), "the producer stops at it");
+        assert!(matches!(&answer[3], Err(Error::Encoding(_))));
+        assert_eq!(g.position("p")?.as_deref(), Some("1"));
+        assert_eq!(rows(&g, "_purge_rules")?, 0);
+        assert!(no_request(&g)?);
+        Ok(())
+    }
+
+    #[test]
     fn the_purge_event_holds_its_rule_and_kind_and_no_target() -> Result {
         let dir = tempfile::tempdir()?;
         let mut g = store(&dir, "s")?;
-        let event = g.purge(
+        let event = purge(
+            &mut g,
             &Target::NodeWord {
                 node: node("book", "plain-key"),
                 source: "plain-source".to_string(),
@@ -1083,7 +1272,8 @@ mod tests {
             .iter()
             .find(|h| h.aliases.len() == 1)
             .ok_or("the hearing with its alias")?;
-        g.purge(
+        purge(
+            &mut g,
             &Target::Fact {
                 identity: one.identity,
             },
@@ -1130,7 +1320,7 @@ mod tests {
                     &app_event("feed"),
                 ],
             )?;
-            g.purge(&target, "r", "app")?;
+            purge(&mut g, &target, "r", "app")?;
             assert_eq!(title(&g, "book", "b2")?, None);
             assert_eq!(title(&g, "book", "b1")?, Some("kept".into()));
             assert_eq!(
@@ -1162,7 +1352,7 @@ mod tests {
                 &ended,
             ],
         )?;
-        g.purge(&Target::Node(node("book", "b1")), "r", "app")?;
+        purge(&mut g, &Target::Node(node("book", "b1")), "r", "app")?;
         assert_eq!(title(&g, "book", "b1")?, None);
         assert_eq!(title(&g, "chapter", "c1")?, None, "its part");
         assert_eq!(title(&g, "chapter", "c2")?, Some("not-part".into()));
@@ -1200,7 +1390,7 @@ mod tests {
                 &in_b1("link", "waiting"),
             ],
         )?;
-        g.purge(&Target::Node(node("book", "b1")), "r", "app")?;
+        purge(&mut g, &Target::Node(node("book", "b1")), "r", "app")?;
         assert_eq!(title(&g, "chapter", "ended")?, Some("former".into()));
         assert_eq!(title(&g, "chapter", "wrong")?, Some("never".into()));
         assert_eq!(title(&g, "chapter", "held")?, None, "held now");
@@ -1214,7 +1404,12 @@ mod tests {
         ));
         // Its link to the whole left with the whole.
         assert!(g.link_hearings("in", "ended", "b1")?.is_empty());
-        g.purge(&Target::Node(node("chapter", "ended")), "own", "app")?;
+        purge(
+            &mut g,
+            &Target::Node(node("chapter", "ended")),
+            "own",
+            "app",
+        )?;
         assert_eq!(title(&g, "chapter", "ended")?, None);
         Ok(())
     }
@@ -1233,7 +1428,7 @@ mod tests {
                              "type": "rannoch.closed.wrote"})
         .to_string();
         land(&mut g, &[&book("b1", "one"), &closed, &retried, &no_data])?;
-        g.purge(&Target::Node(node("book", "b1")), "r", "app")?;
+        purge(&mut g, &Target::Node(node("book", "b1")), "r", "app")?;
         assert_eq!(title(&g, "book", "b1")?, None);
         // Nothing can say what it names, so it stays where it is.
         let held = logged(&g)?;
@@ -1258,7 +1453,8 @@ mod tests {
                 .iter()
                 .any(|body| body.contains("rannoch.closed.wrote"))
         );
-        g.purge(
+        purge(
+            &mut g,
             &Target::Link {
                 relation: "wrote".to_string(),
                 from: "a1".to_string(),
@@ -1292,7 +1488,8 @@ mod tests {
                 &wrote("a", "a1", "b2"),
             ],
         )?;
-        g.purge(
+        purge(
+            &mut g,
             &Target::NodeWord {
                 node: node("book", "b1"),
                 source: "b".to_string(),
@@ -1302,7 +1499,8 @@ mod tests {
         )?;
         assert_eq!(title(&g, "book", "b1")?, Some("older".into()), "falls back");
         // Its node has no word left, and the link's own word waits open for it.
-        g.purge(
+        purge(
+            &mut g,
             &Target::NodeWord {
                 node: node("book", "b2"),
                 source: "b".to_string(),
@@ -1313,7 +1511,8 @@ mod tests {
         assert_eq!(title(&g, "book", "b2")?, None);
         assert_eq!(g.link_hearings("wrote", "a1", "b2")?.len(), 1);
         assert_eq!(rows(&g, "_open")?, 1);
-        g.purge(
+        purge(
+            &mut g,
             &Target::LinkWord {
                 relation: "wrote".to_string(),
                 from: "a1".to_string(),
@@ -1335,7 +1534,7 @@ mod tests {
         let target = book("b1", "one");
         let author = node_from("shop", "author", "a1", "ann");
         land(&mut g, &[&target, &author, &book("b2", "two")])?;
-        g.purge(&Target::Node(node("book", "b1")), "r", "app")?;
+        purge(&mut g, &Target::Node(node("book", "b1")), "r", "app")?;
         let ending = fact_from("shop", "ended", "wrote", ("author", "a1"), ("book", "b1"));
         let late_amendment = amended(
             &target,
@@ -1369,7 +1568,7 @@ mod tests {
     fn a_producer_carries_on_past_a_body_a_rule_refuses() -> Result {
         let dir = tempfile::tempdir()?;
         let mut g = store(&dir, "s")?;
-        g.purge(&Target::Node(node("book", "b1")), "r", "app")?;
+        purge(&mut g, &Target::Node(node("book", "b1")), "r", "app")?;
         let refused = book("b1", "one");
         let kept = book("b2", "two");
         let answer = g.commit(
@@ -1389,7 +1588,7 @@ mod tests {
     fn an_amendment_waiting_for_what_a_rule_refuses_goes_with_it() -> Result {
         let dir = tempfile::tempdir()?;
         let mut g = store(&dir, "s")?;
-        g.purge(&Target::Node(node("book", "b1")), "r", "app")?;
+        purge(&mut g, &Target::Node(node("book", "b1")), "r", "app")?;
         let refused = book("b1", "one");
         let patch = json!({"data": {"properties": {"title": "a-waiting-patch"}}});
         let waiting = amended(&refused, &patch, "rannoch:shop")?;
@@ -1411,7 +1610,7 @@ mod tests {
     fn a_store_replaying_a_log_holds_its_rules_and_fill_never_stores_a_match() -> Result {
         let dir = tempfile::tempdir()?;
         let mut origin = store(&dir, "origin")?;
-        let purge = origin.purge(&Target::Node(node("book", "b1")), "r", "app")?;
+        let purge = purge(&mut origin, &Target::Node(node("book", "b1")), "r", "app")?;
         let mut replica = store(&dir, "replica")?;
         // In one batch: the rule stands from where it lands in the batch.
         let late = book("b1", "a-late-title");
@@ -1452,7 +1651,7 @@ mod tests {
     fn a_copy_holds_the_rules() -> Result {
         let dir = tempfile::tempdir()?;
         let mut g = store(&dir, "s")?;
-        g.purge(&Target::Node(node("book", "b1")), "r", "app")?;
+        purge(&mut g, &Target::Node(node("book", "b1")), "r", "app")?;
         let at = dir.path().join("copy");
         g.copy_to(&at)?;
         let mut copy = open(&at, &KEY)?;
@@ -1472,7 +1671,8 @@ mod tests {
         )?;
         land(&mut g, &[&target, &patch])?;
         assert_eq!(title(&g, "book", "b1")?, Some("patched".into()));
-        g.purge(
+        purge(
+            &mut g,
             &Target::Stream {
                 source: "fixer".to_string(),
             },
@@ -1504,7 +1704,7 @@ mod tests {
             "rannoch:shop",
         )?;
         land(&mut g, &[&later])?;
-        g.purge(&Target::Node(node("book", "b1")), "r", "app")?;
+        purge(&mut g, &Target::Node(node("book", "b1")), "r", "app")?;
         let bytes = file_bytes(&dir, "s")?;
         assert!(!holds(&bytes, b"early-patch"));
         assert!(!holds(&bytes, b"later-patch"));
@@ -1524,7 +1724,7 @@ mod tests {
         land(&mut g, &[&target, &author, &link, &renamed])?;
         assert_eq!(title(&g, "book", "new-key")?, Some("one".into()));
         // Named by its new key, its old key's events go, and either key is refused after.
-        g.purge(&Target::Node(node("book", "new-key")), "r", "app")?;
+        purge(&mut g, &Target::Node(node("book", "new-key")), "r", "app")?;
         assert!(g.hearings(&node("book", "old-key"))?.is_empty());
         assert!(g.hearings(&node("book", "new-key"))?.is_empty());
         assert!(g.link_hearings("wrote", "a1", "new-key")?.is_empty());
@@ -1548,7 +1748,8 @@ mod tests {
         land(&mut g, &[&target, &author, &link, &ended, &renamed])?;
         assert_eq!(title(&g, "book", "b9")?, Some("one".into()));
         assert!(g.link_end("wrote", "a1", "b9")?.is_some());
-        g.purge(
+        purge(
+            &mut g,
             &Target::Stream {
                 source: "fixer".to_string(),
             },
@@ -1615,7 +1816,8 @@ mod tests {
             ],
         )?;
         assert!(rows(&g, "_renames")? > 0 && rows(&g, "_endings")? > 0);
-        g.purge(
+        purge(
+            &mut g,
             &Target::Stream {
                 source: "feed".to_string(),
             },
@@ -1653,7 +1855,8 @@ mod tests {
             g.link_end("wrote", "a1", "b1")?,
             Some(crate::End::Ended { .. })
         ));
-        g.purge(
+        purge(
+            &mut g,
             &Target::Source {
                 source: "other".to_string(),
             },
@@ -1679,7 +1882,8 @@ mod tests {
         g.fill()?;
         assert_eq!(rows(&g, "_work")?, 1);
         g.commit(&[&unfilled], &[])?;
-        g.purge(
+        purge(
+            &mut g,
             &Target::Stream {
                 source: "feed".to_string(),
             },
@@ -1718,8 +1922,8 @@ mod tests {
         for event in &handed[..handed.len() - 1] {
             g.done("w", event.cursor)?;
         }
-        g.purge(&Target::Node(node("book", "b1")), "r", "app")?;
-        g.purge(&Target::Node(node("book", "b2")), "r", "app")?;
+        purge(&mut g, &Target::Node(node("book", "b1")), "r", "app")?;
+        purge(&mut g, &Target::Node(node("book", "b2")), "r", "app")?;
         assert!(
             g.processed()? >= open,
             "the mark is not held behind what left"
@@ -1744,7 +1948,8 @@ mod tests {
     fn a_purge_that_matches_nothing_still_stands_and_an_undeclared_target_is_refused() -> Result {
         let dir = tempfile::tempdir()?;
         let mut g = store(&dir, "s")?;
-        g.purge(
+        purge(
+            &mut g,
             &Target::Source {
                 source: "nobody".to_string(),
             },
@@ -1753,7 +1958,7 @@ mod tests {
         )?;
         let body = node_from("nobody", "book", "b1", "x");
         assert!(g.commit(&[&body], &[])?[0].is_err());
-        let refused = g.purge(&Target::Node(node("ghost", "g1")), "r", "app");
+        let refused = purge(&mut g, &Target::Node(node("ghost", "g1")), "r", "app");
         assert!(matches!(refused, Err(Error::Refused(_))));
         Ok(())
     }
@@ -1766,7 +1971,7 @@ mod tests {
         let reader = rusqlite::Connection::open(dir.path().join("s"))?;
         reader.execute_batch("BEGIN; SELECT count(*) FROM _events;")?;
         // What a kill between the commit and the truncate leaves: committed, and still in the log.
-        let refused = g.purge(&Target::Node(node("book", "b1")), "r", "app");
+        let refused = purge(&mut g, &Target::Node(node("book", "b1")), "r", "app");
         assert!(matches!(refused, Err(Error::Refused(_))), "{refused:?}");
         reader.execute_batch("COMMIT;")?;
         // No close: a clean one would remove the log, as a kill does not.
@@ -1786,7 +1991,7 @@ mod tests {
         land(&mut g, &[&book("b1", "one")])?;
         let reader = rusqlite::Connection::open(dir.path().join("s"))?;
         reader.execute_batch("BEGIN; SELECT count(*) FROM _events;")?;
-        let answer = g.purge(&Target::Node(node("book", "b1")), "r", "app");
+        let answer = purge(&mut g, &Target::Node(node("book", "b1")), "r", "app");
         assert!(matches!(answer, Err(Error::Refused(why)) if why.contains("write-ahead log")));
         reader.execute_batch("COMMIT;")?;
         assert_eq!(title(&g, "book", "b1")?, None, "the purge committed");

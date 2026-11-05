@@ -196,10 +196,10 @@ assert_eq!(ask(&queue, "colleagues", &json!({}))?, relay);
 
 Close the relays before the queue. `Relays::open` brings back every relay in `relays.json`, under the same id and holders. Keep the id, or ask again: the same shape and view find the same relay.
 
-**After a purge** a relay holds nothing of what left, in memory or in its file, from the moment its `read` set's `cursor()` reaches the purge event's cursor. `Queue::purge` returns before that: wait for the cursor when it matters.
+**After a purge** a relay holds nothing of what left, in memory or in its file, from the moment its `read` set's `cursor()` reaches the purge event's cursor. The queue's commit of a `rannoch.purge` request returns before that: wait for the cursor when it matters.
 
-- When its worker is handed the rule event, in the pump the purge wakes (`Queue::purge` tells the relays), the relay drops everything it holds and removes its file before it reads anything. It then reads the graph again and saves at once, not when a save next falls due. A read that fails, or a save that fails, leaves no file, and an empty set until a read succeeds. The change it tells has no value from before: what stays is told as entered.
-- A purge made while no relays run, or through another handle: `Relays::open` finds the rule event after a file's cursor, removes the file and seeds again before it returns. Purge through another handle while relays run is told only at the queue's next commit, so use `Queue::purge`.
+- When its worker is handed the rule event, in the pump the purge's commit wakes (the queue tells the relays), the relay drops everything it holds and removes its file before it reads anything. It then reads the graph again and saves at once, not when a save next falls due. A read that fails, or a save that fails, leaves no file, and an empty set until a read succeeds. The change it tells has no value from before: what stays is told as entered.
+- A purge made while no relays run, or through another handle: `Relays::open` finds the rule event after a file's cursor, removes the file and seeds again before it returns. A purge committed through another handle while relays run is told only at the queue's next commit, so send the request through the queue.
 - `reread` replays the purged log, so it answers without what left, even for a report made before the purge; a body a rule refuses during a replay does not stop it.
 
 The guarantee is about the file: removing and replacing it is all rannoch does. It does not overwrite the old file's blocks, so what the disk beneath keeps after an unlink is the disk's. A set an app took from `read` before the purge is the app's.

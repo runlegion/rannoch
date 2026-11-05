@@ -43,6 +43,19 @@ let (_, failures) = queue.flush();
 
 The heartbeat commits everything held in one transaction, a savepoint per event, then fills the tables and tells subscribers. `flush()` commits now and returns the committed watermark with any failures. `close()` stops the heartbeat, commits what is held and returns the failures; dropping the queue does the same, but a process that exits without unwinding (`std::process::exit`, `panic = "abort"`) runs no drop, so close the queue first.
 
+### Purge
+
+An app asks for a purge by accepting a `rannoch.purge` event, whose `data` names the target, the rule and the source of its record ([store.md](store.md#purge) has the targets):
+
+```rust
+queue.accept(json!({"specversion": "1.0", "id": EventId::now().to_string(),
+    "source": "rannoch:privacy-desk", "type": "rannoch.purge",
+    "data": {"target": {"kind": "node", "class": "book", "key": "b1"},
+             "rule": "erasure-2026-114", "source": "privacy-desk"}}).to_string())?;
+```
+
+It runs when its batch commits: what was accepted before it commits first, so a match among it goes too, then the purge. The request is never stored. Each worker drops what it read ahead and is handed the `rannoch.purged` record in its place; an event already handed out stays with its worker, whose close of it still counts. A request that cannot run, such as one naming a class not declared, is a `Failure::Event` for its ticket, and nothing of it is in effect. Accepted through `accept_from`, its producer's position commits with the purge.
+
 ### Producers and positions
 
 A producer is anything reading a source: a log file, an archive, a socket. `accept_from(body, producer, position)` commits the producer's position in its source in the same transaction as the event. If the event fails at commit, the producer's later events in that batch are not committed and its position stays at its last event that landed.
@@ -68,7 +81,7 @@ Something that goes wrong after an event was accepted is a `Failure`, reported o
 
 ## Write a worker
 
-A worker is a name and a loop. Each worker has its own place in the log and sees every committed event, in order: declarations, nodes, links, endings, amendments, the `rannoch.closed.<relation>` events fill appends when an arriving node closes a waiting link, the `rannoch.refilled` events it appends when an event succeeds on retry, `rannoch.query`, `rannoch.answer` and `rannoch.report` events, and the app's own event types. The worker decides what it cares about and closes everything else as done.
+A worker is a name and a loop. Each worker has its own place in the log and sees every committed event, in order: declarations, nodes, links, endings, amendments, the `rannoch.closed.<relation>` events fill appends when an arriving node closes a waiting link, the `rannoch.refilled` events it appends when an event succeeds on retry, `rannoch.query`, `rannoch.answer` and `rannoch.report` events, the `rannoch.purged` record of each purge, and the app's own event types. A `rannoch.purge` request is never handed out: it is never stored (see [store.md](store.md#purge)). The worker decides what it cares about and closes everything else as done.
 
 ```rust
 fn drain(queue: &Queue, worker: &str) -> Result<usize, rannoch_store::Error> {
