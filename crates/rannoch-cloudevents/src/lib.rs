@@ -406,7 +406,10 @@ fn origin(id: &str) -> Result<EventId, Error> {
 
 /// The write's source from a `rannoch:<source>` URI, percent-decoded as the `CloudEvents` toy
 /// encoded it; a source that is not rannoch's is kept as it is.
-fn source_back(uri: &str) -> Result<String, Error> {
+///
+/// # Errors
+/// [`Error::Refused`] when the source is not percent-encoded correctly.
+pub fn source_back(uri: &str) -> Result<String, Error> {
     let Some(rest) = uri.strip_prefix("rannoch:") else {
         return Ok(uri.to_string());
     };

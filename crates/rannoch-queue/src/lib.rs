@@ -26,7 +26,7 @@ use std::time::Duration;
 use rannoch_cloudevents::Fact;
 use rannoch_ontology::Ontology;
 pub use rannoch_store::State;
-use rannoch_store::{Cursor, Error, Event, Graph, check};
+use rannoch_store::{Cursor, Error, Event, Graph, Target, check};
 
 use workers::{CHUNK, Save, Worker};
 
@@ -259,8 +259,11 @@ impl Queue {
         if from >= watermark {
             return Ok(None);
         }
-        let events = self.shared.graph().events().chunk(from, watermark, CHUNK)?;
+        // The graph stays taken until the events are kept, so a purge cannot pass between.
+        let graph = self.shared.graph();
+        let events = graph.events().chunk(from, watermark, CHUNK)?;
         let mut workers = lock(&self.shared.workers);
+        drop(graph);
         let Some(held) = workers.get_mut(worker) else {
             return Ok(None);
         };
@@ -405,6 +408,40 @@ impl Queue {
         lock(&self.shared.state).committed
     }
 
+    /// Purges `target` under `rule` from `source` ([`Graph::purge`]), after committing everything
+    /// held, so what the purge matches among it leaves too. No worker is handed anything it had
+    /// read ahead from before the purge; each is handed the rule event, which the watermark passes
+    /// and the subscribers hear of as for any commit. An event already handed out stays with its
+    /// worker, whose close of it still counts.
+    ///
+    /// # Errors
+    /// As [`Graph::purge`].
+    pub fn purge(&self, target: &Target, rule: &str, source: &str) -> Result<Event, Error> {
+        self.shared.commit();
+        let mut graph = self.shared.graph();
+        let purged = graph.purge(target, rule, source);
+        for held in lock(&self.shared.workers).values_mut() {
+            held.forget_ahead();
+        }
+        let filled = graph.fill();
+        let high = graph.events().committed();
+        drop(graph);
+        let last = {
+            let mut state = lock(&self.shared.state);
+            if let Ok(filled) = filled {
+                state.filled = filled;
+            }
+            if let Ok(high) = high {
+                state.watermark = high;
+            }
+            Ticket(state.last)
+        };
+        if let Ok(high) = high {
+            self.shared.tell(last, high);
+        }
+        purged
+    }
+
     /// Commits everything held now, without waiting for the heartbeat, and returns the committed
     /// watermark, which has passed every event accepted before the call, with every failure the
     /// app has not yet taken, this flush's and the heartbeat's. The queue keeps none of them after.
@@ -503,6 +540,11 @@ impl Shared {
         let Some((last, watermark)) = told else {
             return;
         };
+        self.tell(last, watermark);
+    }
+
+    /// Tells the subscribers the watermark. The graph is free by now.
+    fn tell(&self, last: Ticket, watermark: Cursor) {
         // A subscriber that panics is reported and the others are still told; the heartbeat lives
         // on, and a drop that is already unwinding does not abort.
         for subscriber in lock(&self.subscribers).iter_mut() {

@@ -991,3 +991,104 @@ fn a_view_known_before_the_epoch_answers_as_graph_answer_does() -> Result {
     assert!(world.settled(&id)?.nodes().is_empty(), "nothing known then");
     Ok(())
 }
+
+/// A quest chain from `q0`, whose `q1` holds a title that can be looked for in a relay's file.
+fn purge_world() -> Result<(World, String, PathBuf)> {
+    let world = World::new(vec![chain_shape()])?;
+    world.write(&[
+        node("quest", "q0", "a-kept-title"),
+        node("quest", "q1", "a-purged-title"),
+        link("next", ("quest", "q0"), ("quest", "q1")),
+    ])?;
+    let (id, _) = world.query("app", "chain", &json!({}))?;
+    world.closed(&id)?;
+    let file = world.dir.path().join("relays").join(format!("{id}.json"));
+    assert!(holds(&std::fs::read(&file)?, "a-purged-title"), "saved");
+    Ok((world, id, file))
+}
+
+fn holds(bytes: &[u8], text: &str) -> bool {
+    bytes
+        .windows(text.len())
+        .any(|window| window == text.as_bytes())
+}
+
+fn q1() -> rannoch_store::Target {
+    rannoch_store::Target::Node(NodeRef::new("quest", "q1"))
+}
+
+#[test]
+fn a_purge_through_the_queue_empties_a_relays_memory_and_its_file() -> Result {
+    let (world, id, file) = purge_world()?;
+    world.queue.purge(&q1(), "erasure", "app")?;
+    let set = world.settled(&id)?;
+    assert_eq!(warm(&set), world.cold("chain", &View::default())?);
+    // Saved at once, not when a save next falls due, and everything folded closes.
+    world.closed(&id)?;
+    let bytes = std::fs::read(&file)?;
+    assert!(!holds(&bytes, "a-purged-title"), "the file lost the value");
+    assert!(!holds(&bytes, "\"q1\""), "and the key");
+    assert!(holds(&bytes, "a-kept-title"), "and only that");
+    assert!(!file.with_extension("tmp").exists());
+    let told = lock_changes(&world).to_string();
+    assert!(
+        !told.contains("a-purged-title"),
+        "no change tells it: {told}"
+    );
+    Ok(())
+}
+
+fn lock_changes(world: &World) -> Json {
+    world
+        .changes
+        .lock()
+        .map_or(Json::Null, |changes| Json::Array(changes.clone()))
+}
+
+#[test]
+fn a_file_from_before_a_purge_is_gone_before_relays_open_returns() -> Result {
+    let (world, id, file) = purge_world()?;
+    let path = path(world.dir.path());
+    let held = file.clone();
+    // The purge lands while no relay runs, so nothing has told this relay's file of it.
+    let world = world.restart_after(|_| {
+        assert!(holds(&std::fs::read(&held)?, "a-purged-title"));
+        open(&path, &KEY)?.purge(&q1(), "erasure", "app")?;
+        Ok(())
+    })?;
+    assert!(!holds(&std::fs::read(&file)?, "a-purged-title"));
+    let set = world.relays.read(&id).ok_or("the relay is back")?;
+    assert_eq!(warm(&set), world.cold("chain", &View::default())?);
+    Ok(())
+}
+
+#[test]
+fn a_reports_reread_after_a_purge_answers_without_what_left() -> Result {
+    let (world, id, _) = purge_world()?;
+    let report = world.relays.report(&id)?;
+    let _ = world.queue.flush();
+    world.queue.purge(&q1(), "erasure", "app")?;
+    let frozen = world.relays.reread(&report)?;
+    assert_eq!(warm(&frozen), world.cold("chain", &View::default())?);
+    let later = world.relays.report(&id)?;
+    let _ = world.queue.flush();
+    world.settled(&id)?;
+    assert_eq!(
+        warm(&world.relays.reread(&later)?),
+        world.cold("chain", &View::default())?
+    );
+    // And a body arriving for what left is told as the rule's, not stored.
+    world.queue.accept(node("quest", "q1", "back"))?;
+    let (_, failures) = world.queue.flush();
+    assert!(
+        matches!(
+            &failures[..],
+            [rannoch_queue::Failure::Event {
+                error: rannoch_store::Error::Purged { .. },
+                ..
+            }]
+        ),
+        "{failures:?}"
+    );
+    Ok(())
+}

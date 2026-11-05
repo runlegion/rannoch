@@ -196,7 +196,15 @@ assert_eq!(ask(&queue, "colleagues", &json!({}))?, relay);
 
 Close the relays before the queue. `Relays::open` brings back every relay in `relays.json`, under the same id and holders. Keep the id, or ask again: the same shape and view find the same relay.
 
-A relay's file (`<id>.json`) only saves time, and is replaced at most once a second. A relay closes events only after saving them, so its worker is never ahead of its file. After a restart it is handed again what it had not closed. A file missing, unreadable or behind is reseeded from the graph. Until it folds what it was handed, `read` returns the set as of the file, so wait for `cursor()` if that matters.
+**After a purge** a relay holds nothing of what left, in memory or in its file:
+
+- When its worker is handed the rule event, in the pump the purge wakes (`Queue::purge` tells the relays), the relay drops everything it holds and removes its file before it reads anything. It then reads the graph again and saves at once, not when a save next falls due. A read that fails, or a save that fails, leaves no file, and an empty set until a read succeeds. The change it tells has no value from before: what stays is told as entered.
+- A purge made while no relays run, or through another handle: `Relays::open` finds the rule event after a file's cursor, removes the file and seeds again before it returns. Purge through another handle while relays run is told only at the queue's next commit, so use `Queue::purge`.
+- `reread` replays the purged log, so it answers without what left, even for a report made before the purge; a body a rule refuses during a replay does not stop it.
+
+The guarantee is about the file: removing and replacing it is all rannoch does. It does not overwrite the old file's blocks, so what the disk beneath keeps after an unlink is the disk's. A set an app took from `read` before the purge is the app's.
+
+A relay's file (`<id>.json`) only saves time, and is replaced at most once a second, or at once after a purge. A relay closes events only after saving them, so its worker is never ahead of its file. After a restart it is handed again what it had not closed. A file missing, unreadable or behind is reseeded from the graph. Until it folds what it was handed, `read` returns the set as of the file, so wait for `cursor()` if that matters.
 
 ## Drop
 

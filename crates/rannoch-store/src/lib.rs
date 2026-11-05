@@ -14,6 +14,7 @@ mod history;
 mod inbox;
 mod log;
 mod ontology;
+mod purge;
 mod queries;
 mod read;
 
@@ -21,6 +22,7 @@ pub use fact::check;
 pub use history::{End, Hearing, Seen, Version, View, millis};
 pub use inbox::{AMENDED, CLOSED_PREFIX, DECLARED_PREFIX, FILL, Place, REFILLED, State};
 pub use log::{Cursor, Event, Events};
+pub use purge::{PURGED, Target};
 pub use rannoch_cloudevents::{Date, EventId, NodeRef, ValidTime};
 pub use rannoch_ontology::{
     Class, Declaration, Ontology, Relation, Roots, Shape, Step, Value, ValueType, Way, has_all,
@@ -56,6 +58,10 @@ pub enum Error {
     /// The graph was opened under a content-identity key other than its own.
     #[error("the content-identity key differs from the graph's")]
     KeyDiffers,
+    /// A purge rule stands against the event: it was not stored, and a producer's position moves
+    /// past it, since sending it again can only meet the same rule.
+    #[error("purge rule {rule} stands against this event")]
+    Purged { rule: String },
 }
 
 /// While another connection holds the file's write lock, a connection retries every millisecond,
@@ -226,8 +232,10 @@ impl Graph {
     /// `producer` to `position` in its source. Each producer's position lands in the same
     /// transaction, as of its last body that landed. Once one of a producer's bodies fails, its
     /// later bodies in the batch are not appended, so its position stops at the failed event and
-    /// a producer that resumes there sends nothing twice and loses nothing. The answer holds one
-    /// result per body, in the same order: the event as logged, or why it did not land.
+    /// a producer that resumes there sends nothing twice and loses nothing. A body a purge rule
+    /// stands against is not stored and answers [`Error::Purged`], and its producer carries on past
+    /// it. The answer holds one result per body, in the same order: the event as logged, or why it
+    /// did not land.
     ///
     /// # Errors
     /// The graph file cannot be written; nothing of the batch lands, positions included.
@@ -250,6 +258,7 @@ impl Graph {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let rules: bool = tx.with(Sql::AnyRule, |s| s.query_row([], |row| row.get(0)))?;
         let mut results = Vec::with_capacity(bodies.len());
         // Each producer's position as of its last body that landed, and whether one has failed.
         let mut reached: BTreeMap<&str, (Option<&str>, bool)> = BTreeMap::new();
@@ -265,6 +274,13 @@ impl Graph {
                 results.push(Err(Error::Refused(format!(
                     "an earlier event from producer {producer} failed at commit"
                 ))));
+                continue;
+            }
+            if rules && let Some(rule) = purge::refused(&*tx, &self.key, body)? {
+                if let Some(((held, _), _, position)) = producer {
+                    *held = Some(position);
+                }
+                results.push(Err(Error::Purged { rule }));
                 continue;
             }
             tx.execute_batch(SAVEPOINT)?;
@@ -545,6 +561,7 @@ fn attempt(
 #[derive(Debug, Clone)]
 struct Flags {
     renames: bool,
+    rules: bool,
     waiting: std::collections::BTreeSet<EventId>,
 }
 
@@ -555,6 +572,7 @@ impl Flags {
         })?;
         Ok(Flags {
             renames: renamed(tx)?,
+            rules: tx.with(Sql::AnyRule, |s| s.query_row([], |row| row.get(0)))?,
             waiting: waited
                 .iter()
                 .filter_map(|id| id.split(':').next()?.parse().ok())
@@ -573,6 +591,11 @@ fn fill_one(
     event: &Event,
     flags: &mut Flags,
 ) -> Result<(), Error> {
+    // A rule that came after this event reached the log: it is never stored.
+    if flags.rules && purge::refused(tx, store_key, &event.body)?.is_some() {
+        purge::remove_event(tx, event.cursor.0)?;
+        return Ok(());
+    }
     let recorded = event.id.recorded().map_err(Error::from)?;
     let stamp = Stamp {
         cursor: event.cursor,
@@ -627,6 +650,8 @@ fn fill_one(
         fact::Fact::None => {
             if amended(tx, ontology, store_key, event, false)? {
                 *flags = Flags::read(tx)?;
+            } else if purge::heard_rule(tx, &event.body)? {
+                flags.rules = true;
             }
         }
         fact::Fact::Declared => {}

@@ -607,3 +607,45 @@ fn a_worker_joins_at_the_watermark_and_is_handed_only_what_follows()
     assert_eq!(queue.join("late"), handed.cursor);
     Ok(())
 }
+
+#[test]
+fn a_purge_through_the_queue_reaches_what_a_worker_read_ahead()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let queue = Queue::open(graph(&path(&dir))?, HOUR)?;
+    let told = Arc::new(Mutex::new(Vec::new()));
+    let heard = Arc::clone(&told);
+    queue.subscribe(move |cursor| lock(&heard).push(cursor));
+    for key in ["first", "secret", "last"] {
+        queue.accept(item(key))?;
+    }
+    let (_, failures) = queue.flush();
+    assert!(failures.is_empty());
+    // The declaration, then the first: the rest are read ahead in memory.
+    let mut taken = queue.next("w")?.ok_or("the declaration")?;
+    queue.done("w", taken.cursor)?;
+    taken = queue.next("w")?.ok_or("the first")?;
+    assert!(taken.body.contains("first"));
+    let before = lock(&told).len();
+    // Held when the purge comes, so it goes with what the log holds.
+    queue.accept(item("secret"))?;
+    let purged = queue.purge(
+        &rannoch_store::Target::Node(rannoch_store::NodeRef::new("item", "secret")),
+        "r",
+        "app",
+    )?;
+    assert!(lock(&told).len() > before, "the subscribers hear of it");
+    let mut seen = Vec::new();
+    while let Some(event) = queue.next("w")? {
+        seen.push(event.body);
+    }
+    assert!(seen.iter().all(|body| !body.contains("secret")), "{seen:?}");
+    assert!(seen.iter().any(|body| body.contains("last")));
+    assert_eq!(
+        seen.last(),
+        Some(&purged.body),
+        "the rule event, and nothing of it"
+    );
+    queue.done("w", taken.cursor)?;
+    Ok(())
+}
