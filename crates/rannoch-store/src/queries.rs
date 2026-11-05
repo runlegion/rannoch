@@ -298,11 +298,12 @@ pub(crate) const WAS_RENAMED: &str =
 /// The places of the events with a hearing of the entity `?1` keyed `?2` (as a link's target
 /// key when `?3` is true).
 /// Copies the endings of the links of `?1` whose start (`?4` false) or end (`?4` true) is keyed
-/// `?2` onto the key `?3`, so a renamed node's links keep their endings under its new key.
+/// `?2` onto the key `?3`, so a renamed node's links keep their endings under its new key, known
+/// there from the rename's known-at `?5` at the earliest.
 pub(crate) const RENAME_ENDINGS: &str = "INSERT OR IGNORE INTO _endings(entity, line, key, \
      to_key, axis, known, event, source, valid) SELECT entity, line, \
-     CASE WHEN ?4 THEN key ELSE ?3 END, CASE WHEN ?4 THEN ?3 ELSE to_key END, axis, known, event, \
-     source, valid FROM _endings \
+     CASE WHEN ?4 THEN key ELSE ?3 END, CASE WHEN ?4 THEN ?3 ELSE to_key END, axis, \
+     max(known, ?5), event, source, valid FROM _endings \
      WHERE entity = ?1 AND line = 'main' AND CASE WHEN ?4 THEN to_key = ?2 ELSE key = ?2 END";
 
 /// Copies the conclusions of the links of `?1` keyed `?2` at one end onto `?3`, as

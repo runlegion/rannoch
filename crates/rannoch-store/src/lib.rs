@@ -1611,6 +1611,37 @@ mod tests {
     }
 
     #[test]
+    fn known_before_a_rename_an_ended_link_answers_only_under_its_old_key()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut g, b1, _) = wrote_b1("rename-ended-before")?;
+        logged(&mut g, &concluded(&id_at(1_500), "ended", "a1", "b1"))?;
+        g.commit(&[&amended(2_000, &b1, r#"{"subject":"b9"}"#)], &[])?;
+        g.commit(&[&amended(3_000, &b1, r#"{"subject":"b10"}"#)], &[])?;
+        g.fill()?;
+        assert!(known_link(&g, "b1", 1_700)?.ok_or("old key")?.ended);
+        assert!(known_link(&g, "b9", 1_700)?.is_none(), "before the rename");
+        assert!(known_link(&g, "b10", 1_700)?.is_none(), "before either");
+        assert!(known_link(&g, "b9", 2_500)?.ok_or("b9 by 2,500")?.ended);
+        assert!(known_link(&g, "b10", 2_500)?.is_none(), "before the second");
+        assert!(known_link(&g, "b10", 3_500)?.ok_or("b10 by 3,500")?.ended);
+        Ok(())
+    }
+
+    #[test]
+    fn an_ending_known_before_a_rename_it_arrives_after_answers_only_from_the_rename()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut g, b1, _) = wrote_b1("rename-late-ending")?;
+        g.commit(&[&amended(2_000, &b1, r#"{"subject":"b9"}"#)], &[])?;
+        g.fill()?;
+        logged(&mut g, &concluded(&id_at(1_500), "ended", "a1", "b1"))?;
+        g.fill()?;
+        assert!(known_link(&g, "b1", 1_700)?.ok_or("old key")?.ended);
+        assert!(known_link(&g, "b9", 1_700)?.is_none(), "before the rename");
+        assert!(known_link(&g, "b9", 2_500)?.ok_or("b9 by 2,500")?.ended);
+        Ok(())
+    }
+
+    #[test]
     fn an_ending_after_a_rename_ends_the_renamed_link() -> Result<(), Box<dyn std::error::Error>> {
         let (mut g, b1, _) = wrote_b1("rename-then-end")?;
         g.commit(&[&amended(2_000, &b1, r#"{"subject":"b9"}"#)], &[])?;

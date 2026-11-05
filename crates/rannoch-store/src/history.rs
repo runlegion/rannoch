@@ -569,12 +569,12 @@ pub(crate) fn conclude(
     let entity = link_entity(relation);
     // Each end as renamed by the conclusion's own known-at, then every key it was renamed to
     // after: the conclusion is kept under each, as a rename copies the endings it finds, so the
-    // order a conclusion and a rename arrive in never changes where it is kept. A store with no
-    // rename is not looked up.
+    // order a conclusion and a rename arrive in never changes where it is kept. An ending is known
+    // under a key only from the rename that reached it. A store with no rename is not looked up.
     let by = event.to_string();
-    let keys = |end: &NodeRef| -> Result<Vec<String>, Error> {
+    let keys = |end: &NodeRef| -> Result<Vec<(String, i64)>, Error> {
         if !renames {
-            return Ok(vec![end.key.clone()]);
+            return Ok(vec![(end.key.clone(), known)]);
         }
         Ok(renamed_from(
             &renames_in(tx, &node_entity(&end.class))?,
@@ -583,8 +583,8 @@ pub(crate) fn conclude(
         ))
     };
     let (froms, tos) = (keys(from)?, keys(to)?);
-    for from in &froms {
-        for to in &tos {
+    for (from, from_known) in &froms {
+        for (to, to_known) in &tos {
             note(Some(known));
             tx.with(Sql::Conclude, |s| {
                 s.execute(params![entity, from, to, by, source, at, valid, known])
@@ -595,6 +595,7 @@ pub(crate) fn conclude(
                 })?;
                 continue;
             };
+            let known = known.max(*from_known).max(*to_known);
             let new = tx.with(Sql::Ending, |s| {
                 s.execute(params![entity, from, to, at, by, source, valid, known])
             })?;
@@ -614,12 +615,14 @@ pub(crate) fn conclude(
 }
 
 /// The key `key` resolves to through `renames` as known at `upto`, then each key it was renamed
-/// to after `upto`, in order.
-fn renamed_from(renames: &[Rename], key: &str, upto: (i64, &str)) -> Vec<String> {
-    let mut keys = vec![resolve(renames, key, upto)];
+/// to after `upto`, in order, each with the known-at it holds from.
+fn renamed_from(renames: &[Rename], key: &str, upto: (i64, &str)) -> Vec<(String, i64)> {
+    let mut key = resolve(renames, key, upto);
+    let mut keys = vec![(key.clone(), upto.0)];
     for (old, new, point, event) in renames {
-        if (*point, event.as_str()) > upto && keys.last() == Some(old) {
-            keys.push(new.clone());
+        if (*point, event.as_str()) > upto && key == *old {
+            key.clone_from(new);
+            keys.push((key.clone(), *point));
         }
     }
     keys
@@ -711,7 +714,7 @@ pub(crate) fn amend(
             tx.with(Sql::Renamed, |s| {
                 s.execute(params![entity, old, new, known, by])
             })?;
-            rename_ends(tx, ontology, entity, &old, new)?;
+            rename_ends(tx, ontology, entity, (&old, new), known)?;
             places.extend(naming(tx, ontology, entity, &old)?);
         }
     }
@@ -880,17 +883,18 @@ fn link_ends(ontology: &Ontology, entity: &str) -> Vec<(String, bool)> {
 }
 
 /// Copies the endings and conclusions of every link keyed `old` at a node of `entity` onto
-/// `new`; the rows under `old` stay, so the link reads as it was known before the rename.
+/// `new`; the rows under `old` stay, so the link reads as it was known before the rename, and an
+/// ending under `new` is known from the rename's `known` at the earliest.
 fn rename_ends(
     tx: &impl Run,
     ontology: &Ontology,
     entity: &str,
-    old: &str,
-    new: &str,
+    (old, new): (&str, &str),
+    known: i64,
 ) -> Result<(), Error> {
     for (of, target) in link_ends(ontology, entity) {
         tx.with(Sql::RenameEndings, |s| {
-            s.execute(params![of, old, new, target])
+            s.execute(params![of, old, new, target, known])
         })?;
         tx.with(Sql::RenameEnds, |s| {
             s.execute(params![of, old, new, target])
