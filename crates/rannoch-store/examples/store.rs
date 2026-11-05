@@ -6,10 +6,10 @@
 
 use std::time::{Duration, SystemTime};
 
-use rannoch_store::{At, Class, Declaration, EventId, NodeRef, Relation, Value, open};
+use rannoch_store::{Class, Declaration, EventId, NodeRef, Relation, Value, View, open};
 
 /// A `CloudEvent` id: `<origin event uuid>:<fact within it>`. The uuid is a `UUIDv7`, and the
-/// millisecond it carries is when the origin recorded the event.
+/// millisecond it carries is the event's known-at: when it became known.
 fn id() -> String {
     format!("{}:0", EventId::now())
 }
@@ -93,7 +93,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // A moment between the write and its amendments, to read "as known then".
     std::thread::sleep(Duration::from_millis(5));
-    let before = At::Time(SystemTime::now());
+    let before = View {
+        axis: None,
+        known: Some(SystemTime::now()),
+    };
     std::thread::sleep(Duration::from_millis(5));
 
     // Amend the title, then rename the book from b1 to b9. The event stays as written; reads
@@ -117,8 +120,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The link followed the rename.
     assert!(g.link_seen("wrote", "a1", "b9")?.is_some());
     // As known before the amendments, the link was a1 -> b1.
-    assert!(g.link_known_at("wrote", "a1", "b1", before)?.is_some());
-    assert!(g.link_known_at("wrote", "a1", "b9", before)?.is_none());
+    assert!(g.link_state_at("wrote", "a1", "b1", &before)?.is_some());
+    assert!(g.link_state_at("wrote", "a1", "b9", &before)?.is_none());
 
     // An amendment fill cannot apply never stops fill: it is tried up to the try limit (3) and
     // then stops, with its reason.

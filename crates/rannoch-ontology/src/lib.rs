@@ -13,20 +13,21 @@ use serde::{Deserialize, Serialize};
 pub struct Refused(pub String);
 
 /// A class: a kind of node, with its natural key, its properties and each one's value type,
-/// and the key its history is ordered by.
+/// and the axis its history is ordered by.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Class {
     pub name: String,
     /// Each property and its value type.
     pub properties: BTreeMap<String, ValueType>,
-    /// The key the class's history is ordered by; the origin's record time when it declares none.
+    /// The named integer parts of the point its history is ordered by, compared in this order:
+    /// each part refines the one before it. Empty: its axis is when each fact became known.
     #[serde(default)]
-    pub history: HistoryKey,
+    pub axis: Vec<String>,
 }
 
 impl Class {
-    /// A class whose properties are all text and whose history is ordered by the origin's
-    /// record time.
+    /// A class whose properties are all text and that declares no axis, so its history is
+    /// ordered by when each fact became known.
     pub fn new<P: Into<String>>(
         name: impl Into<String>,
         properties: impl IntoIterator<Item = P>,
@@ -37,7 +38,7 @@ impl Class {
                 .into_iter()
                 .map(|p| (p.into(), ValueType::Text))
                 .collect(),
-            history: HistoryKey::Origin,
+            axis: Vec::new(),
         }
     }
 
@@ -78,20 +79,6 @@ pub enum ValueType {
     Float,
     /// 64-bit floats, exactly this many.
     FloatVector(usize),
-}
-
-/// What a class's history is ordered by.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HistoryKey {
-    /// The record time of the store that first recorded each hearing, carried in its event:
-    /// never the order this store received it in.
-    #[default]
-    Origin,
-    /// An integer the writer supplies with each write.
-    Integer,
-    /// A time the writer supplies with each write: UTC, millisecond precision.
-    Time,
 }
 
 /// A property's value, of its property's declared type.
@@ -198,6 +185,10 @@ pub struct Relation {
     pub from: String,
     pub to: String,
     pub containment: bool,
+    /// The named integer parts of the point its links and endings are ordered by, as a class
+    /// declares them. Empty: its axis is when each fact became known.
+    #[serde(default)]
+    pub axis: Vec<String>,
 }
 
 impl Relation {
@@ -212,6 +203,7 @@ impl Relation {
             from: from.into(),
             to: to.into(),
             containment,
+            axis: Vec::new(),
         }
     }
 
@@ -278,7 +270,7 @@ impl Ontology {
     ///
     /// # Errors
     /// The declaration conflicts with what is declared: a class or relation of the same name
-    /// with other properties, history or ends, a property of the same name with another type,
+    /// with other properties, axis or ends, a property of the same name with another type,
     /// a property of a class that is not declared, or a relation whose end names a class that
     /// is not declared.
     pub fn check(&self, declaration: &Declaration) -> Result<bool, Refused> {
@@ -286,13 +278,13 @@ impl Ontology {
             Declaration::Class(class) => match self.classes.get(&class.name) {
                 Some(have) if have == class => Ok(false),
                 Some(have) => Err(Refused(format!(
-                    "class {} is already declared with properties {} and history {:?}; \
+                    "class {} is already declared with properties {} and axis {:?}; \
                      this declaration has {} and {:?}",
                     class.name,
                     list(&have.properties),
-                    have.history,
+                    have.axis,
                     list(&class.properties),
-                    class.history
+                    class.axis
                 ))),
                 None => Ok(true),
             },
@@ -351,14 +343,22 @@ fn ends(relation: &Relation) -> String {
     } else {
         ""
     };
-    format!("from {} to {}{containment}", relation.from, relation.to)
+    let axis = if relation.axis.is_empty() {
+        String::new()
+    } else {
+        format!(", on axis {:?}", relation.axis)
+    };
+    format!(
+        "from {} to {}{containment}{axis}",
+        relation.from, relation.to
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::{Class, Declaration, HistoryKey, Ontology, Relation, Value, ValueType};
+    use super::{Class, Declaration, Ontology, Relation, Value, ValueType};
 
     fn declared() -> Ontology {
         let mut ontology = Ontology::default();
@@ -397,13 +397,20 @@ mod tests {
     fn a_conflicting_declaration_is_refused_naming_what_differs_and_no_table() {
         let ontology = declared();
         let mut ordered = Class::new("author", ["name"]);
-        ordered.history = HistoryKey::Integer;
+        ordered.axis = vec!["build".into()];
         for (declaration, names) in [
             (
                 Declaration::Class(Class::new("author", ["born"])),
                 "class author",
             ),
             (Declaration::Class(ordered), "class author"),
+            (
+                Declaration::Relation(Relation {
+                    axis: vec!["build".into()],
+                    ..Relation::new("wrote", "author", "book", false)
+                }),
+                "relation wrote",
+            ),
             (
                 Declaration::Relation(Relation::new("wrote", "book", "author", false)),
                 "relation wrote",
