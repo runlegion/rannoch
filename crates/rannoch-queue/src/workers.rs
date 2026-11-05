@@ -100,6 +100,12 @@ impl Worker {
         Some(event)
     }
 
+    /// Forgets what was read ahead: a purge may have removed it. The next read starts after what
+    /// was handed out.
+    pub(crate) fn forget_ahead(&mut self) {
+        self.ahead.clear();
+    }
+
     /// Keeps `events`, read from the log after `from`, unless the worker moved on meanwhile.
     pub(crate) fn read(&mut self, from: Cursor, events: Vec<Event>) {
         if self.handed == from && self.ahead.is_empty() {

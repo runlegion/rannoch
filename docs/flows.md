@@ -90,6 +90,6 @@ One import run, from raw input to sealed.
 8. **Asks from a long pipeline:**
    - **A join:** wait until every event from source X has reached outcome Y.
    - **Replay:** rerun a step with a new parser version over the stored raw events, before seal.
-   - **Purge scoped by source,** allowed only after seal. (Purge is #148.)
+   - **Purge scoped by source,** allowed only after seal. (Purge is in [store.md](store.md#purge).)
    - **Large inputs by reference:** host actions that take shared reference data, hundreds of MB, by reference rather than inline.
 9. **Scale.** A long pipeline is millions of events per run and terabytes of import log across runs.

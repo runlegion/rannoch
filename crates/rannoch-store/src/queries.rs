@@ -213,6 +213,9 @@ pub(crate) const HISTORY_TABLES: &str = "
     CREATE TABLE IF NOT EXISTS _waiting(
         source TEXT NOT NULL, id TEXT NOT NULL, known INTEGER NOT NULL, event TEXT NOT NULL,
         seq INTEGER NOT NULL, PRIMARY KEY(source, id, known, event)) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS _purge_rules(
+        kind TEXT NOT NULL, value BLOB NOT NULL, rule TEXT NOT NULL,
+        PRIMARY KEY(kind, value)) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS _check(value TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS _newest(one INTEGER PRIMARY KEY CHECK (one = 1), known INTEGER);
     INSERT OR IGNORE INTO _newest(one, known) SELECT 1, (SELECT max(k) FROM (
@@ -364,6 +367,95 @@ pub(crate) const HEAR_AMENDED: &str = "INSERT INTO _hearings(identity, entity, k
 
 pub(crate) const UNSEEN: &str = "DELETE FROM _seen WHERE entity = ?1 AND line = 'main' \
      AND key = ?2 AND to_key = ?3";
+
+/// Whether the store keeps any purge rule.
+pub(crate) const ANY_RULE: &str = "SELECT EXISTS (SELECT 1 FROM _purge_rules)";
+
+/// Keeps the rule `?3` against the match value `?2` of the kind `?1`; the first kept stays.
+pub(crate) const STAND_RULE: &str =
+    "INSERT OR IGNORE INTO _purge_rules(kind, value, rule) VALUES (?1, ?2, ?3)";
+
+/// The rule standing against the match value `?2` of the kind `?1`.
+pub(crate) const RULE_OF: &str = "SELECT rule FROM _purge_rules WHERE kind = ?1 AND value = ?2";
+
+/// The places of the hearing whose identity is `?1`.
+pub(crate) const PLACES_OF_IDENTITY: &str =
+    "SELECT seq FROM _hearings WHERE line = 'main' AND identity = ?1";
+
+/// The identity of the hearing the event at the place `?1` made itself.
+pub(crate) const IDENTITY_AT: &str =
+    "SELECT identity FROM _hearings WHERE line = 'main' AND seq = ?1 AND amended IS NULL";
+
+/// Every hearing the event at the place `?1` is named on: identity, entity, key, target key.
+pub(crate) const HEARINGS_AT: &str =
+    "SELECT identity, entity, key, to_key FROM _hearings WHERE line = 'main' AND seq = ?1";
+
+pub(crate) const DROP_ALIASES: &str = "DELETE FROM _aliases WHERE line = 'main' AND identity = ?1";
+
+pub(crate) const DROP_HEARINGS: &str = "DELETE FROM _hearings WHERE line = 'main' AND seq = ?1";
+
+/// Every link with a conclusion made by the event `?1`.
+pub(crate) const CONCLUDED_BY: &str = "SELECT entity, key, to_key FROM _ends WHERE event = ?1 \
+     UNION SELECT entity, key, to_key FROM _endings WHERE event = ?1 \
+     UNION SELECT entity, key, to_key FROM _corrections WHERE event = ?1";
+
+pub(crate) const DROP_ENDS: &str = "DELETE FROM _ends WHERE event = ?1";
+
+pub(crate) const DROP_ENDINGS: &str = "DELETE FROM _endings WHERE event = ?1";
+
+pub(crate) const DROP_CORRECTIONS: &str = "DELETE FROM _corrections WHERE event = ?1";
+
+/// Every link of `?1` with a conclusion, keyed `?2` at its start (`?3` false) or its end.
+pub(crate) const UNCONCLUDED: &str = "SELECT entity, key, to_key FROM _ends \
+     WHERE entity = ?1 AND CASE WHEN ?3 THEN to_key = ?2 ELSE key = ?2 END \
+     UNION SELECT entity, key, to_key FROM _endings \
+     WHERE entity = ?1 AND CASE WHEN ?3 THEN to_key = ?2 ELSE key = ?2 END \
+     UNION SELECT entity, key, to_key FROM _corrections \
+     WHERE entity = ?1 AND CASE WHEN ?3 THEN to_key = ?2 ELSE key = ?2 END";
+
+pub(crate) const DROP_ENDS_AT: &str = "DELETE FROM _ends WHERE entity = ?1 \
+     AND CASE WHEN ?3 THEN to_key = ?2 ELSE key = ?2 END";
+
+pub(crate) const DROP_ENDINGS_AT: &str = "DELETE FROM _endings WHERE entity = ?1 \
+     AND CASE WHEN ?3 THEN to_key = ?2 ELSE key = ?2 END";
+
+pub(crate) const DROP_CORRECTIONS_AT: &str = "DELETE FROM _corrections WHERE entity = ?1 \
+     AND CASE WHEN ?3 THEN to_key = ?2 ELSE key = ?2 END";
+
+pub(crate) const DROP_ENDS_OF: &str =
+    "DELETE FROM _ends WHERE entity = ?1 AND key = ?2 AND to_key = ?3";
+
+/// Keeps the latest conclusion left of the link `?1`, `?2`, `?3`, by known-at and then event id.
+pub(crate) const LATEST_CONCLUSION: &str = "INSERT INTO _ends(entity, key, to_key, event, source, \
+     axis, valid, known) SELECT ?1, ?2, ?3, event, source, axis, valid, known FROM ( \
+     SELECT event, source, axis, valid, known FROM _endings \
+     WHERE entity = ?1 AND key = ?2 AND to_key = ?3 \
+     UNION ALL SELECT event, source, NULL, NULL, known FROM _corrections \
+     WHERE entity = ?1 AND key = ?2 AND to_key = ?3) ORDER BY known DESC, event DESC LIMIT 1";
+
+/// The place of the event the amendment at the place `?1` patched.
+pub(crate) const TARGET_OF: &str = "SELECT target FROM _amendments WHERE seq = ?1";
+
+pub(crate) const DROP_AMENDMENT: &str = "DELETE FROM _amendments WHERE seq = ?1";
+
+pub(crate) const DROP_WAITING: &str = "DELETE FROM _waiting WHERE seq = ?1";
+
+/// The renames the amendment `?1` made: entity, old key, new key.
+pub(crate) const RENAMES_BY: &str = "SELECT entity, old, new FROM _renames WHERE event = ?1";
+
+pub(crate) const DROP_RENAMES: &str = "DELETE FROM _renames WHERE event = ?1";
+
+pub(crate) const DROP_WORK: &str = "DELETE FROM _work WHERE seq = ?1";
+
+pub(crate) const DROP_EVENT: &str = "DELETE FROM _events WHERE seq = ?1";
+
+/// Every link of `?1` heard with the key `?2` at its start (`?3` false) or its end.
+pub(crate) const LINKS_AT: &str = "SELECT DISTINCT key, to_key FROM _hearings WHERE line = 'main' \
+     AND entity = ?1 AND CASE WHEN ?3 THEN to_key = ?2 ELSE key = ?2 END";
+
+/// Moves every page of the write-ahead log into the file and truncates it to nothing. Its first
+/// column says whether a reader kept it from finishing.
+pub(crate) const TRUNCATE_LOG: &str = "PRAGMA wal_checkpoint(TRUNCATE)";
 
 /// The order versions are chosen by, `DESC` putting the newest first: by axis point, then
 /// known-at, so a correction at the same point follows what it corrects, then event id.
@@ -1331,4 +1423,7 @@ fixed! {
     WaitingOnSource => built!(waiting("from_key")),
     AppendEvent => APPEND_EVENT,
     Place => PLACE,
+    AnyRule => ANY_RULE,
+    StandRule => STAND_RULE,
+    RuleOf => RULE_OF,
 }

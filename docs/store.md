@@ -1,6 +1,6 @@
 # The store
 
-`rannoch-store` is one graph in one SQLite file. Every change is an event in its log; the tables are built from the log. The log only grows, so an app that wants raw data gone keeps it outside the store. This page follows `crates/rannoch-store/examples/store.rs`, which runs:
+`rannoch-store` is one graph in one SQLite file. Every change is an event in its log; the tables are built from the log. The log only grows, apart from [purge](#purge), which is rare and deliberate; an app that wants raw data gone routinely keeps it outside the store. This page follows `crates/rannoch-store/examples/store.rs`, which runs:
 
 ```sh
 cargo run -p rannoch-store --example store
@@ -58,6 +58,7 @@ Every event is a CloudEvents 1.0 JSON object. rannoch reads the `rannoch.*` type
 | `rannoch.corrected.<relation>` | (any) | `{"from", "to"}`: the link was wrong, and does not hold from this event's known-at on |
 | `rannoch.amended` | (any) | `{"target": {"source", "id"}, "patch": {...}}`: a JSON Merge Patch of the target |
 | `rannoch.declared.<name>` | (any) | none; made with `declare`, never accepted |
+| `rannoch.purged` | (none) | `{"rule", "kind", "match", "also"}`: see [Purge](#purge) |
 | `rannoch.query` | (any) | a read and its view, or a shape and its view: see [Read](#read) and [relays.md](relays.md) |
 
 Fill and the relays write the rest of rannoch's types, and every worker is handed them: `rannoch.closed.<relation>` when an arriving node closes a waiting link, `rannoch.refilled` when an event succeeds on retry, `rannoch.answer` for a query a relay answered, and `rannoch.report` from `Relays::report`. None of them fills a table.
@@ -208,6 +209,35 @@ let at = g.copy_to(dir.join("shop-copy.rannoch"))?;
 
 `copy_to` writes a copy of the store at one committed point and returns the cursor the copy holds. It takes no write lock, so writers carry on, and it records nothing in the store: a copy is outside the store, like a backup. It refuses a path that exists and leaves no file when it fails. The copy is not flushed durably to disk; a snapshot tool that does that is issue #154.
 
-## Not built yet
+## Purge
 
-- Purge (erasure of a fact from the store, with a rule that refuses it coming back): #148.
+**Purge is erasure: rare and selective.** It is not how an app records change, or how it corrects a mistake (that is an amendment).
+
+```rust
+g.purge(&Target::Node(NodeRef::new("book", "b1")), "erasure-2026-114", "privacy-desk")?;
+```
+
+`purge(target, rule, source)` runs in one immediate transaction under the connection's `secure_delete`, then truncates the write-ahead log. It first fills, so every part and rename the log holds is known. It reads the whole log, so what is not yet filled, or failed fill, goes too. It returns the purge event. A purge that matches nothing still writes one, and its rule stands.
+
+| `Target` | What leaves |
+|---|---|
+| `Fact { identity }` | one fact, every event it arrived under. An amended version's identity (from `hearings`) names the event it was heard from: that event and every amendment of it |
+| `Stream { source }` | every event with this source: its facts, an app's own events, its amendments |
+| `Node(node)` | the node under every key a rename connects it to, every node part of it by a containment link that holds now, its node arrived or not, and all their links. A former part, whose link ended or was found wrong, survives with no link to the whole, and is purged by its own rule |
+| `Link { relation, from, to }` | the link's hearings, endings and corrections, under every key its ends went by |
+| `NodeWord { node, source }` | that source's hearings of the node |
+| `LinkWord { relation, from, to, source }` | that source's hearings, endings and corrections of the link |
+| `Source { source }` | that source's hearings, endings and corrections of every node and link. Unlike `Stream`, it leaves the source's app events and amendments |
+
+A `source` is compared as `hearings` reports it, so `rannoch:shop` and `shop` are one source.
+
+- **What leaves with it.** Each matched event's body, its hearings and aliases, what is kept of it in the tables, the failures and in-progress rows workers had for it, and the `rannoch.closed` and `rannoch.refilled` events that named it. Every amendment naming a purged event goes too, wherever it waits. A place in the log is never reused, so cursors stay true and the log has a gap.
+- **What stays right.** A node or link left with other hearings reads as its newest left. A link whose node has no hearing left waits open. A latest conclusion that left gives way to the one before it. When a rename's amendment leaves but the node stays (`Stream` of the amendment's source), the rename is undone: the node and its links read under the old key.
+- **The purge event** records its rule and kind plainly and each target only as a keyed match value under the graph's key, so it names what it matched and holds none of it. `also` holds the same for what else the rule stands against: each part, each other key, each event that left.
+- **The rule stands.** Once a store holds a rule, `commit` checks each body against the rules. A match is not stored and answers `Error::Purged { rule }`: a hearing, an ending, a correction, an amendment naming a purged event, or an amendment whose patched event would match, such as a rename onto a purged key. A producer's position moves past such a body and its later bodies still land, since sending it again can only meet the same rule. A store with no rule pays one read per commit. Once one stands, every body committed and filled is hashed into its match values and looked up, and each amendment reads the log to find its target's body at commit as well as in fill.
+- **A rule travels in the log.** A store that commits or fills a `rannoch.purged` event takes its rules, under the same key: a match later in the same batch is refused, and a match in the log that fill has not reached leaves when fill reaches it, though only a purge truncates the write-ahead log. So a store replaying a purged log holds the same rules, and `copy_to` carries them in the file. Filling a rule event removes nothing a store already held.
+- **A reader still open** can keep the write-ahead log from truncating. The purge has committed, and `purge` answers `Error::Refused`; the log holds purged bytes until a checkpoint runs after the readers close.
+
+**With a queue open, purge through it:** `queue.purge(target, rule, source)`. It commits what is held first, so a match among it goes too, drops what workers read ahead, and hands each worker the rule event. A separate handle cannot reach what a queue has read ahead, and the queue's workers hear of that purge only at its next commit. A worker sees a purge only as its rule event. An event already handed out stays with its worker, whose close of it still counts; on `Graph::next`, a close of an event purged in progress is refused as not in progress.
+
+**What it does not reach.** Copies outside the store (`copy_to`, replicas, backups) are the app's to purge. An app's own event that mentions a purged value leaves only with its stream, and that includes a `rannoch.query` or `rannoch.answer` an app chose to log. A shape's declaration that names a purged node keeps naming it, and producers' positions and kept worker state are the app's text. `secure_delete` zeroes what SQLite frees in the file; it says nothing of what the disk beneath it keeps.

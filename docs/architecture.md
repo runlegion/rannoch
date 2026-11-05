@@ -189,10 +189,6 @@ None of the following exists in code. Each crate is an empty scaffold with one d
 
 Worker files (`rannoch-worker`), the harness (`rannoch-harness`) and the steps (`rannoch-processor`, `rannoch-processor-*`). The design: each worker is a file of JSON lines in a folder; the harness runs each as an inbox worker, reads guards, hands each row to its processor, follows `next` and `else`, and commits what a step did together with the worker's place. How a step's effect commits together with the worker's place is not designed, and no public call does it today. [flows.md](flows.md) is the design for mark-up, with its open questions.
 
-### Purge (#148)
-
-Erasing a fact from the store and its WAL, with a standing rule that refuses it coming back.
-
 ### Snapshot tool (#154)
 
 A durable copy of the store, built on `copy_to`, outside the engine.
