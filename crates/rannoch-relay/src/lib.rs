@@ -235,12 +235,7 @@ impl Relays {
                 .unwrap_or_else(PoisonError::into_inner)
                 .remove(id);
             inner.queue.remove_worker(&worker_name(id))?;
-            match fs::remove_file(relay_file(&inner.dir, id)) {
-                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-                    return Err(error.into());
-                }
-                _ => {}
-            }
+            remove_files(&inner.dir, id)?;
         }
         write_manifest(&inner.dir, relays)
     }

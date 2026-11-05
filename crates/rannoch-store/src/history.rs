@@ -648,6 +648,12 @@ struct Made {
     known: i64,
 }
 
+/// The origin's event a `CloudEvent` id `<event uuid>:<fact>` names, in the form its rows are kept
+/// under; `None` when its uuid does not parse.
+pub(crate) fn origin_of(id: &str) -> Option<EventId> {
+    id.split(':').next()?.parse().ok()
+}
+
 /// The source and id of the event `amendment` names as its target.
 pub(crate) fn amendment_target(amendment: &serde_json::Value) -> Option<(&str, &str)> {
     let target = amendment.get("data")?.get("target")?;
@@ -674,8 +680,7 @@ pub(crate) fn amend(
         .get("id")
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
-    let uuid = |id: &str| -> Option<EventId> { id.split(':').next()?.parse().ok() };
-    let event = uuid(id)
+    let event = origin_of(id)
         .ok_or_else(|| Error::Refused(format!("amendment {id} is not <event uuid>:<fact>")))?;
     let data = amendment.get("data");
     let Some((source, target)) = amendment_target(&amendment) else {

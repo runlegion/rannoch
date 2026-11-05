@@ -32,7 +32,7 @@ pub use read::{ANSWER, Counts, Description, Direction, Node, QUERY, ViewData};
 use crate::handles::{Handles, Run};
 use crate::history::{
     Heard, Key, Of, Stamp, Subject, alias, amend, conclude, derive, heard, link_entity,
-    names_renamed, newest, node_entity, reseen_of, take,
+    names_renamed, newest, node_entity, origin_of, reseen_of, take,
 };
 use crate::inbox::place;
 use crate::log::{append, event_at, store};
@@ -288,7 +288,13 @@ impl Graph {
             tx.execute_batch(if landed.is_ok() { RELEASE } else { ROLLBACK_TO })?;
             // A rule that lands here stands for the rest of the batch. One that cannot be read
             // fails when fill reaches it.
-            rules |= landed.is_ok() && purge::heard_rule(&*tx, body).unwrap_or(false);
+            if landed.is_ok() {
+                match purge::heard_rule(&*tx, body) {
+                    Ok(heard) => rules |= heard,
+                    Err(error @ Error::Storage(_)) => return Err(error),
+                    Err(_) => {}
+                }
+            }
             if let Some(((held, stopped), _, position)) = producer {
                 if landed.is_ok() {
                     *held = Some(position);
@@ -576,10 +582,7 @@ impl Flags {
         Ok(Flags {
             renames: renamed(tx)?,
             rules: tx.with(Sql::AnyRule, |s| s.query_row([], |row| row.get(0)))?,
-            waiting: waited
-                .iter()
-                .filter_map(|id| id.split(':').next()?.parse().ok())
-                .collect(),
+            waiting: waited.iter().filter_map(|id| origin_of(id)).collect(),
         })
     }
 }

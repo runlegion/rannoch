@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::handles::{Handles, Run};
 use crate::history::{
     Key, Of, Subject, amendment_target, conclude, derive, keep_noted, link_ends, link_entity,
-    merge, naming, newest, node_entity, renames_in, take_noted,
+    merge, naming, newest, node_entity, origin_of, renames_in, take_noted,
 };
 use crate::inbox::{AMENDED, CLOSED_PREFIX, DECLARED_PREFIX, REFILLED};
 use crate::log::{Cursor, Event, Events, event_at, store};
@@ -409,19 +409,29 @@ fn matching(
     key: &Key,
     target: &Target,
 ) -> Result<(Word, BTreeSet<Word>), Error> {
-    let link_ends =
-        |relation: &str, from: &str, to: &str| -> Result<(Vec<String>, Vec<String>), Error> {
-            let relation = ontology.relation(relation)?;
-            Ok((
-                names_of(run, &relation.from, from)?,
-                names_of(run, &relation.to, to)?,
-            ))
-        };
+    // Every word of `kind` for the link under each key its ends went by.
+    let every_link = |kind: Kind,
+                      relation: &str,
+                      (from, to): (&str, &str),
+                      by: &[&str]|
+     -> Result<Vec<Word>, Error> {
+        let declared = ontology.relation(relation)?;
+        let (froms, tos) = (
+            names_of(run, &declared.from, from)?,
+            names_of(run, &declared.to, to)?,
+        );
+        Ok(froms
+            .iter()
+            .flat_map(|from| {
+                tos.iter()
+                    .map(move |to| link_word(key, kind, relation, (from, to), by))
+            })
+            .collect())
+    };
     let mut set = BTreeSet::new();
     let primary = match target {
         Target::Fact { identity } => {
             let word = fact_word(key, identity);
-            set.insert(word);
             let places: Vec<i64> = run
                 .conn()
                 .prepare_cached(PLACES_OF_IDENTITY)?
@@ -442,16 +452,8 @@ fn matching(
             }
             word
         }
-        Target::Stream { source } => {
-            let word = source_word(key, Kind::Stream, source);
-            set.insert(word);
-            word
-        }
-        Target::Source { source } => {
-            let word = source_word(key, Kind::Source, source);
-            set.insert(word);
-            word
-        }
+        Target::Stream { source } => source_word(key, Kind::Stream, source),
+        Target::Source { source } => source_word(key, Kind::Source, source),
         Target::Node(node) => {
             ontology.class(&node.class)?;
             for part in with_parts(run, ontology, node)? {
@@ -473,12 +475,7 @@ fn matching(
             node_word(key, Kind::NodeWord, &node.class, &node.key, &[source])
         }
         Target::Link { relation, from, to } => {
-            let (froms, tos) = link_ends(relation, from, to)?;
-            for from in &froms {
-                for to in &tos {
-                    set.insert(link_word(key, Kind::Link, relation, (from, to), &[]));
-                }
-            }
+            set.extend(every_link(Kind::Link, relation, (from, to), &[])?);
             link_word(key, Kind::Link, relation, (from, to), &[])
         }
         Target::LinkWord {
@@ -487,21 +484,11 @@ fn matching(
             to,
             source,
         } => {
-            let (froms, tos) = link_ends(relation, from, to)?;
-            for from in &froms {
-                for to in &tos {
-                    set.insert(link_word(
-                        key,
-                        Kind::LinkWord,
-                        relation,
-                        (from, to),
-                        &[source],
-                    ));
-                }
-            }
+            set.extend(every_link(Kind::LinkWord, relation, (from, to), &[source])?);
             link_word(key, Kind::LinkWord, relation, (from, to), &[source])
         }
     };
+    set.insert(primary);
     Ok((primary, set))
 }
 
@@ -588,25 +575,32 @@ fn remove_with_rows(run: &Handles<'_>, seq: i64, left: &mut Left) -> Result<(), 
         left.touched.push(of);
     }
     conn.prepare_cached(DROP_HEARINGS)?.execute([seq])?;
-    // A fact's rows are named by the uuid of its CloudEvent id, in the form the id parses to.
-    let id = attributes(&event.body).map(|e| e.id).unwrap_or_default();
-    let uuid = id.split(':').next().unwrap_or_default();
-    let by = uuid
-        .parse::<EventId>()
-        .map_or_else(|_| uuid.to_string(), |parsed| parsed.to_string());
-    let by = by.as_str();
-    let concluded: Vec<Subject> = conn
-        .prepare_cached(CONCLUDED_BY)?
-        .query_map([by], |row| {
-            Ok((row.get(0)?, row.get(1)?, Some(row.get::<_, String>(2)?)))
-        })?
-        .collect::<Result<_, _>>()?;
-    for of in concluded {
-        left.touched.push(of.clone());
-        left.concluded.insert(of);
-    }
-    for statement in [DROP_ENDS, DROP_ENDINGS, DROP_CORRECTIONS] {
-        conn.prepare_cached(statement)?.execute([by])?;
+    // A fact's rows are named by the uuid of its CloudEvent id, in the form the id parses to. An
+    // id that does not parse made no such rows.
+    let by = attributes(&event.body)
+        .ok()
+        .and_then(|event| origin_of(&event.id))
+        .map(|by| by.to_string());
+    if let Some(by) = &by {
+        let concluded: Vec<Subject> = conn
+            .prepare_cached(CONCLUDED_BY)?
+            .query_map([by], |row| {
+                Ok((row.get(0)?, row.get(1)?, Some(row.get::<_, String>(2)?)))
+            })?
+            .collect::<Result<_, _>>()?;
+        for of in concluded {
+            left.touched.push(of.clone());
+            left.concluded.insert(of);
+        }
+        for statement in [DROP_ENDS, DROP_ENDINGS, DROP_CORRECTIONS] {
+            conn.prepare_cached(statement)?.execute([by])?;
+        }
+        let renames: Vec<(String, String, String)> = conn
+            .prepare_cached(RENAMES_BY)?
+            .query_map([by], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<Result<_, _>>()?;
+        left.renames.extend(renames);
+        conn.prepare_cached(DROP_RENAMES)?.execute([by])?;
     }
     let targets: Vec<i64> = conn
         .prepare_cached(TARGET_OF)?
@@ -615,12 +609,6 @@ fn remove_with_rows(run: &Handles<'_>, seq: i64, left: &mut Left) -> Result<(), 
     left.amended.extend(targets);
     conn.prepare_cached(DROP_AMENDMENT)?.execute([seq])?;
     conn.prepare_cached(DROP_WAITING)?.execute([seq])?;
-    let renames: Vec<(String, String, String)> = conn
-        .prepare_cached(RENAMES_BY)?
-        .query_map([by], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-        .collect::<Result<_, _>>()?;
-    left.renames.extend(renames);
-    conn.prepare_cached(DROP_RENAMES)?.execute([by])?;
     remove_event(run, seq)
 }
 
@@ -732,23 +720,29 @@ fn drop_appended(
         let Ok(attributes) = attributes(&event.body) else {
             return Ok(());
         };
-        let data = || -> serde_json::Result<serde_json::Value> {
-            Ok(serde_json::from_str::<serde_json::Value>(&event.body)?
+        // A body that cannot say what it names names nothing that left.
+        let data = || {
+            serde_json::from_str::<serde_json::Value>(&event.body)
+                .ok()?
                 .get("data")
                 .cloned()
-                .unwrap_or_default())
         };
         let gone = if let Some(relation) = attributes.ty.strip_prefix(CLOSED_PREFIX) {
-            let closed: Closed = serde_json::from_value(data()?)?;
-            no_version((
-                link_entity(relation),
-                closed.from.key.clone(),
-                Some(closed.to.key.clone()),
-            ))? || no_version((node_entity(&closed.from.class), closed.from.key, None))?
-                || no_version((node_entity(&closed.to.class), closed.to.key, None))?
+            match data().and_then(|data| serde_json::from_value::<Closed>(data).ok()) {
+                Some(closed) => {
+                    no_version((
+                        link_entity(relation),
+                        closed.from.key.clone(),
+                        Some(closed.to.key.clone()),
+                    ))? || no_version((node_entity(&closed.from.class), closed.from.key, None))?
+                        || no_version((node_entity(&closed.to.class), closed.to.key, None))?
+                }
+                None => false,
+            }
         } else if attributes.ty == REFILLED {
-            let retried: Retried = serde_json::from_value(data()?)?;
-            places.contains(&retried.cursor)
+            data()
+                .and_then(|data| serde_json::from_value::<Retried>(data).ok())
+                .is_some_and(|retried| places.contains(&retried.cursor))
         } else {
             false
         };
@@ -1200,6 +1194,28 @@ mod tests {
         assert!(g.link_hearings("in", "ended", "b1")?.is_empty());
         g.purge(&Target::Node(node("chapter", "ended")), "own", "app")?;
         assert_eq!(title(&g, "chapter", "ended")?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn a_malformed_body_does_not_stop_a_purge() -> Result {
+        let dir = tempfile::tempdir()?;
+        let mut g = store(&dir, "s")?;
+        let closed = json!({"specversion": "1.0", "id": id(), "source": "rannoch",
+                            "type": "rannoch.closed.wrote", "data": {"to": "no from"}})
+        .to_string();
+        let retried = json!({"specversion": "1.0", "id": id(), "source": "rannoch",
+                             "type": "rannoch.refilled", "data": {"cursor": "not a place"}})
+        .to_string();
+        let no_data = json!({"specversion": "1.0", "id": id(), "source": "rannoch",
+                             "type": "rannoch.closed.wrote"})
+        .to_string();
+        land(&mut g, &[&book("b1", "one"), &closed, &retried, &no_data])?;
+        g.purge(&Target::Node(node("book", "b1")), "r", "app")?;
+        assert_eq!(title(&g, "book", "b1")?, None);
+        // Nothing can say what it names, so it stays where it is.
+        let held = logged(&g)?;
+        assert!(held.contains(&closed) && held.contains(&retried) && held.contains(&no_data));
         Ok(())
     }
 
