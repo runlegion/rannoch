@@ -48,6 +48,12 @@ fn source(k: u64) -> String {
     format!("s{k}")
 }
 
+/// A text that leaves with target `k`. It ends in a letter: in an index a key is followed by a rowid,
+/// whose byte can read as one more digit.
+fn mark(what: &str, k: u64) -> String {
+    format!("secret-{what}-{k:05}z")
+}
+
 fn rule(k: u64) -> String {
     format!("erase-{k}")
 }
@@ -80,7 +86,7 @@ impl Planned {
     fn reads(&self, g: &Graph) -> Vec<bool> {
         let k = self.k;
         let book = g.find("book", &self.book).expect("find").is_some();
-        let chapter = g.find("chapter", &format!("secret-ckey-{k}")).expect("find").is_some();
+        let chapter = g.find("chapter", &mark("ckey", k)).expect("find").is_some();
         let hearings = |relation: &str, from: &str, to: &str| {
             !g.link_hearings(relation, from, to).expect("hearings").is_empty()
         };
@@ -158,15 +164,15 @@ fn setup(run: &Run, targets: u64, fillers: u64) {
     let mut plan = Vec::new();
     for k in 0..targets {
         let from = format!("rannoch:{}", source(k));
-        let (key, chapter, author) = (format!("secret-key-{k}"), format!("secret-ckey-{k}"), format!("keep-author-{k}"));
-        let book = node(&from, "book", &key, &json!({"title": format!("secret-title-{k}")}));
-        let part = node(&from, "chapter", &chapter, &json!({"title": format!("secret-ctitle-{k}")}));
+        let (key, chapter, author) = (mark("key", k), mark("ckey", k), format!("keep-author-{k}"));
+        let book = node(&from, "book", &key, &json!({"title": mark("title", k)}));
+        let part = node(&from, "chapter", &chapter, &json!({"title": mark("ctitle", k)}));
         let contained = fact(&from, "link", "in", ("chapter", &chapter), ("book", &key));
         let wrote = fact(&from, "link", "wrote", ("author", &author), ("book", &key));
         let shelved = fact(&from, "link", "shelved", ("book", &key), ("hub", "hub"));
-        let patch = amended(&from, &book, &json!({"data": {"properties": {"title": format!("secret-patch-{k}")}}}));
+        let patch = amended(&from, &book, &json!({"data": {"properties": {"title": mark("patch", k)}}}));
         let renames = k % 14 == 0;
-        let renamed = format!("secret-renamed-{k}");
+        let renamed = mark("renamed", k);
         let moved = amended(&from, &book, &json!({"subject": renamed}));
         let kept = vec![
             node(SHOP, "author", &author, &json!({"title": format!("kept-author-{k}")})),
@@ -180,10 +186,10 @@ fn setup(run: &Run, targets: u64, fillers: u64) {
         bodies.extend(kept.iter().cloned());
         land(&mut g, &bodies);
         g.fill().expect("fill");
-        let mut named: Vec<String> = ["title", "patch"].map(|what| format!("secret-{what}-{k}")).to_vec();
+        let mut named: Vec<String> = ["title", "patch"].map(|what| mark(what, k)).to_vec();
         let gone = match k % KINDS {
             0..=2 => {
-                named.extend(["ctitle", "key", "ckey"].map(|what| format!("secret-{what}-{k}")));
+                named.extend(["ctitle", "key", "ckey"].map(|what| mark(what, k)));
                 let mut all = vec![book.clone(), part, contained, wrote, shelved, patch];
                 if renames {
                     named.push(renamed.clone());
@@ -276,7 +282,25 @@ fn life(run: &Run) {
     die(queue, relays);
 }
 
-/// Every occurrence of `secret-<what>-<k>` in `bytes`.
+/// What a kill between a purge's commit and its truncate leaves, on purpose: a reader holds the log
+/// through the purge, and the process dies with it unfinished. `check` then says what the next open
+/// did about it. Random kills rarely land in so small a window.
+fn window(run: &Run, count: usize) {
+    let mut g = open(&run.graph, &KEY).expect("open");
+    let rules = landed(&g);
+    let plan = run.plan();
+    let reader = rusqlite::Connection::open(&run.graph).expect("reader");
+    reader.execute_batch("BEGIN; SELECT count(*) FROM _events;").expect("read");
+    for planned in plan.iter().filter(|planned| !rules.contains_key(&rule(planned.k)) && planned.k % KINDS < 5).take(count) {
+        match g.purge(&planned.target(), &rule(planned.k), "privacy") {
+            Err(Error::Refused(_)) => append(&run.dir.join("window.txt"), &format!("{} committed, not truncated", planned.k)),
+            other => run.violation(&format!("window {}: {other:?}", planned.k)),
+        }
+    }
+    std::process::abort();
+}
+
+/// Every occurrence of `secret-<what>-<k>z` in `bytes`.
 fn secrets_in(bytes: &[u8], found: &mut BTreeSet<String>) {
     const MARK: &[u8] = b"secret-";
     let mut at = 0;
@@ -477,6 +501,7 @@ fn main() {
         "setup" => setup(&run, args[3].parse().expect("targets"), args[4].parse().expect("fillers")),
         "life" => life(&run),
         "check" => check(&run),
+        "window" => window(&run, args[3].parse().expect("count")),
         "last" => last(&run),
         _ => panic!("mode"),
     }
