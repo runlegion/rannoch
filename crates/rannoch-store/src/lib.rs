@@ -306,9 +306,7 @@ impl Graph {
             )
         });
         if let Some(((_, true), producer, _)) = &held {
-            return Ok(Err(Error::Refused(format!(
-                "an earlier event from producer {producer} failed at commit"
-            ))));
+            return Ok(Err(stopped(producer)));
         }
         let at = held
             .as_ref()
@@ -352,9 +350,7 @@ impl Graph {
                 )
             });
             if let Some(((_, true), producer, _)) = &producer {
-                results.push(Err(Error::Refused(format!(
-                    "an earlier event from producer {producer} failed at commit"
-                ))));
+                results.push(Err(stopped(producer)));
                 continue;
             }
             if rules && let Some(rule) = purge::refused(&*tx, &self.key, body)? {
@@ -599,6 +595,13 @@ impl Graph {
         }
         Ok(())
     }
+}
+
+/// Why a body of `producer` is not committed after an earlier one of its batch failed.
+fn stopped(producer: &str) -> Error {
+    Error::Refused(format!(
+        "an earlier event from producer {producer} failed at commit"
+    ))
 }
 
 /// Each producer's position in a batch as of its last body that landed, and whether one failed.
