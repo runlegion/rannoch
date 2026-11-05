@@ -24,4 +24,3 @@ workspace = true
 
 [dev-dependencies]
 rusqlite = { version = "0.40", features = ["bundled", "trace"] }
-tempfile = "3"

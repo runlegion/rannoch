@@ -1,13 +1,11 @@
 //! What a committed `CloudEvent` says the store must fill, read through `rannoch-cloudevents` and
-//! checked against the ontology: a node of a declared class whose properties fit it, or a link
-//! of a declared relation between its classes, each carrying the point its class or relation
-//! declares.
+//! checked against the ontology: a node of a declared class whose properties fit it and that
+//! carries the key its history is ordered by, or a link of a declared relation between its
+//! classes.
 
 pub(crate) use rannoch_cloudevents::Fact;
-use std::collections::BTreeMap;
-
 use rannoch_cloudevents::{Conclusion, LinkFact, NodeRef};
-use rannoch_ontology::{Ontology, Relation};
+use rannoch_ontology::{HistoryKey, Ontology, Relation};
 
 use crate::Error;
 
@@ -21,7 +19,7 @@ impl From<rannoch_cloudevents::Error> for Error {
 }
 
 /// Reads `body` as a `CloudEvent` and checks what it says against `ontology`: its format, its class
-/// or relation, its point on their declared axis, its values' types and a link's ends. A
+/// or relation, the history key its class is ordered by, its values' types and a link's ends. A
 /// body that is not a `CloudEvents` 1.0 event, or a node or link the ontology does not allow, is
 /// refused with the reason.
 ///
@@ -32,28 +30,23 @@ pub fn check(body: &str, ontology: &Ontology) -> Result<Fact, Error> {
     match &fact {
         Fact::Node(node) => {
             let class = ontology.class(&node.class)?;
-            point(&class.axis, &node.axis, ("class", &class.name))?;
+            let missing = match class.history {
+                HistoryKey::Time if node.time.is_none() => Some("a time"),
+                HistoryKey::Integer if node.integer.is_none() => Some("an integer key"),
+                _ => None,
+            };
+            if let Some(missing) = missing {
+                return Err(Error::Refused(format!(
+                    "class {} is ordered by {missing} the writer supplies; node {} carries none",
+                    class.name, node.key
+                )));
+            }
             class.check(&node.properties)?;
         }
         Fact::Link(LinkFact {
-            relation,
-            from,
-            to,
-            axis,
-            ..
+            relation, from, to, ..
         })
         | Fact::Concluded(Conclusion {
-            relation,
-            from,
-            to,
-            ended: Some((axis, _)),
-            ..
-        }) => {
-            let relation = ontology.relation(relation)?;
-            point(&relation.axis, axis, ("relation", &relation.name))?;
-            ends(relation, from, to)?;
-        }
-        Fact::Concluded(Conclusion {
             relation, from, to, ..
         }) => ends(ontology.relation(relation)?, from, to)?,
         Fact::Declared | Fact::None => {}
@@ -64,37 +57,4 @@ pub fn check(body: &str, ontology: &Ontology) -> Result<Fact, Error> {
 /// Refuses a link whose ends are not of its relation's classes.
 fn ends(relation: &Relation, from: &NodeRef, to: &NodeRef) -> Result<(), Error> {
     Ok(relation.holds(&from.class, &to.class)?)
-}
-
-/// The point `given` names on the axis `declared` (of `owner`, a class or relation, as its kind
-/// and name), its parts in declared order; empty when the axis is undeclared, so the point is the
-/// fact's known-at.
-///
-/// # Errors
-/// A declared part `given` leaves out, or a part it names that is not declared.
-pub(crate) fn point(
-    declared: &[String],
-    given: &BTreeMap<String, i64>,
-    (kind, name): (&str, &str),
-) -> Result<Vec<i64>, Error> {
-    if declared.is_empty() && given.is_empty() {
-        return Ok(Vec::new());
-    }
-    if let Some(extra) = given.keys().find(|part| !declared.contains(part)) {
-        return Err(Error::Refused(format!(
-            "{kind} {name} declares axis {declared:?}; the event names part {extra}, which it \
-             does not"
-        )));
-    }
-    declared
-        .iter()
-        .map(|part| {
-            given.get(part).copied().ok_or_else(|| {
-                Error::Refused(format!(
-                    "{kind} {name} declares axis {declared:?}; the event's data.axis leaves out \
-                     {part}"
-                ))
-            })
-        })
-        .collect()
 }

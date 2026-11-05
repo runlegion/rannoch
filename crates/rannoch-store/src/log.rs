@@ -6,8 +6,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::Error;
-use crate::handles::Run;
-use crate::queries::{COUNT_BETWEEN, EVENTS_BETWEEN, EVENTS_CHUNK, HIGH_WATER, Sql};
+use crate::queries::{APPEND_EVENT, EVENT_AT, EVENTS_BETWEEN, HIGH_WATER};
 
 /// A place in a graph's event log. Reading since a cursor returns the events after it. An app
 /// stores a cursor by serializing it, and a graph rebuilt from the log keeps each event's place,
@@ -62,11 +61,11 @@ pub(crate) fn decode(seq: i64, id: &str, body: String) -> Result<Event, Error> {
 }
 
 /// The event at `cursor`, if the log holds one there.
-pub(crate) fn event_at(conn: &impl Run, cursor: Cursor) -> Result<Option<Event>, Error> {
-    let row: Option<(String, String)> = conn.with(Sql::EventAt, |s| {
-        s.query_row(params![cursor.0], |row| Ok((row.get(0)?, row.get(1)?)))
-            .optional()
-    })?;
+pub(crate) fn event_at(conn: &Connection, cursor: Cursor) -> Result<Option<Event>, Error> {
+    let row: Option<(String, String)> = conn
+        .prepare_cached(EVENT_AT)?
+        .query_row(params![cursor.0], |row| Ok((row.get(0)?, row.get(1)?)))
+        .optional()?;
     row.map(|(id, body)| decode(cursor.0, &id, body))
         .transpose()
 }
@@ -74,17 +73,19 @@ pub(crate) fn event_at(conn: &impl Run, cursor: Cursor) -> Result<Option<Event>,
 /// Appends one event under the id it already has, inside the caller's transaction: at `place`
 /// when it has one, otherwise at the end of the log.
 pub(crate) fn store(
-    tx: &impl Run,
+    tx: &Connection,
     id: EventId,
     place: Option<Cursor>,
     body: &str,
 ) -> Result<Event, Error> {
-    tx.with(Sql::AppendEvent, |s| {
-        s.execute(params![place.map(|cursor| cursor.0), body, id.to_string()])
-    })?;
+    tx.prepare_cached(APPEND_EVENT)?.execute(params![
+        place.map(|cursor| cursor.0),
+        body,
+        id.to_string()
+    ])?;
     Ok(Event {
         id,
-        cursor: Cursor(tx.conn().last_insert_rowid()),
+        cursor: Cursor(tx.last_insert_rowid()),
         body: body.to_string(),
     })
 }
@@ -138,41 +139,12 @@ impl Events<'_> {
     /// The graph file cannot be read, or an event's id in it cannot be decoded.
     pub fn since_until(&self, cursor: Cursor, until: Cursor) -> Result<Vec<Event>, Error> {
         let mut statement = self.conn.prepare_cached(EVENTS_BETWEEN)?;
-        let rows = statement.query(params![cursor.0, until.0])?;
-        decode_rows(rows)
+        let mut rows = statement.query(params![cursor.0, until.0])?;
+        let mut events = Vec::new();
+        while let Some(row) = rows.next()? {
+            let id: String = row.get(1)?;
+            events.push(decode(row.get(0)?, &id, row.get(2)?)?);
+        }
+        Ok(events)
     }
-
-    /// At most `limit` of the events after `cursor` and up to `until`, in the order they were
-    /// written: [`Events::since_until`] a chunk at a time.
-    ///
-    /// # Errors
-    /// The graph file cannot be read, or an event's id in it cannot be decoded.
-    pub fn chunk(&self, cursor: Cursor, until: Cursor, limit: usize) -> Result<Vec<Event>, Error> {
-        let mut statement = self.conn.prepare_cached(EVENTS_CHUNK)?;
-        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        let rows = statement.query(params![cursor.0, until.0, limit])?;
-        decode_rows(rows)
-    }
-
-    /// How many events the log holds after `cursor` and up to `until`.
-    ///
-    /// # Errors
-    /// The graph file cannot be read.
-    pub fn count(&self, cursor: Cursor, until: Cursor) -> Result<u64, Error> {
-        let count: i64 = self
-            .conn
-            .prepare_cached(COUNT_BETWEEN)?
-            .query_row(params![cursor.0, until.0], |row| row.get(0))?;
-        Ok(u64::try_from(count).unwrap_or(0))
-    }
-}
-
-/// Every event in `rows` of seq, id and body, in order.
-fn decode_rows(mut rows: rusqlite::Rows<'_>) -> Result<Vec<Event>, Error> {
-    let mut events = Vec::new();
-    while let Some(row) = rows.next()? {
-        let id: String = row.get(1)?;
-        events.push(decode(row.get(0)?, &id, row.get(2)?)?);
-    }
-    Ok(events)
 }

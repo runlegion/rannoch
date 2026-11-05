@@ -2,7 +2,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rannoch_probe::{Disk, Error, Memory, disk, memory};
 
@@ -40,7 +40,10 @@ fn memory_allows_no_more_than_the_cgroup_limit() {
 #[test]
 fn disk_reports_a_rate_and_a_flush_and_leaves_no_file() {
     let directory = tempfile::tempdir().unwrap();
-    let measured = disk(directory.path(), Duration::from_secs(5)).unwrap();
+    let budget = Duration::from_secs(5);
+    let start = Instant::now();
+    let measured = disk(directory.path(), budget).unwrap();
+    assert!(start.elapsed() <= budget);
     assert!(measured.bytes_per_second > 0);
     assert!(measured.flush > Duration::ZERO);
     assert_eq!(measured.directory, directory.path());
@@ -49,14 +52,20 @@ fn disk_reports_a_rate_and_a_flush_and_leaves_no_file() {
 }
 
 #[test]
-fn disk_within_a_tight_budget_returns_a_measurement_or_says_it_ran_out() {
+fn disk_within_a_tight_budget_returns_within_it_measured_or_not() {
     let directory = tempfile::tempdir().unwrap();
     let budget = Duration::from_millis(250);
-    match disk(directory.path(), budget) {
-        Ok(measured) => assert!(measured.bytes_per_second > 0),
-        Err(Error::Budget { budget: named, .. }) => assert_eq!(named, budget),
+    let start = Instant::now();
+    let overrun = match disk(directory.path(), budget) {
+        Ok(measured) => {
+            assert!(measured.bytes_per_second > 0);
+            Duration::ZERO
+        }
+        // A durable flush cannot be interrupted: the one in progress may overrun the budget.
+        Err(Error::Budget { flush, .. }) => flush,
         Err(error) => panic!("{error}"),
-    }
+    };
+    assert!(start.elapsed() <= budget + overrun);
     assert_eq!(entries(directory.path()), 0);
 }
 
@@ -65,18 +74,14 @@ fn disk_that_runs_out_of_budget_fails_reports_its_overrun_and_leaves_no_file() {
     let directory = tempfile::tempdir().unwrap();
     // Below the time creating and removing the probe's file takes.
     let budget = Duration::from_nanos(1);
+    let start = Instant::now();
     let result = disk(directory.path(), budget);
-    let Err(Error::Budget {
-        budget: named,
-        flush,
-        overrun,
-    }) = result
-    else {
+    let measured = start.elapsed().saturating_sub(budget);
+    let Err(Error::Budget { overrun, .. }) = result else {
         panic!("expected Err(Budget), got {result:?}");
     };
-    assert_eq!(named, budget);
-    assert_eq!(flush, Duration::ZERO, "it ran out before any flush");
-    assert!(overrun > Duration::ZERO);
+    assert!(overrun + Duration::from_millis(1) >= measured);
+    assert!(overrun <= measured);
     assert_eq!(entries(directory.path()), 0);
 }
 
