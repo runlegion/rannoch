@@ -328,13 +328,19 @@ pub(crate) fn version_row(tail: &str) -> String {
 /// hearing is known from its `known` until the `until` of the amendment that superseded it.
 fn in_view(filter: &str, (axis, known): (&str, &str)) -> String {
     format!(
-        "(SELECT * FROM {} WHERE ({known} IS NULL OR known <= {known}) \
-         AND ({axis} IS NULL OR axis <= {axis}))",
+        "(SELECT * FROM {} WHERE {})",
         known_occurrences(&format!(
             "{filter} AND (h.until IS NULL OR h.until > coalesce({known}, {}))",
             i64::MAX
-        ))
+        )),
+        bounded("", (axis, known))
     )
+}
+
+/// That the row whose columns are prefixed `t` (`""` or `"x."`) is at or before the axis bound
+/// `axis` and known at the known-at `known` (SQL expressions, each NULL for no bound).
+fn bounded(t: &str, (axis, known): (&str, &str)) -> String {
+    format!("({axis} IS NULL OR {t}axis <= {axis}) AND ({known} IS NULL OR {t}known <= {known})")
 }
 
 /// One version row of the node or link `?1`, `?2`, `?3` among its hearings in the view of the
@@ -425,14 +431,7 @@ pub(crate) fn ending_sql(
             "{t}.entity = {entity} AND {t}.line = 'main' AND {t}.key = {from} AND {t}.to_key = {to}"
         )
     };
-    let by = |t: &str| {
-        view.map_or(String::new(), |(axis, known)| {
-            format!(
-                " AND ({axis} IS NULL OR {t}.axis <= {axis}) \
-                 AND ({known} IS NULL OR {t}.known <= {known})"
-            )
-        })
-    };
+    let by = |t: &str| view.map_or(String::new(), |view| format!(" AND {}", bounded(t, view)));
     // The last live hearing's axis point, known-at and event, by its occurrences, or below every
     // ending when there is none.
     let hearings = view.map_or_else(|| occurrences(&link("h")), |view| in_view(&link("h"), view));
@@ -455,7 +454,7 @@ pub(crate) fn ending_sql(
             live("known", &i64::MIN.to_string()),
             live("event", "''"),
             link_x = link("x"),
-            by_x = by("x"),
+            by_x = by("x."),
             link_c = link("c"),
         ),
         format!("{} <= {day}", valid_day(&format!("{e}.valid"))),
@@ -544,8 +543,9 @@ pub(crate) fn link_state() -> String {
          SELECT name AS event, source, valid, axis, known, properties, 0 AS ending FROM {} \
          UNION ALL SELECT event, source, valid, axis, known, NULL, 1 \
          FROM _endings WHERE entity = ?1 AND line = 'main' AND key = ?2 AND to_key = ?3 \
-         AND (?4 IS NULL OR axis <= ?4) AND (?5 IS NULL OR known <= ?5)) ORDER BY {} LIMIT 1",
+         AND {}) ORDER BY {} LIMIT 1",
         in_view(OF, ("?4", "?5")),
+        bounded("", ("?4", "?5")),
         order("DESC")
     )
 }

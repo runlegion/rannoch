@@ -1159,20 +1159,13 @@ mod tests {
         Ok(g.commit(&[body], &[])?.remove(0)?)
     }
 
-    fn known_at(seconds: u64) -> crate::View {
-        crate::View {
-            axis: None,
-            known: Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds)),
-        }
-    }
-
     fn title_known(
         g: &crate::Graph,
         key: &str,
         seconds: u64,
     ) -> Result<Option<crate::Value>, crate::Error> {
         let day = crate::Date::day(2024, 1, 1);
-        Ok(g.find_as_of("book", key, &day, &known_at(seconds))?
+        Ok(g.find_as_of("book", key, &day, &view(None, Some(seconds)))?
             .and_then(|node| node.properties.get("title").cloned()))
     }
 
@@ -1365,7 +1358,7 @@ mod tests {
         to: &str,
         seconds: u64,
     ) -> Result<Option<crate::Version>, crate::Error> {
-        g.link_state_at("wrote", "a1", to, &known_at(seconds))
+        g.link_state_at("wrote", "a1", to, &view(None, Some(seconds)))
     }
 
     #[test]
@@ -1507,7 +1500,7 @@ mod tests {
         assert!(g.link_seen("wrote", "a2", "b9")?.is_some());
         assert!(g.link_seen("wrote", "a2", "b1")?.is_none());
         assert!(
-            g.link_state_at("wrote", "a2", "b9", &known_at(2_500))?
+            g.link_state_at("wrote", "a2", "b9", &view(None, Some(2_500)))?
                 .is_none(),
             "not known before it arrived"
         );
