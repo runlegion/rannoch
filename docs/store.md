@@ -161,7 +161,7 @@ g.fill()?;
 - Amendments are allowed in every class. A patch of `data.axis` moves the version to the patched point.
 - The amended event stays in the log as written. Read as known before the amendment, it reads as written; from the amendment's known-at on, it reads patched.
 - An amendment is known at the clock in its own CloudEvent id.
-- **A rename is a patch of the subject.** It maps the old key to the new one from the amendment's known-at. The node and its links (live or ended) answer under the new key; a link or ending that arrives later naming the old key lands on the new one; a second rename maps on from the new key. Read as known before the rename, everything answers under the old key.
+- **A rename is a patch of the subject.** It maps the old key to the new one from the amendment's known-at. The node and its links (live or ended) answer under the new key; a link or ending that arrives later naming the old key lands on the new one; a second rename maps on from the new key. Read as known before the rename, everything answers under the old key. Under the new key, `link_end` and `Version.known` give a copied ending the rename's known-at, as they do a link's hearing heard again there; the ending keeps its own known-at under the old key.
 
 Amendments are the slow path: finding the target reads the whole log. One amendment's fill took about 23 ms on a 22,619-event store (release build, this machine's SSD). Events that are not amendments pay nothing for them while a store has no renames and no amendment waits.
 
