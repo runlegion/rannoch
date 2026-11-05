@@ -6,15 +6,15 @@
 
 use std::collections::BTreeSet;
 
-use rannoch_cloudevents::{Fact, attributes, read, source_back};
+use rannoch_cloudevents::{EventId, Fact, attributes, read, source_back};
 use rannoch_ontology::{NodeRef, Ontology};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
 use crate::handles::{Handles, Run};
 use crate::history::{
-    Key, Of, Subject, conclude, derive, keep_noted, link_ends, link_entity, merge, naming, newest,
-    node_entity, renames_in, take_noted,
+    Key, Of, Subject, amendment_target, conclude, derive, keep_noted, link_ends, link_entity,
+    merge, naming, newest, node_entity, renames_in, take_noted,
 };
 use crate::inbox::{AMENDED, CLOSED_PREFIX, DECLARED_PREFIX, REFILLED};
 use crate::log::{Cursor, Event, Events, event_at, store};
@@ -62,13 +62,43 @@ pub enum Target {
     Source { source: String },
 }
 
+/// What kind of thing a match value names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Kind {
+    Fact,
+    Stream,
+    Node,
+    Link,
+    NodeWord,
+    LinkWord,
+    Source,
+    Event,
+}
+
+impl Kind {
+    /// Its name, as a purge event and the rules table hold it and its match value is hashed under.
+    fn as_str(self) -> &'static str {
+        match self {
+            Kind::Fact => "fact",
+            Kind::Stream => "stream",
+            Kind::Node => "node",
+            Kind::Link => "link",
+            Kind::NodeWord => "node_word",
+            Kind::LinkWord => "link_word",
+            Kind::Source => "source",
+            Kind::Event => "event",
+        }
+    }
+}
+
 /// One keyed match value: what kind of thing it names, and the value.
-type Word = (&'static str, [u8; 32]);
+type Word = (Kind, [u8; 32]);
 
 /// A rule's match value as a purge event holds it.
 #[derive(Serialize, Deserialize)]
 struct Matched {
-    kind: String,
+    kind: Kind,
     #[serde(rename = "match")]
     value: String,
 }
@@ -78,7 +108,7 @@ struct Matched {
 #[derive(Serialize, Deserialize)]
 struct Purged {
     rule: String,
-    kind: String,
+    kind: Kind,
     #[serde(rename = "match")]
     value: String,
     also: Vec<Matched>,
@@ -87,53 +117,42 @@ struct Purged {
 /// How many events a purge reads from the log at a time.
 const CHUNK: usize = 4096;
 
-const KINDS: [&str; 8] = [
-    "fact",
-    "stream",
-    "node",
-    "link",
-    "node_word",
-    "link_word",
-    "source",
-    "event",
-];
-
 fn hex(value: &[u8; 32]) -> String {
     blake3::Hash::from_bytes(*value).to_hex().to_string()
 }
 
-fn node_word(key: &Key, kind: &'static str, class: &str, name: &str, by: &[&str]) -> Word {
+fn node_word(key: &Key, kind: Kind, class: &str, name: &str, by: &[&str]) -> Word {
     let parts: Vec<&str> = [class, name]
         .into_iter()
         .chain(by.iter().copied())
         .collect();
-    (kind, key.matched(kind, &parts))
+    (kind, key.matched(kind.as_str(), &parts))
 }
 
-fn link_word(
-    key: &Key,
-    kind: &'static str,
-    relation: &str,
-    (from, to): (&str, &str),
-    by: &[&str],
-) -> Word {
+fn link_word(key: &Key, kind: Kind, relation: &str, (from, to): (&str, &str), by: &[&str]) -> Word {
     let parts: Vec<&str> = [relation, from, to]
         .into_iter()
         .chain(by.iter().copied())
         .collect();
-    (kind, key.matched(kind, &parts))
+    (kind, key.matched(kind.as_str(), &parts))
 }
 
-fn source_word(key: &Key, kind: &'static str, source: &str) -> Word {
-    (kind, key.matched(kind, &[source]))
+fn source_word(key: &Key, kind: Kind, source: &str) -> Word {
+    (kind, key.matched(kind.as_str(), &[source]))
 }
 
 fn event_word(key: &Key, source: &str, id: &str) -> Word {
-    ("event", key.matched("event", &[source, id]))
+    (
+        Kind::Event,
+        key.matched(Kind::Event.as_str(), &[source, id]),
+    )
 }
 
 fn fact_word(key: &Key, identity: &[u8; 32]) -> Word {
-    ("fact", key.matched("fact", &[&hex(identity)]))
+    (
+        Kind::Fact,
+        key.matched(Kind::Fact.as_str(), &[&hex(identity)]),
+    )
 }
 
 /// Whether events of type `ty` are the store's own record, which no rule matches: a declaration,
@@ -150,11 +169,11 @@ fn fact_words(key: &Key, fact: &Fact, words: &mut Vec<Word>) -> Result<(), Error
     match fact {
         Fact::Node(node) => {
             words.push(fact_word(key, &Of::Node(node).identity(key)?));
-            words.push(source_word(key, "source", &node.source));
-            words.push(node_word(key, "node", &node.class, &node.key, &[]));
+            words.push(source_word(key, Kind::Source, &node.source));
+            words.push(node_word(key, Kind::Node, &node.class, &node.key, &[]));
             words.push(node_word(
                 key,
-                "node_word",
+                Kind::NodeWord,
                 &node.class,
                 &node.key,
                 &[&node.source],
@@ -187,11 +206,11 @@ fn link_words(
     words: &mut Vec<Word>,
 ) {
     let ends = (from.key.as_str(), to.key.as_str());
-    words.push(source_word(key, "source", source));
-    words.push(link_word(key, "link", relation, ends, &[]));
-    words.push(link_word(key, "link_word", relation, ends, &[source]));
-    words.push(node_word(key, "node", &from.class, &from.key, &[]));
-    words.push(node_word(key, "node", &to.class, &to.key, &[]));
+    words.push(source_word(key, Kind::Source, source));
+    words.push(link_word(key, Kind::Link, relation, ends, &[]));
+    words.push(link_word(key, Kind::LinkWord, relation, ends, &[source]));
+    words.push(node_word(key, Kind::Node, &from.class, &from.key, &[]));
+    words.push(node_word(key, Kind::Node, &to.class, &to.key, &[]));
 }
 
 /// What the event `body` says about itself, each as a keyed match value: its own name and source,
@@ -207,7 +226,7 @@ fn words(tx: &impl Run, key: &Key, body: &str) -> Result<Vec<Word>, Error> {
     let source = source_back(&event.source).unwrap_or_else(|_| event.source.clone());
     let mut words = vec![
         event_word(key, &event.source, &event.id),
-        source_word(key, "stream", &source),
+        source_word(key, Kind::Stream, &source),
     ];
     if event.ty == AMENDED {
         amendment_words(tx, key, body, &mut words)?;
@@ -226,10 +245,7 @@ fn amendment_words(
     words: &mut Vec<Word>,
 ) -> Result<(), Error> {
     let amendment: serde_json::Value = serde_json::from_str(body)?;
-    let data = amendment.get("data");
-    let target = data.and_then(|data| data.get("target"));
-    let named = |field: &str| target.and_then(|t| t.get(field)?.as_str());
-    let (Some(source), Some(id)) = (named("source"), named("id")) else {
+    let Some((source, id)) = amendment_target(&amendment) else {
         return Ok(());
     };
     words.push(event_word(key, source, id));
@@ -237,7 +253,8 @@ fn amendment_words(
         s.query_row(params![source, id], |row| row.get(1))
             .optional()
     })?;
-    let (Some(written), Some(patch)) = (written, data.and_then(|data| data.get("patch"))) else {
+    let patch = amendment.get("data").and_then(|data| data.get("patch"));
+    let (Some(written), Some(patch)) = (written, patch) else {
         return Ok(());
     };
     let mut patched: serde_json::Value = serde_json::from_str(&written)?;
@@ -251,7 +268,7 @@ fn amendment_words(
 /// Keeps the rule `rule` against `word`. The first rule kept for a word stays.
 fn stand(tx: &impl Run, rule: &str, word: &Word) -> Result<(), Error> {
     tx.with(Sql::StandRule, |s| {
-        s.execute(params![word.0, word.1.as_slice(), rule])
+        s.execute(params![word.0.as_str(), word.1.as_slice(), rule])
     })?;
     Ok(())
 }
@@ -260,7 +277,7 @@ fn stand(tx: &impl Run, rule: &str, word: &Word) -> Result<(), Error> {
 fn standing(tx: &impl Run, key: &Key, body: &str) -> Result<Option<String>, Error> {
     for (kind, value) in words(tx, key, body)? {
         let rule = tx.with(Sql::RuleOf, |s| {
-            s.query_row(params![kind, value.as_slice()], |row| row.get(0))
+            s.query_row(params![kind.as_str(), value.as_slice()], |row| row.get(0))
                 .optional()
         })?;
         if rule.is_some() {
@@ -311,16 +328,7 @@ pub(crate) fn heard_rule(tx: &impl Run, body: &str) -> Result<bool, Error> {
         let value = blake3::Hash::from_hex(&matched.value).map_err(|_| {
             Error::Refused(format!("purge rule {} holds a bad match value", data.rule))
         })?;
-        let kind = KINDS
-            .into_iter()
-            .find(|kind| *kind == matched.kind)
-            .ok_or_else(|| {
-                Error::Refused(format!(
-                    "purge rule {} names the unknown kind {}",
-                    data.rule, matched.kind
-                ))
-            })?;
-        stand(tx, &data.rule, &(kind, *value.as_bytes()))?;
+        stand(tx, &data.rule, &(matched.kind, *value.as_bytes()))?;
     }
     Ok(true)
 }
@@ -387,7 +395,7 @@ fn with_parts(
     Ok(all)
 }
 
-/// The target's kind, its match value as the rule event records it, and every word it stands
+/// The target's match value as the rule event records it, and every word it stands
 /// against in this store: the target under each key it went by, its parts, and for an amended
 /// version's identity, the fact and event it was heard from.
 fn matching(
@@ -395,7 +403,7 @@ fn matching(
     ontology: &Ontology,
     key: &Key,
     target: &Target,
-) -> Result<(&'static str, Word, BTreeSet<Word>), Error> {
+) -> Result<(Word, BTreeSet<Word>), Error> {
     let link_ends =
         |relation: &str, from: &str, to: &str| -> Result<(Vec<String>, Vec<String>), Error> {
             let relation = ontology.relation(relation)?;
@@ -405,7 +413,7 @@ fn matching(
             ))
         };
     let mut set = BTreeSet::new();
-    let (kind, primary) = match target {
+    let primary = match target {
         Target::Fact { identity } => {
             let word = fact_word(key, identity);
             set.insert(word);
@@ -427,43 +435,46 @@ fn matching(
                     .optional()?;
                 set.extend(own.map(|own| fact_word(key, &own)));
             }
-            ("fact", word)
+            word
         }
         Target::Stream { source } => {
-            let word = source_word(key, "stream", source);
+            let word = source_word(key, Kind::Stream, source);
             set.insert(word);
-            ("stream", word)
+            word
         }
         Target::Source { source } => {
-            let word = source_word(key, "source", source);
+            let word = source_word(key, Kind::Source, source);
             set.insert(word);
-            ("source", word)
+            word
         }
         Target::Node(node) => {
             ontology.class(&node.class)?;
             for part in with_parts(run, ontology, node)? {
-                set.insert(node_word(key, "node", &part.class, &part.key, &[]));
+                set.insert(node_word(key, Kind::Node, &part.class, &part.key, &[]));
             }
-            ("node", node_word(key, "node", &node.class, &node.key, &[]))
+            node_word(key, Kind::Node, &node.class, &node.key, &[])
         }
         Target::NodeWord { node, source } => {
             ontology.class(&node.class)?;
             for name in names_of(run, &node.class, &node.key)? {
-                set.insert(node_word(key, "node_word", &node.class, &name, &[source]));
+                set.insert(node_word(
+                    key,
+                    Kind::NodeWord,
+                    &node.class,
+                    &name,
+                    &[source],
+                ));
             }
-            (
-                "node_word",
-                node_word(key, "node_word", &node.class, &node.key, &[source]),
-            )
+            node_word(key, Kind::NodeWord, &node.class, &node.key, &[source])
         }
         Target::Link { relation, from, to } => {
             let (froms, tos) = link_ends(relation, from, to)?;
             for from in &froms {
                 for to in &tos {
-                    set.insert(link_word(key, "link", relation, (from, to), &[]));
+                    set.insert(link_word(key, Kind::Link, relation, (from, to), &[]));
                 }
             }
-            ("link", link_word(key, "link", relation, (from, to), &[]))
+            link_word(key, Kind::Link, relation, (from, to), &[])
         }
         Target::LinkWord {
             relation,
@@ -474,16 +485,19 @@ fn matching(
             let (froms, tos) = link_ends(relation, from, to)?;
             for from in &froms {
                 for to in &tos {
-                    set.insert(link_word(key, "link_word", relation, (from, to), &[source]));
+                    set.insert(link_word(
+                        key,
+                        Kind::LinkWord,
+                        relation,
+                        (from, to),
+                        &[source],
+                    ));
                 }
             }
-            (
-                "link_word",
-                link_word(key, "link_word", relation, (from, to), &[source]),
-            )
+            link_word(key, Kind::LinkWord, relation, (from, to), &[source])
         }
     };
-    Ok((kind, primary, set))
+    Ok((primary, set))
 }
 
 /// Removes the event at `seq` from the log, with the worker rows that name it, so `next` never
@@ -569,9 +583,13 @@ fn remove_with_rows(run: &Handles<'_>, seq: i64, left: &mut Left) -> Result<(), 
         left.touched.push(of);
     }
     conn.prepare_cached(DROP_HEARINGS)?.execute([seq])?;
-    // A fact's rows are named by the uuid of its CloudEvent id.
+    // A fact's rows are named by the uuid of its CloudEvent id, in the form the id parses to.
     let id = attributes(&event.body).map(|e| e.id).unwrap_or_default();
-    let by = id.split(':').next().unwrap_or_default();
+    let uuid = id.split(':').next().unwrap_or_default();
+    let by = uuid
+        .parse::<EventId>()
+        .map_or_else(|_| uuid.to_string(), |parsed| parsed.to_string());
+    let by = by.as_str();
     let concluded: Vec<Subject> = conn
         .prepare_cached(CONCLUDED_BY)?
         .query_map([by], |row| {
@@ -769,7 +787,7 @@ impl Graph {
         let sql = Catalogue::new(&ontology);
         let run = Handles::new(&tx, &sql);
         take_noted();
-        let (kind, primary, mut set) = matching(&run, &ontology, &self.key, target)?;
+        let (primary, mut set) = matching(&run, &ontology, &self.key, target)?;
         let places = chosen(&run, &self.key, &mut set)?;
         let mut left = Left::default();
         for seq in &places {
@@ -798,14 +816,14 @@ impl Graph {
             .iter()
             .filter(|word| **word != primary)
             .map(|(kind, value)| Matched {
-                kind: (*kind).to_string(),
+                kind: *kind,
                 value: hex(value),
             })
             .collect();
-        let id = rannoch_cloudevents::EventId::now();
+        let id = EventId::now();
         let data = Purged {
             rule: rule.to_string(),
-            kind: kind.to_string(),
+            kind: primary.0,
             value: hex(&primary.1),
             also,
         };
@@ -1465,6 +1483,65 @@ mod tests {
         assert_eq!(g.link_hearings("wrote", "a1", "b1")?.len(), 1);
         let view = View::default();
         assert!(g.state_at(&node("book", "b1"), &view)?.is_some());
+        Ok(())
+    }
+
+    /// `body` with the uuid of its id in upper case: it parses as the same id, which a fact's rows
+    /// are kept under in its canonical form.
+    fn upper_id(body: &str) -> Result<String> {
+        let mut event: serde_json::Value = serde_json::from_str(body)?;
+        let id = event["id"].as_str().ok_or("an id")?.to_uppercase();
+        event["id"] = json!(id);
+        Ok(event.to_string())
+    }
+
+    #[test]
+    fn a_conclusion_or_a_rename_under_an_upper_case_id_leaves_its_rows() -> Result {
+        let dir = tempfile::tempdir()?;
+        let mut g = store(&dir, "s")?;
+        let target = book("b1", "one");
+        let renamed = upper_id(&amended(
+            &target,
+            &json!({"subject": "b9"}),
+            "rannoch:feed",
+        )?)?;
+        let ended = upper_id(&fact_from(
+            "feed",
+            "ended",
+            "wrote",
+            ("author", "a1"),
+            ("book", "b1"),
+        ))?;
+        let corrected = upper_id(&fact_from(
+            "feed",
+            "corrected",
+            "wrote",
+            ("author", "a1"),
+            ("book", "b1"),
+        ))?;
+        land(
+            &mut g,
+            &[
+                &target,
+                &node_from("shop", "author", "a1", "ann"),
+                &wrote("shop", "a1", "b1"),
+                &ended,
+                &corrected,
+                &renamed,
+            ],
+        )?;
+        assert!(rows(&g, "_renames")? > 0 && rows(&g, "_endings")? > 0);
+        g.purge(
+            &Target::Stream {
+                source: "feed".to_string(),
+            },
+            "r",
+            "app",
+        )?;
+        for table in ["_renames", "_ends", "_endings", "_corrections"] {
+            assert_eq!(rows(&g, table)?, 0, "{table}");
+        }
+        assert_eq!(title(&g, "book", "b1")?, Some("one".into()));
         Ok(())
     }
 

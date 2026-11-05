@@ -423,22 +423,30 @@ impl Queue {
         for held in lock(&self.shared.workers).values_mut() {
             held.forget_ahead();
         }
-        let filled = graph.fill();
-        let high = graph.events().committed();
-        drop(graph);
-        let last = {
-            let mut state = lock(&self.shared.state);
-            if let Ok(filled) = filled {
-                state.filled = filled;
-            }
-            if let Ok(high) = high {
-                state.watermark = high;
-            }
-            Ticket(state.last)
+        let last = Ticket(lock(&self.shared.state).last);
+        let moved = filled_to(&mut graph, last);
+        // A fill that failed leaves the rule event unfilled, and still in the log for workers.
+        let high = match &moved {
+            Ok((_, high)) => Ok(*high),
+            Err(_) => graph.events().committed(),
         };
-        if let Ok(high) = high {
-            self.shared.tell(last, high);
-        }
+        drop(graph);
+        let watermark = {
+            let mut state = lock(&self.shared.state);
+            match moved {
+                Ok((to, _)) => state.filled = to,
+                Err(failure) => state.failed.push(failure),
+            }
+            match high {
+                Ok(high) => state.watermark = high,
+                Err(error) => state.failed.push(Failure::Fill {
+                    ticket: last,
+                    error,
+                }),
+            }
+            state.watermark
+        };
+        self.shared.tell(last, watermark);
         purged
     }
 
@@ -659,18 +667,12 @@ impl Shared {
         if landed.is_some() {
             // Fill logs a closed event for each link it closes, after the batch; the watermark
             // takes them in, so they are handed out without waiting for a later commit.
-            match graph
-                .fill()
-                .and_then(|to| Ok((to, graph.events().committed()?)))
-            {
+            match filled_to(graph, last) {
                 Ok((to, high)) => {
                     filled = Some(to);
                     landed = Some(high);
                 }
-                Err(error) => failed.push(Failure::Fill {
-                    ticket: last,
-                    error,
-                }),
+                Err(failure) => failed.push(failure),
             }
         }
         let watermark = {
@@ -687,6 +689,15 @@ impl Shared {
         };
         Some((last, watermark))
     }
+}
+
+/// Fills the tables, and returns the place filled to and the highest place the log has given, or
+/// the failure of the commit through `ticket`.
+fn filled_to(graph: &mut Graph, ticket: Ticket) -> Result<(Cursor, Cursor), Failure> {
+    graph
+        .fill()
+        .and_then(|to| Ok((to, graph.events().committed()?)))
+        .map_err(|error| Failure::Fill { ticket, error })
 }
 
 /// The text a panic carried, when it carried text.

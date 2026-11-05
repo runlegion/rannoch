@@ -649,3 +649,34 @@ fn a_purge_through_the_queue_reaches_what_a_worker_read_ahead()
     queue.done("w", taken.cursor)?;
     Ok(())
 }
+
+#[test]
+fn a_fill_that_fails_after_a_purge_is_reported_and_the_rule_event_still_reaches_workers()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let queue = Queue::open(graph(&path(&dir))?, HOUR)?;
+    queue.accept(item("k"))?;
+    let (_, failures) = queue.flush();
+    assert!(failures.is_empty());
+    while let Some(event) = queue.next("w")? {
+        queue.done("w", event.cursor)?;
+    }
+    // Fill's place cannot move, so filling the rule event fails in the store, not in one event.
+    rusqlite::Connection::open(path(&dir))?.execute_batch(
+        "CREATE TRIGGER fill_stuck BEFORE UPDATE ON _places WHEN NEW.worker = 'rannoch.fill' \
+         BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END;",
+    )?;
+    let purged = queue.purge(
+        &rannoch_store::Target::Node(rannoch_store::NodeRef::new("item", "k")),
+        "r",
+        "app",
+    )?;
+    let failures = queue.take_failures();
+    assert!(
+        matches!(&failures[..], [Failure::Fill { .. }]),
+        "{failures:?}"
+    );
+    let handed = queue.next("w")?.ok_or("the rule event")?;
+    assert_eq!(handed.body, purged.body);
+    Ok(())
+}

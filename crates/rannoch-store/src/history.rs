@@ -648,6 +648,12 @@ struct Made {
     known: i64,
 }
 
+/// The source and id of the event `amendment` names as its target.
+pub(crate) fn amendment_target(amendment: &serde_json::Value) -> Option<(&str, &str)> {
+    let target = amendment.get("data")?.get("target")?;
+    Some((target.get("source")?.as_str()?, target.get("id")?.as_str()?))
+}
+
 /// Folds the amendment `body`, at its place `cursor`: its data names the event it amends by that
 /// event's `CloudEvent` source and id (`target`), and holds a JSON Merge Patch of it (`patch`).
 /// The amended event stays in the log as written. An amendment whose target this store has not
@@ -672,9 +678,7 @@ pub(crate) fn amend(
     let event = uuid(id)
         .ok_or_else(|| Error::Refused(format!("amendment {id} is not <event uuid>:<fact>")))?;
     let data = amendment.get("data");
-    let target = data.and_then(|data| data.get("target"));
-    let named = |field: &str| target.and_then(|t| t.get(field)?.as_str());
-    let (Some(source), Some(target)) = (named("source"), named("id")) else {
+    let Some((source, target)) = amendment_target(&amendment) else {
         return Err(Error::Refused(format!(
             "amendment {id} names no target: its data has no target {{source, id}}"
         )));
