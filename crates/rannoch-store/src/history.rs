@@ -70,6 +70,13 @@ impl Key {
             check: blake3::keyed_hash(bytes, CHECK_LABEL).to_hex().to_string(),
         }
     }
+
+    /// The keyed match value of a purge target of the kind `kind` made of `parts`. Its fixed
+    /// label keeps it from ever equalling a content identity.
+    pub(crate) fn matched(&self, kind: &str, parts: &[&str]) -> [u8; 32] {
+        let named = serde_json::json!(["rannoch purge match", kind, parts]).to_string();
+        *blake3::keyed_hash(&self.bytes, named.as_bytes()).as_bytes()
+    }
 }
 
 impl fmt::Debug for Key {
@@ -641,6 +648,18 @@ struct Made {
     known: i64,
 }
 
+/// The origin's event a `CloudEvent` id `<event uuid>:<fact>` names, in the form its rows are kept
+/// under; `None` when its uuid does not parse.
+pub(crate) fn origin_of(id: &str) -> Option<EventId> {
+    id.split(':').next()?.parse().ok()
+}
+
+/// The source and id of the event `amendment` names as its target.
+pub(crate) fn amendment_target(amendment: &serde_json::Value) -> Option<(&str, &str)> {
+    let target = amendment.get("data")?.get("target")?;
+    Some((target.get("source")?.as_str()?, target.get("id")?.as_str()?))
+}
+
 /// Folds the amendment `body`, at its place `cursor`: its data names the event it amends by that
 /// event's `CloudEvent` source and id (`target`), and holds a JSON Merge Patch of it (`patch`).
 /// The amended event stays in the log as written. An amendment whose target this store has not
@@ -661,13 +680,10 @@ pub(crate) fn amend(
         .get("id")
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
-    let uuid = |id: &str| -> Option<EventId> { id.split(':').next()?.parse().ok() };
-    let event = uuid(id)
+    let event = origin_of(id)
         .ok_or_else(|| Error::Refused(format!("amendment {id} is not <event uuid>:<fact>")))?;
     let data = amendment.get("data");
-    let target = data.and_then(|data| data.get("target"));
-    let named = |field: &str| target.and_then(|t| t.get(field)?.as_str());
-    let (Some(source), Some(target)) = (named("source"), named("id")) else {
+    let Some((source, target)) = amendment_target(&amendment) else {
         return Err(Error::Refused(format!(
             "amendment {id} names no target: its data has no target {{source, id}}"
         )));
@@ -764,7 +780,7 @@ fn made_by(tx: &impl Run, seq: i64) -> Result<Option<Made>, Error> {
 type Rename = (String, String, i64, String);
 
 /// Every rename in the class entity `entity`, by known-at and then event id.
-fn renames_in(tx: &impl Run, entity: &str) -> Result<Vec<Rename>, Error> {
+pub(crate) fn renames_in(tx: &impl Run, entity: &str) -> Result<Vec<Rename>, Error> {
     Ok(tx.with(Sql::RenamesIn, |s| {
         s.query_map(params![entity], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
@@ -854,7 +870,12 @@ fn amendments_of(tx: &impl Run, seq: i64) -> Result<Vec<(i64, String, serde_json
 
 /// The places of every event with a hearing that names the node keyed `key` of the class entity
 /// `entity`: its own, and every link to or from it.
-fn naming(tx: &impl Run, ontology: &Ontology, entity: &str, key: &str) -> Result<Vec<i64>, Error> {
+pub(crate) fn naming(
+    tx: &impl Run,
+    ontology: &Ontology,
+    entity: &str,
+    key: &str,
+) -> Result<Vec<i64>, Error> {
     let mut asks = vec![(entity.to_string(), false)];
     asks.extend(link_ends(ontology, entity));
     let mut places = Vec::new();
@@ -869,7 +890,7 @@ fn naming(tx: &impl Run, ontology: &Ontology, entity: &str, key: &str) -> Result
 }
 
 /// The link entities whose start (`false`) or end (`true`) is a node of `entity`.
-fn link_ends(ontology: &Ontology, entity: &str) -> Vec<(String, bool)> {
+pub(crate) fn link_ends(ontology: &Ontology, entity: &str) -> Vec<(String, bool)> {
     let mut ends = Vec::new();
     for relation in ontology.relations.values() {
         if node_entity(&relation.from) == entity {
@@ -1058,7 +1079,7 @@ fn heard_as(
 
 /// Applies the JSON Merge Patch `patch` to `target` (RFC 7386): an object's members patch the
 /// target's, `null` removes one, and any other value replaces the target whole.
-fn merge(target: &mut serde_json::Value, patch: &serde_json::Value) {
+pub(crate) fn merge(target: &mut serde_json::Value, patch: &serde_json::Value) {
     let serde_json::Value::Object(members) = patch else {
         *target = patch.clone();
         return;

@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 use rannoch_cloudevents::{Attributes, EventId, attributes};
 use rannoch_queue::Queue;
 use rannoch_store::{
-    ANSWER, CLOSED_PREFIX, Cursor, DECLARED_PREFIX, Declaration, Graph, QUERY, REFILLED, Shape,
-    ViewData, open,
+    ANSWER, CLOSED_PREFIX, Cursor, DECLARED_PREFIX, Declaration, Graph, PURGED, QUERY, REFILLED,
+    Shape, ViewData, open,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -235,12 +235,7 @@ impl Relays {
                 .unwrap_or_else(PoisonError::into_inner)
                 .remove(id);
             inner.queue.remove_worker(&worker_name(id))?;
-            match fs::remove_file(relay_file(&inner.dir, id)) {
-                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-                    return Err(error.into());
-                }
-                _ => {}
-            }
+            remove_files(&inner.dir, id)?;
         }
         write_manifest(&inner.dir, relays)
     }
@@ -363,8 +358,43 @@ fn replace(path: &Path, bytes: &[u8]) -> Result<(), Error> {
     Ok(())
 }
 
-/// A relay of the manifest, from its file when that is not behind its worker's cursor, otherwise
-/// seeded again. Its file's cursor is the one that counts.
+/// Removes relay `id`'s file and the temporary a save writes before it replaces the file.
+fn remove_files(dir: &Path, id: &str) -> Result<(), Error> {
+    let file = relay_file(dir, id);
+    for path in [file.clone(), file.with_extension("tmp")] {
+        match fs::remove_file(path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                return Err(error.into());
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Whether the log holds a purge event after `cursor`: a relay's file from before it may hold what
+/// left.
+fn purged_since(graph: &Graph, mut cursor: Cursor) -> Result<bool, Error> {
+    let log = graph.events();
+    let high = log.committed()?;
+    loop {
+        let events = log.chunk(cursor, high, REPLAY_CHUNK)?;
+        let Some(last) = events.last() else {
+            return Ok(false);
+        };
+        cursor = last.cursor;
+        if events
+            .iter()
+            .any(|event| attributes(&event.body).is_ok_and(|event| event.ty == PURGED))
+        {
+            return Ok(true);
+        }
+    }
+}
+
+/// A relay of the manifest, from its file when that is not behind its worker's cursor and no purge
+/// came after it, otherwise seeded again, its file replaced before anything can read it. Its
+/// file's cursor is the one that counts.
 fn resume(dir: &Path, queue: &Queue, graph: &Graph, entry: Entry) -> Result<Live, Error> {
     let shape = shape_of(graph, &entry.shape)?;
     let place = queue.join(&worker_name(&entry.id));
@@ -372,6 +402,13 @@ fn resume(dir: &Path, queue: &Queue, graph: &Graph, entry: Entry) -> Result<Live
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Saved>(&bytes).ok())
         .filter(|saved| saved.cursor >= place);
+    let saved = match saved {
+        Some(saved) if purged_since(graph, saved.cursor)? => {
+            remove_files(dir, &entry.id)?;
+            None
+        }
+        saved => saved,
+    };
     let view = entry.view.view();
     if let Some(saved) = saved {
         return Ok(Live::new(entry, Warm::restored(graph, shape, view, saved)?));
@@ -551,6 +588,13 @@ impl Inner {
             }
             live.warm.fold(graph, event.cursor, &event.body);
             live.unsaved.push(event.cursor);
+            // The file goes before anything is read again, so a failed read or save leaves none
+            // holding what left. A relay with no file only reseeds.
+            if live.warm.purged
+                && let Err(error) = remove_files(&self.dir, &live.entry.id)
+            {
+                self.failed(error);
+            }
         }
         // Costs nothing with nothing folded, and a relay that failed to read tries again here.
         let change = match live.warm.settle(graph) {
@@ -571,11 +615,12 @@ impl Inner {
     /// Saves `live`'s file when one is due and closes what it now holds. A stale relay is not
     /// saved: its file would claim a cursor whose truth it has not read.
     fn save_due(&self, worker: &str, live: &mut Live) -> Result<(), Error> {
-        let due = live.saved_at.is_none_or(|at| at.elapsed() >= SAVE_EVERY);
+        let due = live.warm.purged || live.saved_at.is_none_or(|at| at.elapsed() >= SAVE_EVERY);
         if live.unsaved.is_empty() || !due || live.warm.is_stale() {
             return Ok(());
         }
         save(&self.dir, live)?;
+        live.warm.purged = false;
         for cursor in live.unsaved.drain(..) {
             self.queue.done(worker, cursor)?;
         }
@@ -729,8 +774,12 @@ fn replay(source: &Graph, into: &mut Graph, until: Cursor) -> Result<(), Error> 
                 })
             })
             .collect();
+        // A body a rule refuses is one that rule took out of the log it came from.
         for landed in into.commit(&bodies, &[])? {
-            landed?;
+            match landed {
+                Ok(_) | Err(rannoch_store::Error::Purged { .. }) => {}
+                Err(error) => return Err(error.into()),
+            }
         }
         into.fill()?;
     }
@@ -997,6 +1046,85 @@ mod tests {
             .then_some(())
         })?;
         assert_eq!(lock(&heard).len(), 1, "the retry tells nothing again");
+        Ok(())
+    }
+
+    fn k() -> rannoch_store::Target {
+        rannoch_store::Target::Node(NodeRef::new("a", "k"))
+    }
+
+    #[test]
+    fn a_read_that_fails_after_a_purge_leaves_no_file_and_an_empty_set() -> Result {
+        let dir = tempfile::tempdir()?;
+        let (queue, relays, id) = relay(&dir)?;
+        let file = relay_file(&relays.inner.dir, &id);
+        until(|| file.exists().then_some(()))?;
+        let real = break_reads(&dir, &relays, &id)?;
+        queue.purge(&k(), "r", "app")?;
+        failures_of(&relays)?;
+        // Taking the state waits out the pump that failed.
+        drop(lock(&relays.inner.state));
+        assert!(!file.exists(), "the file went before anything was read");
+        assert!(!holds(&relays, &id, "v"), "and the set holds nothing");
+        lock(&relays.inner.state).graph = real;
+        until(|| file.exists().then_some(()))?;
+        assert!(!fs::read_to_string(&file)?.contains("\"v\""));
+        Ok(())
+    }
+
+    #[test]
+    fn a_save_that_fails_after_a_purge_leaves_no_file() -> Result {
+        let dir = tempfile::tempdir()?;
+        let (queue, relays, id) = relay(&dir)?;
+        let file = relay_file(&relays.inner.dir, &id);
+        until(|| file.exists().then_some(()))?;
+        // A directory where the save writes its temporary file: the save fails, and only the save.
+        let blocker = file.with_extension("tmp");
+        fs::create_dir(&blocker)?;
+        let at = queue.purge(&k(), "r", "app")?.cursor;
+        until(|| {
+            relays
+                .read(&id)
+                .filter(|set| set.cursor() >= at)
+                .map(|_| ())
+        })?;
+        assert!(!file.exists());
+        assert!(!holds(&relays, &id, "v"));
+        fs::remove_dir(&blocker)?;
+        until(|| file.exists().then_some(()))?;
+        assert!(!fs::read_to_string(&file)?.contains("\"v\""));
+        Ok(())
+    }
+
+    #[test]
+    fn a_replay_does_not_stop_on_a_rules_refusal() -> Result {
+        let dir = tempfile::tempdir()?;
+        let (queue, relays, _) = relay(&dir)?;
+        queue.accept(node("gone"))?;
+        queue.accept(
+            json!({"specversion": "1.0", "id": format!("{}:0", EventId::now()),
+            "source": "rannoch:s", "type": "rannoch.node.a", "subject": "kept",
+            "data": {"properties": {"n": "1"}}})
+            .to_string(),
+        )?;
+        let _ = queue.flush();
+        drop(relays);
+        let source = open(dir.path().join("graph"), &KEY)?;
+        let mut into = open(dir.path().join("into"), &KEY)?;
+        // The rule stands in the store replayed into, so its match is refused there mid-replay.
+        let until = source.events().committed()?;
+        into.purge(
+            &rannoch_store::Target::Stream {
+                source: "t".to_string(),
+            },
+            "r",
+            "app",
+        )?;
+        replay(&source, &mut into, until)?;
+        assert!(
+            into.find("a", "kept")?.is_some(),
+            "the replay went on past it"
+        );
         Ok(())
     }
 

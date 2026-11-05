@@ -607,3 +607,76 @@ fn a_worker_joins_at_the_watermark_and_is_handed_only_what_follows()
     assert_eq!(queue.join("late"), handed.cursor);
     Ok(())
 }
+
+#[test]
+fn a_purge_through_the_queue_reaches_what_a_worker_read_ahead()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let queue = Queue::open(graph(&path(&dir))?, HOUR)?;
+    let told = Arc::new(Mutex::new(Vec::new()));
+    let heard = Arc::clone(&told);
+    queue.subscribe(move |cursor| lock(&heard).push(cursor));
+    for key in ["first", "secret", "last"] {
+        queue.accept(item(key))?;
+    }
+    let (_, failures) = queue.flush();
+    assert!(failures.is_empty());
+    // The declaration, then the first: the rest are read ahead in memory.
+    let mut taken = queue.next("w")?.ok_or("the declaration")?;
+    queue.done("w", taken.cursor)?;
+    taken = queue.next("w")?.ok_or("the first")?;
+    assert!(taken.body.contains("first"));
+    let before = lock(&told).len();
+    // Held when the purge comes, so it goes with what the log holds.
+    queue.accept(item("secret"))?;
+    let purged = queue.purge(
+        &rannoch_store::Target::Node(rannoch_store::NodeRef::new("item", "secret")),
+        "r",
+        "app",
+    )?;
+    assert!(lock(&told).len() > before, "the subscribers hear of it");
+    let mut seen = Vec::new();
+    while let Some(event) = queue.next("w")? {
+        seen.push(event.body);
+    }
+    assert!(seen.iter().all(|body| !body.contains("secret")), "{seen:?}");
+    assert!(seen.iter().any(|body| body.contains("last")));
+    assert_eq!(
+        seen.last(),
+        Some(&purged.body),
+        "the rule event, and nothing of it"
+    );
+    queue.done("w", taken.cursor)?;
+    Ok(())
+}
+
+#[test]
+fn a_fill_that_fails_after_a_purge_is_reported_and_the_rule_event_still_reaches_workers()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let queue = Queue::open(graph(&path(&dir))?, HOUR)?;
+    queue.accept(item("k"))?;
+    let (_, failures) = queue.flush();
+    assert!(failures.is_empty());
+    while let Some(event) = queue.next("w")? {
+        queue.done("w", event.cursor)?;
+    }
+    // Fill's place cannot move, so filling the rule event fails in the store, not in one event.
+    rusqlite::Connection::open(path(&dir))?.execute_batch(
+        "CREATE TRIGGER fill_stuck BEFORE UPDATE ON _places WHEN NEW.worker = 'rannoch.fill' \
+         BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END;",
+    )?;
+    let purged = queue.purge(
+        &rannoch_store::Target::Node(rannoch_store::NodeRef::new("item", "k")),
+        "r",
+        "app",
+    )?;
+    let failures = queue.take_failures();
+    assert!(
+        matches!(&failures[..], [Failure::Fill { .. }]),
+        "{failures:?}"
+    );
+    let handed = queue.next("w")?.ok_or("the rule event")?;
+    assert_eq!(handed.body, purged.body);
+    Ok(())
+}

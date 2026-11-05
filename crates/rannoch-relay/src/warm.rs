@@ -7,8 +7,8 @@ use std::sync::{Arc, OnceLock};
 
 use rannoch_cloudevents::{Conclusion, Fact, LinkFact, NodeFact, NodeRef, ValidTime};
 use rannoch_store::{
-    AMENDED, Cursor, Direction, Graph, Ontology, REFILLED, Roots, Shape, Value, Version, View, Way,
-    has_all, millis,
+    AMENDED, Cursor, Direction, Graph, Ontology, PURGED, REFILLED, Roots, Shape, Value, Version,
+    View, Way, has_all, millis,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
@@ -184,6 +184,8 @@ pub(crate) struct Warm {
     pub(crate) walked: u64,
     /// Everything read may be wrong, as an amendment or a rename makes it: read it all again.
     stale: bool,
+    /// A purge event was folded and the relay's file does not yet say so.
+    pub(crate) purged: bool,
 }
 
 /// What a relay's file holds besides its shape and view, which the manifest holds.
@@ -230,6 +232,7 @@ impl Warm {
             reads: 0,
             walked: 0,
             stale: false,
+            purged: false,
         }
     }
 
@@ -318,6 +321,17 @@ impl Warm {
         Ok(())
     }
 
+    /// A purge took something this relay may hold: it holds nothing from here until the next settle
+    /// reads the graph again, so no read answers what left and no change tells it as a value before.
+    fn forget(&mut self) {
+        self.versions.clear();
+        self.adjacent.clear();
+        self.roots.clear();
+        self.set.held = Arc::default();
+        self.stale = true;
+        self.purged = true;
+    }
+
     /// Whatever went wrong, the next settle reads everything again.
     pub(crate) fn mark_stale(&mut self) {
         self.stale = true;
@@ -331,6 +345,10 @@ impl Warm {
     /// Folds one event. An event of nothing this relay holds costs its parse.
     pub(crate) fn fold(&mut self, graph: &Graph, cursor: Cursor, body: &str) {
         self.folded = cursor;
+        if rannoch_cloudevents::attributes(body).is_ok_and(|event| event.ty == PURGED) {
+            self.forget();
+            return;
+        }
         if self.stale {
             return;
         }
