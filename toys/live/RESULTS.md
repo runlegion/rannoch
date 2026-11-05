@@ -62,3 +62,35 @@ Same harness, stores on /Volumes/store, run one at a time. The kill loops are no
 | 5. Legion's memory, 9,682 reflections | 22,619 events in 1.7 s, none refused or stopped; 0 text mismatches, live sets per repo exact, follows 808/808; 200 amendments and 100 renames, 0 mismatches, 53 ms each (was 106 ms on 3f48131) | Held |
 
 The livelock (bug 1 above) is gone: before #161 the amendment kill run sat at fill 6,325 after 25,800 kills; it now finishes in 140.
+
+## Release check for #187, 2026-11-04: main 63681e5 (Puck, M4, release build, stores on /Volumes/store)
+
+Suite head 395db69, which holds main 63681e5 with no change under `crates/`. Main then moved to 5ede80b, which changes `docs/store.md` alone. The predictions (R1-R7 in PREDICTIONS.md) were committed before these runs. Load average about 2.5 throughout, from other agents.
+
+| Run | Result | Verdict |
+|---|---|---|
+| Produce 300,000 under kill -9 every 50-300 ms | 1,630 kills in 9 min; clean open then verify: missing 0, doubled 0, unfilled 0, position 299999 | Held |
+| Amendments under kill -9 (2,000 books, 4,930-event script) | Seed 3 kills, feed 163; 0 mismatches against the oracle; refused 40 = stopped 40, reason no hearing; no other fill rows; `_open` 0; processed = committed = 11,255 | Held |
+| Tries across those kills | 168 snapshots: none went down, none over 3; the last, taken after the check, has 40 rows, all at 3 | Held |
+| Worker, 30,000 events under kill -9 | 105 kills; 30,001 done (the declaration included), none in progress | Held |
+| Legion's memory, 9,682 reflections | 22,619 events in 1.1 s, none refused or stopped; 0 text mismatches; live sets per repo exact; follows 808/808; 200 amendments and 100 renames, 0 mismatches, 22.4 ms each | Held |
+| Clean fill, 306,000 events (`fillbench`) | 88,294, 89,777 and 91,381 events/s, 0 stopped | Held, floor 50,000 |
+
+### What the first pass on main 6606817 found
+
+- **R2's defect was real.** The amendment kill run gave 100 mismatches of 2,000: a link ended before a rename answered under the new key when read as known before the rename, against `docs/store.md`. #188 had relaxed this check; here it stayed strict. Fixed by #196, an ending under a renamed key being known from the rename at the earliest. Everything else in that pass held: produce through 5,161 kills, 0 missing, doubled or unfilled; fill at 91,817, 91,832 and 91,699 events/s; memory 0 mismatches.
+- **The worker run proved nothing at first.** `next` and `done` have got so fast that 3,001 events finished in about a millisecond, with 0 kills. `work` now pauses 5 ms every 50 events, and `kw.sh` works 30,000 events, so kills land.
+- **A misleading tries line.** The last snapshot was taken before the check, whose fills took five refused amendments from 2 tries to 3, so it read "at 3: 35" beside "tries != 3: 0". `ka.sh` now snapshots after the check too.
+- **The port.** The docs now refuse no amendment for its timing, so the script's former refusals are valid or wait, and the oracle's refusals are the 40 amendments of an app event. `rannoch-store` reads take a `View`.
+
+### Predictions
+
+| | Prediction | Result |
+|---|---|---|
+| R1 | Produce holds | Held |
+| R2 | Amendment run holds but for up to 100 of the rename kind (0.6) | Held on 6606817 as stated: exactly 100 |
+| R3 | Worker holds | Held, once kills landed |
+| R4 | Memory holds | Held |
+| R5 | Fill 85,000-92,000 events/s | Held |
+| R6 | After the fix: 0 mismatches, all 40 at 3 | Held |
+| R7 | The rest hold; fill within 5% of 91,800 | Held: lowest 88,294 is 3.8% under |

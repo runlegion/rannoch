@@ -44,5 +44,7 @@ Two defects these runs found, both fixed: tables left behind the log after a kil
 - `target/release/amend seed|script|feed|check|tries|retry <graph> ...`: a seed of books, authors, links and refusal targets; a script of amendments (valid ones and ones fill must refuse) with an oracle computed from the plan; both fed through the queue with positions, resumable after kill -9. `kill-amend.sh` runs them under kills (`WIDE=1` for a 0.5-3.0 s window).
 - `target/release/memory <slice.jsonl> <graph>`: legion's 9,682-reflection slice (local, never committed), live sets, then amends and renames real linked reflections.
 - `target/release/fillprobe <graph>`: times one fill.
+- `target/release/fillbench <dir>`: writes a store of 306,000 committed events and times one clean fill.
+- `kp.sh`, `ka.sh`, `kw.sh`: the producer, amendment and worker kill loops. `kp.sh` and `ka.sh` resume, each call running at most `CAP` seconds.
 
 Predictions: PREDICTIONS.md. Results and the bugs they found: RESULTS.md.

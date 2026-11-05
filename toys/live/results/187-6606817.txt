@@ -1,0 +1,61 @@
+start Tue Nov  3 23:53:10 PST 2026 load 23:53  up 1 day, 15:50, 5 users, load averages: 2.14 2.45 2.50
+fill 306000 events in 3.333 s: 91817 events/s, stopped 0
+fill 306000 events in 3.332 s: 91832 events/s, stopped 0
+fill 306000 events in 3.337 s: 91699 events/s, stopped 0
+load 23:53  up 1 day, 15:50, 5 users, load averages: 1.96 2.40 2.48
+--- memory
+load 22619 events in 1.1s, refused at commit 0, stopped 0
+P4.1 text mismatches 0 of 9682 | live sets equal true want {"eavesdrop": 1128, "kessel": 1051, "rafters": 3074, "rannoch": 34, "smugglr": 1708, "warden": 246} got {"eavesdrop": 1128, "kessel": 1051, "rafters": 3074, "rannoch": 34, "smugglr": 1708, "warden": 246} | follows 808/808
+P4.2 amended 200 renamed 100 in 6.7s (22.4 ms each), stopped 0, mismatches 0
+  kinds {}
+  probe unamended 01a12a0a-30a3-7881-80e4-9123cb225f23: now Some(712) | as of before Some(712)
+  probe amended 019cd228-41a9-7270-92f8-2dae2bfdef24: as of before Some("When someone proposes compress") | as of now Some("amended: 019cd228-41a9-7270-92")
+--- worker
+produced 0..3000, failures 0 | open 150.1ms, accept 50.1ms, close+drain 72.0ms, total 272.2ms, 11021 events/s
+worked 3001 in 0.0s, 2839616 events/s | next 0.00ms each, done 0.00ms each
+kills 0
+states {"Done": 3001} in-progress cursors []
+./kw.sh  0.07s user 0.05s system 18% cpu 0.690 total
+--- produce
+paused
+kills so far 3514
+events 262001 distinct 262001 missing 37999 doubled 0 unfilled 37999 position Some("262000")
+paused
+kills so far 5161
+events 300000 distinct 300000 missing 0 doubled 0 unfilled 0 position Some("299999")
+produced 300000..300000, failures 0 | open 0.8ms, accept 0.0ms, close+drain 0.4ms, total 1.2ms, 0 events/s
+kills so far 5161
+events 300000 distinct 300000 missing 0 doubled 0 unfilled 0 position Some("299999")
+( until [ -f runs/kp.done ]; do; CAP=540 ./kp.sh; done; )  241.38s user 384.46s system 57% cpu 18:06.87 total
+--- clean verify
+read log 227ms, 300000 finds 1276ms (4.3us each)
+events 300000 distinct 300000 missing 0 doubled 0 unfilled 0 position Some("299999")
+--- amend
+fed seed 3801..6320 failures 0 in 162.4ms
+seed done, kills 2
+script 4930 lines, 40 to refuse
+fed script 4930..4930 failures 0 in 255.8ms
+feed done, kills 164
+CHECK:
+books checked 2000, mismatches 100
+  link a1003->r1003 known before the rename
+  link a1023->r1023 known before the rename
+  link a103->r103 known before the rename
+  link a1043->r1043 known before the rename
+  link a1063->r1063 known before the rename
+  link a1083->r1083 known before the rename
+  link a1103->r1103 known before the rename
+  link a1123->r1123 known before the rename
+  link a1143->r1143 known before the rename
+  link a1163->r1163 known before the rename
+  link a1183->r1183 known before the rename
+  link a1203->r1203 known before the rename
+  link a1223->r1223 known before the rename
+  link a123->r123 known before the rename
+  link a1243->r1243 known before the rename
+refused 40 stopped 40 equal true | fill rows other than refused 0 | refused rows with tries != 3 0 | _open 0
+  reason x40: no hearing
+processed Cursor(11255) committed Cursor(11255)
+tries snapshots 167: went down 0, over the limit 0; final rows 40, at 3: 35, other: [2, 3]
+( until [ -f runs/ak.all.done ]; do; CAP=540 ./ka.sh; done; )  39.69s user 1.97s system 84% cpu 49.053 total
+end Wed Nov  4 00:12:33 PST 2026
