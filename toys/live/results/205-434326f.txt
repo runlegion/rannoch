@@ -1,0 +1,63 @@
+start Thu Nov  5 11:30:09 PST 2026 11:30  up 3 days,  3:27, 6 users, load averages: 14.13 10.35 8.25
+ba524c55ba965232632eb9171de84528759dca68
+434326fe06701478ba4c90658455fc585256ab5d
+fill 306000 events in 5.981 s: 51161 events/s, stopped 0
+fill 306000 events in 5.615 s: 54494 events/s, stopped 0
+fill 306000 events in 6.202 s: 49336 events/s, stopped 0
+--- memory
+load 22619 events in 1.5s, refused at commit 0, stopped 0
+P4.1 text mismatches 0 of 9682 | live sets equal true want {"eavesdrop": 1128, "kessel": 1051, "rafters": 3074, "rannoch": 34, "smugglr": 1708, "warden": 246} got {"eavesdrop": 1128, "kessel": 1051, "rafters": 3074, "rannoch": 34, "smugglr": 1708, "warden": 246} | follows 808/808
+P4.2 amended 200 renamed 100 in 12.7s (42.4 ms each), stopped 0, mismatches 0
+  kinds {}
+  probe unamended 01a12a0a-30a3-7881-80e4-9123cb225f23: now Some(712) | as of before Some(712)
+  probe amended 019cd228-41a9-7270-92f8-2dae2bfdef24: as of before Some("When someone proposes compress") | as of now Some("amended: 019cd228-41a9-7270-92")
+--- worker
+produced 0..30000, failures 0 | open 205.6ms, accept 473.9ms, close+drain 258.2ms, total 937.7ms, 31993 events/s
+worked 289 in 0.0s, 8016 events/s | next 0.00ms each, done 0.12ms each
+kills 28
+states {"Done": 30001} in-progress cursors []
+--- produce
+paused
+kills so far 1728
+events 300000 distinct 300000 missing 0 doubled 0 unfilled 0 position Some("299999")
+produced 300000..300000, failures 0 | open 1.9ms, accept 0.0ms, close+drain 0.7ms, total 2.6ms, 0 events/s
+kills so far 1728
+events 300000 distinct 300000 missing 0 doubled 0 unfilled 0 position Some("299999")
+--- clean verify
+read log 593ms, 300000 finds 3340ms (11.1us each)
+events 300000 distinct 300000 missing 0 doubled 0 unfilled 0 position Some("299999")
+--- amend
+fed seed 6320..6320 failures 0 in 56.2ms
+seed done, kills 3
+script 4930 lines, 40 to refuse
+fed script 4930..4930 failures 0 in 53.3ms
+feed done, kills 231
+CHECK:
+books checked 2000, mismatches 0
+refused 40 stopped 40 equal true | fill rows other than refused 0 | refused rows with tries != 3 0 | _open 0
+  reason x40: no hearing
+processed Cursor(11255) committed Cursor(11255)
+tries snapshots 236: went down 0, over the limit 0; final rows 40, at 3: 40, other: [3]
+--- relay
+life reached 40000
+free done, kills 225
+life reached 44000
+step done, kills 458
+events 44000 missing 0 doubled 0 position Some("43999") stopped 0
+checks      685, violations        2
+opened capped: file Cursor(46113) ahead of log Cursor(46112)
+opened capped: file Cursor(46267) ahead of log Cursor(46266)
+watermark Cursor(48421) position Some("43999") equal 4/4 sizes [43, 441, 588, 1] told 0
+--- purge
+planned 140 targets, 20000 fillers
+kills 33; inside a purge, landed 16; inside, not landed 17; between 4
+refused for a reader        0
+rules landed 140 of 140, all true
+last kill, no clean close: scanned 0 texts
+sent again: refused 490, stored 0; log Cursor(36924) to Cursor(36924); stopped 0
+relay shelf equal, 181 nodes
+clean close: scanned 0 texts
+checks       37, violations        0
+between | rules 140 of 140 | held 0 | relay equal 1/1 | wal 197792
+end Thu Nov  5 11:46:52 PST 2026 11:46  up 3 days,  3:44, 6 users, load averages: 9.39 12.37 11.72
+FINAL-END

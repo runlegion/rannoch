@@ -271,8 +271,11 @@ fn check(run: &Run, dir: &str) {
     let queue = Arc::new(Queue::open(open(&run.graph, &KEY).expect("open"), Queue::INTERVAL).expect("queue"));
     let entries = manifest(&run.relays);
     let relays = Relays::open(&run.relays, Arc::clone(&queue), &run.graph, &KEY).expect("relays");
+    // The log as of now: opening the queue filled, and fill may have appended a closing the relays
+    // have already read.
+    let opened = reader.events().committed().expect("committed");
     for entry in &entries {
-        files(run, &queue, entry, committed, "opened");
+        files(run, &queue, entry, opened, "opened");
     }
     let Some(high) = settled(&queue, &relays, &reader, &entries) else {
         run.violation("after a restart a relay did not reach the watermark");

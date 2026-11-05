@@ -1,7 +1,7 @@
 #!/bin/zsh
 # The whole release check, in #187's order and then the relay and purge runs, into one results file.
 # Each kill run starts on a fresh store. Usage: ./final.sh <results file>
-OUT=$1; R=runs; B=target/release
+setopt null_glob; OUT=$1; R=runs; B=target/release
 for f in kill.rannoch kill.rannoch-wal kill.rannoch-shm kp.kills kp.done out.txt; do mv $R/$f $R/old-$f 2>/dev/null; done
 for f in $R/ak* $R/aktries-*; do mv $f $R/old-${f:t} 2>/dev/null; done
 {

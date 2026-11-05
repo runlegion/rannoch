@@ -94,3 +94,33 @@ Suite head 395db69, which holds main 63681e5 with no change under `crates/`. Mai
 | R5 | Fill 85,000-92,000 events/s | Held |
 | R6 | After the fix: 0 mismatches, all 40 at 3 | Held |
 | R7 | The rest hold; fill within 5% of 91,800 | Held: lowest 88,294 is 3.8% under |
+
+## Release check for #205, 2026-11-05: main 434326f (Puck, M4, release build, stores on /Volumes/store)
+
+Suite head ba524c5, which holds main 434326f with no change under `crates/` or `docs/`. Predictions R8-R18 in PREDICTIONS.md were committed before the runs they name. Load average 9-14 throughout, from other agents and an older purge loop. Raw output: `results/205-434326f.txt`. The release is on hold: purge is being removed from rannoch, so no tag was made.
+
+| Run | Result | Verdict |
+|---|---|---|
+| Clean fill, 306,000 events | 51,161, 54,494 and 49,336 events/s, 0 stopped | Over the 50,000 floor in two of three, under load |
+| Fill, A/B against 63681e5 at matched load, 5 pairs | medians 48,552 (63681e5) and 47,253 (434326f) | No regression; the drop from 88-91k is load |
+| Produce, A/B, 100,000 events, 4 pairs | medians 32,326 (63681e5) and 31,210 (434326f) | Within the spread of 26-36k |
+| Legion's memory, 9,682 reflections | 22,619 events in 1.5 s; 0 text mismatches; live sets exact; 300 amendments and renames, 0 mismatches, 42.4 ms each | Held |
+| Worker, 30,000 events under kill -9 | 28 kills; 30,001 done, none in progress | Held |
+| Produce 300,000 under kill -9 every 50-300 ms | 1,728 kills; missing 0, doubled 0, unfilled 0, position 299999 | Held |
+| Amendments under kill -9 | seed 3 kills, feed 231; 0 mismatches of 2,000; refused 40 = stopped 40, all at 3; 236 tries snapshots, none down or over | Held |
+| Relay under kill -9, four relays, a producer writing (`kr.sh`) | 683 kills over 44,000 events, a check after each restart: all four equal a cold walk at every restart; no told cursor ahead of `read` or past the log; stepped run held each set and each last change after every commit; 0 missing, doubled or stopped | Held, see below |
+| Purge under kill -9 (`kg.sh`), 140 targets of seven kinds, `rannoch.purge` events | 33 kills: 16 inside a request that landed, 17 inside one that did not, 4 between; 3 probes left a purge committed and not truncated. Every target all before or all after at every check; no purged text in the file, write-ahead log or relay's file after any restart, the last kill or a clean close; 490 bodies sent again all refused, log unchanged; relay equal | Held |
+
+**Two relay check lines were the check's, not rannoch's.** "file Cursor(46113) ahead of log Cursor(46112)", twice. The check read the log's high before opening the queue, and opening filled and appended a `rannoch.closed` event at the next place, which the relay then read and saved. Both places hold such an event. `check` now reads the log after opening; not rerun, since the release is on hold.
+
+**What this pass found and fixed (#207, before the runs above):** a fact sent again under a renamed key left a row there, so the next node event at that key stopped at the try limit (the relay mix stopped 3 of 3,300 events); and a kill between a purge's commit and its truncate left purged bytes in the write-ahead log, which `open` now finishes. The first purge loop livelocked (144,248 kills, 4 of 140 targets), since a purge outlasted every 50-300 ms window; `kg.sh` now kills at 50 ms to 2.5 s and stops on no progress.
+
+| | Prediction | Result |
+|---|---|---|
+| R8, R15 | Relay equal at every restart; no claim ahead | Held |
+| R9 | Producer 0 missing, 0 doubled | Held |
+| R10 | Stopped expected on ea94dae | Held as stated: 3; after #207, 0 |
+| R11, R16 | Purge all or nothing; kills inside | Held; 33 inside, 16 after commit. R11's "some between commit and truncate" was not met by random kills (0 of 139 on the first form); the probes cover it |
+| R12, R17 | No purged byte after restart | Failed by reading on ea94dae (fixed by #207); held on 434326f |
+| R13 | Sent again refused | Held |
+| R14, R18 | #187 suite holds, fill at least 50,000 | Held, but for one fill at 49,336 under load average 14 |
