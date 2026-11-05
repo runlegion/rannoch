@@ -1049,8 +1049,20 @@ mod tests {
         Ok(())
     }
 
-    fn k() -> rannoch_store::Target {
-        rannoch_store::Target::Node(NodeRef::new("a", "k"))
+    /// The `rannoch.purge` event asking to purge `target` under rule `r`.
+    fn purge_of(target: &Json) -> String {
+        json!({"specversion": "1.0", "id": EventId::now().to_string(), "source": "rannoch:app",
+               "type": "rannoch.purge",
+               "data": {"target": target, "rule": "r", "source": "app"}})
+        .to_string()
+    }
+
+    /// Asks `queue` for the purge of the node `k` and commits it; returns the log's high cursor
+    /// after it, the rule event's or past it.
+    fn purge_k(queue: &Queue, dir: &tempfile::TempDir) -> Result<Cursor> {
+        queue.accept(purge_of(&json!({"kind": "node", "class": "a", "key": "k"})))?;
+        queue.commit();
+        Ok(open(dir.path().join("graph"), &KEY)?.events().committed()?)
     }
 
     #[test]
@@ -1060,7 +1072,7 @@ mod tests {
         let file = relay_file(&relays.inner.dir, &id);
         until(|| file.exists().then_some(()))?;
         let real = break_reads(&dir, &relays, &id)?;
-        queue.purge(&k(), "r", "app")?;
+        purge_k(&queue, &dir)?;
         failures_of(&relays)?;
         // Taking the state waits out the pump that failed.
         drop(lock(&relays.inner.state));
@@ -1081,7 +1093,7 @@ mod tests {
         // A directory where the save writes its temporary file: the save fails, and only the save.
         let blocker = file.with_extension("tmp");
         fs::create_dir(&blocker)?;
-        let at = queue.purge(&k(), "r", "app")?.cursor;
+        let at = purge_k(&queue, &dir)?;
         until(|| {
             relays
                 .read(&id)
@@ -1113,13 +1125,8 @@ mod tests {
         let mut into = open(dir.path().join("into"), &KEY)?;
         // The rule stands in the store replayed into, so its match is refused there mid-replay.
         let until = source.events().committed()?;
-        into.purge(
-            &rannoch_store::Target::Stream {
-                source: "t".to_string(),
-            },
-            "r",
-            "app",
-        )?;
+        into.commit(&[&purge_of(&json!({"kind": "stream", "source": "t"}))], &[])?
+            .remove(0)?;
         replay(&source, &mut into, until)?;
         assert!(
             into.find("a", "kept")?.is_some(),

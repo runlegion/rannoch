@@ -38,6 +38,18 @@ fn item(key: &str) -> String {
     node("item", key)
 }
 
+/// The `rannoch.purge` event asking to purge the item `key` under rule `r`.
+fn purge_item(key: &str) -> String {
+    format!(
+        r#"{{"specversion":"1.0","id":"{}","source":"rannoch:app","type":"rannoch.purge","data":{{"target":{{"kind":"node","class":"item","key":"{key}"}},"rule":"r","source":"app"}}}}"#,
+        rannoch_cloudevents::EventId::now()
+    )
+}
+
+fn is_rule_event(body: &str) -> bool {
+    rannoch_cloudevents::attributes(body).is_ok_and(|event| event.ty == rannoch_store::PURGED)
+}
+
 /// Makes every event whose key is `bad` fail at commit: with `ABORT` it rolls back alone, with
 /// `ROLLBACK` it takes its whole transaction.
 fn failing_bad(path: &Path, how: &str) -> rusqlite::Result<()> {
@@ -629,11 +641,8 @@ fn a_purge_through_the_queue_reaches_what_a_worker_read_ahead()
     let before = lock(&told).len();
     // Held when the purge comes, so it goes with what the log holds.
     queue.accept(item("secret"))?;
-    let purged = queue.purge(
-        &rannoch_store::Target::Node(rannoch_store::NodeRef::new("item", "secret")),
-        "r",
-        "app",
-    )?;
+    queue.accept(purge_item("secret"))?;
+    queue.commit();
     assert!(lock(&told).len() > before, "the subscribers hear of it");
     let mut seen = Vec::new();
     while let Some(event) = queue.next("w")? {
@@ -641,10 +650,9 @@ fn a_purge_through_the_queue_reaches_what_a_worker_read_ahead()
     }
     assert!(seen.iter().all(|body| !body.contains("secret")), "{seen:?}");
     assert!(seen.iter().any(|body| body.contains("last")));
-    assert_eq!(
-        seen.last(),
-        Some(&purged.body),
-        "the rule event, and nothing of it"
+    assert!(
+        seen.last().is_some_and(|body| is_rule_event(body)),
+        "the rule event, and nothing of it: {seen:?}"
     );
     queue.done("w", taken.cursor)?;
     Ok(())
@@ -666,17 +674,14 @@ fn a_fill_that_fails_after_a_purge_is_reported_and_the_rule_event_still_reaches_
         "CREATE TRIGGER fill_stuck BEFORE UPDATE ON _places WHEN NEW.worker = 'rannoch.fill' \
          BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END;",
     )?;
-    let purged = queue.purge(
-        &rannoch_store::Target::Node(rannoch_store::NodeRef::new("item", "k")),
-        "r",
-        "app",
-    )?;
+    queue.accept(purge_item("k"))?;
+    queue.commit();
     let failures = queue.take_failures();
     assert!(
         matches!(&failures[..], [Failure::Fill { .. }]),
         "{failures:?}"
     );
     let handed = queue.next("w")?.ok_or("the rule event")?;
-    assert_eq!(handed.body, purged.body);
+    assert!(is_rule_event(&handed.body), "{}", handed.body);
     Ok(())
 }
