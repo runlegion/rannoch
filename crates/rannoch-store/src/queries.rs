@@ -213,6 +213,8 @@ pub(crate) const HISTORY_TABLES: &str = "
     CREATE TABLE IF NOT EXISTS _waiting(
         source TEXT NOT NULL, id TEXT NOT NULL, known INTEGER NOT NULL, event TEXT NOT NULL,
         seq INTEGER NOT NULL, PRIMARY KEY(source, id, known, event)) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS _purge_unfinished(
+        one INTEGER PRIMARY KEY CHECK (one = 1));
     CREATE TABLE IF NOT EXISTS _purge_rules(
         kind TEXT NOT NULL, value BLOB NOT NULL, rule TEXT NOT NULL,
         PRIMARY KEY(kind, value)) WITHOUT ROWID;
@@ -456,6 +458,10 @@ pub(crate) const LINKS_AT: &str = "SELECT DISTINCT key, to_key FROM _hearings WH
 /// Moves every page of the write-ahead log into the file and truncates it to nothing. Its first
 /// column says whether a reader kept it from finishing.
 pub(crate) const TRUNCATE_LOG: &str = "PRAGMA wal_checkpoint(TRUNCATE)";
+/// A purge's transaction marks it unfinished until its write-ahead log has been truncated.
+pub(crate) const PURGE_UNFINISHED: &str = "INSERT OR IGNORE INTO _purge_unfinished(one) VALUES (1)";
+pub(crate) const IS_PURGE_UNFINISHED: &str = "SELECT EXISTS (SELECT 1 FROM _purge_unfinished)";
+pub(crate) const PURGE_FINISHED: &str = "DELETE FROM _purge_unfinished";
 
 /// The order versions are chosen by, `DESC` putting the newest first: by axis point, then
 /// known-at, so a correction at the same point follows what it corrects, then event id.
