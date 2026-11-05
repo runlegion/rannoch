@@ -193,10 +193,6 @@ Worker files (`rannoch-worker`), the harness (`rannoch-harness`) and the steps (
 
 Erasing a fact from the store and its WAL, with a standing rule that refuses it coming back.
 
-### Trim
-
-Retention declared per class, such as dropping raw events once processed. No issue is filed.
-
 ### Snapshot tool (#154)
 
 A durable copy of the store, built on `copy_to`, outside the engine.
