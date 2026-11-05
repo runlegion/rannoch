@@ -2,7 +2,7 @@
 
 This page describes the second edition of rannoch as the code at this commit builds it. Every part is labelled **built** or **designed, not built**. A built part does what this page says; a designed part does nothing yet and has its own section at the end. The first edition lives at the tag `v0.4.0.a`, not on main; it is a reference for working code only, never for what rannoch is.
 
-How to use what is built: [store.md](store.md) and [inbox.md](inbox.md). The design for flows: [flows.md](flows.md).
+How to use what is built: [store.md](store.md), [inbox.md](inbox.md) and [relays.md](relays.md). The design for flows: [flows.md](flows.md).
 
 ## What rannoch is
 
@@ -14,7 +14,7 @@ It keeps every change as an event in an append-only log and never changes an eve
 
 | Crate | Owns | State |
 |---|---|---|
-| `rannoch-ontology` | Classes, relations, properties, value types and history keys; checking a declaration against what is declared and a value against its type. No I/O. | Built |
+| `rannoch-ontology` | Classes, relations, properties, value types, axes and shapes; checking a declaration against what is declared and a value against its type. No I/O. | Built |
 | `rannoch-cloudevents` | Reading a CloudEvents 1.0 body into the fact it states: a node, a link, a link's ending or correction, a declaration, or no fact. Event ids and dates. No I/O. | Built |
 | `rannoch-store` | The graph file: the log, the ontology tables, fill, hearings, amendments and renames, the tables kept for speed, reads, the inbox's places and work rows, fill retries, `copy_to`. | Built |
 | `rannoch-queue` | The inbox in memory: accepting events, the heartbeat that commits them, producers' positions, each worker's cursor and the group commit that saves them, lag, failures, subscribers. | Built |
@@ -68,10 +68,11 @@ All in one file. rannoch's own tables start with `_`.
 | `_seen` | Per node and link: first and last heard, first recorded, first true, count. |
 | `class:<name>` | One row per node of the class, one column per property. |
 | `relation:<name>` | One row per link with a version known now (endings are read from `_endings`, not from this table), with foreign keys to both classes' tables. |
-| `_places`, `_work` | The inbox: each worker's place, and a row for each event in progress or failed, with its reason and try count. |
+| `_places`, `_work`, `_kept` | The inbox: each worker's place, a row for each event in progress or failed, with its reason and try count, and the state a worker keeps with its cursor. |
 | `_positions` | Each producer's position in its source. |
 | `_fill` | Fill's try limit (3 unless set). |
 | `_check` | The check value of the app's key. |
+| `_newest` | The highest known-at ever filled, read by a query with no known-at. |
 
 The tables kept for speed are `class:<name>`, `relation:<name>` and `_seen`; fill keeps them current. Reads answer from `_hearings`, `_aliases`, `_ends`, `_endings`, `_corrections` and `_seen`. The class and relation tables serve the app's own SQL. `find` returns `None` for a key renamed away. A link of the wrong classes cannot exist in a relation table, since both ends are foreign keys.
 
@@ -89,7 +90,7 @@ Reads take a `View`: an optional axis point and an optional known-at, each defau
 
 - **Now** (`find`, `hearings`, `seen`, `link_seen`, `link_end`): hearings with no `until`, the newest on the axis. A version that arrives late answers at its own point and becomes current only if it is the newest on the axis.
 - **In a view** (`state_at`, `link_state_at`): the newest version at or before the view's point among the hearings known at its known-at (`known` at or before it, `until` after it or absent). None needs a valid date. An amendment or rename known later is not in the answer.
-- **Listed in a view** (`links`, `nodes`, `counts`, `describe`, and `answer` for a `rannoch.query` event): every node `state_at` reads in the view, and every link `link_state_at` reads there as a version with `ended` false, which is a link with a hearing in the view. `ended` on a version means the link does not hold there, whether it ended or was found wrong. `links` and `nodes` are one statement over the history tables; `counts` runs one per class and per relation, and `describe` one for the node and one per relation and direction. `nodes` filters only on properties the class declares `indexed`, through a partial index on `_hearings` made when the class is declared; links to a node are found through `_hearings_to`, which holds link hearings only.
+- **Listed in a view** (`links`, `nodes`, `counts`, `describe`, and `answer` for a `rannoch.query` event): every node `state_at` reads in the view, and every link `link_state_at` reads there as a version with `ended` false, which is a link with a hearing in the view. `ended` on a version means the link does not hold there, whether it ended or was found wrong. `links` and `nodes` are one statement over the history tables; `counts` runs one per class and per relation, and `describe` one for the node and one per relation and direction. `nodes` filters only on properties the class declares `indexed`, through an index on `_hearings` made when the class is declared; links to a node are found through the index `_hearings_to`. No index has a `WHERE` clause, so no statement is prepared again for a new bound value.
 - **As of a valid date, in a view** (`find_as_of(class, key, date, view)`): the version valid on that date among those the view sees.
 
 **Identity.** A hearing's identity is its content together with its source, hashed with BLAKE3 under the app's 32-byte key. Identical content from the same source is one hearing: a repeat under the same CloudEvent id records nothing; a repeat under a new id becomes an alias, an occurrence of the hearing at the repeat's own known-at. A declared axis point is content; known-at is not. The key is held in memory only; the file keeps a check value, and opening it under another key returns `Error::KeyDiffers`.
@@ -150,7 +151,7 @@ Each worker reads with its own cursor, held in the queue's memory: every event a
 
 ## Relays
 
-A shape is declared in the ontology: `Declaration::Shape`, `{name, roots: {node} | {class, filter}, steps: [{relation, keep?, drop?, cap?}]}`. A step's relation carries its direction in its name (`r` forward, `r<-` backward, `r<->` either). `keep` and `drop` are property-equals maps on the reached node. `Relays` (in `rannoch-relay`) holds an app's relays in one directory.
+A shape is declared in the ontology: `Declaration::Shape`, `{name, roots: {node} | {class, filter}, steps: [{relation, keep?, drop?, cap?}]}`. A step's relation carries its direction in its name (`r` forward, `r<-` backward, `r<->` either). `keep` and `drop` are property-equals maps on the reached node. `Relays` (in `rannoch-relay`) holds an app's relays in one directory. How to use them, and what was measured: [relays.md](relays.md).
 
 - **Asking.** A `rannoch.query` whose data is `{shape, view}` is answered by a `rannoch.answer` with subject the query's id and data `{result: {relay, cursor, steps: [{nodes, cut, dropped}]}, known}`, not the nodes. The worker `rannoch.relay` takes these from the inbox and accepts its answer back. `Graph::answer` refuses them. A relay id is a `UUIDv7`; a relay of the same shape and view is shared. A holder is the query's `source`; `release` removes one, and a relay no app holds is dropped with its worker and file.
 - **The walk.** Each step takes the distinct unvisited nodes its links reach that have a version in the view and pass its filters, in key order, up to its cap. A taken node is marked, so a cycle never repeats it. A node a cap cuts is neither marked nor expanded, so a later step may reach it. Every node reached and every list of links read stays in memory, cut ones too, so boundary churn needs no list read again.
@@ -176,6 +177,9 @@ A view is one `View`, read as every read does: a class with no axis reads an axi
 - **A removed property stays in its class table column** for as long as the row exists. A later write that omits the property leaves the old value; only deleting the row clears it. `find` reads from `_hearings` and answers correctly.
 - **One history line.** The history tables other than `_amendments` and `_renames` have a `line` column, and every read and write uses the line `main`.
 - **Copies are not durable on return.** See `copy_to`.
+- **`relation:<name>` tables still hold corrected links.** An app's own SQL over them sees a link found wrong, which the reads do not list.
+- **Listings are whole and filters are simple.** `links` and `nodes` have no paging, filters are equality only and ANDed, and an index can be declared only with its class.
+- **A relay has not run under `kill -9`.** Its restart paths are tested after a clean close, and its fold and walk time swings for a reason not found: see [relays.md](relays.md#what-was-measured).
 
 ## Designed, not built
 
