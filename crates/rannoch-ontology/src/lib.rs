@@ -2,7 +2,7 @@
 //! class at each end. Declaring, checking a declaration against what is declared, and checking a
 //! value against its declared type. Pure code with no I/O.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -13,25 +13,20 @@ use serde::{Deserialize, Serialize};
 pub struct Refused(pub String);
 
 /// A class: a kind of node, with its natural key, its properties and each one's value type,
-/// and the axis its history is ordered by.
+/// and the key its history is ordered by.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Class {
     pub name: String,
     /// Each property and its value type.
     pub properties: BTreeMap<String, ValueType>,
-    /// The named integer parts of the point its history is ordered by, compared in this order:
-    /// each part refines the one before it. Empty: its axis is when each fact became known.
+    /// The key the class's history is ordered by; the origin's record time when it declares none.
     #[serde(default)]
-    pub axis: Vec<String>,
-    /// The properties its nodes can be listed by. Only these are indexed, so writing a node
-    /// pays for an index only where one is declared.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    pub indexed: BTreeSet<String>,
+    pub history: HistoryKey,
 }
 
 impl Class {
-    /// A class whose properties are all text and that declares no axis, so its history is
-    /// ordered by when each fact became known.
+    /// A class whose properties are all text and whose history is ordered by the origin's
+    /// record time.
     pub fn new<P: Into<String>>(
         name: impl Into<String>,
         properties: impl IntoIterator<Item = P>,
@@ -42,8 +37,7 @@ impl Class {
                 .into_iter()
                 .map(|p| (p.into(), ValueType::Text))
                 .collect(),
-            axis: Vec::new(),
-            indexed: BTreeSet::new(),
+            history: HistoryKey::Origin,
         }
     }
 
@@ -84,6 +78,20 @@ pub enum ValueType {
     Float,
     /// 64-bit floats, exactly this many.
     FloatVector(usize),
+}
+
+/// What a class's history is ordered by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryKey {
+    /// The record time of the store that first recorded each hearing, carried in its event:
+    /// never the order this store received it in.
+    #[default]
+    Origin,
+    /// An integer the writer supplies with each write.
+    Integer,
+    /// A time the writer supplies with each write: UTC, millisecond precision.
+    Time,
 }
 
 /// A property's value, of its property's declared type.
@@ -190,10 +198,6 @@ pub struct Relation {
     pub from: String,
     pub to: String,
     pub containment: bool,
-    /// The named integer parts of the point its links and endings are ordered by, as a class
-    /// declares them. Empty: its axis is when each fact became known.
-    #[serde(default)]
-    pub axis: Vec<String>,
 }
 
 impl Relation {
@@ -208,7 +212,6 @@ impl Relation {
             from: from.into(),
             to: to.into(),
             containment,
-            axis: Vec::new(),
         }
     }
 
@@ -228,102 +231,12 @@ impl Relation {
     }
 }
 
-/// A node named by its class and natural key.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct NodeRef {
-    pub class: String,
-    pub key: String,
-}
-
-impl NodeRef {
-    pub fn new(class: impl Into<String>, key: impl Into<String>) -> Self {
-        NodeRef {
-            class: class.into(),
-            key: key.into(),
-        }
-    }
-}
-
-/// A shape: a named neighbourhood, walked from its roots one step at a time.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Shape {
-    pub name: String,
-    pub roots: Roots,
-    pub steps: Vec<Step>,
-}
-
-/// Where a shape's walk starts.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum Roots {
-    /// One node.
-    Node { node: NodeRef },
-    /// The nodes of a class that have every value in `filter`, each an indexed property.
-    Class {
-        class: String,
-        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-        filter: BTreeMap<String, Value>,
-    },
-}
-
-/// One step of a shape: the links it follows, what it keeps of the nodes they reach, and how many
-/// it takes. A step with no cap is exact.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Step {
-    /// A relation with its direction in its name: `r` forward, `r<-` backward, `r<->` either.
-    pub relation: String,
-    /// A reached node stays only if it has every one of these values.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub keep: BTreeMap<String, Value>,
-    /// A reached node goes if it has every one of these values.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub drop: BTreeMap<String, Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cap: Option<usize>,
-}
-
-/// Which way a step follows its relation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Way {
-    Forward,
-    Backward,
-    Either,
-}
-
-impl Step {
-    /// The relation's name without its direction, and the direction.
-    #[must_use]
-    pub fn way(&self) -> (&str, Way) {
-        if let Some(name) = self.relation.strip_suffix("<->") {
-            (name, Way::Either)
-        } else if let Some(name) = self.relation.strip_suffix("<-") {
-            (name, Way::Backward)
-        } else {
-            (&self.relation, Way::Forward)
-        }
-    }
-
-    /// Whether a reached node with `properties` passes this step's filters.
-    #[must_use]
-    pub fn passes(&self, properties: &BTreeMap<String, Value>) -> bool {
-        has_all(properties, &self.keep)
-            && (self.drop.is_empty() || !has_all(properties, &self.drop))
-    }
-}
-
-/// Whether `properties` holds every property of `wanted`, each at its value.
-#[must_use]
-pub fn has_all(properties: &BTreeMap<String, Value>, wanted: &BTreeMap<String, Value>) -> bool {
-    wanted.iter().all(|(p, v)| properties.get(p) == Some(v))
-}
-
 /// One declaration on a graph's stream.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Declaration {
     Class(Class),
     Relation(Relation),
-    Shape(Shape),
     /// A property added to a declared class, of value type `of`.
     Property {
         class: String,
@@ -337,7 +250,6 @@ pub enum Declaration {
 pub struct Ontology {
     pub classes: BTreeMap<String, Class>,
     pub relations: BTreeMap<String, Relation>,
-    pub shapes: BTreeMap<String, Shape>,
 }
 
 impl Ontology {
@@ -361,107 +273,28 @@ impl Ontology {
             .ok_or_else(|| Refused(format!("relation {name} is not declared")))
     }
 
-    /// The declared shape `name`.
-    ///
-    /// # Errors
-    /// No shape of that name is declared.
-    pub fn shape(&self, name: &str) -> Result<&Shape, Refused> {
-        self.shapes
-            .get(name)
-            .ok_or_else(|| Refused(format!("shape {name} is not declared")))
-    }
-
-    /// Checks a shape against what is declared: its roots' class and indexed properties, each
-    /// step's relation and that the classes the step before reached are at one of its ends, and
-    /// that a property a step filters on is declared on a class it reaches.
-    fn check_shape(&self, shape: &Shape) -> Result<(), Refused> {
-        let mut reached = BTreeSet::new();
-        match &shape.roots {
-            Roots::Node { node } => {
-                self.class(&node.class)?;
-                reached.insert(node.class.as_str());
-            }
-            Roots::Class { class, filter } => {
-                let declared = self.class(class)?;
-                if let Some(property) = filter.keys().find(|p| !declared.indexed.contains(*p)) {
-                    return Err(Refused(format!(
-                        "shape {} chooses its roots by property {property}, which class {class} \
-                         does not index",
-                        shape.name
-                    )));
-                }
-                reached.insert(class.as_str());
-            }
-        }
-        for step in &shape.steps {
-            let (name, way) = step.way();
-            let relation = self.relation(name)?;
-            let mut next = BTreeSet::new();
-            if way != Way::Backward && reached.contains(relation.from.as_str()) {
-                next.insert(relation.to.as_str());
-            }
-            if way != Way::Forward && reached.contains(relation.to.as_str()) {
-                next.insert(relation.from.as_str());
-            }
-            if next.is_empty() {
-                return Err(Refused(format!(
-                    "shape {} steps along {} from {reached:?}, which that relation does not hold",
-                    shape.name, step.relation
-                )));
-            }
-            for property in step.keep.keys().chain(step.drop.keys()) {
-                let declared = next.iter().any(|class| {
-                    self.classes
-                        .get(*class)
-                        .is_some_and(|c| c.properties.contains_key(property))
-                });
-                if !declared {
-                    return Err(Refused(format!(
-                        "shape {} filters step {} on property {property}, which {next:?} do not \
-                         declare",
-                        shape.name, step.relation
-                    )));
-                }
-            }
-            reached = next;
-        }
-        Ok(())
-    }
-
     /// Checks a declaration against what is declared. Returns false when the declaration is
     /// identical to what is declared, so it changes nothing; true when it declares something new.
     ///
     /// # Errors
     /// The declaration conflicts with what is declared: a class or relation of the same name
-    /// with other properties, axis or ends, a property of the same name with another type,
-    /// a property of a class that is not declared, a relation whose end names a class that
-    /// is not declared, or a shape that does not fit what is declared.
+    /// with other properties, history or ends, a property of the same name with another type,
+    /// a property of a class that is not declared, or a relation whose end names a class that
+    /// is not declared.
     pub fn check(&self, declaration: &Declaration) -> Result<bool, Refused> {
         match declaration {
             Declaration::Class(class) => match self.classes.get(&class.name) {
                 Some(have) if have == class => Ok(false),
                 Some(have) => Err(Refused(format!(
-                    "class {} is already declared with properties {}, axis {:?} and indexed \
-                     {:?}; this declaration has {}, {:?} and {:?}",
+                    "class {} is already declared with properties {} and history {:?}; \
+                     this declaration has {} and {:?}",
                     class.name,
                     list(&have.properties),
-                    have.axis,
-                    have.indexed,
+                    have.history,
                     list(&class.properties),
-                    class.axis,
-                    class.indexed
+                    class.history
                 ))),
-                None => match class
-                    .indexed
-                    .iter()
-                    .find(|p| !class.properties.contains_key(*p))
-                {
-                    Some(property) => Err(Refused(format!(
-                        "class {} indexes property {property}, which it does not declare",
-                        class.name
-                    ))),
-                    None => Ok(true),
-                },
+                None => Ok(true),
             },
             Declaration::Relation(relation) => {
                 if let Some(have) = self.relations.get(&relation.name) {
@@ -483,19 +316,6 @@ impl Ontology {
                         )));
                     }
                 }
-                Ok(true)
-            }
-            Declaration::Shape(shape) => {
-                if let Some(have) = self.shapes.get(&shape.name) {
-                    if have == shape {
-                        return Ok(false);
-                    }
-                    return Err(Refused(format!(
-                        "shape {} is already declared differently",
-                        shape.name
-                    )));
-                }
-                self.check_shape(shape)?;
                 Ok(true)
             }
             Declaration::Property {
@@ -531,24 +351,14 @@ fn ends(relation: &Relation) -> String {
     } else {
         ""
     };
-    let axis = if relation.axis.is_empty() {
-        String::new()
-    } else {
-        format!(", on axis {:?}", relation.axis)
-    };
-    format!(
-        "from {} to {}{containment}{axis}",
-        relation.from, relation.to
-    )
+    format!("from {} to {}{containment}", relation.from, relation.to)
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::{
-        Class, Declaration, NodeRef, Ontology, Relation, Roots, Shape, Step, Value, ValueType, Way,
-    };
+    use super::{Class, Declaration, HistoryKey, Ontology, Relation, Value, ValueType};
 
     fn declared() -> Ontology {
         let mut ontology = Ontology::default();
@@ -583,136 +393,17 @@ mod tests {
         );
     }
 
-    fn along(relation: &str) -> Step {
-        Step {
-            relation: relation.into(),
-            ..Step::default()
-        }
-    }
-
-    #[test]
-    fn a_step_reads_its_direction_from_its_name() {
-        assert_eq!(along("wrote").way(), ("wrote", Way::Forward));
-        assert_eq!(along("wrote<-").way(), ("wrote", Way::Backward));
-        assert_eq!(along("wrote<->").way(), ("wrote", Way::Either));
-    }
-
-    #[test]
-    fn a_shape_is_checked_against_what_is_declared() {
-        let shape = |roots: Roots, steps: &[&str]| {
-            Declaration::Shape(Shape {
-                name: "s".into(),
-                roots,
-                steps: steps.iter().map(|s| along(s)).collect(),
-            })
-        };
-        let author = || Roots::Node {
-            node: NodeRef::new("author", "a1"),
-        };
-        let mut ontology = declared();
-        let books = shape(author(), &["wrote", "wrote<-"]);
-        assert_eq!(ontology.check(&books), Ok(true));
-        let Declaration::Shape(declared_shape) = books.clone() else {
-            return;
-        };
-        ontology.shapes.insert("s".into(), declared_shape);
-        assert_eq!(ontology.check(&books), Ok(false), "identical");
-        assert!(
-            ontology.check(&shape(author(), &["wrote"])).is_err(),
-            "conflict"
-        );
-        let fresh = declared();
-        assert!(
-            fresh.check(&shape(author(), &["wrote<-"])).is_err(),
-            "wrong end"
-        );
-        assert!(
-            fresh.check(&shape(author(), &["sold"])).is_err(),
-            "no relation"
-        );
-        let by_name = Roots::Class {
-            class: "book".into(),
-            filter: BTreeMap::from([("title".to_string(), Value::from("Dune"))]),
-        };
-        assert!(
-            fresh
-                .check(&shape(by_name, &[]))
-                .is_err_and(|refused| refused.0.contains("does not index"))
-        );
-        let filtered = Declaration::Shape(Shape {
-            name: "f".into(),
-            roots: author(),
-            steps: vec![Step {
-                keep: BTreeMap::from([("pages".to_string(), Value::Integer(1))]),
-                ..along("wrote")
-            }],
-        });
-        assert!(fresh.check(&filtered).is_err_and(|r| r.0.contains("pages")));
-    }
-
-    #[test]
-    fn a_shape_reads_as_issue_151_writes_it() -> Result<(), serde_json::Error> {
-        let node: Shape = serde_json::from_str(
-            r#"{"name":"n","roots":{"node":{"class":"a","key":"k"}},"steps":[{"relation":"r<-","cap":2}]}"#,
-        )?;
-        assert!(matches!(node.roots, Roots::Node { .. }));
-        assert_eq!(node.steps[0].cap, Some(2));
-        let class: Shape = serde_json::from_str(
-            r#"{"name":"c","roots":{"class":"a","filter":{"p":"v"}},"steps":[{"relation":"r","keep":{"p":"v"},"drop":{"q":"w"}}]}"#,
-        )?;
-        assert!(matches!(class.roots, Roots::Class { .. }));
-        let props = |v: &str| BTreeMap::from([("p".to_string(), Value::from(v))]);
-        assert!(class.steps[0].passes(&props("v")));
-        assert!(!class.steps[0].passes(&props("x")));
-        Ok(())
-    }
-
-    #[test]
-    fn a_class_indexes_only_properties_it_declares() {
-        let ontology = declared();
-        let shelf = |indexed: &str| {
-            Declaration::Class(Class {
-                indexed: [indexed.to_string()].into(),
-                ..Class::new("shelf", ["label"])
-            })
-        };
-        assert_eq!(ontology.check(&shelf("label")), Ok(true));
-        assert!(
-            ontology
-                .check(&shelf("colour"))
-                .is_err_and(|refused| refused.0.contains("colour"))
-        );
-        let mut indexed = declared();
-        let Declaration::Class(label) = shelf("label") else {
-            return;
-        };
-        indexed.classes.insert(label.name.clone(), label);
-        assert!(
-            indexed
-                .check(&Declaration::Class(Class::new("shelf", ["label"])))
-                .is_err_and(|refused| refused.0.contains(r#"indexed {"label"}"#)),
-            "a redeclaration that differs only in what it indexes names it"
-        );
-    }
-
     #[test]
     fn a_conflicting_declaration_is_refused_naming_what_differs_and_no_table() {
         let ontology = declared();
         let mut ordered = Class::new("author", ["name"]);
-        ordered.axis = vec!["build".into()];
+        ordered.history = HistoryKey::Integer;
         for (declaration, names) in [
             (
                 Declaration::Class(Class::new("author", ["born"])),
                 "class author",
             ),
             (Declaration::Class(ordered), "class author"),
-            (
-                Declaration::Relation(Relation {
-                    axis: vec!["build".into()],
-                    ..Relation::new("wrote", "author", "book", false)
-                }),
-                "relation wrote",
-            ),
             (
                 Declaration::Relation(Relation::new("wrote", "book", "author", false)),
                 "relation wrote",

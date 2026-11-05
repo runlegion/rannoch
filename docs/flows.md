@@ -48,7 +48,7 @@ Each row names a step: the processor that runs it.
 
 A worker passes work on by emitting a CloudEvent. The next worker's guard matches that event's type.
 
-**rannoch is at-least-once.** A step retried after a crash can emit again, and that is fine. The store does not dedupe by CloudEvent id: the log mints a fresh log id for every event, and the queue accepts a body it has accepted before. A repeated `rannoch.node` or `rannoch.link` event under the same CloudEvent id records nothing in the graph. Under a new id it is an alias of the same hearing at its own known-at, and on an undeclared axis, if that is newer than the current version, the repeated content becomes current. An app's own event types can reach a worker twice, so every worker and every host action must be idempotent: doing the same work twice leaves the same result.
+**rannoch is at-least-once.** A step retried after a crash can emit again, and that is fine. The store does not dedupe by CloudEvent id: the log mints a fresh log id for every event, and the queue accepts a body it has accepted before. A repeated `rannoch.node` or `rannoch.link` event under the same CloudEvent id records nothing in the graph. Under a new id it is an alias of the same hearing at its own point, and if that point is newer than the current version, the repeated content becomes current. An app's own event types can reach a worker twice, so every worker and every host action must be idempotent: doing the same work twice leaves the same result.
 
 `next` can also name another worker directly; whether that is needed beside emit is an open question below.
 
@@ -76,7 +76,9 @@ One import run, from raw input to sealed.
 2. **Recognise.** Guards match by type alone (`raw.<kind>`, `raw.unsplit`), with `source` scoping a guard to one run.
 3. **Decode, in parallel.** Each raw kind goes to its reader, a host action: typed in, the raw bytes and a reference to shared reference data; typed out, decoded fields or a decode failure with byte offsets. Each output is keyed to the raw event and the parser version, and emits `object.added`, `object.changed` or `object.removed` against the same key in the previous run. A failure emits `decode.failed` and goes to a recovery worker; only if recovery fails does it go to a judge.
 4. **Hand off.** `object.*` fans out in parallel to domain workers, each emitting domain facts. A link is made once both ends exist and emits `link.found` with the source event ids. Beside them, an `onnx` step classifies `object.added`.
-5. **Join, then seal.** Once every raw event of the run has a decode or a judged failure, checks run: everything decoded, nothing lost between input and store, and coverage against a reference. If all pass, the flow emits `run.sealed`. A failed check holds the seal and emits the gap.
+5. **Join, then seal.** Once every raw event of the run has a decode or a judged failure, checks run: everything decoded, nothing lost between input and store, and coverage against a reference. If all pass, the flow emits `run.sealed` and drops the run's `raw.*` events. A failed check holds the seal and emits the gap.
+
+Open: which raw kinds are kept after seal. Large media can be most of a run's size.
 
 ## Open questions
 
@@ -90,6 +92,6 @@ One import run, from raw input to sealed.
 8. **Asks from a long pipeline:**
    - **A join:** wait until every event from source X has reached outcome Y.
    - **Replay:** rerun a step with a new parser version over the stored raw events, before seal.
-   - **Purge scoped by source,** allowed only after seal. (Purge is in [store.md](store.md#purge).)
+   - **Purge scoped by source,** allowed only after seal. (Purge is #148; a retention rule per class, trim, has no issue yet.)
    - **Large inputs by reference:** host actions that take shared reference data, hundreds of MB, by reference rather than inline.
-9. **Scale.** A long pipeline is millions of events per run and terabytes of import log across runs.
+9. **Scale.** A long pipeline is millions of events per run and terabytes of import log across runs. What the store keeps after a run is sealed decides its size.

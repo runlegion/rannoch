@@ -7,7 +7,7 @@ A release is a git tag and a GitHub release. rannoch is not published to
 crates.io yet (`publish = false`), so consumers pin the tag:
 
 ```toml
-rannoch-store = { git = "https://github.com/runlegion/rannoch", tag = "vX.Y.Z" }
+rannoch = { git = "https://github.com/runlegion/rannoch", tag = "vX.Y.Z" }
 ```
 
 Config is `release.toml`. The mechanics are `scripts/release.sh` and
@@ -15,11 +15,6 @@ Config is `release.toml`. The mechanics are `scripts/release.sh` and
 from runlegion/legion (legion 0.43.5) with two patches: the version bump also
 moves the `version` pin on every `path = "..."` dependency, and `--activate` is
 refused. Check their behavior with `bash scripts/test-release.sh`.
-
-On macOS, `scripts/test-release.sh` needs `TMPDIR=$(getconf DARWIN_USER_TEMP_DIR)`.
-`mktemp` hands it directories under that folder; with `TMPDIR` set anywhere else
-its perimeter guard refuses them and aborts the suite. `release.sh` runs the suite
-in its preflight, so step 5 sets it too.
 
 Replace `X.Y.Z` with the new version, `<level>` with `patch`, `minor` or
 `major`, and `<pr>` with the release PR number.
@@ -80,7 +75,7 @@ step 3 result on it.
 ## 5. Stage the release commit
 
 ```bash
-TMPDIR=$(getconf DARWIN_USER_TEMP_DIR) scripts/release.sh <level>
+scripts/release.sh <level>
 ```
 
 It runs the preflight commands from `release.toml`, bumps `Cargo.toml`, refreshes

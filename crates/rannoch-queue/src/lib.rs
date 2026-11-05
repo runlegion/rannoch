@@ -10,14 +10,8 @@
 //! was in flight. Nothing committed is lost. A producer's position in its source commits in the
 //! same transaction as the events it wrote, so a producer that resumes from [`Queue::position`]
 //! after a crash sends again exactly what was lost, and nothing twice.
-//!
-//! Each worker reads with its own cursor, held in memory: taking an event and closing it write
-//! nothing. Every worker that changed is saved in one transaction by the heartbeat, a flush or a
-//! close, so a worker that resumes after a crash is handed again whatever came after its last
-//! saved cursor: delivery is at least once.
 
 use std::any::Any;
-use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
@@ -26,11 +20,7 @@ use std::time::Duration;
 use rannoch_cloudevents::Fact;
 use rannoch_ontology::Ontology;
 pub use rannoch_store::State;
-use rannoch_store::{Cursor, Error, Event, Graph, PURGE, check};
-
-use workers::{CHUNK, Save, Worker};
-
-mod workers;
+use rannoch_store::{Cursor, Error, Event, Graph, check};
 
 /// An event's place in its queue. A later event has a greater ticket, so the committed watermark
 /// has passed an event once [`Queue::committed`] is at or above its ticket.
@@ -64,10 +54,6 @@ pub enum Failure {
         #[source]
         error: Error,
     },
-    /// The workers' cursors could not be saved; they stay in memory and the next group commit
-    /// saves them.
-    #[error("the workers' cursors were not saved: {0}")]
-    Workers(#[source] Error),
 }
 
 type Subscriber = Box<dyn FnMut(Cursor) + Send>;
@@ -85,8 +71,6 @@ pub struct Queue {
 struct Shared {
     graph: Mutex<Graph>,
     state: Mutex<Inbox>,
-    /// Each worker's place in memory, by name.
-    workers: Mutex<HashMap<String, Worker>>,
     stopped: Condvar,
     subscribers: Mutex<Vec<Subscriber>>,
     handler: Mutex<Option<Handler>>,
@@ -94,9 +78,6 @@ struct Shared {
     /// reported and the batch kept.
     #[cfg(test)]
     panic_beat: std::sync::atomic::AtomicBool,
-    /// How many times the graph has been taken, so a test can count the queue's trips to the store.
-    #[cfg(test)]
-    graph_taken: std::sync::atomic::AtomicUsize,
 }
 
 /// The producer an event came from and the position in its source it reached.
@@ -109,8 +90,6 @@ struct Inbox {
     committed: Option<Ticket>,
     /// The highest place in the log a commit has landed; nothing past it is handed out.
     watermark: Cursor,
-    /// The place fill has reached.
-    filled: Cursor,
     /// Failures the app has not yet taken, oldest first.
     failed: Vec<Failure>,
     stop: bool,
@@ -131,17 +110,9 @@ impl Queue {
     /// # Errors
     /// The graph file cannot be read, or the tables cannot be filled from the log.
     pub fn open(mut graph: Graph, interval: Duration) -> Result<Queue, Error> {
-        let filled = graph.fill()?;
+        graph.fill()?;
         let ontology = graph.ontology().clone();
         let watermark = graph.events().committed()?;
-        let workers = graph
-            .places()?
-            .into_iter()
-            .map(|(place, last_failed)| {
-                let worker = Worker::resumed(&place, last_failed);
-                (place.worker, worker)
-            })
-            .collect();
         let shared = Arc::new(Shared {
             graph: Mutex::new(graph),
             state: Mutex::new(Inbox {
@@ -149,18 +120,14 @@ impl Queue {
                 last: 0,
                 committed: None,
                 watermark,
-                filled,
                 failed: Vec::new(),
                 stop: false,
             }),
-            workers: Mutex::new(workers),
             stopped: Condvar::new(),
             subscribers: Mutex::new(Vec::new()),
             handler: Mutex::new(None),
             #[cfg(test)]
             panic_beat: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(test)]
-            graph_taken: std::sync::atomic::AtomicUsize::new(0),
         });
         let beat = Arc::clone(&shared);
         let heartbeat = std::thread::spawn(move || {
@@ -189,11 +156,6 @@ impl Queue {
 
     /// Checks `body`, a `CloudEvent` as JSON, against the ontology, holds it in memory and returns
     /// its ticket, without waiting on the store.
-    ///
-    /// A `rannoch.purge` event asks for a purge ([`Graph::commit`]): it runs when its batch
-    /// commits, after what was accepted before it, and is never stored. No worker is handed
-    /// anything it had read ahead from before it; each is handed the `rannoch.purged` rule event.
-    /// An event already handed out stays with its worker, whose close of it still counts.
     ///
     /// # Errors
     /// [`Error::Refused`] with the reason, and nothing held, when the ontology does not allow the
@@ -236,173 +198,58 @@ impl Queue {
     /// # Errors
     /// The graph file cannot be read.
     pub fn position(&self, producer: &str) -> Result<Option<String>, Error> {
-        self.shared.graph().position(producer)
+        lock(&self.shared.graph).position(producer)
     }
 
-    /// Hands out to worker `worker` its next committed event after its cursor, at or below the
-    /// committed watermark, and marks it in progress; `None` when there is none. A worker joins at
-    /// the start of the log on its first call. Nothing is written: the worker reads ahead from the
-    /// log a chunk at a time, and its place reaches disk only in a group commit.
+    /// Hands out to worker `worker` (its worker file's id) the next committed event, at or below
+    /// the committed watermark, and marks it in progress; `None` when there is none.
     ///
     /// # Errors
-    /// The graph file cannot be read.
+    /// The graph file cannot be read or written.
     pub fn next(&self, worker: &str) -> Result<Option<Event>, Error> {
-        let from = {
-            let mut workers = lock(&self.shared.workers);
-            let held = match workers.get_mut(worker) {
-                Some(held) => held,
-                None => workers
-                    .entry(worker.to_string())
-                    .or_insert_with(|| Worker::joining(Cursor::START)),
-            };
-            if let Some(event) = held.take() {
-                return Ok(Some(event));
-            }
-            held.handed()
-        };
+        let mut graph = lock(&self.shared.graph);
         let watermark = lock(&self.shared.state).watermark;
-        if from >= watermark {
-            return Ok(None);
-        }
-        // The graph stays taken until the events are kept, so a purge cannot pass between.
-        let graph = self.shared.graph();
-        let events = graph.events().chunk(from, watermark, CHUNK)?;
-        let mut workers = lock(&self.shared.workers);
-        drop(graph);
-        let Some(held) = workers.get_mut(worker) else {
-            return Ok(None);
-        };
-        held.read(from, events);
-        Ok(held.take())
+        graph.next(worker, watermark)
     }
 
-    /// Where `worker` stands: its cursor when it has a place, otherwise it joins at the committed
-    /// watermark, so everything committed before now is never handed to it. A worker that reads
-    /// the tables first has no need of the log behind them.
-    #[must_use]
-    pub fn join(&self, worker: &str) -> Cursor {
-        let watermark = lock(&self.shared.state).watermark;
-        lock(&self.shared.workers)
-            .entry(worker.to_string())
-            .or_insert_with(|| Worker::joining(watermark))
-            .cursor()
-    }
-
-    /// Closes the event at `cursor`, in progress for `worker`, as done, in memory.
+    /// Closes the event at `cursor`, in progress for `worker`, as done.
     ///
     /// # Errors
     /// [`Error::Refused`] when the event is not in progress for the worker.
     pub fn done(&self, worker: &str, cursor: Cursor) -> Result<(), Error> {
-        self.close_as(worker, cursor, None, None)
+        lock(&self.shared.graph).done(worker, cursor)
     }
 
-    /// Closes the event at `cursor` as [`Queue::done`] does, and keeps `kept`, an opaque string,
-    /// with the worker's cursor once the cursor reaches the event. It is saved in the same group
-    /// commit as the cursor and read back with [`Queue::kept`], after a restart too.
-    ///
-    /// # Errors
-    /// As [`Queue::done`].
-    pub fn done_keeping(
-        &self,
-        worker: &str,
-        cursor: Cursor,
-        kept: impl Into<String>,
-    ) -> Result<(), Error> {
-        self.close_as(worker, cursor, None, Some(kept.into()))
-    }
-
-    /// Closes the event at `cursor`, in progress for `worker`, as failed with `reason`, in
-    /// memory; the failure is recorded with its reason in the next group commit.
+    /// Closes the event at `cursor`, in progress for `worker`, as failed with `reason`.
     ///
     /// # Errors
     /// [`Error::Refused`] when the event is not in progress for the worker.
     pub fn failed(&self, worker: &str, cursor: Cursor, reason: &str) -> Result<(), Error> {
-        self.close_as(worker, cursor, Some(reason), None)
+        lock(&self.shared.graph).failed(worker, cursor, reason)
     }
 
-    fn close_as(
-        &self,
-        worker: &str,
-        cursor: Cursor,
-        reason: Option<&str>,
-        kept: Option<String>,
-    ) -> Result<(), Error> {
-        match lock(&self.shared.workers).get_mut(worker) {
-            Some(held) => held.close(worker, cursor, reason, kept),
-            None => Err(workers::not_in_progress(worker, cursor)),
-        }
-    }
-
-    /// The state `worker` keeps with its cursor ([`Queue::done_keeping`]), or `None` when it keeps
-    /// none.
-    #[must_use]
-    pub fn kept(&self, worker: &str) -> Option<String> {
-        lock(&self.shared.workers)
-            .get(worker)
-            .and_then(|held| held.kept().map(str::to_string))
-    }
-
-    /// Where the committed event at `cursor` stands for `worker`, closes not yet saved included.
+    /// Where the committed event at `cursor` stands for `worker`.
     ///
     /// # Errors
     /// The graph file cannot be read.
     pub fn state(&self, worker: &str, cursor: Cursor) -> Result<State, Error> {
-        let known = lock(&self.shared.workers)
-            .get(worker)
-            .map(|held| held.state(cursor));
-        match known {
-            Some(Some(state)) => Ok(state),
-            _ => self.shared.graph().state(worker, cursor),
-        }
+        lock(&self.shared.graph).state(worker, cursor)
     }
 
-    /// How many committed events `worker` has not yet closed: its lag behind the newest, read
-    /// from memory and the log. A worker not yet seen has every committed event ahead of it.
+    /// The processed mark: the lowest point every worker has finished ([`Graph::processed`]).
     ///
     /// # Errors
     /// The graph file cannot be read.
-    pub fn lag(&self, worker: &str) -> Result<u64, Error> {
-        let cursor = lock(&self.shared.workers)
-            .get(worker)
-            .map_or(Cursor::START, Worker::cursor);
-        let watermark = lock(&self.shared.state).watermark;
-        self.shared.graph().events().count(cursor, watermark)
-    }
-
-    /// The slowest worker's cursor, the lowest of them, or `None` with no worker. A producer or a
-    /// ring reads it to apply back-pressure; the queue itself never blocks or refuses `accept`.
-    #[must_use]
-    pub fn slowest(&self) -> Option<Cursor> {
-        lock(&self.shared.workers)
-            .values()
-            .map(Worker::cursor)
-            .min()
-    }
-
-    /// The processed mark: the lowest point every worker has finished, fill included, closes not
-    /// yet saved included, and never past the committed watermark. With no worker it is the
-    /// lower of fill's place and the watermark.
-    ///
-    /// # Errors
-    /// None today; the signature keeps room for a read.
     pub fn processed(&self) -> Result<Cursor, Error> {
-        let (watermark, filled) = {
-            let state = lock(&self.shared.state);
-            (state.watermark, state.filled)
-        };
-        let mark = self.slowest().map_or(filled, |slowest| slowest.min(filled));
-        Ok(mark.min(watermark))
+        lock(&self.shared.graph).processed()
     }
 
-    /// Removes `worker`, its place, the state it keeps and its failures, and releases the
-    /// processed mark it held ([`Graph::remove_worker`]).
+    /// Removes `worker` and releases the processed mark it held ([`Graph::remove_worker`]).
     ///
     /// # Errors
     /// The graph file cannot be written.
     pub fn remove_worker(&self, worker: &str) -> Result<(), Error> {
-        let mut graph = self.shared.graph();
-        lock(&self.shared.workers).remove(worker);
-        graph.remove_worker(worker)
+        lock(&self.shared.graph).remove_worker(worker)
     }
 
     /// The committed watermark: the highest ticket the heartbeat or a flush has taken through a
@@ -421,12 +268,6 @@ impl Queue {
         self.shared.commit();
         let mut state = lock(&self.shared.state);
         (state.committed, std::mem::take(&mut state.failed))
-    }
-
-    /// Commits everything held now, without waiting for the heartbeat, and leaves every failure
-    /// for the app to take: for a worker whose answer someone is waiting on.
-    pub fn commit(&self) {
-        self.shared.commit();
     }
 
     /// Takes the failures the app has not yet taken, oldest first; the queue keeps none of them
@@ -486,89 +327,20 @@ impl Inbox {
 }
 
 impl Shared {
-    /// The graph, once it is free. Everything the queue does in the store goes through here.
-    fn graph(&self) -> MutexGuard<'_, Graph> {
-        #[cfg(test)]
-        self.graph_taken
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        lock(&self.graph)
-    }
-
     /// Keeps `failure` for the app to take.
     fn failed(&self, failure: Failure) {
         lock(&self.state).failed.push(failure);
     }
 
     /// Commits what is held with the producers' positions, fills the tables, moves the watermark,
-    /// saves every worker that changed in one transaction, then releases the graph and tells the
-    /// subscribers. Commits never interleave; a subscriber that calls back into the queue finds
-    /// the graph free.
+    /// then releases the graph and tells the subscribers. Commits never interleave; a subscriber
+    /// that calls back into the queue finds the graph free.
     fn commit(&self) {
-        let mut graph = self.graph();
-        let told = self.write(&mut graph);
-        self.save(&mut graph);
-        drop(graph);
-        let Some((last, watermark)) = told else {
+        let mut graph = lock(&self.graph);
+        let batch = std::mem::take(&mut lock(&self.state).queued);
+        let Some(&(last, ..)) = batch.last() else {
             return;
         };
-        self.tell(last, watermark);
-    }
-
-    /// Tells the subscribers the watermark. The graph is free by now.
-    fn tell(&self, last: Ticket, watermark: Cursor) {
-        // A subscriber that panics is reported and the others are still told; the heartbeat lives
-        // on, and a drop that is already unwinding does not abort.
-        for subscriber in lock(&self.subscribers).iter_mut() {
-            if let Err(panic) = catch_unwind(AssertUnwindSafe(|| subscriber(watermark))) {
-                self.failed(Failure::Subscriber {
-                    ticket: last,
-                    message: message(&*panic).to_string(),
-                });
-            }
-        }
-    }
-
-    /// Saves every worker that changed since the last group commit, in one transaction. A save
-    /// that fails is reported, and the next group commit saves those workers again.
-    fn save(&self, graph: &mut Graph) {
-        let saves: Vec<Save> = lock(&self.workers)
-            .iter_mut()
-            .filter_map(|(name, held)| held.save(name))
-            .collect();
-        if saves.is_empty() {
-            return;
-        }
-        let places: Vec<_> = saves.iter().map(|(place, _)| place.clone()).collect();
-        let closes: Vec<(&str, Cursor, Option<&str>)> = saves
-            .iter()
-            .flat_map(|(place, closes)| {
-                closes
-                    .iter()
-                    .map(|(cursor, reason)| (place.worker.as_str(), *cursor, reason.as_deref()))
-            })
-            .collect();
-        let written = graph.save_places(&places, &closes);
-        let mut workers = lock(&self.workers);
-        for save in &saves {
-            if let Some(held) = workers.get_mut(&save.0.worker) {
-                match written {
-                    Ok(()) => held.saved(save),
-                    Err(_) => held.unsaved(),
-                }
-            }
-        }
-        drop(workers);
-        if let Err(error) = written {
-            self.failed(Failure::Workers(error));
-        }
-    }
-
-    /// Commits what is held with the producers' positions, fills the tables and moves the
-    /// watermark; returns the last ticket and the watermark to tell subscribers, or `None` when
-    /// nothing was held.
-    fn write(&self, graph: &mut Graph) -> Option<(Ticket, Cursor)> {
-        let batch = std::mem::take(&mut lock(&self.state).queued);
-        let &(last, ..) = batch.last()?;
         // A panic while the batch is written rolls its transaction back; the batch goes back to the front of the queue, in order, for the next flush, close or drop.
         let written = catch_unwind(AssertUnwindSafe(|| {
             #[cfg(test)]
@@ -587,17 +359,7 @@ impl Shared {
                         .map(|(producer, position)| (index, producer.as_str(), position.as_str()))
                 })
                 .collect();
-            let written = graph.commit(&bodies, &places);
-            // A purge may have removed what a worker read ahead: no worker is handed it. Each is
-            // handed the rule event instead, which the watermark passes below.
-            if bodies.iter().any(|body| {
-                rannoch_cloudevents::attributes(body).is_ok_and(|event| event.ty == PURGE)
-            }) {
-                for held in lock(&self.workers).values_mut() {
-                    held.forget_ahead();
-                }
-            }
-            written
+            graph.commit(&bodies, &places)
         }));
         let written = match written {
             Ok(written) => written,
@@ -636,17 +398,13 @@ impl Shared {
                 });
             }
         }
-        let mut filled = None;
-        if landed.is_some() {
-            // Fill logs a closed event for each link it closes, after the batch; the watermark
-            // takes them in, so they are handed out without waiting for a later commit.
-            match filled_to(graph, last) {
-                Ok((to, high)) => {
-                    filled = Some(to);
-                    landed = Some(high);
-                }
-                Err(failure) => failed.push(failure),
-            }
+        if landed.is_some()
+            && let Err(error) = graph.fill()
+        {
+            failed.push(Failure::Fill {
+                ticket: last,
+                error,
+            });
         }
         let watermark = {
             let mut state = lock(&self.state);
@@ -654,23 +412,21 @@ impl Shared {
             if let Some(cursor) = landed {
                 state.watermark = cursor;
             }
-            if let Some(to) = filled {
-                state.filled = to;
-            }
             state.failed.extend(failed);
             state.watermark
         };
-        Some((last, watermark))
+        drop(graph);
+        // A subscriber that panics is reported and the others are still told; the heartbeat lives
+        // on, and a drop that is already unwinding does not abort.
+        for subscriber in lock(&self.subscribers).iter_mut() {
+            if let Err(panic) = catch_unwind(AssertUnwindSafe(|| subscriber(watermark))) {
+                self.failed(Failure::Subscriber {
+                    ticket: last,
+                    message: message(&*panic).to_string(),
+                });
+            }
+        }
     }
-}
-
-/// Fills the tables, and returns the place filled to and the highest place the log has given, or
-/// the failure of the commit through `ticket`.
-fn filled_to(graph: &mut Graph, ticket: Ticket) -> Result<(Cursor, Cursor), Failure> {
-    graph
-        .fill()
-        .and_then(|to| Ok((to, graph.events().committed()?)))
-        .map_err(|error| Failure::Fill { ticket, error })
 }
 
 /// The text a panic carried, when it carried text.

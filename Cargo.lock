@@ -422,20 +422,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rannoch-relay"
-version = "0.1.0"
-dependencies = [
- "rannoch-cloudevents",
- "rannoch-queue",
- "rannoch-store",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
-]
-
-[[package]]
 name = "rannoch-store"
 version = "0.1.0"
 dependencies = [
@@ -445,7 +431,6 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
- "tempfile",
  "thiserror",
  "uuid",
 ]

@@ -6,7 +6,6 @@ members = [
     "crates/rannoch-cloudevents",
     "crates/rannoch-ontology",
     "crates/rannoch-queue",
-    "crates/rannoch-relay",
     "crates/rannoch-worker",
     "crates/rannoch-harness",
     "crates/rannoch-processor",
@@ -25,7 +24,7 @@ members = [
 
 # The version of record: release.toml points here, and each tag `v{version}` names it.
 [workspace.package]
-version = "0.6.0"
+version = "0.4.0"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
