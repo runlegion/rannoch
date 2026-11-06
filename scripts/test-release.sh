@@ -158,11 +158,11 @@ SUITE_SELF_TOP="$( (cd "$DIR" 2>/dev/null && git rev-parse --show-toplevel 2>/de
 
 # ONE temp root for the whole suite, so "is this path mine?" is a containment
 # test rather than a list of four unrelated mktemp results.
-SUITE_TMP="$(phys "$(mktemp -d)")" || {
+SUITE_TMP="$(phys "$(make_temp_dir)")" || {
   printf '[test-release] could not create the suite temp root\n' >&2
   exit 90
 }
-SYSTEM_TMP="$(phys "${TMPDIR:-/tmp}" || printf '/tmp')"
+SYSTEM_TMP="$(phys "$(temp_root)")"
 SUITE_ABORT_NOTE="${SUITE_TMP}/ABORT"
 
 # suite_abort <reason>: kill the RUN, from wherever it is called. `exit` alone
@@ -739,6 +739,18 @@ no "resolve: a missing parent is refused, never guessed" \
 no "resolve: a '..' leaf under a missing parent is refused, not rejoined" \
   fixture_resolve "${SUITE_TMP}/gone/.."
 no "resolve: empty" fixture_resolve ""
+
+# temp_root / make_temp_dir: every temp dir lands under the folder the guard
+# checks, whatever TMPDIR is (#215). A bare `mktemp -d` on macOS ignores TMPDIR.
+TMPDIR_ALT="${SUITE_TMP}/alt-tmpdir"
+mkdir -p "$TMPDIR_ALT"
+eq "temp_root: TMPDIR set"                "$TMPDIR_ALT" "$(TMPDIR="$TMPDIR_ALT" temp_root)"
+eq "temp_root: trailing slash dropped"    "$TMPDIR_ALT" "$(TMPDIR="${TMPDIR_ALT}/" temp_root)"
+eq "temp_root: TMPDIR unset"              "/tmp" "$(unset TMPDIR; temp_root)"
+eq "temp_root: TMPDIR empty"              "/tmp" "$(TMPDIR='' temp_root)"
+ALT_MADE="$(TMPDIR="$TMPDIR_ALT" make_temp_dir)"
+eq "make_temp_dir: lands under TMPDIR"    "$TMPDIR_ALT" "$(dirname "$ALT_MADE")"
+ok "make_temp_dir: the dir exists"        test -d "$ALT_MADE"
 
 # fixture_dir_allowed
 ok "allowed: the suite temp root itself"  fixture_dir_allowed "$SUITE_TMP"
