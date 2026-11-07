@@ -10,6 +10,10 @@
 pub fn check(ty: &str, source: &str) -> Result<(), String> {
     let of_type = ty.split_once('.').map_or(ty, |(d, _)| d);
     let of_source = source.split_once('/').map_or(source, |(d, _)| d);
+    // Rannoch's own types (amend, correct, end) may come from any known domain.
+    if of_type == "rannoch" && (of_source == "westwind" || of_source == "oz" || of_source == "build") {
+        return Ok(());
+    }
     if of_type == of_source && (of_type == "westwind" || of_type == "oz" || of_type == "build") {
         Ok(())
     } else {

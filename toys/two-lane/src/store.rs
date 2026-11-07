@@ -6,7 +6,7 @@
 //! they changed. No log table, no hearing table, no second copy of a row.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -31,6 +31,9 @@ pub struct Row {
     /// The value of its kind's declared axis at its latest version; 0 for a kind with none.
     #[serde(default)]
     pub axis: i64,
+    /// The fact no longer holds under this key: a rename moved it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ended: bool,
 }
 
 /// The known-at of an event: the millisecond in its `UUIDv7` id.
@@ -105,7 +108,11 @@ pub fn fact_of(event: &Event) -> Option<Fact> {
         "oz.citizen.joined" => fact("oz_citizen", s(d, "id"), true, vec![]),
         "oz.order.placed" => fact("oz_order", s(d, "order_id"), true, vec![("ordered_by", "oz_citizen", s(d, "citizen_id"))]),
         "westwind.clock.tick" => None,
-        "build.object.written" => fact("build_object", s(d, "id"), true, vec![]),
+        "build.object.written" => {
+            let dep = d.pointer("/body/depends_on").and_then(Value::as_str).unwrap_or_default().to_string();
+            let edges = if dep.is_empty() { vec![] } else { vec![("depends_on", "build_object", dep)] };
+            fact("build_object", event.subject.clone().unwrap_or_default(), true, edges)
+        }
         t if ["ticket.", "remake.", "return.", "returns.", "support.", "compensation."].iter().any(|p| t.starts_with(&format!("westwind.{p}"))) => {
             fact("westwind_ticket", s(d, "ticket"), false, vec![])
         }
@@ -120,7 +127,13 @@ pub struct Shard {
     cache: HashMap<(String, String), Row>,
     /// Versions to append at the next commit: one per changed fact, each its row as it became.
     versions: Vec<(String, String, i64, i64, String, String)>,
-    edges: Vec<(String, String, String, String, String, String)>,
+    edges: Vec<(String, String, String, String, String, i64)>,
+    links: Vec<(String, String, String, i64, String, String)>,
+    renames: HashMap<(String, String), (String, i64)>,
+    new_renames: Vec<(String, String, String, i64, String)>,
+    amended: Vec<(String, String)>,
+    hearings: Option<Connection>,
+    dir: PathBuf,
     answers: Vec<((String, String), Answer)>,
     pub writes: u64,
     /// Reads of the row table: a row found (read back), and a row looked for and not there.
@@ -140,8 +153,14 @@ const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS versions(kind TEXT NOT NULL, key TEXT NOT NULL, axis INTEGER NOT NULL,
         known INTEGER NOT NULL, event TEXT NOT NULL, body TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS versions_at ON versions(kind, key, axis, known);
-    CREATE TABLE IF NOT EXISTS edges(src TEXT NOT NULL, rel TEXT NOT NULL, dst TEXT NOT NULL,
+    CREATE TABLE IF NOT EXISTS edges(src TEXT NOT NULL, rel TEXT NOT NULL, dst TEXT NOT NULL, known INTEGER NOT NULL,
         PRIMARY KEY(src, rel, dst)) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS link_versions(src TEXT NOT NULL, rel TEXT NOT NULL, dst TEXT NOT NULL,
+        known INTEGER NOT NULL, event TEXT NOT NULL, state TEXT NOT NULL);
+    CREATE INDEX IF NOT EXISTS link_versions_at ON link_versions(src, rel, dst, known);
+    CREATE TABLE IF NOT EXISTS renames(kind TEXT NOT NULL, old TEXT NOT NULL, new TEXT NOT NULL, known INTEGER NOT NULL,
+        event TEXT NOT NULL, PRIMARY KEY(kind, old)) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS amended(event TEXT PRIMARY KEY, outcome TEXT NOT NULL) WITHOUT ROWID;
     CREATE INDEX IF NOT EXISTS edges_to ON edges(dst, rel);
     CREATE TABLE IF NOT EXISTS host(action TEXT NOT NULL, event TEXT NOT NULL, answer TEXT NOT NULL,
         PRIMARY KEY(action, event)) WITHOUT ROWID;
@@ -159,7 +178,33 @@ impl Shard {
         conn.execute_batch(&format!("PRAGMA page_size={page};")).map_err(|e| e.to_string())?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA fullfsync=ON;").map_err(|e| e.to_string())?;
         conn.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
-        Ok(Shard { conn, cache: HashMap::new(), versions: Vec::new(), edges: Vec::new(), answers: Vec::new(), writes: 0, found: 0, absent: 0, from_memory: 0 })
+        let mut renames = HashMap::new();
+        {
+            let mut st = conn.prepare("SELECT kind, old, new, known FROM renames").map_err(|e| e.to_string())?;
+            let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?))).map_err(|e| e.to_string())?;
+            for r in rows {
+                let (kind, old, new, known) = r.map_err(|e| e.to_string())?;
+                renames.insert((kind, old), (new, known));
+            }
+        }
+        let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        Ok(Shard {
+            conn,
+            cache: HashMap::new(),
+            versions: Vec::new(),
+            edges: Vec::new(),
+            links: Vec::new(),
+            renames,
+            new_renames: Vec::new(),
+            amended: Vec::new(),
+            hearings: None,
+            dir,
+            answers: Vec::new(),
+            writes: 0,
+            found: 0,
+            absent: 0,
+            from_memory: 0,
+        })
     }
 
     /// The row of `kind` keyed `key`. A row this process has written is handed back from memory,
@@ -224,8 +269,165 @@ impl Shard {
         body.map(|b| serde_json::from_str(&b).map_err(|e| e.to_string())).transpose()
     }
 
-    pub fn edge(&mut self, src: (&str, &str), rel: &str, dst: (&str, &str), event: &str) {
-        self.edges.push((src.0.into(), src.1.into(), rel.into(), dst.0.into(), dst.1.into(), event.into()));
+    pub fn edge(&mut self, src: (&str, &str), rel: &str, dst: (&str, &str), known: i64) {
+        self.edges.push((src.0.into(), src.1.into(), rel.into(), dst.0.into(), dst.1.into(), known));
+    }
+
+    /// The key a fact of `kind` named `key` lands on, known at `known`: the new key, once a rename
+    /// of it is known.
+    #[must_use]
+    pub fn renamed(&self, kind: &str, key: &str, known: i64) -> String {
+        let mut key = key.to_string();
+        for _ in 0..16 {
+            match self.renames.get(&(kind.to_string(), key.clone())) {
+                Some((new, at)) if known >= *at => key = new.clone(),
+                _ => break,
+            }
+        }
+        key
+    }
+
+    /// One more version of a link: it was found wrong, or it stopped holding.
+    pub fn link_change(&mut self, event: &Event) {
+        let state = if event.ty.starts_with("rannoch.corrected.") { "wrong" } else { "ended" };
+        let rel = event.ty.split('.').nth(2).unwrap_or_default();
+        let d = &event.data;
+        let (fc, fk) = (s(&d["from"], "class"), s(&d["from"], "key"));
+        let (tc, tk) = (s(&d["to"], "class"), s(&d["to"], "key"));
+        self.links.push((fk, format!("{fc}.{rel}.{tc}"), tk, known_of(event), event.id.clone(), state.to_string()));
+    }
+
+    /// A link's state as known at `known`: holds, wrong or ended; `None` before it was known.
+    ///
+    /// # Errors
+    /// The file cannot be read.
+    pub fn link_state(&self, src: &str, rel: &str, dst: &str, known: i64) -> Result<Option<String>, String> {
+        let later: Option<String> = self
+            .conn
+            .prepare_cached("SELECT state FROM link_versions WHERE src = ?1 AND rel = ?2 AND dst = ?3 AND known <= ?4 ORDER BY known DESC, rowid DESC LIMIT 1")
+            .map_err(|e| e.to_string())?
+            .query_row(params![src, rel, dst, known], |r| r.get(0))
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if later.is_some() {
+            return Ok(later);
+        }
+        let held: Option<i64> = self
+            .conn
+            .prepare_cached("SELECT known FROM edges WHERE src = ?1 AND rel = ?2 AND dst = ?3 AND known <= ?4")
+            .map_err(|e| e.to_string())?
+            .query_row(params![src, rel, dst, known], |r| r.get(0))
+            .optional()
+            .map_err(|e| e.to_string())?;
+        Ok(held.map(|_| "holds".to_string()))
+    }
+
+    fn version_of(&mut self, kind: &str, key: &str, axis: i64, known: i64, event: &str, row: &Row) -> Result<(), String> {
+        let body = serde_json::to_string(row).map_err(|e| e.to_string())?;
+        self.versions.push((kind.to_string(), key.to_string(), axis, known, event.to_string(), body));
+        Ok(())
+    }
+
+    /// Applies one `rannoch.amended`: finds what the amended event said from its hearing, patches
+    /// it, and writes each fact it made again at its own axis point, known at the amendment. A
+    /// patch to the subject ends the old key's fact and writes the new key's. Returns `None` while
+    /// the trickle reader has not yet heard the amended event, so the amendment waits.
+    ///
+    /// # Errors
+    /// The hearings or the log cannot be read.
+    pub fn amend(&mut self, amendment: &Event) -> Result<Option<String>, String> {
+        let done: Option<String> = self
+            .conn
+            .prepare_cached("SELECT outcome FROM amended WHERE event = ?1")
+            .map_err(|e| e.to_string())?
+            .query_row([&amendment.id], |r| r.get(0))
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if done.is_some() || self.amended.iter().any(|(e, _)| *e == amendment.id) {
+            return Ok(Some("already applied".into()));
+        }
+        if self.hearings.is_none() {
+            let path = self.dir.join("hearings.db");
+            if !path.exists() {
+                return Ok(None);
+            }
+            let conn = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|e| e.to_string())?;
+            conn.busy_timeout(std::time::Duration::from_secs(30)).map_err(|e| e.to_string())?;
+            self.hearings = Some(conn);
+        }
+        let target = amendment.subject.clone().unwrap_or_default();
+        let heard: Option<(i64, i64)> = self
+            .hearings
+            .as_ref()
+            .ok_or("no hearings")?
+            .prepare_cached("SELECT at, len FROM hearings WHERE id = ?1")
+            .map_err(|e| e.to_string())?
+            .query_row([&target], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let Some((at, len)) = heard else { return Ok(None) };
+        let line = {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut f = std::fs::File::open(self.dir.join("log.jsonl")).map_err(|e| e.to_string())?;
+            f.seek(SeekFrom::Start(u64::try_from(at).unwrap_or(0))).map_err(|e| e.to_string())?;
+            let mut buf = vec![0u8; usize::try_from(len).unwrap_or(0)];
+            f.read_exact(&mut buf).map_err(|e| e.to_string())?;
+            String::from_utf8(buf).map_err(|e| e.to_string())?
+        };
+        let mut patched: Value = serde_json::from_str(line.trim_end()).map_err(|e| e.to_string())?;
+        let original = crate::entrance::admit(line.trim_end(), 0)?;
+        merge_patch(&mut patched, &amendment.data);
+        let patched = crate::entrance::admit(&patched.to_string(), 0)?;
+        let outcome = self.apply_amendment(&original, &patched, amendment)?;
+        self.amended.push((amendment.id.clone(), outcome.clone()));
+        Ok(Some(outcome))
+    }
+
+    fn apply_amendment(&mut self, original: &Event, patched: &Event, amendment: &Event) -> Result<String, String> {
+        let Some(fact) = fact_of(original) else { return Ok("refused: the amended event says no fact".into()) };
+        let kind = fact.kind;
+        let made: Option<i64> = self
+            .conn
+            .prepare_cached("SELECT axis FROM versions WHERE kind = ?1 AND event = ?2 LIMIT 1")
+            .map_err(|e| e.to_string())?
+            .query_row(params![kind, original.id], |r| r.get(0))
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let in_memory = self.versions.iter().any(|v| v.0 == kind && v.4 == original.id);
+        if made.is_none() && !in_memory {
+            return Ok("refused: the amended event has no version of its own".into());
+        }
+        let axis = axis_of(kind, original);
+        let known = known_of(amendment);
+        let old_key = self.renamed(kind, &fact.key, known_of(original));
+        let new_fact = fact_of(patched).ok_or("the patched event says no fact")?;
+        let data = defined(kind, patched);
+        if new_fact.key == fact.key {
+            let current = self.row(kind, &old_key)?.clone();
+            let mut row = current.clone();
+            row.data = data.clone();
+            row.axis = axis;
+            self.version_of(kind, &old_key, axis, known, &amendment.id, &row)?;
+            if current.axis == axis {
+                self.row(kind, &old_key)?.data = data;
+            }
+            return Ok("patched".into());
+        }
+        let mut ended = self.row(kind, &old_key)?.clone();
+        ended.ended = true;
+        ended.axis = ended.axis.max(axis);
+        let end_axis = ended.axis;
+        self.version_of(kind, &old_key, end_axis, known, &amendment.id, &ended)?;
+        *self.row(kind, &old_key)? = ended.clone();
+        let mut fresh = ended;
+        fresh.ended = false;
+        fresh.data = data;
+        fresh.event = amendment.id.clone();
+        self.version_of(kind, &new_fact.key, end_axis, known, &amendment.id, &fresh)?;
+        self.cache.insert((kind.to_string(), new_fact.key.clone()), fresh);
+        self.renames.insert((kind.to_string(), old_key.clone()), (new_fact.key.clone(), known));
+        self.new_renames.push((kind.to_string(), old_key, new_fact.key, known, amendment.id.clone()));
+        Ok("renamed".into())
     }
 
     pub fn keep_answer(&mut self, at: (String, String), answer: Answer) {
@@ -263,9 +465,21 @@ impl Shard {
                 self.writes += 1;
             }
             // An edge's relation names the kinds at both ends, so the edge holds only the keys.
-            let mut edge = tx.prepare_cached("INSERT OR IGNORE INTO edges VALUES (?1, ?2, ?3)").map_err(err)?;
+            let mut edge = tx.prepare_cached("INSERT OR IGNORE INTO edges VALUES (?1, ?2, ?3, ?4)").map_err(err)?;
             for e in &self.edges {
-                edge.execute(params![e.1, format!("{}.{}.{}", e.0, e.2, e.3), e.4]).map_err(err)?;
+                edge.execute(params![e.1, format!("{}.{}.{}", e.0, e.2, e.3), e.4, e.5]).map_err(err)?;
+            }
+            let mut link = tx.prepare_cached("INSERT INTO link_versions VALUES (?1, ?2, ?3, ?4, ?5, ?6)").map_err(err)?;
+            for l in &self.links {
+                link.execute(params![l.0, l.1, l.2, l.3, l.4, l.5]).map_err(err)?;
+            }
+            let mut rename = tx.prepare_cached("INSERT OR REPLACE INTO renames VALUES (?1, ?2, ?3, ?4, ?5)").map_err(err)?;
+            for r in &self.new_renames {
+                rename.execute(params![r.0, r.1, r.2, r.3, r.4]).map_err(err)?;
+            }
+            let mut amended = tx.prepare_cached("INSERT OR IGNORE INTO amended VALUES (?1, ?2)").map_err(err)?;
+            for a in &self.amended {
+                amended.execute(params![a.0, a.1]).map_err(err)?;
             }
             let mut host = tx.prepare_cached("INSERT OR IGNORE INTO host VALUES (?1, ?2, ?3)").map_err(err)?;
             for ((action, event), answer) in &self.answers {
@@ -278,6 +492,9 @@ impl Shard {
         tx.commit().map_err(err)?;
         self.versions.clear();
         self.edges.clear();
+        self.links.clear();
+        self.new_renames.clear();
+        self.amended.clear();
         self.answers.clear();
         Ok(())
     }
@@ -339,5 +556,25 @@ impl Shard {
 
     pub fn conn(&self) -> &Connection {
         &self.conn
+    }
+}
+
+/// RFC 7386 JSON Merge Patch: a value replaces, `null` removes, an omitted field stays.
+pub fn merge_patch(target: &mut Value, patch: &Value) {
+    if let Value::Object(p) = patch {
+        if !target.is_object() {
+            *target = Value::Object(serde_json::Map::new());
+        }
+        if let Value::Object(t) = target {
+            for (k, v) in p {
+                if v.is_null() {
+                    t.remove(k);
+                } else {
+                    merge_patch(t.entry(k.clone()).or_insert(Value::Null), v);
+                }
+            }
+        }
+    } else {
+        *target = patch.clone();
     }
 }

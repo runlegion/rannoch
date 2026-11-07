@@ -598,12 +598,41 @@ fn file_bytes(path: &Path) -> Result<u64> {
     Ok(["", "-wal", "-shm"].iter().map(|s| std::fs::metadata(format!("{}{s}", path.display())).map(|m| m.len()).unwrap_or(0)).sum())
 }
 
-/// Feeds the build stream from arrival `skip` on, a batch at a time; returns each build's
-/// seconds and the store's size after it.
-fn feed_build(dir: &Path, plan: &build::Plan, log: bool, skip: usize) -> Result<(Lane, Vec<(i64, f64, u64)>)> {
+/// Feeds the build stream from arrival `skip` on, a batch at a time, with `extras` placed in it;
+/// returns each build's seconds and the store's size after it. With extras, a trickle reader
+/// follows the log beside it, as the amend worker needs.
+fn feed_build(dir: &Path, plan: &build::Plan, log: bool, skip: usize, extras: Option<&build::Extras>) -> Result<(Lane, Vec<(i64, f64, u64)>)> {
     let mut lane = Lane::open(dir, Vec::new(), Schemas::load(SCHEMAS)?, LATENESS, 1, log)?;
     let die_after: Option<u64> = std::env::var("TWO_LANE_DIE_AFTER").ok().and_then(|v| v.parse().ok());
-    let order = plan.order();
+    let base = plan.order();
+    // Every arrival: (build, base index or none, extra index or none).
+    let mut order: Vec<(i64, Option<usize>, Option<usize>)> = Vec::with_capacity(base.len());
+    let mut next = 0;
+    for (j, &(b, _, _)) in base.iter().enumerate() {
+        order.push((b, Some(j), None));
+        if let Some(ex) = extras {
+            while next < ex.items.len() && ex.items[next].0 == j + 1 {
+                order.push((b, None, Some(next)));
+                next += 1;
+            }
+        }
+    }
+    let writing = Arc::new(AtomicBool::new(true));
+    let heard = Arc::new(AtomicU64::new(0));
+    let reader = (extras.is_some() && log).then(|| {
+        let (l, h, w, d) = (dir.join("log.jsonl"), dir.join("hearings.db"), Arc::clone(&writing), Arc::clone(&heard));
+        std::thread::spawn(move || trickle::follow(&l, &h, &w, &d))
+    });
+    let line_of = |a: &(i64, Option<usize>, Option<usize>)| -> String {
+        match a {
+            (_, Some(j), _) => {
+                let (b, i, f) = base[*j];
+                plan.line(b, i, f)
+            }
+            (_, _, Some(x)) => extras.map(|e| e.items[*x].2.clone()).unwrap_or_default(),
+            _ => String::new(),
+        }
+    };
     let mut marks = Vec::new();
     let mut t = Instant::now();
     let mut current = order.get(skip).map_or(1, |o| o.0);
@@ -612,7 +641,7 @@ fn feed_build(dir: &Path, plan: &build::Plan, log: bool, skip: usize) -> Result<
         let end = (i + 4096).min(order.len());
         // A batch never spans two builds, so each build's time and size are its own.
         let end = (i..end).find(|&j| order[j].0 != current).unwrap_or(end);
-        let lines: Vec<String> = order[i..end].iter().map(|&(b, k, f)| plan.line(b, k, f)).collect();
+        let lines: Vec<String> = order[i..end].iter().map(line_of).collect();
         let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
         lane.take(&refs)?;
         while lane.round()? {
@@ -631,6 +660,17 @@ fn feed_build(dir: &Path, plan: &build::Plan, log: bool, skip: usize) -> Result<
     }
     lane.ended = true;
     lane.drain()?;
+    // Amendments still waiting for the trickle reader: keep going until it has passed them.
+    let mut tries = 0;
+    while lane.held() > 0 && tries < 6000 {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        lane.round()?;
+        tries += 1;
+    }
+    if let Some(r) = reader {
+        writing.store(false, Ordering::SeqCst);
+        r.join().map_err(|_| "trickle panicked")??;
+    }
     Ok((lane, marks))
 }
 
@@ -644,7 +684,7 @@ fn builds(out: &Path, objects: usize) -> Result<()> {
     for (run, log) in [(0, false), (0, true), (1, false), (1, true)] {
         let dir = fresh(out, &format!("build-{}-{run}", if log { "log" } else { "nolog" }))?;
         println!("  build stream, log {log}, run {run}: starting; {}; load {}", building(), load_average());
-        let (lane, marks) = feed_build(&dir, &plan, log, 0)?;
+        let (lane, marks) = feed_build(&dir, &plan, log, 0, None)?;
         let total: f64 = marks.iter().map(|m| m.1).sum();
         drop(lane);
         let shard = store::Shard::open(&dir.join("shard-0.db"))?;
@@ -725,14 +765,14 @@ fn builds(out: &Path, objects: usize) -> Result<()> {
 fn build_child(dir: &Path, objects: usize) -> Result<()> {
     let plan = build::Plan::new(objects);
     let taken = std::fs::read_to_string(dir.join("inbox.jsonl")).unwrap_or_default().lines().count();
-    feed_build(dir, &plan, true, taken).map(|_| ())
+    feed_build(dir, &plan, true, taken, None).map(|_| ())
 }
 
 /// Prediction 8 on the build stream: 10 aborts at random rounds.
 fn build_kills(out: &Path, objects: usize) -> Result<()> {
     let plan = build::Plan::new(objects);
     let base = fresh(out, "build-kill-base")?;
-    let (lane, _) = feed_build(&base, &plan, true, 0)?;
+    let (lane, _) = feed_build(&base, &plan, true, 0, None)?;
     let rounds = lane.rounds;
     drop(lane);
     let want = digest(&store::Shard::open(&base.join("shard-0.db"))?.versions_text()?);
@@ -761,6 +801,153 @@ fn build_kills(out: &Path, objects: usize) -> Result<()> {
     Ok(())
 }
 
+/// The amend toy's seeded set: 2,000 property amendments, 200 renames, 500 corrected and 500
+/// ended links, 2,000 aliases.
+fn seeded(plan: &build::Plan) -> build::Extras {
+    // Scaled down with the stream, for a quick trial on fewer objects.
+    let k = |n: usize| (n * plan.objects / 200_000).max(1);
+    plan.extras(k(2000), k(200), k(500), k(500), k(2000))
+}
+
+/// Predictions 1 to 5 on the build stream with the seeded set, and 6 against its rate.
+#[allow(clippy::too_many_lines)]
+fn amends(out: &Path, objects: usize, runs: usize) -> Result<()> {
+    let plan = build::Plan::new(objects);
+    let extras = seeded(&plan);
+    println!("build stream with {} added events; {}; load {}", extras.items.len(), building(), load_average());
+    let mut dir = PathBuf::new();
+    for run in 0..runs {
+        dir = fresh(out, &format!("amend-{run}"))?;
+        println!("  run {run} starting; {}; load {}", building(), load_average());
+        let (lane, marks) = feed_build(&dir, &plan, true, 0, Some(&extras))?;
+        for (b, seconds, _) in &marks {
+            let sent = objects + if *b == build::FIX_BUILD { plan.fixed.len() } else { 0 };
+            println!("P6 run {run} build {b}: {seconds:.1}s = {:.0} objects/s; load {}", sent as f64 / seconds, load_average());
+        }
+        let mut outcomes: BTreeMap<String, usize> = BTreeMap::new();
+        for (_, o) in &lane.amendments {
+            *outcomes.entry(o.clone()).or_insert(0) += 1;
+        }
+        println!("P5 run {run}: {} amendments waited for the trickle reader; outcomes {outcomes:?}", lane.amend_waited.len());
+        drop(lane);
+    }
+    let shard = store::Shard::open(&dir.join("shard-0.db"))?;
+    let (mut p1, mut n1, mut p2, mut n2, mut c, mut nc, mut e, mut ne, mut a, mut na) = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    let h = Connection::open(dir.join("hearings.db")).map_err(|e| e.to_string())?;
+    let rel = "build_object.depends_on.build_object";
+    for (_, extra, _, id, known) in &extras.items {
+        match extra {
+            build::Extra::Property { b, i, value } => {
+                n1 += 1;
+                let original = build::body(*i, plan.version_at(*i, *b, i64::MAX));
+                let mut patched = original.clone();
+                patched["fields"]["f05"] = Value::String(value.clone());
+                let before = shard.as_of("build_object", &build::key(*i), *b, known - 1)?.map(|r| r.data["body"].clone());
+                let after = shard.as_of("build_object", &build::key(*i), *b, *known)?.map(|r| r.data["body"].clone());
+                let now = shard.as_of("build_object", &build::key(*i), *b, i64::MAX)?.map(|r| r.data["body"].clone());
+                if before.as_ref() == Some(&original) && after.as_ref() == Some(&patched) && now.as_ref() == Some(&patched) {
+                    p1 += 1;
+                }
+            }
+            build::Extra::Rename { b, i, new } => {
+                n2 += 1;
+                let old = build::key(*i);
+                let present = |r: &Option<store::Row>| r.as_ref().is_some_and(|r| !r.ended);
+                let old_after = shard.as_of("build_object", &old, build::BUILDS, i64::MAX)?;
+                let new_after = shard.as_of("build_object", new, build::BUILDS, i64::MAX)?;
+                let old_before = shard.as_of("build_object", &old, *b, known - 1)?;
+                let new_before = shard.as_of("build_object", new, build::BUILDS, known - 1)?;
+                if old_after.as_ref().is_some_and(|r| r.ended) && present(&new_after) && present(&old_before) && new_before.is_none() {
+                    p2 += 1;
+                }
+            }
+            build::Extra::Corrected { i } | build::Extra::Ended { i } => {
+                let want = if matches!(extra, build::Extra::Corrected { .. }) { "wrong" } else { "ended" };
+                let after = shard.link_state(&build::key(*i), rel, &build::depends_on(*i), *known)?;
+                let before = shard.link_state(&build::key(*i), rel, &build::depends_on(*i), known - 1)?;
+                let ok = after.as_deref() == Some(want) && before.as_deref() == Some("holds");
+                if want == "wrong" {
+                    nc += 1;
+                    c += usize::from(ok);
+                } else {
+                    ne += 1;
+                    e += usize::from(ok);
+                }
+            }
+            build::Extra::Alias { b, i } => {
+                na += 1;
+                let (_, original) = plan.id_of(*b, *i, false);
+                let wrote: i64 = shard.conn().query_row("SELECT COUNT(*) FROM versions WHERE event = ?1", [id], |r| r.get(0)).map_err(|e| e.to_string())?;
+                let ids: Vec<String> = h
+                    .prepare("SELECT id FROM hearings WHERE content = (SELECT content FROM hearings WHERE id = ?1) ORDER BY id")
+                    .map_err(|e| e.to_string())?
+                    .query_map([id], |r| r.get(0))
+                    .map_err(|e| e.to_string())?
+                    .collect::<std::result::Result<_, _>>()
+                    .map_err(|e| e.to_string())?;
+                if wrote == 0 && ids.contains(id) && ids.contains(&original) {
+                    a += 1;
+                }
+            }
+        }
+    }
+    println!("P1 property amendments read right before, after and now: {p1} of {n1}");
+    println!("P2 renames read right before and after: {p2} of {n2}");
+    println!("P3 corrected links: {c} of {nc}; ended links: {e} of {ne}");
+    println!("P4 aliases that wrote nothing and are both in the hearings: {a} of {na}");
+    Ok(())
+}
+
+/// Prediction 7: 10 aborts at random rounds with amendments in flight.
+fn amend_kills(out: &Path, objects: usize) -> Result<()> {
+    let plan = build::Plan::new(objects);
+    let extras = seeded(&plan);
+    let base = fresh(out, "amend-kill-base")?;
+    let (lane, _) = feed_build(&base, &plan, true, 0, Some(&extras))?;
+    let rounds = lane.rounds;
+    drop(lane);
+    let want = digest(&store::Shard::open(&base.join("shard-0.db"))?.versions_text()?);
+    let dir = fresh(out, "amend-killed")?;
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let mut rng = rows::Rng::new(91);
+    let (mut landed, mut tries) = (0, 0);
+    while landed < 10 && tries < 40 {
+        tries += 1;
+        let after = 1 + rng.below((rounds / 10).max(2));
+        let status = std::process::Command::new(&exe)
+            .args(["amend-child", &dir.display().to_string(), &objects.to_string()])
+            .env("TWO_LANE_DIE_AFTER", after.to_string())
+            .status()
+            .map_err(|e| e.to_string())?;
+        if !status.success() {
+            landed += 1;
+        }
+    }
+    let status = std::process::Command::new(&exe).args(["amend-child", &dir.display().to_string(), &objects.to_string()]).status().map_err(|e| e.to_string())?;
+    if !status.success() {
+        return Err("the last amend child failed".into());
+    }
+    let shard = store::Shard::open(&dir.join("shard-0.db"))?;
+    let got = digest(&shard.versions_text()?);
+    let applied: i64 = shard.conn().query_row("SELECT COUNT(*) FROM amended", [], |r| r.get(0)).map_err(|e| e.to_string())?;
+    let twice: i64 = shard
+        .conn()
+        .query_row("SELECT COUNT(*) FROM (SELECT event FROM versions WHERE event IN (SELECT event FROM amended) GROUP BY event, kind, key, axis HAVING COUNT(*) > 1)", [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    println!(
+        "P7 {landed} of {tries} children aborted with amendments in flight; versions {got} against unkilled {want}: equal {}; amendments applied {applied}, applied twice {twice}",
+        got == want
+    );
+    Ok(())
+}
+
+fn amend_child(dir: &Path, objects: usize) -> Result<()> {
+    let plan = build::Plan::new(objects);
+    let extras = seeded(&plan);
+    let taken = std::fs::read_to_string(dir.join("inbox.jsonl")).unwrap_or_default().lines().count();
+    feed_build(dir, &plan, true, taken, Some(&extras)).map(|_| ())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let arg = |i: usize| args.get(i).map(PathBuf::from).unwrap_or_default();
@@ -774,6 +961,9 @@ fn main() {
         Some("builds") => builds(&arg(2), args.get(3).and_then(|s| s.parse().ok()).unwrap_or(200_000)),
         Some("build-kills") => build_kills(&arg(2), args.get(3).and_then(|s| s.parse().ok()).unwrap_or(200_000)),
         Some("build-child") => build_child(&arg(2), args.get(3).and_then(|s| s.parse().ok()).unwrap_or(200_000)),
+        Some("amends") => amends(&arg(2), args.get(3).and_then(|s| s.parse().ok()).unwrap_or(200_000), args.get(4).and_then(|s| s.parse().ok()).unwrap_or(1)),
+        Some("amend-kills") => amend_kills(&arg(2), args.get(3).and_then(|s| s.parse().ok()).unwrap_or(200_000)),
+        Some("amend-child") => amend_child(&arg(2), args.get(3).and_then(|s| s.parse().ok()).unwrap_or(200_000)),
         Some("child") => child(&arg(2), &arg(3), args.get(4).map_or("in", String::as_str)),
         _ => Err("usage: two-lane-toy run|replays|fast|hearings|parallel <westwind dir> <out dir>".into()),
     };

@@ -52,6 +52,55 @@
   ],
   "type": "object"
  },
+ "rannoch.amended": {
+  "type": "object"
+ },
+ "rannoch.corrected.depends_on": {
+  "properties": {
+   "from": {
+    "required": [
+     "class",
+     "key"
+    ],
+    "type": "object"
+   },
+   "to": {
+    "required": [
+     "class",
+     "key"
+    ],
+    "type": "object"
+   }
+  },
+  "required": [
+   "from",
+   "to"
+  ],
+  "type": "object"
+ },
+ "rannoch.ended.depends_on": {
+  "properties": {
+   "from": {
+    "required": [
+     "class",
+     "key"
+    ],
+    "type": "object"
+   },
+   "to": {
+    "required": [
+     "class",
+     "key"
+    ],
+    "type": "object"
+   }
+  },
+  "required": [
+   "from",
+   "to"
+  ],
+  "type": "object"
+ },
  "westwind.accept.payment_due": {
   "properties": {
    "customer_id": {

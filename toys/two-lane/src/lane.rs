@@ -33,6 +33,10 @@ use crate::store::{Shard, axis_of, defined, fact_of};
 pub enum Target {
     Fact,
     Flow(usize),
+    /// A `rannoch.amended`, for the amend worker.
+    Amend,
+    /// A `rannoch.corrected.<relation>` or `rannoch.ended.<relation>`: one more version of a link.
+    Link,
 }
 
 /// One event's work on one row.
@@ -47,6 +51,7 @@ pub struct Unit {
 #[derive(Debug, Default)]
 struct Outcome {
     sent: Vec<Event>,
+    amended: Vec<(String, String)>,
     waiting: Vec<Unit>,
     retry: Vec<Unit>,
     stalls: Vec<String>,
@@ -107,7 +112,9 @@ fn work(shard: &mut Shard, flows: &[Flow], pool: &mut Pool, window: i64, units: 
             Target::Fact => {
                 let Some(fact) = fact_of(event) else { continue };
                 let axis = axis_of(&unit.kind, event);
-                let Ok(row) = shard.row(&unit.kind, &unit.key) else { continue };
+                // A fact naming a key a rename has moved lands on the new key.
+                let key = shard.renamed(&unit.kind, &unit.key, crate::store::known_of(event));
+                let Ok(row) = shard.row(&unit.kind, &key) else { continue };
                 if row.facts.contains_key(&event.id) {
                     continue;
                 }
@@ -125,13 +132,22 @@ fn work(shard: &mut Shard, flows: &[Flow], pool: &mut Pool, window: i64, units: 
                 row.axis = row.axis.max(axis);
                 let horizon = row.time.saturating_sub(window);
                 row.facts.retain(|_, t| *t >= horizon);
-                if shard.touched(&unit.kind, &unit.key, event, axis).is_err() {
+                if shard.touched(&unit.kind, &key, event, axis).is_err() {
                     continue;
                 }
                 for (rel, kind, to) in fact.edges {
-                    shard.edge((fact.kind, &fact.key), rel, (kind, &to), &event.id);
+                    shard.edge((fact.kind, &key), rel, (kind, &to), crate::store::known_of(event));
                 }
             }
+            Target::Amend => match shard.amend(event) {
+                Ok(Some(outcome)) => out.amended.push((event.id.clone(), outcome)),
+                Ok(None) => out.waiting.push(unit),
+                Err(e) => {
+                    out.stalls.push(format!("amend: {e}"));
+                    out.retry.push(unit);
+                }
+            },
+            Target::Link => shard.link_change(event),
             Target::Flow(f) => {
                 let flow = &flows[f];
                 let needs_met = {
@@ -208,6 +224,9 @@ pub struct Lane {
     pub rounds: u64,
     pub stalls: Vec<String>,
     pub max_lateness: i64,
+    /// Amendments that had to wait for the trickle reader, and every amendment's outcome.
+    pub amend_waited: std::collections::HashSet<String>,
+    pub amendments: Vec<(String, String)>,
 }
 
 fn shard_of(kind: &str, key: &str, n: usize) -> usize {
@@ -291,6 +310,8 @@ impl Lane {
             rounds: 0,
             stalls: Vec::new(),
             max_lateness: 0,
+            amend_waited: std::collections::HashSet::new(),
+            amendments: Vec::new(),
         };
         for unit in place.held {
             lane.hold(unit);
@@ -300,7 +321,7 @@ impl Lane {
 
     fn hold(&mut self, unit: Unit) {
         let clocked = match unit.target {
-            Target::Fact => false,
+            Target::Fact | Target::Amend | Target::Link => false,
             Target::Flow(f) => self.flows[f].clocked(&unit.event.ty) || self.timers.contains(&unit.event.ty),
         };
         if clocked {
@@ -351,6 +372,14 @@ impl Lane {
             log.write_all(b"\n").map_err(|e| e.to_string())?;
         }
         let mut ready = Vec::new();
+        if event.ty == "rannoch.amended" {
+            ready.push(Unit { event: event.clone(), target: Target::Amend, kind: String::new(), key: String::new() });
+            return Ok(Some(ready));
+        }
+        if event.ty.starts_with("rannoch.corrected.") || event.ty.starts_with("rannoch.ended.") {
+            ready.push(Unit { event: event.clone(), target: Target::Link, kind: String::new(), key: String::new() });
+            return Ok(Some(ready));
+        }
         if let Some(fact) = fact_of(event) {
             ready.push(Unit { event: event.clone(), target: Target::Fact, kind: fact.kind.to_string(), key: fact.key });
         }
@@ -372,7 +401,11 @@ impl Lane {
         let n = self.workers.len();
         let mut parts: Vec<Vec<Unit>> = vec![Vec::new(); n];
         for unit in units {
-            parts[shard_of(&unit.kind, &unit.key, n)].push(unit);
+            let at = match unit.target {
+                Target::Amend | Target::Link => 0,
+                _ => shard_of(&unit.kind, &unit.key, n),
+            };
+            parts[at].push(unit);
         }
         for (i, part) in parts.into_iter().enumerate() {
             self.workers[i].0.send(Job::Units(part)).map_err(|e| e.to_string())?;
@@ -383,6 +416,12 @@ impl Lane {
             match self.workers[i].1.recv().map_err(|e| e.to_string())? {
                 Reply::Done(o) => {
                     sent.extend(o.sent);
+                    for w in &o.waiting {
+                        if w.target == Target::Amend {
+                            self.amend_waited.insert(w.event.id.clone());
+                        }
+                    }
+                    self.amendments.extend(o.amended);
                     unfinished += o.waiting.len() + o.retry.len();
                     self.stalls.extend(o.stalls);
                     waiting.extend(o.waiting);
