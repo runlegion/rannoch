@@ -32,8 +32,8 @@ use crate::inbox::place;
 use crate::log::{append, event_at, store};
 use crate::ontology::{Bound, build, load};
 use crate::queries::{
-    ANY_RENAME, CLOSE_OPEN, COPY_INTO, DONE_RETRY, HISTORY_TABLES, OPEN_LINK, OWN_TABLES, PRAGMAS,
-    RELEASE, RESET_TRIES, RETRY_WORK, ROLLBACK_TO, SAVEPOINT, SCHEMA_VERSION, SET_PLACE,
+    ANY_RENAME, CACHE, CLOSE_OPEN, COPY_INTO, DONE_RETRY, HISTORY_TABLES, OPEN_LINK, OWN_TABLES,
+    PRAGMAS, RELEASE, RESET_TRIES, RETRY_WORK, ROLLBACK_TO, SAVEPOINT, SCHEMA_VERSION, SET_PLACE,
     SET_POSITION, SET_TRY_LIMIT, STOPPED_WORK, TRIED_WORK, TRY_LIMIT, delete_link, delete_node,
     node_id, upsert_link, upsert_node, waiting,
 };
@@ -104,6 +104,7 @@ pub fn open(path: impl AsRef<Path>, key: &[u8; 32]) -> Result<Graph, Error> {
     let mut conn = Connection::open(path)?;
     conn.busy_handler(Some(retry_lock))?;
     conn.execute_batch(PRAGMAS)?;
+    conn.execute_batch(CACHE)?;
     conn.set_prepared_statement_cache_capacity(256);
     conn.execute_batch(OWN_TABLES)?;
     conn.execute_batch(HISTORY_TABLES)?;
@@ -291,10 +292,9 @@ impl Graph {
                 .to_str()
                 .ok_or_else(|| Error::Refused(format!("the copy's path {shown} is not UTF-8")))?;
             self.conn.execute(COPY_INTO, [into])?;
-            Events {
-                conn: &Connection::open(path)?,
-            }
-            .committed()
+            let conn = Connection::open(path)?;
+            conn.execute_batch(CACHE)?;
+            Events { conn: &conn }.committed()
         })();
         if copied.is_err() {
             let _ = std::fs::remove_file(path);
@@ -2395,6 +2395,24 @@ mod tests {
         let forward = answers("replay-in-order", false)?;
         assert_eq!(answers("replay-again", false)?, forward, "a rebuild");
         assert_eq!(answers("replay-reversed", true)?, forward, "reversed");
+        Ok(())
+    }
+
+    #[test]
+    fn a_connection_keeps_a_64_mb_cache_and_syncs_every_commit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let g = open(temp("settings"), &KEY)?;
+        let setting = |name: &str| -> rusqlite::Result<i64> {
+            g.conn
+                .query_row(&format!("PRAGMA {name}"), [], |row| row.get(0))
+        };
+        // A negative cache size is in KiB: 65,536 KiB is 64 MB.
+        assert_eq!(setting("cache_size")?, -65_536);
+        assert_eq!(setting("temp_store")?, 2, "temp_store=MEMORY");
+        assert_eq!(setting("wal_autocheckpoint")?, 10_000);
+        assert_eq!(setting("synchronous")?, 2, "synchronous=FULL");
+        assert_eq!(setting("fullfsync")?, 1);
+        assert_eq!(setting("secure_delete")?, 1);
         Ok(())
     }
 }

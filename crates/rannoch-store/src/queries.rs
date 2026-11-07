@@ -10,6 +10,13 @@ use crate::ontology::{CLASS, RELATION};
 pub(crate) const PRAGMAS: &str = "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; \
      PRAGMA fullfsync=ON; PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON;";
 
+/// The memory every connection works in, run after [`PRAGMAS`]: a 64 MB page cache, so fill keeps
+/// the pages it touches until commit instead of reading them back and spilling them
+/// mid-transaction; temporary tables in memory; and a checkpoint every 10,000 WAL pages. None of
+/// it changes what a commit syncs.
+pub(crate) const CACHE: &str =
+    "PRAGMA cache_size=-65536; PRAGMA temp_store=MEMORY; PRAGMA wal_autocheckpoint=10000;";
+
 /// rannoch's own tables: the event log and the ontology. An event's place is never reused, so a
 /// cursor stays a place in the log.
 pub(crate) const OWN_TABLES: &str = "
