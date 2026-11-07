@@ -83,7 +83,8 @@ fn stream(dir: &Path, inbound: &[Inbound], workers: usize, with_flows: bool, log
     let mut lane = Lane::open(dir, flows(with_flows)?, Schemas::load(SCHEMAS)?, LATENESS, workers, log)?;
     // A kill test sets this: the process dies, as by SIGKILL, after this many rounds.
     let die_after: Option<u64> = std::env::var("TWO_LANE_DIE_AFTER").ok().and_then(|v| v.parse().ok());
-    for chunk in inbound[skip..].chunks(512) {
+    let size = std::env::var("TWO_LANE_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(512);
+    for chunk in inbound[skip..].chunks(size) {
         let lines: Vec<&str> = chunk.iter().map(|i| i.line.as_str()).collect();
         lane.take(&lines)?;
         while lane.round()? {
@@ -326,13 +327,14 @@ fn replays(westwind: &Path, out: &Path) -> Result<()> {
             let status = std::process::Command::new(&exe)
                 .args(["child", &westwind.display().to_string(), &dir.display().to_string(), order])
                 .env("TWO_LANE_DIE_AFTER", after.to_string())
+                .env("TWO_LANE_CHUNK", "128")
                 .status()
                 .map_err(|e| e.to_string())?;
             if !status.success() {
                 landed += 1;
             }
         }
-        let status = std::process::Command::new(&exe).args(["child", &westwind.display().to_string(), &dir.display().to_string(), order]).status().map_err(|e| e.to_string())?;
+        let status = std::process::Command::new(&exe).args(["child", &westwind.display().to_string(), &dir.display().to_string(), order]).env("TWO_LANE_CHUNK", "128").status().map_err(|e| e.to_string())?;
         if !status.success() {
             return Err("the last child failed".into());
         }
@@ -533,6 +535,10 @@ fn hearings(westwind: &Path, out: &Path) -> Result<()> {
 
 /// Prediction 8: the full chain over extended orders, 1 worker against 4.
 fn parallel(westwind: &Path, out: &Path, orders: usize) -> Result<()> {
+    // Both sides bound each round to the lateness of event time, so they make the same rounds.
+    if std::env::var("TWO_LANE_SPAN").is_err() {
+        return Err("run parallel with TWO_LANE_SPAN=1, so 1 worker and 4 make the same rounds".into());
+    }
     let seed = rows::load_seed(westwind)?;
     let (lines, n) = extended_world(&seed, orders, true)?;
     let inbound: Vec<Inbound> = lines.iter().enumerate().map(|(i, l)| Inbound { line: l.clone(), time: 0, arrival: 0, seq: i as u64 }).collect();

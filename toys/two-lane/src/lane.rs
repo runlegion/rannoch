@@ -426,7 +426,7 @@ impl Lane {
                 // the lateness: what a restart hands again stays inside the rows' windows. With one
                 // shard the round and the lane's place commit together.
                 let start = *first_time.get_or_insert(event.time);
-                if self.workers.len() > 1 && event.time - start > self.lateness {
+                if (self.workers.len() > 1 || std::env::var("TWO_LANE_SPAN").is_ok()) && event.time - start > self.lateness {
                     read = most;
                 }
             }
