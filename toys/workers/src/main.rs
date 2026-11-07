@@ -8,6 +8,7 @@
 //! workers-toy rebuild  <westwind dir> <out dir>   # rebuild time against history length
 //! ```
 
+mod compare;
 mod entrance;
 mod flow;
 mod runtime;
@@ -708,6 +709,85 @@ fn rebuild(out: &Path) -> Result<()> {
     Ok(())
 }
 
+/// What else is building on the machine, so a speed line can say it ran alone.
+fn building() -> String {
+    let out = std::process::Command::new("pgrep").args(["-lx", "rustc|cargo|clang|ld|cc"]).output();
+    let names: Vec<String> = out
+        .map(|o| String::from_utf8_lossy(&o.stdout).lines().filter_map(|l| l.split_whitespace().nth(1).map(str::to_string)).collect())
+        .unwrap_or_default();
+    if names.is_empty() { "nothing else building".into() } else { format!("also running: {}", names.join(",")) }
+}
+
+/// The graph against nodes-only against relational toy, on the seed or the extended log.
+fn compare_run(westwind: &Path, out: &Path, which: &str, runs: usize) -> Result<()> {
+    use compare::{SCENARIOS, Version};
+    let conn = load_seed(westwind)?;
+    let events = if which == "seed" { seed_events(&conn)? } else { extended_events(&conn, 1_000_000)? };
+    let rows = events.iter().filter(|e| e.ty != "westwind.ontology.declared").count();
+    println!("{which}: {} events, {rows} rows; load {}", events.len(), load_average());
+    let dir = fresh_dir(out, &format!("compare-{which}"))?;
+    let mut loads: BTreeMap<&str, Vec<f64>> = BTreeMap::new();
+    for run in 0..runs {
+        for version in [Version::Relational, Version::Nodes, Version::Graph] {
+            println!("  {} load starting [run {run}]; {}; load {}", version.name(), building(), load_average());
+            let seconds = compare::load(version, &compare::path(&dir, version), &events)?;
+            loads.entry(version.name()).or_default().push(seconds);
+            println!(
+                "  {} load: {seconds:.2}s, {:.0} rows/s [run {run}]; load {}",
+                version.name(),
+                rows as f64 / seconds,
+                load_average()
+            );
+        }
+    }
+    let relational = rusqlite::Connection::open(compare::path(&dir, Version::Relational)).map_err(|e| e.to_string())?;
+    let inputs = compare::inputs(&conn, &relational)?;
+    println!("  inputs {inputs:?}");
+    let conns: Vec<(Version, rusqlite::Connection)> = Version::ALL
+        .iter()
+        .map(|&v| rusqlite::Connection::open(compare::path(&dir, v)).map(|c| (v, c)).map_err(|e| e.to_string()))
+        .collect::<Result<_>>()?;
+    let repeats = if which == "seed" { 5 } else { 20 };
+    for name in SCENARIOS {
+        let mut answers = Vec::new();
+        let mut line = format!("  {name:7}");
+        for (version, c) in &conns {
+            let (rows, ms) = compare::answer(c, *version, name, &inputs, repeats)?;
+            line.push_str(&format!(" {} {:>9.3} ms ({} rows)", version.name(), ms, rows.len()));
+            answers.push(rows);
+        }
+        let agree = answers.windows(2).all(|w| w[0] == w[1]);
+        println!("{line}; all three agree: {agree}; load {}", load_average());
+        if which == "seed" {
+            let (direct, _) = compare::answer(&conn, Version::Relational, name, &inputs, 1)?;
+            println!("          against SQL over seed.sql itself: {}", answers[2] == direct);
+        }
+        if which == "seed" {
+            let expected = match name {
+                "A" => Some(sql_stock_low(&conn)?.into_iter().map(|id| format!("Text({id:?})")).collect::<Vec<_>>()),
+                _ => None,
+            };
+            if let Some(expected) = expected {
+                println!("          A against the worker toy's SQL over the seed: {}", answers[2] == expected);
+            }
+        }
+        if which == "seed" && name == "B" {
+            let clock: String = conn.query_row("SELECT MAX(MAX(order_date), MAX(COALESCE(shipped_date, ''))) FROM orders", [], |r| r.get(0)).map_err(|e| e.to_string())?;
+            let mut expected: Vec<String> = sql_unshipped(&conn, entrance::date_ms(&clock)?)?.into_iter().map(|id| format!("Text({id:?})")).collect();
+            expected.sort();
+            println!("          B against the worker toy's SQL over the seed: {}", answers[2] == expected);
+        }
+    }
+    for version in Version::ALL {
+        let bytes = compare::size(&compare::path(&dir, version))?;
+        println!("  {} on disk: {bytes} bytes ({:.1} MB)", version.name(), bytes as f64 / 1e6);
+    }
+    for (name, seconds) in &loads {
+        println!("  {name} loads: {seconds:.2?}");
+    }
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let arg = |i: usize| args.get(i).map(PathBuf::from).unwrap_or_default();
@@ -720,6 +800,7 @@ fn main() {
             speed(&arg(2), &arg(3), lines, runs)
         }
         Some("rebuild") => rebuild(&arg(3)),
+        Some("compare") => compare_run(&arg(2), &arg(3), args.get(4).map_or("seed", String::as_str), args.get(5).and_then(|s| s.parse().ok()).unwrap_or(1)),
         Some("child") => child(&arg(2), &arg(3), args.get(4).map_or("in", String::as_str)),
         _ => Err("usage: workers-toy correct|replays|speed|rebuild <westwind dir> <out dir>".into()),
     };
