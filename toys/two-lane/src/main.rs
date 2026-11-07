@@ -81,10 +81,16 @@ fn fresh(out: &Path, name: &str) -> Result<PathBuf> {
 /// Streams `inbound` into a lane in `dir`, a batch at a time, then drains it.
 fn stream(dir: &Path, inbound: &[Inbound], workers: usize, with_flows: bool, log: bool, skip: usize) -> Result<Lane> {
     let mut lane = Lane::open(dir, flows(with_flows)?, Schemas::load(SCHEMAS)?, LATENESS, workers, log)?;
+    // A kill test sets this: the process dies, as by SIGKILL, after this many rounds.
+    let die_after: Option<u64> = std::env::var("TWO_LANE_DIE_AFTER").ok().and_then(|v| v.parse().ok());
     for chunk in inbound[skip..].chunks(512) {
         let lines: Vec<&str> = chunk.iter().map(|i| i.line.as_str()).collect();
         lane.take(&lines)?;
-        while lane.round()? {}
+        while lane.round()? {
+            if die_after.is_some_and(|n| lane.rounds >= n) {
+                std::process::abort();
+            }
+        }
     }
     lane.ended = true;
     lane.drain()?;
@@ -305,21 +311,26 @@ fn replays(westwind: &Path, out: &Path) -> Result<()> {
     let mut table = Vec::new();
     let base = fresh(out, "base")?;
     let lane = stream(&base, &world.inbound, 1, true, true, 0)?;
-    table.push(("in order".to_string(), summary(&base, &lane)?, String::new()));
+    let rounds = lane.rounds;
+    table.push(("in order".to_string(), summary(&base, &lane)?, format!("{rounds} rounds")));
     drop(lane);
     for order in ["in", "shuffled:1"] {
         let dir = fresh(out, &format!("killed-{}", order.replace(':', "-")))?;
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
         let mut rng = rows::Rng::new(41);
         let mut landed = 0;
-        for _ in 0..10 {
-            let mut c = std::process::Command::new(&exe).args(["child", &westwind.display().to_string(), &dir.display().to_string(), order]).spawn().map_err(|e| e.to_string())?;
-            std::thread::sleep(std::time::Duration::from_millis(100 + rng.below(1500)));
-            if c.try_wait().map_err(|e| e.to_string())?.is_none() {
+        let mut tries = 0;
+        while landed < 10 && tries < 30 {
+            tries += 1;
+            let after = 1 + rng.below(3);
+            let status = std::process::Command::new(&exe)
+                .args(["child", &westwind.display().to_string(), &dir.display().to_string(), order])
+                .env("TWO_LANE_DIE_AFTER", after.to_string())
+                .status()
+                .map_err(|e| e.to_string())?;
+            if !status.success() {
                 landed += 1;
             }
-            let _ = c.kill();
-            let _ = c.wait();
         }
         let status = std::process::Command::new(&exe).args(["child", &westwind.display().to_string(), &dir.display().to_string(), order]).status().map_err(|e| e.to_string())?;
         if !status.success() {
@@ -327,7 +338,7 @@ fn replays(westwind: &Path, out: &Path) -> Result<()> {
         }
         let lane = Lane::open(&dir, flows(true)?, Schemas::load(SCHEMAS)?, LATENESS, 1, true)?;
         let shard = store::Shard::open(&dir.join("shard-0.db"))?;
-        let note = format!("{landed} of 10 kills landed mid-run; host triage answers kept {}", shard.answers_kept("triage"));
+        let note = format!("{landed} children of {tries} died mid-run (each aborted after a random 1 to 3 rounds of what was left); host triage answers kept {}", shard.answers_kept("triage"));
         table.push((format!("killed x10, {order}"), summary(&dir, &lane)?, note));
     }
     for s in [1u64, 2, 3] {

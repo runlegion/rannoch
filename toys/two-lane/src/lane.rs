@@ -177,8 +177,6 @@ pub struct Lane {
     workers: Vec<(Sender<Job>, Receiver<Reply>, std::thread::JoinHandle<()>)>,
     clocked: BTreeMap<(i64, String, Target), Unit>,
     waiting: Vec<Unit>,
-    /// Events sent and run within a round, so reading them back from the inbox skips them.
-    inline: std::collections::HashSet<String>,
     max_external: Option<i64>,
     pub ended: bool,
     pub bins: BTreeMap<&'static str, u64>,
@@ -262,7 +260,6 @@ impl Lane {
             workers: started,
             clocked: BTreeMap::new(),
             waiting: Vec::new(),
-            inline: std::collections::HashSet::new(),
             max_external: place.max_external,
             ended: false,
             bins: BTreeMap::new(),
@@ -411,7 +408,9 @@ impl Lane {
                     continue;
                 }
             };
-            if self.inline.remove(&event.id) {
+            // A step that ran in the round that sent it is on the inbox marked so: the round that
+            // ran it committed with it, or was undone with it and will send it again.
+            if text.contains("\"inline\":true") {
                 continue;
             }
             if !event.source.contains("/flow/") {
@@ -469,7 +468,6 @@ impl Lane {
                 if let Some(units) = self.units_of(&event, &text)? {
                     ready.extend(units);
                 }
-                self.inline.insert(event.id.clone());
                 out.push(event);
             }
         }
@@ -480,7 +478,10 @@ impl Lane {
         }
         if !out.is_empty() {
             for e in &out {
-                self.inbox.write_all(to_json(e).as_bytes()).map_err(|e| e.to_string())?;
+                let mut text = to_json(e);
+                text.truncate(text.len() - 1);
+                text.push_str(",\"inline\":true}");
+                self.inbox.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
                 self.inbox.write_all(b"\n").map_err(|e| e.to_string())?;
             }
             self.inbox.flush().map_err(|e| e.to_string())?;
