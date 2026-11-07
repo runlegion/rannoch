@@ -1901,6 +1901,41 @@ mod tests {
         Ok(TRACED.with(std::cell::RefCell::take))
     }
 
+    #[test]
+    fn fill_seeks_each_alias() -> Result<(), Box<dyn std::error::Error>> {
+        let mut g = graph("alias-seek")?;
+        for seconds in [1_000, 2_000] {
+            g.commit(
+                &[
+                    &node_with(&id_at(seconds), "author", "a1", "ann"),
+                    &book_at(seconds, "b1", "hi"),
+                    &link_with(&id_at(seconds), "a1", "b1"),
+                ],
+                &[],
+            )?;
+        }
+        let ran = statements(&mut g, crate::Graph::fill)?;
+        let b1 = crate::NodeRef::new("book", "b1");
+        assert_eq!(g.hearings(&b1)?[0].aliases.len(), 1, "b1 has an alias");
+        let mut looked = 0;
+        for sql in ran.iter().filter(|s| s.contains("_aliases")) {
+            let mut plan = g.conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+            let nulls = vec![rusqlite::types::Null; plan.parameter_count()];
+            let steps: Vec<String> = plan
+                .query_map(rusqlite::params_from_iter(nulls), |row| row.get(3))?
+                .collect::<std::result::Result<_, _>>()?;
+            for step in steps.iter().filter(|s| s.contains("_aliases")) {
+                assert!(
+                    step.starts_with("SEARCH") && step.contains("identity=?"),
+                    "an alias lookup that is not a seek: {step}\nin {sql}"
+                );
+                looked += 1;
+            }
+        }
+        assert!(looked > 0, "fill looks aliases up");
+        Ok(())
+    }
+
     fn books(g: &mut crate::Graph, keys: impl Iterator<Item = usize>) -> Result<(), crate::Error> {
         let bodies: Vec<String> = keys.map(|i| node("book", &format!("b{i}"), "t")).collect();
         let refs: Vec<&str> = bodies.iter().map(String::as_str).collect();
