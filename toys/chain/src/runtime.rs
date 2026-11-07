@@ -257,6 +257,11 @@ pub struct Runtime {
     state: Option<PathBuf>,
     last: Option<(i64, String)>,
     durable_last: Option<(i64, String)>,
+    /// The latest outside time at the last checkpoint. The runtime checkpoints at least once per
+    /// lateness of event time, so nothing a restart hands again is older than the windows that
+    /// recognise it as handed.
+    checkpointed_at: i64,
+    pub checkpoints: u64,
 }
 
 impl std::fmt::Debug for Runtime {
@@ -300,6 +305,8 @@ impl Runtime {
             state: None,
             last: None,
             durable_last: None,
+            checkpointed_at: i64::MIN,
+            checkpoints: 0,
         };
         if let Some(dir) = dir {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
@@ -386,7 +393,13 @@ impl Runtime {
         }
         self.max_external = self.max_external.max(event.time);
         self.queue.insert(key, event);
-        self.release()
+        self.release()?;
+        if self.checkpointed_at == i64::MIN {
+            self.checkpointed_at = self.max_external;
+        } else if self.max_external - self.checkpointed_at >= self.lateness {
+            self.checkpoint()?;
+        }
+        Ok(())
     }
 
     /// Releases everything nothing earlier can still arrive in time for.
@@ -480,6 +493,8 @@ impl Runtime {
             std::fs::rename(&tmp, path).map_err(|e| e.to_string())?;
         }
         self.durable_last = self.last.clone();
+        self.checkpointed_at = self.max_external;
+        self.checkpoints += 1;
         Ok(())
     }
 

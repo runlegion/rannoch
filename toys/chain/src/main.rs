@@ -472,7 +472,7 @@ fn replays(westwind: &Path, out: &Path) -> Result<()> {
                 .args(["child", &westwind.display().to_string(), &dir.display().to_string(), order])
                 .spawn()
                 .map_err(|e| e.to_string())?;
-            std::thread::sleep(std::time::Duration::from_millis(500 + rng.below(6000)));
+            std::thread::sleep(std::time::Duration::from_millis(80 + rng.below(1100)));
             if child.try_wait().map_err(|e| e.to_string())?.is_none() {
                 landed += 1;
             }
@@ -644,6 +644,7 @@ fn main() {
         Some("age") => age(&arg(2), &arg(3)),
         Some("domain") => domain(&arg(2)),
         Some("load") => load(&arg(2), &arg(3)),
+        Some("dump") => flow_text(&arg(2)).and_then(|f| std::fs::write(arg(2).join("flows.txt"), f).map_err(|e| e.to_string())),
         Some("child") => child(&arg(2), &arg(3), args.get(4).map_or("in", String::as_str)),
         _ => Err("usage: chain-toy run|replays|age|domain|load <westwind dir> <out dir>".into()),
     };
