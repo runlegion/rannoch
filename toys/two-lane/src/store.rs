@@ -114,7 +114,8 @@ impl Shard {
         Ok(Shard { conn, cache: HashMap::new(), dirty: BTreeSet::new(), edges: Vec::new(), answers: Vec::new(), writes: 0 })
     }
 
-    /// The row of `kind` keyed `key`, read once and then held until the next commit.
+    /// The row of `kind` keyed `key`. A row this process has written is handed back from memory,
+    /// never read back from the file; a row it has not seen is looked for once.
     ///
     /// # Errors
     /// The file cannot be read.
@@ -199,9 +200,6 @@ impl Shard {
         self.dirty.clear();
         self.edges.clear();
         self.answers.clear();
-        if self.cache.len() > 200_000 {
-            self.cache.clear();
-        }
         Ok(())
     }
 

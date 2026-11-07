@@ -177,6 +177,8 @@ pub struct Lane {
     workers: Vec<(Sender<Job>, Receiver<Reply>, std::thread::JoinHandle<()>)>,
     clocked: BTreeMap<(i64, String, Target), Unit>,
     waiting: Vec<Unit>,
+    /// Events sent and run within a round, so reading them back from the inbox skips them.
+    inline: std::collections::HashSet<String>,
     max_external: Option<i64>,
     pub ended: bool,
     pub bins: BTreeMap<&'static str, u64>,
@@ -258,6 +260,7 @@ impl Lane {
             workers: started,
             clocked: BTreeMap::new(),
             waiting: Vec::new(),
+            inline: std::collections::HashSet::new(),
             max_external: place.max_external,
             ended: false,
             bins: BTreeMap::new(),
@@ -308,7 +311,73 @@ impl Lane {
         }
     }
 
-    /// Runs one round. Returns whether it did anything.
+    /// Checks one event, logs it, and makes its units: an event in clock order waits in the
+    /// clock queue; the rest are returned, ready.
+    fn units_of(&mut self, event: &Event, text: &str) -> Result<Option<Vec<Unit>>, String> {
+        if let Err(e) = crate::domain::check(&event.ty, &event.source) {
+            self.bin("another domain", text, e);
+            return Ok(None);
+        }
+        if let Err(e) = self.schemas.check(&event.ty, &event.data) {
+            if event.source.contains("/flow/") {
+                self.invalid.push((event.ty.clone(), e));
+            } else {
+                self.bin("malformed", text, e);
+            }
+            return Ok(None);
+        }
+        if let Some(log) = &mut self.log {
+            log.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
+            log.write_all(b"\n").map_err(|e| e.to_string())?;
+        }
+        let mut ready = Vec::new();
+        if let Some(fact) = fact_of(event) {
+            ready.push(Unit { event: event.clone(), target: Target::Fact, kind: fact.kind.to_string(), key: fact.key });
+        }
+        for &f in self.routes.get(&event.ty).map(Vec::as_slice).unwrap_or(&[]) {
+            let flow = &self.flows[f];
+            let unit = Unit { event: event.clone(), target: Target::Flow(f), kind: flow.row_kind.clone(), key: flow.key(event) };
+            if flow.clocked(&event.ty) || self.timers.contains(&event.ty) {
+                self.clocked.insert((event.time, event.id.clone(), unit.target), unit);
+            } else {
+                ready.push(unit);
+            }
+        }
+        Ok(Some(ready))
+    }
+
+    /// Hands units to the shards and waits for them; returns what they sent and how many finished.
+    fn pass(&mut self, units: Vec<Unit>, waiting: &mut Vec<Unit>, retry: &mut Vec<Unit>) -> Result<(Vec<Event>, usize), String> {
+        let total = units.len();
+        let n = self.workers.len();
+        let mut parts: Vec<Vec<Unit>> = vec![Vec::new(); n];
+        for unit in units {
+            parts[shard_of(&unit.kind, &unit.key, n)].push(unit);
+        }
+        for (i, part) in parts.into_iter().enumerate() {
+            self.workers[i].0.send(Job::Units(part)).map_err(|e| e.to_string())?;
+        }
+        let mut sent = Vec::new();
+        let mut unfinished = 0;
+        for i in 0..n {
+            match self.workers[i].1.recv().map_err(|e| e.to_string())? {
+                Reply::Done(o) => {
+                    sent.extend(o.sent);
+                    unfinished += o.waiting.len() + o.retry.len();
+                    self.stalls.extend(o.stalls);
+                    waiting.extend(o.waiting);
+                    retry.extend(o.retry);
+                }
+                _ => return Err("worker out of step".into()),
+            }
+        }
+        self.units += total as u64;
+        Ok((sent, total - unfinished))
+    }
+
+    /// Runs one round: reads what the inbox holds (no more than the lateness of event time), runs
+    /// it and everything it causes now, the clock queue one moment of event time at a time, then
+    /// makes it all durable together. Returns whether it did anything.
     ///
     /// # Errors
     /// A file cannot be read or written, or a shard fails.
@@ -324,7 +393,6 @@ impl Lane {
             let n = self.reader.read_line(&mut line).map_err(|e| e.to_string())?;
             if n == 0 || !line.ends_with('\n') {
                 if n > 0 {
-                    // A line still being written: read it next round.
                     self.reader.seek(SeekFrom::Start(self.offset)).map_err(|e| e.to_string())?;
                 }
                 break;
@@ -332,31 +400,21 @@ impl Lane {
             self.offset += n as u64;
             read += 1;
             self.read += 1;
-            let text = line.trim_end();
-            let event = match admit(text, 0) {
+            let text = line.trim_end().to_string();
+            let event = match admit(&text, 0) {
                 Ok(e) => e,
                 Err(e) => {
-                    self.bin("malformed", text, e);
+                    self.bin("malformed", &text, e);
                     continue;
                 }
             };
-            if let Err(e) = crate::domain::check(&event.ty, &event.source) {
-                self.bin("another domain", text, e);
+            if self.inline.remove(&event.id) {
                 continue;
             }
-            if let Err(e) = self.schemas.check(&event.ty, &event.data) {
-                if event.source.contains("/flow/") {
-                    self.invalid.push((event.ty.clone(), e));
-                } else {
-                    self.bin("malformed", text, e);
-                }
-                continue;
-            }
-            let external = !event.source.contains("/flow/");
-            if external {
+            if !event.source.contains("/flow/") {
                 if let Some(max) = self.max_external {
                     if event.time < max - self.lateness {
-                        self.bin("later than the declared lateness", text, format!("{} ms behind", max - event.time));
+                        self.bin("later than the declared lateness", &text, format!("{} ms behind", max - event.time));
                         continue;
                     }
                     self.max_lateness = self.max_lateness.max(max - event.time);
@@ -367,68 +425,55 @@ impl Lane {
                     read = ROUND;
                 }
             }
-            if let Some(log) = &mut self.log {
-                log.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
-                log.write_all(b"\n").map_err(|e| e.to_string())?;
-            }
-            if let Some(fact) = fact_of(&event) {
-                ready.push(Unit { event: event.clone(), target: Target::Fact, kind: fact.kind.to_string(), key: fact.key });
-            }
-            for &f in self.routes.get(&event.ty).map(Vec::as_slice).unwrap_or(&[]) {
-                let flow = &self.flows[f];
-                let unit = Unit { event: event.clone(), target: Target::Flow(f), kind: flow.row_kind.clone(), key: flow.key(&event) };
-                let clocked = flow.clocked(&event.ty) || self.timers.contains(&event.ty);
-                if clocked {
-                    self.clocked.insert((event.time, event.id.clone(), unit.target), unit);
-                } else {
-                    ready.push(unit);
-                }
+            if let Some(units) = self.units_of(&event, &text)? {
+                ready.extend(units);
             }
         }
-        if let Some(max) = self.max_external {
-            let watermark = if self.ended { max.saturating_add(1) } else { max - self.lateness };
-            while let Some(entry) = self.clocked.first_entry() {
-                if entry.key().0 >= watermark {
+        let watermark = self.max_external.map(|max| if self.ended { max.saturating_add(1) } else { max - self.lateness });
+        let mut waiting = std::mem::take(&mut self.waiting);
+        let mut retry = Vec::new();
+        let mut out: Vec<Event> = Vec::new();
+        let mut retry_waiting = true;
+        let mut finished = 0;
+        loop {
+            if ready.is_empty() {
+                if retry_waiting && !waiting.is_empty() {
+                    ready = std::mem::take(&mut waiting);
+                    retry_waiting = false;
+                } else if let Some(w) = watermark
+                    && let Some(t) = self.clocked.keys().next().map(|k| k.0)
+                    && t < w
+                {
+                    while self.clocked.keys().next().is_some_and(|k| k.0 == t) {
+                        if let Some((_, u)) = self.clocked.pop_first() {
+                            ready.push(u);
+                        }
+                    }
+                } else {
                     break;
                 }
-                ready.push(entry.remove());
+            }
+            let (sent, done) = self.pass(std::mem::take(&mut ready), &mut waiting, &mut retry)?;
+            finished += done;
+            if done > 0 {
+                retry_waiting = true;
+            }
+            for event in sent {
+                let text = to_json(&event);
+                if let Some(units) = self.units_of(&event, &text)? {
+                    ready.extend(units);
+                }
+                self.inline.insert(event.id.clone());
+                out.push(event);
             }
         }
-        let waited = std::mem::take(&mut self.waiting);
-        let fresh = ready.len();
-        ready.extend(waited);
-        let total = ready.len();
-        if ready.is_empty() && read == 0 {
+        self.waiting = waiting;
+        self.waiting.extend(retry);
+        if read == 0 && finished == 0 && out.is_empty() {
             return Ok(false);
         }
-        let n = self.workers.len();
-        let mut parts: Vec<Vec<Unit>> = vec![Vec::new(); n];
-        for unit in ready {
-            parts[shard_of(&unit.kind, &unit.key, n)].push(unit);
-        }
-        for (i, part) in parts.into_iter().enumerate() {
-            self.workers[i].0.send(Job::Units(part)).map_err(|e| e.to_string())?;
-        }
-        let mut sent = Vec::new();
-        let mut progressed = read > 0;
-        let mut unfinished = 0;
-        for i in 0..n {
-            match self.workers[i].1.recv().map_err(|e| e.to_string())? {
-                Reply::Done(o) => {
-                    sent.extend(o.sent);
-                    unfinished += o.waiting.len() + o.retry.len();
-                    self.stalls.extend(o.stalls);
-                    self.waiting.extend(o.waiting);
-                    self.waiting.extend(o.retry);
-                }
-                _ => return Err("worker out of step".into()),
-            }
-        }
-        progressed |= unfinished < total;
-        self.units += fresh as u64;
-        if !sent.is_empty() {
-            progressed = true;
-            for e in &sent {
+        if !out.is_empty() {
+            for e in &out {
                 self.inbox.write_all(to_json(e).as_bytes()).map_err(|e| e.to_string())?;
                 self.inbox.write_all(b"\n").map_err(|e| e.to_string())?;
             }
@@ -441,6 +486,7 @@ impl Lane {
         let mut held: Vec<Unit> = self.clocked.values().cloned().collect();
         held.extend(self.waiting.iter().cloned());
         let place = serde_json::to_string(&Place { offset: self.offset, max_external: self.max_external, held }).map_err(|e| e.to_string())?;
+        let n = self.workers.len();
         for i in (0..n).rev() {
             let meta = (i == 0).then(|| place.clone());
             self.workers[i].0.send(Job::Commit(meta)).map_err(|e| e.to_string())?;
@@ -449,7 +495,7 @@ impl Lane {
                 _ => return Err("worker out of step".into()),
             }
         }
-        Ok(progressed)
+        Ok(true)
     }
 
     /// Runs rounds until nothing is left to do.
