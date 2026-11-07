@@ -300,7 +300,8 @@ pub(crate) fn occurrences(filter: &str) -> String {
 }
 
 /// Every occurrence of the hearings `filter` picks, whether known now or only before an
-/// amendment superseded them: each row also carries its hearing's `until`.
+/// amendment superseded them: each row also carries its hearing's `until`. `CROSS JOIN` keeps
+/// the hearing first, so each alias is a seek on its line and identity, not a scan of its line.
 fn known_occurrences(filter: &str) -> String {
     let hearing = "h.arrived, h.identity, h.event AS name, h.source, h.valid, \
                    h.recorded, h.properties, h.until";
@@ -308,7 +309,7 @@ fn known_occurrences(filter: &str) -> String {
         "(SELECT {hearing}, h.axis AS axis, h.known AS known, h.event AS event FROM _hearings h \
          WHERE {filter} \
          UNION ALL SELECT {hearing}, a.axis, a.known, a.alias FROM _hearings h \
-         JOIN _aliases a ON a.line = h.line AND a.identity = h.identity WHERE {filter})"
+         CROSS JOIN _aliases a ON a.line = h.line AND a.identity = h.identity WHERE {filter})"
     )
 }
 
