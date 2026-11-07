@@ -262,6 +262,8 @@ pub struct Runtime {
     /// recognise it as handed.
     checkpointed_at: i64,
     pub checkpoints: u64,
+    /// Where a resumed runtime's last run stopped: an event at or before it was handled then.
+    resumed_at: Option<(i64, String)>,
 }
 
 impl std::fmt::Debug for Runtime {
@@ -307,6 +309,7 @@ impl Runtime {
             durable_last: None,
             checkpointed_at: i64::MIN,
             checkpoints: 0,
+            resumed_at: None,
         };
         if let Some(dir) = dir {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
@@ -315,6 +318,7 @@ impl Runtime {
                 && let Ok(s) = serde_json::from_str::<State>(&text)
             {
                 runtime.last = s.last.clone();
+                runtime.resumed_at = s.last.clone();
                 runtime.durable_last = s.last;
                 runtime.max_external = s.max_external;
             }
@@ -379,7 +383,7 @@ impl Runtime {
             self.duplicates += 1;
             return Ok(());
         }
-        if self.durable_last.as_ref().is_some_and(|last| key <= *last) {
+        if self.resumed_at.as_ref().is_some_and(|last| key <= *last) {
             self.skipped += 1;
             return Ok(());
         }
