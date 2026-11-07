@@ -493,14 +493,21 @@ impl Lane {
         let mut held: Vec<Unit> = self.clocked.values().cloned().collect();
         held.extend(self.waiting.iter().cloned());
         let place = serde_json::to_string(&Place { offset: self.offset, max_external: self.max_external, held }).map_err(|e| e.to_string())?;
+        // The other shards commit together; the first shard, which holds the lane's place, last.
         let n = self.workers.len();
-        for i in (0..n).rev() {
-            let meta = (i == 0).then(|| place.clone());
-            self.workers[i].0.send(Job::Commit(meta)).map_err(|e| e.to_string())?;
+        for i in 1..n {
+            self.workers[i].0.send(Job::Commit(None)).map_err(|e| e.to_string())?;
+        }
+        for i in 1..n {
             match self.workers[i].1.recv().map_err(|e| e.to_string())? {
                 Reply::Committed(r) => r?,
                 _ => return Err("worker out of step".into()),
             }
+        }
+        self.workers[0].0.send(Job::Commit(Some(place))).map_err(|e| e.to_string())?;
+        match self.workers[0].1.recv().map_err(|e| e.to_string())? {
+            Reply::Committed(r) => r?,
+            _ => return Err("worker out of step".into()),
         }
         Ok(true)
     }
