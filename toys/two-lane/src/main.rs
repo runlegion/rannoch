@@ -419,7 +419,13 @@ fn extended_world(seed: &Connection, orders: usize, with_flows: bool) -> Result<
 fn fast(westwind: &Path, out: &Path) -> Result<()> {
     let seed = rows::load_seed(westwind)?;
     let (lines, orders) = extended_world(&seed, usize::MAX, false)?;
-    println!("extended, fast lane only: {} events, {orders} orders; {}; load {}", lines.len(), building(), load_average());
+    println!(
+        "extended, fast lane only: {} events, {orders} orders, batches of {}; {}; load {}",
+        lines.len(),
+        std::env::var("TWO_LANE_BATCH").unwrap_or_else(|_| "4096".into()),
+        building(),
+        load_average()
+    );
     let mut results = Vec::new();
     for (run, log) in [(0, false), (0, true), (1, false), (1, true)] {
         let dir = fresh(out, &format!("fast-{}-{run}", if log { "log" } else { "nolog" }))?;
@@ -433,7 +439,8 @@ fn fast(westwind: &Path, out: &Path) -> Result<()> {
         println!("  load starting (log {log}, run {run}); {}; load {}", building(), load_average());
         let t = Instant::now();
         let mut lags = Vec::new();
-        for (i, chunk) in lines.chunks(4096).enumerate() {
+        let batch = std::env::var("TWO_LANE_BATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(4096);
+        for (i, chunk) in lines.chunks(batch).enumerate() {
             let refs: Vec<&str> = chunk.iter().map(String::as_str).collect();
             lane.take(&refs)?;
             while lane.round()? {}

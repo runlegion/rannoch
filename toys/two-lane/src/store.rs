@@ -96,10 +96,10 @@ impl std::fmt::Debug for Shard {
 
 const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS rows(kind TEXT NOT NULL, key TEXT NOT NULL, event TEXT NOT NULL, time INTEGER NOT NULL,
-        body TEXT NOT NULL, PRIMARY KEY(kind, key)) WITHOUT ROWID;
-    CREATE TABLE IF NOT EXISTS edges(src_kind TEXT NOT NULL, src TEXT NOT NULL, rel TEXT NOT NULL, dst_kind TEXT NOT NULL,
-        dst TEXT NOT NULL, event TEXT NOT NULL, PRIMARY KEY(src_kind, src, rel, dst_kind, dst)) WITHOUT ROWID;
-    CREATE INDEX IF NOT EXISTS edges_to ON edges(dst_kind, dst, rel);
+        body TEXT NOT NULL, UNIQUE(kind, key));
+    CREATE TABLE IF NOT EXISTS edges(src TEXT NOT NULL, rel TEXT NOT NULL, dst TEXT NOT NULL,
+        PRIMARY KEY(src, rel, dst)) WITHOUT ROWID;
+    CREATE INDEX IF NOT EXISTS edges_to ON edges(dst, rel);
     CREATE TABLE IF NOT EXISTS host(action TEXT NOT NULL, event TEXT NOT NULL, answer TEXT NOT NULL,
         PRIMARY KEY(action, event)) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT NOT NULL) WITHOUT ROWID;";
@@ -109,6 +109,7 @@ impl Shard {
     /// The file cannot be opened.
     pub fn open(path: &Path) -> Result<Shard, String> {
         let conn = Connection::open(path).map_err(|e| e.to_string())?;
+        conn.busy_timeout(std::time::Duration::from_secs(30)).map_err(|e| e.to_string())?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA fullfsync=ON;").map_err(|e| e.to_string())?;
         conn.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
         Ok(Shard { conn, cache: HashMap::new(), dirty: BTreeSet::new(), edges: Vec::new(), answers: Vec::new(), writes: 0 })
@@ -184,9 +185,10 @@ impl Shard {
                     self.writes += 1;
                 }
             }
-            let mut edge = tx.prepare_cached("INSERT OR IGNORE INTO edges VALUES (?1, ?2, ?3, ?4, ?5, ?6)").map_err(err)?;
+            // An edge's relation names the kinds at both ends, so the edge holds only the keys.
+            let mut edge = tx.prepare_cached("INSERT OR IGNORE INTO edges VALUES (?1, ?2, ?3)").map_err(err)?;
             for e in &self.edges {
-                edge.execute(params![e.0, e.1, e.2, e.3, e.4, e.5]).map_err(err)?;
+                edge.execute(params![e.1, format!("{}.{}.{}", e.0, e.2, e.3), e.4]).map_err(err)?;
             }
             let mut host = tx.prepare_cached("INSERT OR IGNORE INTO host VALUES (?1, ?2, ?3)").map_err(err)?;
             for ((action, event), answer) in &self.answers {
@@ -222,8 +224,8 @@ impl Shard {
             out.push_str(&r.map_err(err)?);
             out.push('\n');
         }
-        let mut st = self.conn.prepare("SELECT src_kind, src, rel, dst_kind, dst FROM edges ORDER BY 1, 2, 3, 4, 5").map_err(err)?;
-        let rows = st.query_map([], |r| Ok(format!("{}|{}|{}|{}|{}", r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, String>(4)?))).map_err(err)?;
+        let mut st = self.conn.prepare("SELECT src, rel, dst FROM edges ORDER BY 1, 2, 3").map_err(err)?;
+        let rows = st.query_map([], |r| Ok(format!("{}|{}|{}", r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))).map_err(err)?;
         for r in rows {
             out.push_str(&r.map_err(err)?);
             out.push('\n');

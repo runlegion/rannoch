@@ -197,8 +197,10 @@ fn shard_of(kind: &str, key: &str, n: usize) -> usize {
     usize::try_from(h.finish() % n as u64).unwrap_or(0)
 }
 
-/// Lines a round reads at most.
-const ROUND: usize = 4096;
+/// Lines a round reads at most: `TWO_LANE_BATCH`, else 4096.
+fn round_lines() -> usize {
+    std::env::var("TWO_LANE_BATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(4096)
+}
 
 impl Lane {
     /// Opens the lane in `dir` with `workers` shards, resuming from what is durable there.
@@ -229,6 +231,7 @@ impl Lane {
         }
         let inbox_file = OpenOptions::new().create(true).append(true).open(&inbox_path).map_err(|e| e.to_string())?;
         let inbox = BufWriter::with_capacity(1 << 20, inbox_file.try_clone().map_err(|e| e.to_string())?);
+        let place: Place = Shard::open(&dir.join("shard-0.db"))?.meta().and_then(|m| serde_json::from_str(&m).ok()).unwrap_or_default();
         let mut started = Vec::new();
         for n in 0..workers {
             let (tx, rx) = channel();
@@ -238,7 +241,6 @@ impl Lane {
             let handle = std::thread::spawn(move || worker(path, f, 2 * lateness, rx, rtx));
             started.push((tx, rrx, handle));
         }
-        let place: Place = Shard::open(&dir.join("shard-0.db"))?.meta().and_then(|m| serde_json::from_str(&m).ok()).unwrap_or_default();
         let mut reader = BufReader::with_capacity(1 << 20, File::open(&inbox_path).map_err(|e| e.to_string())?);
         reader.seek(SeekFrom::Start(place.offset)).map_err(|e| e.to_string())?;
         let log = if log {
@@ -388,7 +390,8 @@ impl Lane {
         let mut line = String::new();
         let mut first_time: Option<i64> = None;
         let mut read = 0;
-        while read < ROUND {
+        let most = round_lines();
+        while read < most {
             line.clear();
             let n = self.reader.read_line(&mut line).map_err(|e| e.to_string())?;
             if n == 0 || !line.ends_with('\n') {
@@ -420,9 +423,12 @@ impl Lane {
                     self.max_lateness = self.max_lateness.max(max - event.time);
                 }
                 self.max_external = Some(self.max_external.map_or(event.time, |m| m.max(event.time)));
+                // With more than one shard a round is not one transaction, so it spans no more than
+                // the lateness: what a restart hands again stays inside the rows' windows. With one
+                // shard the round and the lane's place commit together.
                 let start = *first_time.get_or_insert(event.time);
-                if event.time - start > self.lateness {
-                    read = ROUND;
+                if self.workers.len() > 1 && event.time - start > self.lateness {
+                    read = most;
                 }
             }
             if let Some(units) = self.units_of(&event, &text)? {
