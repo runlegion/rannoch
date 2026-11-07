@@ -252,7 +252,7 @@ impl Handler for Declare {
 ///
 /// # Errors
 /// The store cannot be read.
-pub fn canonical(path: &Path, events: &[Event]) -> Result<String, String> {
+pub fn canonical(path: &Path, events: &[Event], with_recorded: bool) -> Result<String, String> {
     let graph = rannoch_store::open(path, &KEY).map_err(|e| e.to_string())?;
     let mut nodes = std::collections::BTreeSet::new();
     let mut links = std::collections::BTreeSet::new();
@@ -275,9 +275,16 @@ pub fn canonical(path: &Path, events: &[Event]) -> Result<String, String> {
     let err = |e: rannoch_store::Error| e.to_string();
     for (class, key) in &nodes {
         let node = NodeRef::new(class.clone(), key.clone());
+        let now = graph.find(class, key).map_err(err)?.map(|n| {
+            if with_recorded {
+                format!("{n:?}")
+            } else {
+                format!("{:?} {:?} {:?}", n.properties, n.source, n.valid)
+            }
+        });
         text.push_str(&format!(
             "node {class} {key}\n  now {:?}\n  hearings {:?}\n  seen {:?}\n",
-            graph.find(class, key).map_err(err)?,
+            now,
             graph.hearings(&node).map_err(err)?,
             graph.seen(&node).map_err(err)?,
         ));

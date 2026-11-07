@@ -10,8 +10,8 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
 use std::rc::Rc;
 
 use serde::{Deserialize, Serialize};
@@ -207,7 +207,10 @@ pub struct Runner {
     pub clock: i64,
     host: Option<Rc<RefCell<dyn Host>>>,
     pub writer: Option<Writer>,
-    history: Option<(PathBuf, BufWriter<File>)>,
+    /// The history file, and the entries since the last checkpoint. They reach the file only at
+    /// a checkpoint, after what their steps wrote to the store is committed: a history that got
+    /// ahead of the store would say a step was done that a crash undid.
+    history: Option<(File, Vec<u8>)>,
     last: Option<u64>,
     durable: Option<u64>,
     /// Every timer that fired, in the order it fired.
@@ -266,7 +269,7 @@ impl Runner {
             runner.durable = lines.iter().map(|l| l.entry.position).max();
             runner.last = runner.durable;
             let file = OpenOptions::new().create(true).append(true).open(path).map_err(|e| e.to_string())?;
-            runner.history = Some((path.to_path_buf(), BufWriter::with_capacity(1 << 20, file)));
+            runner.history = Some((file, Vec::new()));
         }
         Ok(runner)
     }
@@ -300,9 +303,9 @@ impl Runner {
     }
 
     fn write(&mut self, key: &str, entry: &Entry) -> Result<(), String> {
-        if let Some((_, file)) = &mut self.history {
+        if let Some((_, pending)) = &mut self.history {
             let line = serde_json::to_string(&Line { key: key.to_string(), entry: entry.clone() }).map_err(|e| e.to_string())?;
-            writeln!(file, "{line}").map_err(|e| e.to_string())?;
+            writeln!(pending, "{line}").map_err(|e| e.to_string())?;
         }
         Ok(())
     }
@@ -429,9 +432,11 @@ impl Runner {
             }
             "after" => {
                 let due = entry.time + row.delay_ms.unwrap_or_default();
-                instance.timers.insert((due, row.id.clone()), data);
+                // The data the timer sends is part of its result, so a rebuilt timer sends it too.
+                let result = recorded.unwrap_or_else(|| json!({"due": due, "data": data}));
+                let sends = result.get("data").cloned().unwrap_or(Value::Null);
+                instance.timers.insert((due, row.id.clone()), sends);
                 self.timers.insert((due, key.to_string(), row.id.clone()));
-                let result = recorded.unwrap_or_else(|| json!({"due": due}));
                 Ok((result.clone(), json!({"type": format!("{}.{}.set", self.flow.name, row.id), "data": result})))
             }
             "store" => {
@@ -542,8 +547,9 @@ impl Handler for Runner {
         if let Some(writer) = &mut self.writer {
             writer.checkpoint()?;
         }
-        if let Some((_, file)) = &mut self.history {
-            file.flush().map_err(|e| e.to_string())?;
+        if let Some((file, pending)) = &mut self.history {
+            file.write_all(pending).map_err(|e| e.to_string())?;
+            pending.clear();
         }
         self.durable = self.last;
         Ok(self.durable)
@@ -658,6 +664,28 @@ mod tests {
         let rebuilt = Runner::start(Flow::parse(STOCK).unwrap(), Some(host), None, Some(&path)).unwrap();
         assert_eq!(rebuilt.instances, runner.instances);
         assert_eq!(rebuilt.place(), Some(6));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_rebuilt_timer_sends_what_the_live_one_would() {
+        let dir = std::env::temp_dir().join(format!("workers-toy-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("unshipped.jsonl");
+        let mut runner = Runner::start(Flow::parse(UNSHIPPED).unwrap(), None, None, Some(&path)).unwrap();
+        let placed = Event {
+            id: "p1".into(),
+            ty: "westwind.order.placed".into(),
+            source: "t".into(),
+            subject: Some("a".into()),
+            time: 0,
+            data: json!({"id": "a", "freight": 19.9}),
+            position: 1,
+        };
+        runner.handle(&placed, &mut Vec::new()).unwrap();
+        runner.checkpoint().unwrap();
+        let rebuilt = Runner::start(Flow::parse(UNSHIPPED).unwrap(), None, None, Some(&path)).unwrap();
+        assert_eq!(rebuilt.instances, runner.instances);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

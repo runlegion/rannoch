@@ -136,7 +136,9 @@ fn ids(events: &[Event]) -> Vec<String> {
 fn rebuilt(flow: &str, dir: &Path, host: Rc<RefCell<dyn Host>>) -> Result<String> {
     let (text, file) = if flow == "stock" { (STOCK, "stock.history.jsonl") } else { (UNSHIPPED, "unshipped.history.jsonl") };
     let runner = Runner::start(Flow::parse(text)?, Some(host), None, Some(&dir.join(file)))?;
-    Ok(state(&runner))
+    let state = state(&runner);
+    std::fs::write(dir.join(format!("{flow}-rebuilt.txt")), &state).map_err(|e| e.to_string())?;
+    Ok(state)
 }
 
 fn state(runner: &Runner) -> String {
@@ -233,20 +235,28 @@ struct Outcome {
     name: String,
     file: String,
     westwind: String,
+    unrecorded: String,
     unshipped_nodes: String,
     stock: Option<String>,
     unshipped: String,
     fired: String,
 }
 
-fn store_text(path: &Path, events: &[Event], unshipped_keys: &[String]) -> Result<(String, String)> {
-    let westwind = canonical(path, events)?;
+fn store_text(path: &Path, events: &[Event], unshipped_keys: &[String]) -> Result<(String, String, String)> {
+    let westwind = canonical(path, events, true)?;
+    let unrecorded = canonical(path, events, false)?;
     let graph = rannoch_store::open(path, &store::KEY).map_err(|e| e.to_string())?;
     let mut nodes = String::new();
     for key in unshipped_keys {
-        nodes.push_str(&format!("{key} {:?}\n", graph.find("unshipped_order", key).map_err(|e| e.to_string())?));
+        let node = graph.find("unshipped_order", key).map_err(|e| e.to_string())?;
+        nodes.push_str(&format!("{key} {:?}\n", node.map(|n| (n.properties, n.source))));
     }
-    Ok((westwind, nodes))
+    if let Some(dir) = path.parent() {
+        for (file, text) in [("graph.txt", &westwind), ("graph-unrecorded.txt", &unrecorded), ("unshipped-nodes.txt", &nodes)] {
+            std::fs::write(dir.join(file), text).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok((westwind, unrecorded, nodes))
 }
 
 /// Runs `events` into one store `times` times over, in process.
@@ -265,12 +275,13 @@ fn replay_in_process(name: &str, events: &[Event], times: u64, conn: &rusqlite::
     let unshipped_rebuilt = rebuilt("unshipped", &dir, host.clone())?;
     let fired = fired_of(&dir)?;
     drop(run);
-    let (westwind, nodes) = store_text(&path, events, keys)?;
+    let (westwind, unrecorded, nodes) = store_text(&path, events, keys)?;
     println!("  {name}: {times} pass(es) in {seconds:.1}s");
     Ok(Outcome {
         name: name.to_string(),
         file: file_hash(&path)?[..16].to_string(),
         westwind: digest(&westwind),
+        unrecorded: digest(&unrecorded),
         unshipped_nodes: digest(&nodes),
         stock: Some(digest(&stock_rebuilt)),
         unshipped: digest(&unshipped_rebuilt),
@@ -337,7 +348,7 @@ fn replay_killed(name: &str, westwind: &Path, out: &Path, order: &str, kills: u3
         return Err(format!("{name}: the last child failed: {status}"));
     }
     let path = dir.join("store.rannoch");
-    let (westwind_text, nodes) = store_text(&path, events, keys)?;
+    let (westwind_text, unrecorded, nodes) = store_text(&path, events, keys)?;
     let host: Rc<RefCell<dyn Host>> = Rc::new(RefCell::new(Warehouse::default()));
     let unshipped = rebuilt("unshipped", &dir, host)?;
     Ok((
@@ -345,6 +356,7 @@ fn replay_killed(name: &str, westwind: &Path, out: &Path, order: &str, kills: u3
             name: name.to_string(),
             file: file_hash(&path)?[..16].to_string(),
             westwind: digest(&westwind_text),
+            unrecorded: digest(&unrecorded),
             unshipped_nodes: digest(&nodes),
             stock: None,
             unshipped: digest(&unshipped),
@@ -386,12 +398,13 @@ fn replay_stopped(name: &str, events: &[Event], conn: &rusqlite::Connection, out
     }
     let stock = rebuilt("stock", &dir, host.clone())?;
     let unshipped = rebuilt("unshipped", &dir, host.clone())?;
-    let (westwind_text, nodes) = store_text(&path, events, keys)?;
+    let (westwind_text, unrecorded, nodes) = store_text(&path, events, keys)?;
     println!("  {name}: {stops} stops; handed {live}");
     Ok(Outcome {
         name: name.to_string(),
         file: file_hash(&path)?[..16].to_string(),
         westwind: digest(&westwind_text),
+        unrecorded: digest(&unrecorded),
         unshipped_nodes: digest(&nodes),
         stock: Some(digest(&stock)),
         unshipped: digest(&unshipped),
@@ -425,7 +438,9 @@ fn replays(westwind: &Path, out: &Path) -> Result<()> {
     }
     run.runtime.checkpoint()?;
     for name in ["stock", "unshipped"] {
-        live_states.insert(name, snapshot(&run.runtime, name).ok_or("no snapshot")?);
+        let live = snapshot(&run.runtime, name).ok_or("no snapshot")?;
+        std::fs::write(dir.join(format!("{name}-live.txt")), &live).map_err(|e| e.to_string())?;
+        live_states.insert(name, live);
     }
     drop(run);
     for name in ["stock", "unshipped"] {
@@ -448,13 +463,17 @@ fn replays(westwind: &Path, out: &Path) -> Result<()> {
     println!("  killed-shuffled-1: {landed} of 6 kills landed mid-run");
     outcomes.push(killed);
 
-    println!("\n{:22} {:17} {:17} {:17} {:17} {:17} {:17}", "run", "file sha256", "westwind graph", "unshipped nodes", "stock flow", "unshipped flow", "timers fired");
+    println!(
+        "\n{:22} {:17} {:17} {:17} {:17} {:17} {:17} {:17}",
+        "run", "file sha256", "graph as read", "graph - recorded", "unshipped nodes", "stock flow", "unshipped flow", "timers fired"
+    );
     for o in &outcomes {
         println!(
-            "{:22} {:17} {:17} {:17} {:17} {:17} {:17}",
+            "{:22} {:17} {:17} {:17} {:17} {:17} {:17} {:17}",
             o.name,
             o.file,
             o.westwind,
+            o.unrecorded,
             o.unshipped_nodes,
             o.stock.as_deref().unwrap_or("-"),
             o.unshipped,
