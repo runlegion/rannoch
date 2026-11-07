@@ -1,0 +1,38 @@
+disk's durable append rate (3.3 KB records, 4,096 per sync): 500.3 MB/s; nothing else building; load { 3.96 3.13 3.09 }
+  build stream, log false, run 0: starting; nothing else building; load { 3.96 3.13 3.09 }
+P1/P2 build 1: 200000 objects sent, 200000 versions written, generator changed 200000; store grew 699.6 MB for 595.6 MB changed (1.17x); 9.2s = 21666 objects/s, 71.5 MB/s
+P1/P2 build 2: 200000 objects sent, 8000 versions written, generator changed 8000; store grew 27.6 MB for 23.8 MB changed (1.16x); 6.2s = 32307 objects/s, 106.6 MB/s
+P1/P2 build 3: 200000 objects sent, 10000 versions written, generator changed 10000; store grew 34.5 MB for 29.8 MB changed (1.16x); 6.5s = 30999 objects/s, 102.3 MB/s
+P1/P2 build 4: 202000 objects sent, 12000 versions written, generator changed 12000; store grew 42.7 MB for 35.7 MB changed (1.19x); 6.8s = 29670 objects/s, 97.9 MB/s
+P1/P2 build 5: 200000 objects sent, 10000 versions written, generator changed 10000; store grew 34.9 MB for 29.8 MB changed (1.17x); 6.5s = 30590 objects/s, 100.9 MB/s
+P1/P2 build 6: 200000 objects sent, 8000 versions written, generator changed 8000; store grew 27.9 MB for 23.8 MB changed (1.17x); 6.7s = 30036 objects/s, 99.1 MB/s
+  run total 41.9s; nothing else building; load { 3.78 3.19 3.11 }
+  build stream, log true, run 0: starting; nothing else building; load { 3.78 3.19 3.11 }
+P1/P2 build 1: 200000 objects sent, 200000 versions written, generator changed 200000; store grew 699.6 MB for 595.6 MB changed (1.17x); 9.2s = 21825 objects/s, 72.0 MB/s
+P1/P2 build 2: 200000 objects sent, 8000 versions written, generator changed 8000; store grew 27.6 MB for 23.8 MB changed (1.16x); 6.3s = 31971 objects/s, 105.5 MB/s
+P1/P2 build 3: 200000 objects sent, 10000 versions written, generator changed 10000; store grew 34.5 MB for 29.8 MB changed (1.16x); 6.6s = 30209 objects/s, 99.7 MB/s
+P1/P2 build 4: 202000 objects sent, 12000 versions written, generator changed 12000; store grew 42.7 MB for 35.7 MB changed (1.19x); 7.0s = 28996 objects/s, 95.7 MB/s
+P1/P2 build 5: 200000 objects sent, 10000 versions written, generator changed 10000; store grew 34.9 MB for 29.8 MB changed (1.17x); 6.8s = 29344 objects/s, 96.8 MB/s
+P1/P2 build 6: 200000 objects sent, 8000 versions written, generator changed 8000; store grew 27.9 MB for 23.8 MB changed (1.17x); 6.9s = 29066 objects/s, 95.9 MB/s
+  run total 42.7s; nothing else building; load { 4.01 3.32 3.16 }
+  build stream, log false, run 1: starting; nothing else building; load { 4.01 3.32 3.16 }
+P1/P2 build 1: 200000 objects sent, 200000 versions written, generator changed 200000; store grew 699.6 MB for 595.6 MB changed (1.17x); 9.2s = 21844 objects/s, 72.1 MB/s
+P1/P2 build 2: 200000 objects sent, 8000 versions written, generator changed 8000; store grew 27.6 MB for 23.8 MB changed (1.16x); 6.2s = 32381 objects/s, 106.9 MB/s
+P1/P2 build 3: 200000 objects sent, 10000 versions written, generator changed 10000; store grew 34.5 MB for 29.8 MB changed (1.16x); 6.4s = 31110 objects/s, 102.7 MB/s
+P1/P2 build 4: 202000 objects sent, 12000 versions written, generator changed 12000; store grew 42.7 MB for 35.7 MB changed (1.19x); 6.8s = 29823 objects/s, 98.4 MB/s
+P1/P2 build 5: 200000 objects sent, 10000 versions written, generator changed 10000; store grew 34.9 MB for 29.8 MB changed (1.17x); 6.6s = 30416 objects/s, 100.4 MB/s
+P1/P2 build 6: 200000 objects sent, 8000 versions written, generator changed 8000; store grew 27.9 MB for 23.8 MB changed (1.17x); 6.6s = 30300 objects/s, 100.0 MB/s
+  run total 41.7s; nothing else building; load { 3.95 3.39 3.20 }
+  build stream, log true, run 1: starting; nothing else building; load { 3.95 3.39 3.20 }
+P1/P2 build 1: 200000 objects sent, 200000 versions written, generator changed 200000; store grew 699.6 MB for 595.6 MB changed (1.17x); 9.1s = 21940 objects/s, 72.4 MB/s
+P1/P2 build 2: 200000 objects sent, 8000 versions written, generator changed 8000; store grew 27.6 MB for 23.8 MB changed (1.16x); 6.2s = 32191 objects/s, 106.2 MB/s
+P1/P2 build 3: 200000 objects sent, 10000 versions written, generator changed 10000; store grew 34.5 MB for 29.8 MB changed (1.16x); 6.6s = 30241 objects/s, 99.8 MB/s
+P1/P2 build 4: 202000 objects sent, 12000 versions written, generator changed 12000; store grew 42.7 MB for 35.7 MB changed (1.19x); 6.9s = 29235 objects/s, 96.5 MB/s
+P1/P2 build 5: 200000 objects sent, 10000 versions written, generator changed 10000; store grew 34.9 MB for 29.8 MB changed (1.17x); 6.8s = 29494 objects/s, 97.3 MB/s
+P1/P2 build 6: 200000 objects sent, 8000 versions written, generator changed 8000; store grew 27.9 MB for 23.8 MB changed (1.17x); 7.1s = 28191 objects/s, 93.0 MB/s
+  run total 42.7s; nothing else building; load { 4.13 3.54 3.26 }
+P10 log on against off, whole stream: +2.2% (mean of 2 interleaved runs each)
+P4 as-of reads equal to the generator: 1200000 of 1200000 (every object at every build)
+P4 single-key as-of read: p50 0.012 ms, p99 0.015 ms over 20,000 random reads; load { 4.08 3.56 3.27 }
+P5 fix-pass objects as known before the fix: 2000 of 2000 give the earlier answer; as known after: 2000 of 2000 the fixed one
+P6 every read above ran with log.jsonl and hearings.db moved out of the lane's directory

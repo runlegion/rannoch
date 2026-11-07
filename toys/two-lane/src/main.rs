@@ -247,11 +247,11 @@ fn run(westwind: &Path, out: &Path) -> Result<()> {
     let count = |sql: &str| -> Result<i64> { shard.conn().query_row(sql, [], |r| r.get(0)).map_err(|e| e.to_string()) };
     println!(
         "    rows {} (Oz {}), edges {}; host answers kept: triage {}; Hodor's identical tickets: {} rows",
-        count("SELECT COUNT(*) FROM rows")?,
-        count("SELECT COUNT(*) FROM rows WHERE kind LIKE 'oz_%'")?,
+        count("SELECT COUNT(*) FROM (SELECT DISTINCT kind, key FROM versions)")?,
+        count("SELECT COUNT(*) FROM (SELECT DISTINCT kind, key FROM versions WHERE kind LIKE 'oz_%')")?,
         count("SELECT COUNT(*) FROM edges")?,
         shard.answers_kept("triage"),
-        count("SELECT COUNT(*) FROM rows WHERE kind = 'westwind_ticket' AND body LIKE '%Hodor. Hodor hodor.%'")?
+        count("SELECT COUNT(DISTINCT key) FROM versions WHERE kind = 'westwind_ticket' AND body LIKE '%Hodor. Hodor hodor.%'")?
     );
     let triaged = host::effects().iter().filter(|((a, _), _)| a == "triage").map(|(_, n)| *n).collect::<Vec<_>>();
     println!("    triage work per ticket in this process: {triaged:?}");
@@ -268,7 +268,8 @@ fn run(westwind: &Path, out: &Path) -> Result<()> {
     let (found, absent, memory) = lane.reads()?;
     println!("reads of the row store: {found} rows read back, {absent} looked for and not yet there, {memory} handed from memory");
     let text = lane.text()?;
-    println!("rows {}, outcomes {}", digest(&text), digest(&outcome_text(&dir)?));
+    let versions: i64 = shard.conn().query_row("SELECT COUNT(*) FROM versions", [], |r| r.get(0)).map_err(|e| e.to_string())?;
+    println!("versions written {versions}; rows {}, outcomes {}", digest(&text), digest(&outcome_text(&dir)?));
     Ok(())
 }
 

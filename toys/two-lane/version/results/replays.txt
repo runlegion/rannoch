@@ -1,0 +1,10 @@
+nothing else building; load { 3.50 3.03 3.09 }
+
+run                                  rows              emitted           outcomes           note
+in order                             5a5577901c0814ca  dc0204f060c0ffd3  a8184fc0102a6e76   37 rounds
+killed x10, in                       5a5577901c0814ca  dc0204f060c0ffd3  a8184fc0102a6e76   10 children of 10 died mid-run (each aborted after a random 1 to 3 rounds of what was left); host triage answers kept 5
+killed x10, shuffled:1               5a5577901c0814ca  dc0204f060c0ffd3  a8184fc0102a6e76   10 children of 10 died mid-run (each aborted after a random 1 to 3 rounds of what was left); host triage answers kept 5
+shuffled within lateness, seed 1     5a5577901c0814ca  dc0204f060c0ffd3  a8184fc0102a6e76   largest lateness 1.62 days; bins {"another domain": 4, "later than the declared lateness": 2, "malformed": 4}
+shuffled within lateness, seed 2     5a5577901c0814ca  dc0204f060c0ffd3  a8184fc0102a6e76   largest lateness 1.67 days; bins {"another domain": 4, "later than the declared lateness": 2, "malformed": 4}
+shuffled within lateness, seed 3     5a5577901c0814ca  dc0204f060c0ffd3  a8184fc0102a6e76   largest lateness 1.62 days; bins {"another domain": 4, "later than the declared lateness": 2, "malformed": 4}
+in order, 4 workers                  45c4a22dbda5aa6b  dc0204f060c0ffd3  a8184fc0102a6e76   

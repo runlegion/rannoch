@@ -155,7 +155,8 @@ impl Shard {
         conn.busy_timeout(std::time::Duration::from_secs(30)).map_err(|e| e.to_string())?;
         // Versions of 3 KB objects fit one to a 4 KB page with most of a page left over; a
         // larger page packs them. Set before the file has a journal, so it takes.
-        conn.execute_batch("PRAGMA page_size=65536;").map_err(|e| e.to_string())?;
+        let page = std::env::var("TWO_LANE_PAGE").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(65536);
+        conn.execute_batch(&format!("PRAGMA page_size={page};")).map_err(|e| e.to_string())?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA fullfsync=ON;").map_err(|e| e.to_string())?;
         conn.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
         Ok(Shard { conn, cache: HashMap::new(), versions: Vec::new(), edges: Vec::new(), answers: Vec::new(), writes: 0, found: 0, absent: 0, from_memory: 0 })
