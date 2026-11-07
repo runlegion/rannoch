@@ -168,6 +168,26 @@ Nothing else was building during any run. The machine's load average still ran f
 
 The event-shaped load took 357.30 s for 753,806 events (load 6.84 at the start, 4.46 at the end), and fill stopped on no events. An order node holds its lines as JSON text, which rannoch keeps three times: the log body, the hearing's properties and the class table. Each order also adds one edge to its customer and one per product, about 3.5 more rannoch events per order, each with its own log body and hearing. Shaping events after the business does not make rannoch's store cheaper per order. Its cost per fact, which the graph-vs-relational toy measured, is still where the time and bytes go.
 
+## Finding: rannoch has no structured property type, so an order's lines are JSON text
+
+On 7aa6841 a property is text, integer, decimal, float or a float vector, and a link carries no properties. An order that "is a node with its lines" therefore holds its lines as one JSON text property, and the store cannot see inside it. What that costs, measured with the `sqlite3` shell on P13's extended store (400,839 orders) against the graph-vs-relational toy's relational file (load 4.8, nothing else building):
+
+| read | rannoch, lines as JSON text | relational, indexed `order_details` |
+|---|---|---|
+| one product's lines and total quantity (50,000 lines) | 0.82 s warm, 10.94 s cold (a `json_each` over every order's lines) | 0.05 s warm, 2.52 s cold |
+| the orders that hold that product | 0.07 s, through the `westwind_contains` edge (orders only, no quantity) | |
+| one order's lines, by its key | under 0.01 s (one row, then parse its JSON) | under 0.01 s |
+
+- **Reading by order** costs nothing extra.
+- **Reading a line by anything else** is a scan of every order's JSON: 16 times slower than relational when warm. The scan pays for the lines being stored three times: in the log body, the hearing's properties and the class table.
+- **The edges help only for "which orders":** they say an order holds a product, not how many.
+- **What it costs the stock flow:** stock cannot be read from the store. A line's product and quantity reach the stock flow only inside events: `order.accepted` fans out into `line.requested`, one per line. Each product's stock, and the lines waiting on it, live in that flow instance's variables, not in the store.
+  - The store holds no line-level fact that the stock flow, or any reader, could query or index.
+  - The waiting list grows inside the instance's carried state.
+- **What would change it:** a structured property type, or links that carry properties, let a line be a fact of its own without being a node.
+
+The domain check reads the event itself, its type and its source, at the entrance, before anything is routed or written. P4's counts are taken against that check. The class prefix only says where a fact lands once its event has passed.
+
 ## What breaks the idea
 
 - **An event lands in another ontology's graph.** It did not: 0 hearings across domains, and all 4 cross-domain events binned.
