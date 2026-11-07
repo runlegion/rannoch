@@ -1,0 +1,3 @@
+{"flow": "stock", "correlation": {"westwind.order_line.added": "/product_id"}}
+{"id": "line", "on": "westwind.order_line.added", "step": "host", "action": "take_stock", "next": "low"}
+{"id": "low", "guard": {"data": {"crossed": true}}, "step": "emit", "type": "westwind.stock.low"}

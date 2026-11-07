@@ -1,0 +1,5 @@
+{"flow": "unshipped", "correlation": {"westwind.order.placed": "/id", "westwind.order.shipped": "/id", "westwind.order.due": "/id"}}
+{"id": "placed", "on": "westwind.order.placed", "step": "after", "delay_ms": 2592000000, "type": "westwind.order.due"}
+{"id": "shipped", "on": "westwind.order.shipped"}
+{"id": "due", "on": "westwind.order.due", "guard": {"unseen": "westwind.order.shipped"}, "step": "emit", "type": "westwind.order.unshipped", "next": "record"}
+{"id": "record", "step": "store", "class": "unshipped_order", "properties": {"order_date": "/order_date", "customer_id": "/customer_id"}}
