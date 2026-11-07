@@ -1,0 +1,7 @@
+extended: 1754619 events, 1754602 rows; load { 4.91 5.68 6.67 }
+  relational load starting [run 0]; nothing else building; load { 4.91 5.68 6.67 }
+  relational load: 21.35s, 82198 rows/s [run 0]; load { 5.10 5.66 6.63 }
+  nodes-only load starting [run 0]; nothing else building; load { 5.10 5.66 6.63 }
+  nodes-only load: 369.26s, 4752 rows/s [run 0]; load { 6.91 5.66 6.22 }
+  graph load starting [run 0]; also running: cargo,clang,clang; load { 6.91 5.66 6.22 }
+stopped at the lead's request (rannoch #217, #218 about to build); load at stop { 6.48 5.66 6.21 }

@@ -1,0 +1,7 @@
+relational (relational) load starting: 1754602 rows; nothing else building; load { 4.72 5.71 6.24 }
+relational load: 22.59s, 77688 rows/s; nothing else building; load { 4.86 5.67 6.21 }
+relational on disk: 470917120 bytes (470.9 MB)
+nodes-7aa6841 (nodes-only) load starting: 1754602 rows; nothing else building; load { 5.11 5.71 6.22 }
+nodes-7aa6841 load: 234.17s, 7493 rows/s; nothing else building; load { 4.28 4.90 5.72 }
+nodes-7aa6841 on disk: 2634719232 bytes (2634.7 MB)
+graph-fabf9fd (graph) load starting: 1754602 rows; nothing else building; load { 4.28 4.90 5.72 }

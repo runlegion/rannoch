@@ -788,6 +788,53 @@ fn compare_run(westwind: &Path, out: &Path, which: &str, runs: usize) -> Result<
     Ok(())
 }
 
+fn version_named(name: &str) -> Result<compare::Version> {
+    compare::Version::ALL.into_iter().find(|v| v.name() == name).ok_or_else(|| format!("no version {name}"))
+}
+
+/// Loads the extended log into one version at `dir/<label>.db`, in a process of its own.
+fn compare_load(westwind: &Path, dir: &Path, version: &str, label: &str) -> Result<()> {
+    let version = version_named(version)?;
+    let conn = load_seed(westwind)?;
+    let events = extended_events(&conn, 1_000_000)?;
+    let rows = events.iter().filter(|e| e.ty != "westwind.ontology.declared").count();
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let path = dir.join(format!("{label}.db"));
+    println!("{label} ({}) load starting: {rows} rows; {}; load {}", version.name(), building(), load_average());
+    let seconds = compare::load(version, &path, &events)?;
+    println!("{label} load: {seconds:.2}s, {:.0} rows/s; {}; load {}", rows as f64 / seconds, building(), load_average());
+    let bytes = compare::size(&path)?;
+    println!("{label} on disk: {bytes} bytes ({:.1} MB)", bytes as f64 / 1e6);
+    Ok(())
+}
+
+/// Answers every scenario on each `label=version:path`, and says whether they all agree.
+fn compare_ask(westwind: &Path, specs: &[String]) -> Result<()> {
+    let conn = load_seed(westwind)?;
+    let mut targets = Vec::new();
+    for spec in specs {
+        let (label, rest) = spec.split_once('=').ok_or("label=version:path")?;
+        let (version, path) = rest.split_once(':').ok_or("label=version:path")?;
+        let c = rusqlite::Connection::open(path).map_err(|e| e.to_string())?;
+        targets.push((label.to_string(), version_named(version)?, c));
+    }
+    let relational = &targets.iter().find(|t| t.1 == compare::Version::Relational).ok_or("no relational")?.2;
+    let inputs = compare::inputs(&conn, relational)?;
+    println!("inputs {inputs:?}; {}; load {}", building(), load_average());
+    for name in compare::SCENARIOS {
+        let mut answers = Vec::new();
+        let mut line = format!("{name:7}");
+        for (label, version, c) in &targets {
+            let (rows, ms) = compare::answer(c, *version, name, &inputs, 20)?;
+            line.push_str(&format!(" | {label} {ms:.3} ms"));
+            answers.push(rows);
+        }
+        let agree = answers.windows(2).all(|w| w[0] == w[1]);
+        println!("{line} | {} rows | all agree: {agree} | load {}", answers[0].len(), load_average());
+    }
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let arg = |i: usize| args.get(i).map(PathBuf::from).unwrap_or_default();
@@ -801,6 +848,8 @@ fn main() {
         }
         Some("rebuild") => rebuild(&arg(3)),
         Some("compare") => compare_run(&arg(2), &arg(3), args.get(4).map_or("seed", String::as_str), args.get(5).and_then(|s| s.parse().ok()).unwrap_or(1)),
+        Some("compare-load") => compare_load(&arg(2), &arg(3), args.get(4).map_or("", String::as_str), args.get(5).map_or("", String::as_str)),
+        Some("compare-ask") => compare_ask(&arg(2), &args[3.min(args.len())..]),
         Some("child") => child(&arg(2), &arg(3), args.get(4).map_or("in", String::as_str)),
         _ => Err("usage: workers-toy correct|replays|speed|rebuild <westwind dir> <out dir>".into()),
     };

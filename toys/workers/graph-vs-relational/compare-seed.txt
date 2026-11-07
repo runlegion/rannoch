@@ -1,0 +1,30 @@
+seed: 1496 events, 1479 rows; load { 4.99 5.72 6.70 }
+  relational load starting [run 0]; nothing else building; load { 4.99 5.72 6.70 }
+  relational load: 0.01s, 130126 rows/s [run 0]; load { 4.99 5.72 6.70 }
+  nodes-only load starting [run 0]; nothing else building; load { 4.99 5.72 6.70 }
+  nodes-only load: 0.08s, 17412 rows/s [run 0]; load { 4.99 5.72 6.70 }
+  graph load starting [run 0]; nothing else building; load { 4.99 5.72 6.70 }
+  graph load: 0.14s, 10212 rows/s [run 0]; load { 4.99 5.72 6.70 }
+  inputs Inputs { order: "019438ea-9ba9-745b-8854-f5b102a50964", customer: "019438e9-dcd7-7d7f-b863-5b2984049441", employee: "019438ea-8894-7aca-989f-6c208367351e", manager: "019438ea-6ddd-7f47-baeb-74507e8f0461", supplier: "019438e9-6e2a-74e4-88ef-78fed3f00cab" }
+  A       graph     0.577 ms (19 rows) nodes-only     0.660 ms (19 rows) relational     0.701 ms (19 rows); all three agree: true; load { 4.99 5.72 6.70 }
+          against SQL over seed.sql itself: true
+          A against the worker toy's SQL over the seed: true
+  B       graph     0.835 ms (37 rows) nodes-only     0.800 ms (37 rows) relational     0.771 ms (37 rows); all three agree: true; load { 4.99 5.72 6.70 }
+          against SQL over seed.sql itself: true
+          B against the worker toy's SQL over the seed: true
+  C       graph     0.004 ms (4 rows) nodes-only     0.061 ms (4 rows) relational     0.003 ms (4 rows); all three agree: true; load { 4.99 5.72 6.70 }
+          against SQL over seed.sql itself: true
+  D       graph     0.011 ms (17 rows) nodes-only     0.124 ms (17 rows) relational     0.010 ms (17 rows); all three agree: true; load { 4.99 5.72 6.70 }
+          against SQL over seed.sql itself: true
+  E-up    graph     0.005 ms (2 rows) nodes-only     0.004 ms (2 rows) relational     0.004 ms (2 rows); all three agree: true; load { 4.99 5.72 6.70 }
+          against SQL over seed.sql itself: true
+  E-down  graph     0.008 ms (8 rows) nodes-only     0.008 ms (8 rows) relational     0.007 ms (8 rows); all three agree: true; load { 4.99 5.72 6.70 }
+          against SQL over seed.sql itself: true
+  F       graph     0.030 ms (31 rows) nodes-only     0.113 ms (31 rows) relational     0.030 ms (31 rows); all three agree: true; load { 4.99 5.72 6.70 }
+          against SQL over seed.sql itself: true
+  graph on disk: 4399104 bytes (4.4 MB)
+  nodes-only on disk: 2428928 bytes (2.4 MB)
+  relational on disk: 536576 bytes (0.5 MB)
+  graph loads: [0.14]
+  nodes-only loads: [0.08]
+  relational loads: [0.01]
