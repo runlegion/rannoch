@@ -56,6 +56,7 @@ enum Job {
     Units(Vec<Unit>),
     Commit(Option<String>),
     Text,
+    Reads,
     Stop,
 }
 
@@ -63,6 +64,7 @@ enum Reply {
     Done(Outcome),
     Committed(Result<(), String>),
     Text(Result<String, String>),
+    Reads(u64, u64, u64),
 }
 
 fn worker(path: PathBuf, flows: Arc<Vec<Flow>>, window: i64, jobs: Receiver<Job>, replies: Sender<Reply>) {
@@ -79,6 +81,7 @@ fn worker(path: PathBuf, flows: Arc<Vec<Flow>>, window: i64, jobs: Receiver<Job>
             Job::Units(units) => Reply::Done(work(&mut shard, &flows, &mut pool, window, units)),
             Job::Commit(meta) => Reply::Committed(shard.commit(meta.as_deref())),
             Job::Text => Reply::Text(shard.text()),
+            Job::Reads => Reply::Reads(shard.found, shard.absent, shard.from_memory),
             Job::Stop => break,
         };
         if replies.send(reply).is_err() {
@@ -545,6 +548,23 @@ impl Lane {
             out.push('\n');
         }
         Ok(out)
+    }
+
+    /// Reads of the row store across shards: rows read back, rows looked for and absent, and
+    /// rows handed from memory.
+    ///
+    /// # Errors
+    /// A shard does not answer.
+    pub fn reads(&self) -> Result<(u64, u64, u64), String> {
+        let mut total = (0, 0, 0);
+        for w in &self.workers {
+            w.0.send(Job::Reads).map_err(|e| e.to_string())?;
+            match w.1.recv().map_err(|e| e.to_string())? {
+                Reply::Reads(a, b, c) => total = (total.0 + a, total.1 + b, total.2 + c),
+                _ => return Err("worker out of step".into()),
+            }
+        }
+        Ok(total)
     }
 
     #[must_use]

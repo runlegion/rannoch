@@ -1,8 +1,6 @@
 # Two-lane toy: results
 
-Run 2026-11-06 and 07 in `toys/two-lane` on rannoch main 7aa6841, against [PREDICTIONS.md](PREDICTIONS.md) as committed in legion at d6f443f1. Rannoch's crates are not used. The store is the toy's own, on SQLite, built to the predictions' shape.
-
-Legion's later commit 0ddeb25e adds that flows run on the row the worker just wrote, handed in memory, and that nothing reads a row back after writing it. The toy does this too: a row this process has written stays in memory and is never read back from the file. A row it has not seen yet is looked for once.
+Run 2026-11-06 and 07 in `toys/two-lane` on rannoch main 7aa6841, against [PREDICTIONS.md](PREDICTIONS.md) as amended in legion at 0ddeb25e. The amendment says the flows run on the row the worker just wrote, handed to them in memory, and nothing reads a row back after writing it. Rannoch's crates are not used. The store is the toy's own, on SQLite, built to the predictions' shape.
 
 The toy reuses the chain toy's world, cast, expected trails, schemas, host actions and flow rows. Each flow header now names its row and its ordering. Outputs are in `results/`.
 
@@ -43,6 +41,20 @@ Nothing else was building during any timed run. The load average from other agen
   3. the lane's place (inbox offset, the events still held) commits with the first shard.
 
   With more than one shard, a round spans no more than the lateness of event time. Whatever a restart hands again then stays inside the rows' dedupe windows.
+
+## Reads of the row store on the fast lane
+
+Counted on every shard, in every run (`results/fast.txt`, `results/run.txt`):
+
+| run | rows read back after a write | rows looked for, not yet there | rows handed from memory |
+|---|---|---|---|
+| fast lane, extended orders (753,806 facts) | **0** | 400,919 | 352,887 |
+| the cast and the seed, full chain (12,000 events) | **0** | 556 | 176,605 |
+
+- **Read back after writing:** 0, as expected. Every later fact or flow step on a row, such as an order's shipment or every stage of its chain, is handed the row from memory.
+- **The other reads:** they are lookups for a key the process has not seen yet, one per new row: 400,839 orders plus the 80 customers, products, employees, shippers and suppliers. Each finds nothing and costs one index probe.
+  - On an empty store they could be skipped.
+  - After a restart they are the reads that bring existing rows back into memory, so a run resumed after a kill reads those rows once.
 
 ## Predictions
 

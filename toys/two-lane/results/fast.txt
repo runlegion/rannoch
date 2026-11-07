@@ -1,11 +1,15 @@
-extended, fast lane only: 753806 events, 400839 orders, batches of 4096; nothing else building; load { 4.01 4.63 3.96 }
-  load starting (log false, run 0); nothing else building; load { 4.01 4.63 3.96 }
-P2 fast lane, log false: 753806 facts in 22.80s = 33060 facts/s; store file 910.4 MB (inbox 487.9 MB, log 0.0 MB); nothing else building; load { 3.81 4.53 3.94 }
-  load starting (log true, run 0); nothing else building; load { 3.81 4.53 3.94 }
-P2 fast lane, log true: 753806 facts in 23.11s = 32615 facts/s; store file 910.4 MB (inbox 487.9 MB, log 487.9 MB); trickle heard 753806, lag sampled every 20 batches max 0 events (last 0), finished 0.01s after the fast lane; nothing else building; load { 3.58 4.43 3.92 }
-P5 hearings built: 753806 (0.035s to count)
-  load starting (log false, run 1); nothing else building; load { 3.58 4.43 3.92 }
-P2 fast lane, log false: 753806 facts in 22.41s = 33636 facts/s; store file 910.4 MB (inbox 487.9 MB, log 0.0 MB); nothing else building; load { 3.66 4.38 3.92 }
-  load starting (log true, run 1); nothing else building; load { 3.66 4.38 3.92 }
-P2 fast lane, log true: 753806 facts in 22.94s = 32866 facts/s; store file 910.4 MB (inbox 487.9 MB, log 487.9 MB); trickle heard 753806, lag sampled every 20 batches max 0 events (last 0), finished 0.01s after the fast lane; nothing else building; load { 3.33 4.25 3.88 }
-P4 log on against off: +1.8% (mean of 2 runs each, interleaved)
+extended, fast lane only: 753806 events, 400839 orders, batches of 4096; nothing else building; load { 6.49 4.59 4.30 }
+  load starting (log false, run 0); nothing else building; load { 6.49 4.59 4.30 }
+  reads of the row store: 0 rows read back, 400919 looked for and not yet there, 352887 handed from memory
+P2 fast lane, log false: 753806 facts in 23.18s = 32515 facts/s; store file 910.4 MB (inbox 487.9 MB, log 0.0 MB); nothing else building; load { 5.22 4.42 4.24 }
+  load starting (log true, run 0); nothing else building; load { 5.22 4.42 4.24 }
+  reads of the row store: 0 rows read back, 400919 looked for and not yet there, 352887 handed from memory
+P2 fast lane, log true: 753806 facts in 23.17s = 32529 facts/s; store file 910.4 MB (inbox 487.9 MB, log 487.9 MB); trickle heard 753806, lag sampled every 20 batches max 0 events (last 0), finished 0.01s after the fast lane; nothing else building; load { 4.45 4.30 4.21 }
+P5 hearings built: 753806 (0.061s to count)
+  load starting (log false, run 1); nothing else building; load { 4.45 4.30 4.21 }
+  reads of the row store: 0 rows read back, 400919 looked for and not yet there, 352887 handed from memory
+P2 fast lane, log false: 753806 facts in 22.47s = 33551 facts/s; store file 910.4 MB (inbox 487.9 MB, log 0.0 MB); nothing else building; load { 4.04 4.21 4.17 }
+  load starting (log true, run 1); nothing else building; load { 4.04 4.21 4.17 }
+  reads of the row store: 0 rows read back, 400919 looked for and not yet there, 352887 handed from memory
+P2 fast lane, log true: 753806 facts in 23.05s = 32705 facts/s; store file 910.4 MB (inbox 487.9 MB, log 487.9 MB); trickle heard 753806, lag sampled every 20 batches max 0 events (last 0), finished 0.01s after the fast lane; nothing else building; load { 3.82 4.15 4.15 }
+P4 log on against off: +1.3% (mean of 2 runs each, interleaved)

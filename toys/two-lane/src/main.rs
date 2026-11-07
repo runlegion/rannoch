@@ -264,6 +264,8 @@ fn run(westwind: &Path, out: &Path) -> Result<()> {
     let cersei = world.stories.iter().find(|s| s.who == "Cersei").ok_or("no Cersei")?;
     let authorized = log.iter().filter(|e| e.ty == "westwind.return.authorized" && trails_root(&log, &e.id) == Some(cersei.root.clone())).count();
     println!("P10 Cersei's return authorized {authorized} time(s); duplicate ids dropped by the rows' windows");
+    let (found, absent, memory) = lane.reads()?;
+    println!("reads of the row store: {found} rows read back, {absent} looked for and not yet there, {memory} handed from memory");
     let text = lane.text()?;
     println!("rows {}, outcomes {}", digest(&text), digest(&outcome_text(&dir)?));
     Ok(())
@@ -464,6 +466,8 @@ fn fast(westwind: &Path, out: &Path) -> Result<()> {
         lane.ended = true;
         lane.drain()?;
         let seconds = t.elapsed().as_secs_f64();
+        let (found, absent, memory) = lane.reads()?;
+        println!("  reads of the row store: {found} rows read back, {absent} looked for and not yet there, {memory} handed from memory");
         let mut trickle_note = String::new();
         if let Some(r) = reader {
             writing.store(false, Ordering::SeqCst);

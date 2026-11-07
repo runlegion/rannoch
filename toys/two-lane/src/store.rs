@@ -86,6 +86,11 @@ pub struct Shard {
     edges: Vec<(String, String, String, String, String, String)>,
     answers: Vec<((String, String), Answer)>,
     pub writes: u64,
+    /// Reads of the row table: a row found (read back), and a row looked for and not there.
+    pub found: u64,
+    pub absent: u64,
+    /// Rows handed from memory instead.
+    pub from_memory: u64,
 }
 
 impl std::fmt::Debug for Shard {
@@ -112,7 +117,7 @@ impl Shard {
         conn.busy_timeout(std::time::Duration::from_secs(30)).map_err(|e| e.to_string())?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA fullfsync=ON;").map_err(|e| e.to_string())?;
         conn.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
-        Ok(Shard { conn, cache: HashMap::new(), dirty: BTreeSet::new(), edges: Vec::new(), answers: Vec::new(), writes: 0 })
+        Ok(Shard { conn, cache: HashMap::new(), dirty: BTreeSet::new(), edges: Vec::new(), answers: Vec::new(), writes: 0, found: 0, absent: 0, from_memory: 0 })
     }
 
     /// The row of `kind` keyed `key`. A row this process has written is handed back from memory,
@@ -122,7 +127,9 @@ impl Shard {
     /// The file cannot be read.
     pub fn row(&mut self, kind: &str, key: &str) -> Result<&mut Row, String> {
         let at = (kind.to_string(), key.to_string());
-        if !self.cache.contains_key(&at) {
+        if self.cache.contains_key(&at) {
+            self.from_memory += 1;
+        } else {
             let body: Option<String> = self
                 .conn
                 .prepare_cached("SELECT body FROM rows WHERE kind = ?1 AND key = ?2")
@@ -131,8 +138,14 @@ impl Shard {
                 .optional()
                 .map_err(|e| e.to_string())?;
             let row = match body {
-                Some(b) => serde_json::from_str(&b).map_err(|e| e.to_string())?,
-                None => Row::default(),
+                Some(b) => {
+                    self.found += 1;
+                    serde_json::from_str(&b).map_err(|e| e.to_string())?
+                }
+                None => {
+                    self.absent += 1;
+                    Row::default()
+                }
             };
             self.cache.insert(at.clone(), row);
         }
