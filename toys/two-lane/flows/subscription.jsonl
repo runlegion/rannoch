@@ -1,0 +1,6 @@
+{"flow": "subscription", "domain": "westwind", "correlation": {"westwind.subscription.started": "/subscription_id", "westwind.subscription.due": "/subscription_id"}, "row": "westwind_subscription", "ordering": "none"}
+{"id": "started", "on": "westwind.subscription.started", "step": "host", "action": "subscribe", "next": "order"}
+{"id": "due", "on": "westwind.subscription.due", "step": "host", "action": "renew", "next": "order"}
+{"id": "order", "guard": {"answer": {"active": true}}, "step": "emit", "type": "westwind.order.placed", "data": "/answer/order", "next": "pay"}
+{"id": "pay", "step": "after", "delay_ms": 3600000, "type": "westwind.payment.received", "data": "/answer/payment", "next": "next"}
+{"id": "next", "step": "after", "delay_ms": 2592000000, "type": "westwind.subscription.due", "data": "/answer/sub"}

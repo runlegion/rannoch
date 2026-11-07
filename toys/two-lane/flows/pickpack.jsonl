@@ -1,0 +1,8 @@
+{"flow": "pickpack", "domain": "westwind", "correlation": {"westwind.order.accepted": "/order_id", "westwind.line.allocated": "/order_id", "westwind.line.backordered": "/order_id", "westwind.order.cancelled": "/order_id"}, "row": "westwind_order", "ordering": "dependency", "needs": {"westwind.line.allocated": ["westwind.order.accepted"], "westwind.line.backordered": ["westwind.order.accepted"]}}
+{"id": "accepted", "on": "westwind.order.accepted", "step": "host", "action": "expect_lines"}
+{"id": "allocated", "on": "westwind.line.allocated", "guard": {"unseen": ["westwind.order.cancelled"]}, "step": "emit", "type": "westwind.line.picked", "next": "pick"}
+{"id": "pick", "step": "host", "action": "pick", "next": "pack"}
+{"id": "pack", "guard": {"answer": {"pack": true}}, "step": "emit", "type": "westwind.order.packed", "data": "/answer/packed"}
+{"id": "backordered", "on": "westwind.line.backordered", "guard": {"unseen": ["westwind.order.cancelled"]}, "step": "host", "action": "wait_line", "next": "pack_rest"}
+{"id": "pack_rest", "guard": {"answer": {"pack": true}}, "step": "emit", "type": "westwind.order.packed", "data": "/answer/packed"}
+{"id": "cancelled", "on": "westwind.order.cancelled"}

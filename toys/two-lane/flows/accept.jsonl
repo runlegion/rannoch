@@ -1,0 +1,6 @@
+{"flow": "accept", "domain": "westwind", "correlation": {"westwind.order.placed": "/order_id", "westwind.payment.received": "/order_id", "westwind.accept.payment_due": "/order_id", "westwind.order.cancelled": "/order_id"}, "row": "westwind_order", "ordering": "clock"}
+{"id": "placed", "on": "westwind.order.placed", "step": "host", "action": "remember_order", "next": "wait"}
+{"id": "wait", "step": "after", "delay_ms": 86400000, "type": "westwind.accept.payment_due"}
+{"id": "paid", "on": "westwind.payment.received", "guard": {"unseen": ["westwind.order.cancelled"], "vars": {"has_order": true}}, "step": "emit", "type": "westwind.order.accepted", "data": "/vars/order"}
+{"id": "due", "on": "westwind.accept.payment_due", "guard": {"unseen": ["westwind.payment.received", "westwind.order.cancelled"]}, "step": "emit", "type": "westwind.order.abandoned"}
+{"id": "cancelled", "on": "westwind.order.cancelled"}

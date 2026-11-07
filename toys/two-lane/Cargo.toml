@@ -1,0 +1,23 @@
+[package]
+name = "two-lane-toy"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.98"
+publish = false
+
+# Its own workspace: the toy sits outside rannoch's crates and builds against them by path.
+[workspace]
+
+[dependencies]
+blake3 = "1.8"
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+sha2 = "0.10"
+uuid = "1"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[profile.release]
+debug = 1

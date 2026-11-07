@@ -1,0 +1,8 @@
+{"flow": "ship", "domain": "westwind", "correlation": {"westwind.order.packed": "/order_id", "westwind.carrier.collected": "/order_id", "westwind.ship.overdue": "/order_id", "westwind.order.shipped": "/order_id", "westwind.order.cancelled": "/order_id", "westwind.address.changed": "/order_id"}, "row": "westwind_order", "ordering": "dependency", "needs": {"westwind.carrier.collected": ["westwind.order.packed"]}, "clock": ["westwind.address.changed", "westwind.order.cancelled"]}
+{"id": "packed", "on": "westwind.order.packed", "step": "after", "delay_ms": 2592000000, "type": "westwind.ship.overdue"}
+{"id": "collected", "on": "westwind.carrier.collected", "guard": {"unseen": ["westwind.order.cancelled"]}, "step": "emit", "type": "westwind.order.shipped"}
+{"id": "overdue", "on": "westwind.ship.overdue", "guard": {"unseen": ["westwind.order.shipped", "westwind.order.cancelled"]}, "step": "emit", "type": "westwind.order.unshipped"}
+{"id": "shipped", "on": "westwind.order.shipped"}
+{"id": "cancelled", "on": "westwind.order.cancelled"}
+{"id": "address", "on": "westwind.address.changed", "guard": {"seen": ["westwind.order.shipped"]}, "step": "emit", "type": "westwind.shipment.redirected", "else": "update"}
+{"id": "update", "step": "emit", "type": "westwind.address.updated"}

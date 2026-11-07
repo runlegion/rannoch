@@ -1,0 +1,14 @@
+{"flow": "support", "domain": "westwind", "correlation": {"westwind.ticket.opened": "@id", "westwind.remake.approved": "/ticket", "westwind.support.approval_due": "/ticket", "westwind.remake.expired": "/ticket"}, "row": "westwind_ticket", "ordering": "dependency", "needs": {"westwind.remake.approved": ["westwind.remake.requested"]}}
+{"id": "opened", "on": "westwind.ticket.opened", "step": "host", "action": "triage", "next": "triaged"}
+{"id": "triaged", "step": "emit", "type": "westwind.ticket.triaged", "data": "/answer", "next": "remake"}
+{"id": "remake", "guard": {"answer": {"category": "remake"}}, "step": "emit", "type": "westwind.remake.requested", "data": "/answer", "next": "return_it", "else": "refund"}
+{"id": "return_it", "step": "emit", "type": "westwind.return.authorized", "data": "/answer", "next": "approval"}
+{"id": "approval", "step": "after", "delay_ms": 259200000, "type": "westwind.support.approval_due", "data": "/answer"}
+{"id": "refund", "guard": {"answer": {"category": "refund"}}, "step": "emit", "type": "westwind.return.authorized", "data": "/answer", "else": "lost"}
+{"id": "lost", "guard": {"answer": {"category": "lost"}}, "step": "emit", "type": "westwind.refund.issued", "data": "/answer", "else": "address"}
+{"id": "address", "guard": {"answer": {"category": "address"}}, "step": "emit", "type": "westwind.address.updated", "data": "/answer", "else": "noise"}
+{"id": "noise", "step": "emit", "type": "westwind.ticket.closed", "data": "/answer"}
+{"id": "approved", "on": "westwind.remake.approved", "guard": {"unseen": ["westwind.remake.expired"]}, "step": "emit", "type": "westwind.remake.ordered", "next": "compensate"}
+{"id": "compensate", "step": "emit", "type": "westwind.compensation.issued"}
+{"id": "approval_due", "on": "westwind.support.approval_due", "guard": {"unseen": ["westwind.remake.approved"]}, "step": "emit", "type": "westwind.remake.expired"}
+{"id": "expired", "on": "westwind.remake.expired"}

@@ -1,0 +1,2 @@
+{"flow": "allocate", "domain": "westwind", "correlation": {"westwind.order.accepted": "/order_id"}, "row": "westwind_order", "ordering": "none"}
+{"id": "accepted", "on": "westwind.order.accepted", "step": "emit_each", "each": "/data/lines", "type": "westwind.line.requested"}
