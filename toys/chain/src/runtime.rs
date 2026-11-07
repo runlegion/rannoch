@@ -478,17 +478,19 @@ impl Runtime {
         Ok(())
     }
 
-    /// Checkpoints every handler in order, then the log, then the runtime's own place.
+    /// Checkpoints the log, then every handler in order, then the runtime's own place.
     ///
     /// # Errors
     /// A checkpoint failed.
     pub fn checkpoint(&mut self) -> Result<(), String> {
-        for handler in &mut self.handlers {
-            handler.checkpoint()?;
-        }
+        // The log first: whatever a handler holds durably is in the log, and an event the log
+        // holds that no handler kept is released again and read once by id.
         if let Some((file, buffer)) = &mut self.log {
             file.write_all(buffer).map_err(|e| e.to_string())?;
             buffer.clear();
+        }
+        for handler in &mut self.handlers {
+            handler.checkpoint()?;
         }
         if let Some(path) = &self.state {
             let state = State { last: self.last.clone(), max_external: self.max_external };

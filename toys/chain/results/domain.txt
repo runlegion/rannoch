@@ -1,0 +1,1 @@
+P5 domain check: 10.9 ns per event over 5327 events (best of 20 x 20 passes); nothing else building; load { 12.45 9.15 6.87 }

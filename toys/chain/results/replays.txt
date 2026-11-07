@@ -1,0 +1,13 @@
+nothing else building; load { 9.95 8.82 6.82 }
+
+run                                    store             flow states       outcomes           note
+in order x1                            40f13da57bb77d93  647bdcfc1d4156fc  a8184fc0102a6e76   
+in order x10                           40f13da57bb77d93  647bdcfc1d4156fc  a8184fc0102a6e76   8s; bins {"another domain": 40, "later than the declared lateness": 47854, "malformed": 40}; duplicates 38
+in order x1000                         40f13da57bb77d93  647bdcfc1d4156fc  a8184fc0102a6e76   14s; bins {"another domain": 4000, "later than the declared lateness": 5311684, "malformed": 4000}; duplicates 3998
+stopped x8, in process                 40f13da57bb77d93  647bdcfc1d4156fc  a8184fc0102a6e76   
+killed x6, in order                    40f13da57bb77d93  647bdcfc1d4156fc  a8184fc0102a6e76   6 of 6 kills landed mid-run
+killed x6, shuffled 1                  40f13da57bb77d93  647bdcfc1d4156fc  a8184fc0102a6e76   6 of 6 kills landed mid-run
+shuffled within lateness, seed 1       40f13da57bb77d93  647bdcfc1d4156fc  a8184fc0102a6e76   largest lateness 1.62 days; bins {"another domain": 4, "later than the declared lateness": 1, "malformed": 4}
+shuffled within lateness, seed 2       40f13da57bb77d93  647bdcfc1d4156fc  a8184fc0102a6e76   largest lateness 1.67 days; bins {"another domain": 4, "later than the declared lateness": 1, "malformed": 4}
+shuffled within lateness, seed 3       40f13da57bb77d93  647bdcfc1d4156fc  a8184fc0102a6e76   largest lateness 1.62 days; bins {"another domain": 4, "later than the declared lateness": 1, "malformed": 4}
+without the duplicate copies           40f13da57bb77d93  647bdcfc1d4156fc  a8184fc0102a6e76   2 fewer arrivals

@@ -1,3 +1,4 @@
+// Shared with the worker toy; not every part is used here.
 //! Westwind row for row, as the worker toy loaded it: kept to rebuild the same orders event-shaped.
 //! Westwind as typed `CloudEvents`: its seed, checked against the research document's hash, read
 //! into events; the toy's extension of its order history; its ontology; and the SQL answers the

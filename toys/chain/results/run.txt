@@ -1,0 +1,37 @@
+seed.sql sha256 matches 6d38971dc46a9677b46d8b6b072c88fdc6af67d381b4d731316064c166e60e71; nothing else building; load { 12.11 10.38 7.74 }
+world: 5329 arrivals, 13 stories
+ran in 8.8s: admitted 5329, released 12067, duplicates dropped 2, queued at end 0; load { 12.87 10.61 7.85 }
+P1 Cersei                     trail of   30 events matches
+P1 Jon Snow                   trail of   43 events matches
+P1 Davos                      trail of   16 events matches
+P1 Tyrion                     trail of 1921 events matches
+P1 Arya, before paying        trail of    4 events matches
+P1 Arya, after packing        trail of   17 events matches
+P1 Arya, while backordered    trail of   10 events matches
+P1 Arya, after shipping       trail of   17 events matches
+P1 Daenerys                   trail of    6 events matches
+P1 Hodor                      trail of   21 events matches
+P1 Lion, abandoned            trail of    3 events matches
+P1 Lion, unanswered           trail of   23 events matches
+P1 Tin Man                    trail of   18 events matches
+P1 13 of 13 trails match
+P2 seed orders: 320 of 320 match SQL (SQL: 283 delivered, 100 of them late, 37 unshipped); differing []
+P3 6749 emitted events of 38 types: 0 invalid
+P4 bin by reason: {"another domain": 4, "later than the declared lateness": 1, "malformed": 4}
+     another domain                     "0197526a-7d00-722c-a9af-468218d0628b" {"data":{"customer_id":"00000000-0000-7410-9652-aff077f2a05f","lines":[{"line_id":"0000000
+     another domain                     "019752a1-6b80-7d99-85e7-b341ca9443d9" {"data":{"order_id":"019751fc-a000-7ce3-acad-9fca00639149","text":"If I only had a brain."
+     another domain                     "019752d8-5a00-7224-8d27-34d362b3b0bb" {"data":{"citizen_id":"00000000-0000-7410-9652-aff077f2a05f","item":"A brain","order_id":"
+     another domain                     "0197530f-4880-7bdb-83ce-60bc4a76f12b" {"data":{"id":"00000000-0000-7c63-b2ed-56549181bf04","name":"Arya"},"id":"0197530f-4880-7b
+     malformed                          "-" this is not an event
+     malformed                          "-" {"data":{},"id":"019751fc-a000-7a2d-8d99-fbecc3ff060b","source":"westwind/web","specversio
+     malformed                          "019751fc-a000-73a6-8b5b-a8acccaf2635" {"data":{"order_id":"x"},"id":"019751fc-a000-73a6-8b5b-a8acccaf2635","source":"westwind/we
+     malformed                          "019751fc-a000-7e69-9f0b-20603d80c0d6" {"data":{},"id":"019751fc-a000-7e69-9f0b-20603d80c0d6","source":"westwind/web","specversio
+     later than the declared lateness   "019751fc-a000-7b57-9f47-483b9897d3f9" {"data":{"city":"Pentos","id":"019751fc-a000-7b57-9f47-483b9897d3f9","name":"Late Larry"},
+P4 hearings: Westwind 4974, Oz 5, in another domain's classes 0; Scarecrow's order in Westwind: 0
+P6 duplicates dropped 2; Hodor's identical tickets stored as 2 tickets
+P7 handler support restarted 1 times, binned 0; reasons ["host action triage stalled: no answer within 300 ms"]
+P7 triage work per ticket: [1, 1, 1, 1, 1] (each ticket's triage done this many times)
+P8 Lion, abandoned: ["order.abandoned at day 1"]
+P8 Lion, unanswered: ["remake.expired at day 9", "return.expired at day 20"]
+P9 largest lateness seen in order: 0 ms
+store 40f13da57bb77d93, flows 647bdcfc1d4156fc, outcomes a8184fc0102a6e76

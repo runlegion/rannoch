@@ -331,7 +331,7 @@ impl Runner {
                     at = row.otherwise.as_ref().map(|r| self.flow.index[r]);
                     continue;
                 }
-                let mut sent = |ty: &str, time: i64, data: Value, n: usize| -> Event {
+                let sent = |ty: &str, time: i64, data: Value, n: usize| -> Event {
                     let seed = format!("{}\n{key}\n{}\n{}\n{n}\n{time}", self.flow.name, row.id, event.id);
                     Event {
                         id: mint(time, seed.as_bytes()),

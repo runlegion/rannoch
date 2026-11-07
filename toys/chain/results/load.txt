@@ -1,0 +1,4 @@
+P13 baseline (nodes-only, row for row, 7aa6841): 1754602 rows in 234.17s = 400839 orders, 1712 orders/s, 6573 bytes per order
+P13 targets: 5135 orders/s or more, under 3287 bytes per order
+P13 load starting: 753806 events; nothing else building; load { 6.84 5.12 4.34 }
+P13 event-shaped: 400839 orders in 357.30s = 1122 orders/s (0.66x); 3572785152 bytes = 8913 bytes per order (1.36 of the baseline); fill stopped on 0; nothing else building; load { 4.46 4.51 4.26 }

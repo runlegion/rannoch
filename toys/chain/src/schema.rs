@@ -30,6 +30,7 @@ impl Schemas {
     }
 
     #[must_use]
+    #[allow(dead_code)]
     pub fn knows(&self, ty: &str) -> bool {
         self.0.contains_key(ty)
     }

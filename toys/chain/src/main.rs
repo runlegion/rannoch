@@ -13,6 +13,7 @@
 mod entrance;
 mod flow;
 mod host;
+#[allow(dead_code)]
 mod rows;
 mod runtime;
 mod schema;

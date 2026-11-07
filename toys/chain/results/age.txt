@@ -1,0 +1,10 @@
+nothing else building; load { 9.23 7.82 6.10 }
+P10 carry true  (every 64 entries) year  1: Tyrion's subscription history   13 lines, rebuild    245.5 us (best of 50), 1 ids in its window; load { 9.23 7.82 6.10 }
+P10 carry true  (every 64 entries) year  5: Tyrion's subscription history   61 lines, rebuild    987.7 us (best of 50), 1 ids in its window; load { 9.94 7.99 6.17 }
+P10 carry true  (every 64 entries) year 10: Tyrion's subscription history   58 lines, rebuild    918.1 us (best of 50), 1 ids in its window; load { 9.94 7.99 6.17 }
+P10 carry false (every - entries) year  1: Tyrion's subscription history   13 lines, rebuild    240.0 us (best of 50), 1 ids in its window; load { 9.30 7.89 6.15 }
+P10 carry false (every - entries) year  5: Tyrion's subscription history   61 lines, rebuild    990.0 us (best of 50), 1 ids in its window; load { 9.04 7.86 6.15 }
+P10 carry false (every - entries) year 10: Tyrion's subscription history  121 lines, rebuild   1938.0 us (best of 50), 1 ids in its window; load { 9.04 7.86 6.15 }
+P10 carry true  (every 12 entries) year  1: Tyrion's subscription history    2 lines, rebuild     31.0 us (best of 50), 1 ids in its window; load { 8.79 7.83 6.14 }
+P10 carry true  (every 12 entries) year  5: Tyrion's subscription history    2 lines, rebuild     30.4 us (best of 50), 1 ids in its window; load { 8.79 7.83 6.14 }
+P10 carry true  (every 12 entries) year 10: Tyrion's subscription history    2 lines, rebuild     20.8 us (best of 50), 1 ids in its window; load { 8.81 7.84 6.16 }
