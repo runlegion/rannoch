@@ -23,6 +23,10 @@ pub const DEADLINE: Duration = Duration::from_millis(300);
 /// Work done outside the store, by action and event: what "happens once" is counted against.
 pub static EFFECTS: OnceLock<Mutex<HashMap<(String, String), u32>>> = OnceLock::new();
 
+/// Every answer given, by action and event: the host's idempotency key. A call again for the same
+/// event, as after a restart, gets the remembered answer and does no work twice.
+static REMEMBERED: OnceLock<Mutex<HashMap<(String, String), Answer>>> = OnceLock::new();
+
 /// Whether the Tin Man's triage has stalled yet: it stalls the first time only.
 static STALLED: AtomicBool = AtomicBool::new(false);
 
@@ -264,6 +268,20 @@ impl Pool {
     /// # Errors
     /// The action fails, or does not answer in time: then its thread is abandoned.
     pub fn run(&mut self, name: &str, input: &Value) -> Result<Answer, String> {
+        let event = input.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
+        let at = (name.to_string(), event);
+        let remembered = REMEMBERED.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Some(answer) = remembered.lock().ok().and_then(|m| m.get(&at).cloned()) {
+            return Ok(answer);
+        }
+        let answer = self.ask(name, input)?;
+        if let Ok(mut m) = remembered.lock() {
+            m.insert(at, answer.clone());
+        }
+        Ok(answer)
+    }
+
+    fn ask(&mut self, name: &str, input: &Value) -> Result<Answer, String> {
         let (tx, rx) = channel();
         if self.jobs.send((name.to_string(), input.clone(), tx.clone())).is_err() {
             self.jobs = spawn();
