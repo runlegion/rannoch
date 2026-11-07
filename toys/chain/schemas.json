@@ -1,0 +1,1359 @@
+{
+ "oz.citizen.joined": {
+  "properties": {
+   "id": {
+    "type": "string"
+   },
+   "name": {
+    "type": "string"
+   }
+  },
+  "required": [
+   "id",
+   "name"
+  ],
+  "type": "object"
+ },
+ "oz.order.placed": {
+  "properties": {
+   "citizen_id": {
+    "type": "string"
+   },
+   "item": {
+    "type": "string"
+   },
+   "order_id": {
+    "type": "string"
+   }
+  },
+  "required": [
+   "order_id",
+   "citizen_id",
+   "item"
+  ],
+  "type": "object"
+ },
+ "westwind.accept.payment_due": {
+  "properties": {
+   "customer_id": {
+    "type": "string"
+   },
+   "lines": {
+    "items": {
+     "properties": {
+      "line_id": {
+       "type": "string"
+      },
+      "order_id": {
+       "type": "string"
+      },
+      "product_id": {
+       "type": "string"
+      },
+      "quantity": {
+       "type": "integer"
+      },
+      "spoils_in_days": {
+       "type": [
+        "integer",
+        "null"
+       ]
+      },
+      "unit_price": {
+       "type": "number"
+      }
+     },
+     "required": [
+      "line_id",
+      "order_id",
+      "product_id",
+      "quantity",
+      "unit_price"
+     ],
+     "type": "object"
+    },
+    "type": "array"
+   },
+   "order_id": {
+    "type": "string"
+   },
+   "placed_on": {
+    "type": "string"
+   },
+   "required_on": {
+    "type": [
+     "string",
+     "null"
+    ]
+   },
+   "ship_to": {
+    "type": "string"
+   }
+  },
+  "required": [
+   "order_id",
+   "customer_id",
+   "placed_on",
+   "ship_to",
+   "lines"
+  ],
+  "type": "object"
+ },
+ "westwind.address.changed": {
+  "properties": {
+   "order_id": {
+    "type": "string"
+   },
+   "ship_to": {
+    "type": "string"
+   }
+  },
+  "required": [
+   "order_id",
+   "ship_to"
+  ],
+  "type": "object"
+ },
+ "westwind.address.updated": {
+  "properties": {
+   "order_id": {
+    "type": "string"
+   },
+   "ship_to": {
+    "type": "string"
+   }
+  },
+  "required": [
+   "order_id",
+   "ship_to"
+  ],
+  "type": "object"
+ },
+ "westwind.aftership.window_closed": {
+  "properties": {
+   "order_id": {
+    "type": "string"
+   },
+   "shipment_id": {
+    "type": "string"
+   },
+   "tracking": {
+    "type": "string"
+   }
+  },
+  "required": [
+   "order_id",
+   "shipment_id"
+  ],
+  "type": "object"
+ },
+ "westwind.cancel.refused": {
+  "properties": {
+   "order_id": {
+    "type": "string"
+   }
+  },
+  "required": [
+   "order_id"
+  ],
+  "type": "object"
+ },
+ "westwind.carrier.collected": {
+  "properties": {
+   "order_id": {
+    "type": "string"
+   },
+   "shipment_id": {
+    "type": "string"
+   },
+   "tracking": {
+    "type": "string"
+   }
+  },
+  "required": [
+   "order_id",
+   "shipment_id"
+  ],
+  "type": "object"
+ },
+ "westwind.carrier.delivered": {
+  "properties": {
+   "order_id": {
+    "type": "string"
+   },
+   "shipment_id": {
+    "type": "string"
+   },
+   "tracking": {
+    "type": "string"
+   }
+  },
+  "required": [
+   "order_id",
+   "shipment_id"
+  ],
+  "type": "object"
+ },
+ "westwind.carrier.lost": {
+  "properties": {
+   "order_id": {
+    "type": "string"
+   },
+   "shipment_id": {
+    "type": "string"
+   },
+   "tracking": {
+    "type": "string"
+   }
+  },
+  "required": [
+   "order_id",
+   "shipment_id"
+  ],
+  "type": "object"
+ },
+ "westwind.clock.tick": {
+  "properties": {
+   "day": {
+    "type": "string"
+   }
+  },
+  "required": [
+   "day"
+  ],
+  "type": "object"
+ },
+ "westwind.compensation.issued": {
+  "properties": {
+   "order_id": {
+    "type": "string"
+   },
+   "ticket": {
+    "type": "string"
+   }
+  },
+  "required": [
+   "ticket",
+   "order_id"
+  ],
+  "type": "object"
+ },
+ "westwind.customer.joined": {
+  "properties": {
+   "city": {
+    "type": "string"
+   },
+   "id": {
+    "type": "string"
+   },
+   "name": {
+    "type": "string"
+   }
+  },
+  "required": [
+   "id",
+   "name",
+   "city"
+  ],
+  "type": "object"
+ },
+ "westwind.deliver.spoil_check": {
+  "properties": {
+   "order_id": {
+    "type": "string"
+   },
+   "shipment_id": {
+    "type": "string"
+   },
+   "tracking": {
+    "type": "string"
+   }
+  },
+  "required": [
+   "order_id",
+   "shipment_id"
+  ],
+  "type": "object"
+ },
+ "westwind.employee.hired": {
+  "properties": {
+   "id": {
+    "type": "string"
+   },
+   "name": {
+    "type": "string"
+   },
+   "reports_to": {
+    "type": [
+     "string",
+     "null"
+    ]
+   },
+   "title": {
+    "type": "string"
+   }
+  },
+  "required": [
+   "id",
+   "name",
+   "title"
+  ],
+  "type": "object"
+ },
+ "westwind.line.allocated": {
+  "properties": {
+   "line_id": {
+    "type": "string"
+   },
+   "order_id": {
+    "type": "string"
+   },
+   "product_id": {
+    "type": "string"
+   },
+   "quantity": {
+    "type": "integer"
+   },
+   "spoils_in_days": {
+    "type": [
+     "integer",
+     "null"
+    ]
+   },
+   "unit_price": {
+    "type": "number"
+   }
+  },
+  "required": [
+   "line_id",
+   "order_id",
+   "product_id",
+   "quantity",
+   "unit_price"
+  ],
+  "type": "object"
+ },
+ "westwind.line.backordered": {
+  "properties": {
+   "line_id": {
+    "type": "string"
+   },
+   "order_id": {
+    "type": "string"
+   },
+   "product_id": {
+    "type": "string"
+   },
+   "quantity": {
+    "type": "integer"
+   },
+   "spoils_in_days": {
+    "type": [
+     "integer",
+     "null"
+    ]
+   },
+   "unit_price": {
+    "type": "number"
+   }
+  },
+  "required": [
+   "line_id",
+   "order_id",
+   "product_id",
+   "quantity",
+   "unit_price"
+  ],
+  "type": "object"
+ },
+ "westwind.line.picked": {
+  "properties": {
+   "line_id": {
+    "type": "string"
+   },
+   "order_id": {
+    "type": "string"
+   },
+   "product_id": {
+    "type": "string"
+   },
+   "quantity": {
+    "type": "integer"
+   },
+   "spoils_in_days": {
+    "type": [
+     "integer",
+     "null"
+    ]
+   },
+   "unit_price": {
+    "type": "number"
+   }
+  },
+  "required": [
+   "line_id",
+   "order_id",
+   "product_id",
+   "quantity",
+   "unit_price"
+  ],
+  "type": "object"
+ },
+ "westwind.line.requested": {
+  "properties": {
+   "line_id": {
+    "type": "string"
+   },
+   "order_id": {
+    "type": "string"
+   },
+   "product_id": {
+    "type": "string"
+   },
+   "quantity": {
+    "type": "integer"
+   },
+   "spoils_in_days": {
+    "type": [
+     "integer",
+     "null"
+    ]
+   },
+   "unit_price": {
+    "type": "number"
+   }
+  },
+  "required": [
+   "line_id",
+   "order_id",
+   "product_id",
+   "quantity",
+   "unit_price"
+  ],
+  "type": "object"
+ },
+ "westwind.order.abandoned": {
+  "properties": {
+   "customer_id": {
+    "type": "string"
+   },
+   "lines": {
+    "items": {
+     "properties": {
+      "line_id": {
+       "type": "string"
+      },
+      "order_id": {
+       "type": "string"
+      },
+      "product_id": {
+       "type": "string"
+      },
+      "quantity": {
+       "type": "integer"
+      },
+      "spoils_in_days": {
+       "type": [
+        "integer",
+        "null"
+       ]
+      },
+      "unit_price": {
+       "type": "number"
+      }
+     },
+     "required": [
+      "line_id",
+      "order_id",
+      "product_id",
+      "quantity",
+      "unit_price"
+     ],
+     "type": "object"
+    },
+    "type": "array"
+   },
+   "order_id": {
+    "type": "string"
+   },
+   "placed_on": {
+    "type": "string"
+   },
+   "required_on": {
+    "type": [
+     "string",
+     "null"
+    ]
+   },
+   "ship_to": {
+    "type": "string"
+   }
+  },
+  "required": [
+   "order_id",
+   "customer_id",
+   "placed_on",
+   "ship_to",
+   "lines"
+  ],
+  "type": "object"
+ },
+ "westwind.order.accepted": {
+  "properties": {
+   "customer_id": {
+    "type": "string"
+   },
+   "lines": {
+    "items": {
+     "properties": {
+      "line_id": {
+       "type": "string"
+      },
+      "order_id": {
+       "type": "string"
+      },
+      "product_id": {
+       "type": "string"
+      },
+      "quantity": {
+       "type": "integer"
+      },
+      "spoils_in_days": {
+       "type": [
+        "integer",
+        "null"
+       ]
+      },
+      "unit_price": {
+       "type": "number"
+      }
+     },
+     "required": [
+      "line_id",
+      "order_id",
+      "product_id",
+      "quantity",
+      "unit_price"
+     ],
+     "type": "object"
+    },
+    "type": "array"
+   },
+   "order_id": {
+    "type": "string"
+   },
+   "placed_on": {
+    "type": "string"
+   },
+   "required_on": {
+    "type": [
+     "string",
+     "null"
+    ]
+   },
+   "ship_to": {
+    "type": "string"
+   }
+  },
+  "required": [
+   "order_id",
+   "customer_id",
+   "placed_on",
+   "ship_to",
+   "lines"
+  ],
+  "type": "object"
+ },
+ "westwind.order.cancel_requested": {
+  "properties": {
+   "order_id": {
+    "type": "string"
+   }
+  },
+  "required": [
+   "order_id"
+  ],
+  "type": "object"
+ },
+ "westwind.order.cancelled": {
+  "properties": {
+   "order_id": {
+    "type": "string"
+   }
+  },
+  "required": [
+   "order_id"
+  ],
+  "type": "object"
+ },
+ "westwind.order.closed": {
+  "properties": {
+   "order_id": {
+    "type": "string"
+   },
+   "shipment_id": {
+    "type": "string"
+   },
+   "tracking": {
+    "type": "string"
+   }
+  },
+  "required": [
+   "order_id",
+   "shipment_id"
+  ],
+  "type": "object"
+ },
+ "westwind.order.delivered": {
+  "properties": {
+   "order_id": {
+    "type": "string"
+   },
+   "shipment_id": {
+    "type": "string"
+   },
+   "tracking": {
+    "type": "string"
+   }
+  },
+  "required": [
+   "order_id",
+   "shipment_id"
+  ],
+  "type": "object"
+ },
+ "westwind.order.late": {
+  "properties": {
+   "order_id": {
+    "type": "string"
+   },
+   "shipment_id": {
+    "type": "string"
+   },
+   "tracking": {
+    "type": "string"
+   }
+  },
+  "required": [
+   "order_id",
+   "shipment_id"
+  ],
+  "type": "object"
+ },
+ "westwind.order.lost": {
+  "properties": {
+   "order_id": {
+    "type": "string"
+   },
+   "shipment_id": {
+    "type": "string"
+   },
+   "tracking": {
+    "type": "string"
+   }
+  },
+  "required": [
+   "order_id",
+   "shipment_id"
+  ],
+  "type": "object"
+ },
+ "westwind.order.packed": {
+  "properties": {
+   "lines": {
+    "items": {
+     "type": "string"
+    },
+    "type": "array"
+   },
+   "order_id": {
+    "type": "string"
+   },
+   "shipment_no": {
+    "type": "integer"
+   }
+  },
+  "required": [
+   "order_id",
+   "shipment_no",
+   "lines"
+  ],
+  "type": "object"
+ },
+ "westwind.order.placed": {
+  "properties": {
+   "customer_id": {
+    "type": "string"
+   },
+   "lines": {
+    "items": {
+     "properties": {
+      "line_id": {
+       "type": "string"
+      },
+      "order_id": {
+       "type": "string"
+      },
+      "product_id": {
+       "type": "string"
+      },
+      "quantity": {
+       "type": "integer"
+      },
+      "spoils_in_days": {
+       "type": [
+        "integer",
+        "null"
+       ]
+      },
+      "unit_price": {
+       "type": "number"
+      }
+     },
+     "required": [
+      "line_id",
+      "order_id",
+      "product_id",
+      "quantity",
+      "unit_price"
+     ],
+     "type": "object"
+    },
+    "type": "array"
+   },
+   "order_id": {
+    "type": "string"
+   },
+   "placed_on": {
+    "type": "string"
+   },
+   "required_on": {
+    "type": [
+     "string",
+     "null"
+    ]
+   },
+   "ship_to": {
+    "type": "string"
+   }
+  },
+  "required": [
+   "order_id",
+   "customer_id",
+   "placed_on",
+   "ship_to",
+   "lines"
+  ],
+  "type": "object"
+ },
+ "westwind.order.shipped": {
+  "properties": {
+   "order_id": {
+    "type": "string"
+   },
+   "shipment_id": {
+    "type": "string"
+   },
+   "tracking": {
+    "type": "string"
+   }
+  },
+  "required": [
+   "order_id",
+   "shipment_id"
+  ],
+  "type": "object"
+ },
+ "westwind.order.spoiled": {
+  "properties": {
+   "order_id": {
+    "type": "string"
+   },
+   "shipment_id": {
+    "type": "string"
+   },
+   "tracking": {
+    "type": "string"
+   }
+  },
+  "required": [
+   "order_id",
+   "shipment_id"
+  ],
+  "type": "object"
+ },
+ "westwind.order.unshipped": {
+  "properties": {
+   "lines": {
+    "items": {
+     "type": "string"
+    },
+    "type": "array"
+   },
+   "order_id": {
+    "type": "string"
+   },
+   "shipment_no": {
+    "type": "integer"
+   }
+  },
+  "required": [
+   "order_id",
+   "shipment_no",
+   "lines"
+  ],
+  "type": "object"
+ },
+ "westwind.payment.received": {
+  "properties": {
+   "amount": {
+    "type": "number"
+   },
+   "order_id": {
+    "type": "string"
+   }
+  },
+  "required": [
+   "order_id",
+   "amount"
+  ],
+  "type": "object"
+ },
+ "westwind.product.listed": {
+  "properties": {
+   "available": {
+    "type": "boolean"
+   },
+   "id": {
+    "type": "string"
+   },
+   "made_to_order": {
+    "type": "boolean"
+   },
+   "name": {
+    "type": "string"
+   },
+   "spoils_in_days": {
+    "type": [
+     "integer",
+     "null"
+    ]
+   },
+   "stock": {
+    "type": "integer"
+   },
+   "supplier_id": {
+    "type": "string"
+   },
+   "unit_price": {
+    "type": "number"
+   }
+  },
+  "required": [
+   "id",
+   "name",
+   "supplier_id",
+   "unit_price",
+   "stock",
+   "made_to_order",
+   "available"
+  ],
+  "type": "object"
+ },
+ "westwind.refund.issued": {
+  "properties": {
+   "order_id": {
+    "type": "string"
+   }
+  },
+  "required": [
+   "order_id"
+  ],
+  "type": "object"
+ },
+ "westwind.remake.approved": {
+  "properties": {
+   "approver": {
+    "type": "string"
+   },
+   "order_id": {
+    "type": "string"
+   },
+   "ticket": {
+    "type": "string"
+   }
+  },
+  "required": [
+   "ticket",
+   "order_id",
+   "approver"
+  ],
+  "type": "object"
+ },
+ "westwind.remake.expired": {
+  "properties": {
+   "category": {
+    "enum": [
+     "remake",
+     "refund",
+     "address",
+     "lost",
+     "noise"
+    ],
+    "type": "string"
+   },
+   "order_id": {
+    "type": "string"
+   },
+   "ticket": {
+    "type": "string"
+   }
+  },
+  "required": [
+   "ticket",
+   "order_id",
+   "category"
+  ],
+  "type": "object"
+ },
+ "westwind.remake.ordered": {
+  "properties": {
+   "order_id": {
+    "type": "string"
+   },
+   "ticket": {
+    "type": "string"
+   }
+  },
+  "required": [
+   "ticket",
+   "order_id"
+  ],
+  "type": "object"
+ },
+ "westwind.remake.requested": {
+  "properties": {
+   "category": {
+    "enum": [
+     "remake",
+     "refund",
+     "address",
+     "lost",
+     "noise"
+    ],
+    "type": "string"
+   },
+   "order_id": {
+    "type": "string"
+   },
+   "ticket": {
+    "type": "string"
+   }
+  },
+  "required": [
+   "ticket",
+   "order_id",
+   "category"
+  ],
+  "type": "object"
+ },
+ "westwind.return.authorized": {
+  "properties": {
+   "category": {
+    "enum": [
+     "remake",
+     "refund",
+     "address",
+     "lost",
+     "noise"
+    ],
+    "type": "string"
+   },
+   "order_id": {
+    "type": "string"
+   },
+   "ticket": {
+    "type": "string"
+   }
+  },
+  "required": [
+   "ticket",
+   "order_id",
+   "category"
+  ],
+  "type": "object"
+ },
+ "westwind.return.expired": {
+  "properties": {
+   "category": {
+    "enum": [
+     "remake",
+     "refund",
+     "address",
+     "lost",
+     "noise"
+    ],
+    "type": "string"
+   },
+   "order_id": {
+    "type": "string"
+   },
+   "ticket": {
+    "type": "string"
+   }
+  },
+  "required": [
+   "ticket",
+   "order_id",
+   "category"
+  ],
+  "type": "object"
+ },
+ "westwind.return.received": {
+  "properties": {
+   "order_id": {
+    "type": "string"
+   },
+   "ticket": {
+    "type": "string"
+   }
+  },
+  "required": [
+   "ticket",
+   "order_id"
+  ],
+  "type": "object"
+ },
+ "westwind.return.shipped": {
+  "properties": {
+   "order_id": {
+    "type": "string"
+   },
+   "ticket": {
+    "type": "string"
+   }
+  },
+  "required": [
+   "ticket",
+   "order_id"
+  ],
+  "type": "object"
+ },
+ "westwind.returns.due": {
+  "properties": {
+   "category": {
+    "enum": [
+     "remake",
+     "refund",
+     "address",
+     "lost",
+     "noise"
+    ],
+    "type": "string"
+   },
+   "order_id": {
+    "type": "string"
+   },
+   "ticket": {
+    "type": "string"
+   }
+  },
+  "required": [
+   "ticket",
+   "order_id",
+   "category"
+  ],
+  "type": "object"
+ },
+ "westwind.ship.overdue": {
+  "properties": {
+   "lines": {
+    "items": {
+     "type": "string"
+    },
+    "type": "array"
+   },
+   "order_id": {
+    "type": "string"
+   },
+   "shipment_no": {
+    "type": "integer"
+   }
+  },
+  "required": [
+   "order_id",
+   "shipment_no",
+   "lines"
+  ],
+  "type": "object"
+ },
+ "westwind.shipment.redirected": {
+  "properties": {
+   "order_id": {
+    "type": "string"
+   },
+   "ship_to": {
+    "type": "string"
+   }
+  },
+  "required": [
+   "order_id",
+   "ship_to"
+  ],
+  "type": "object"
+ },
+ "westwind.shipper.joined": {
+  "properties": {
+   "company": {
+    "type": "string"
+   },
+   "id": {
+    "type": "string"
+   }
+  },
+  "required": [
+   "id",
+   "company"
+  ],
+  "type": "object"
+ },
+ "westwind.stock.released": {
+  "properties": {
+   "line_id": {
+    "type": "string"
+   },
+   "order_id": {
+    "type": "string"
+   },
+   "product_id": {
+    "type": "string"
+   },
+   "quantity": {
+    "type": "integer"
+   },
+   "spoils_in_days": {
+    "type": [
+     "integer",
+     "null"
+    ]
+   },
+   "unit_price": {
+    "type": "number"
+   }
+  },
+  "required": [
+   "line_id",
+   "order_id",
+   "product_id",
+   "quantity",
+   "unit_price"
+  ],
+  "type": "object"
+ },
+ "westwind.subscription.due": {
+  "properties": {
+   "subscription_id": {
+    "type": "string"
+   }
+  },
+  "required": [
+   "subscription_id"
+  ],
+  "type": "object"
+ },
+ "westwind.subscription.started": {
+  "properties": {
+   "customer_id": {
+    "type": "string"
+   },
+   "months": {
+    "type": "integer"
+   },
+   "product_id": {
+    "type": "string"
+   },
+   "quantity": {
+    "type": "integer"
+   },
+   "ship_to": {
+    "type": "string"
+   },
+   "subscription_id": {
+    "type": "string"
+   },
+   "unit_price": {
+    "type": "number"
+   }
+  },
+  "required": [
+   "subscription_id",
+   "customer_id",
+   "product_id",
+   "quantity",
+   "unit_price",
+   "months",
+   "ship_to"
+  ],
+  "type": "object"
+ },
+ "westwind.supplier.delivered": {
+  "properties": {
+   "product_id": {
+    "type": "string"
+   },
+   "quantity": {
+    "type": "integer"
+   }
+  },
+  "required": [
+   "product_id",
+   "quantity"
+  ],
+  "type": "object"
+ },
+ "westwind.supplier.joined": {
+  "properties": {
+   "city": {
+    "type": "string"
+   },
+   "company": {
+    "type": "string"
+   },
+   "id": {
+    "type": "string"
+   }
+  },
+  "required": [
+   "id",
+   "company",
+   "city"
+  ],
+  "type": "object"
+ },
+ "westwind.supplier.ordered": {
+  "properties": {
+   "line_id": {
+    "type": "string"
+   },
+   "order_id": {
+    "type": "string"
+   },
+   "product_id": {
+    "type": "string"
+   },
+   "quantity": {
+    "type": "integer"
+   },
+   "spoils_in_days": {
+    "type": [
+     "integer",
+     "null"
+    ]
+   },
+   "unit_price": {
+    "type": "number"
+   }
+  },
+  "required": [
+   "line_id",
+   "order_id",
+   "product_id",
+   "quantity",
+   "unit_price"
+  ],
+  "type": "object"
+ },
+ "westwind.support.approval_due": {
+  "properties": {
+   "category": {
+    "enum": [
+     "remake",
+     "refund",
+     "address",
+     "lost",
+     "noise"
+    ],
+    "type": "string"
+   },
+   "order_id": {
+    "type": "string"
+   },
+   "ticket": {
+    "type": "string"
+   }
+  },
+  "required": [
+   "ticket",
+   "order_id",
+   "category"
+  ],
+  "type": "object"
+ },
+ "westwind.ticket.closed": {
+  "properties": {
+   "category": {
+    "enum": [
+     "remake",
+     "refund",
+     "address",
+     "lost",
+     "noise"
+    ],
+    "type": "string"
+   },
+   "order_id": {
+    "type": "string"
+   },
+   "ticket": {
+    "type": "string"
+   }
+  },
+  "required": [
+   "ticket",
+   "order_id",
+   "category"
+  ],
+  "type": "object"
+ },
+ "westwind.ticket.opened": {
+  "properties": {
+   "order_id": {
+    "type": "string"
+   },
+   "text": {
+    "type": "string"
+   }
+  },
+  "required": [
+   "order_id",
+   "text"
+  ],
+  "type": "object"
+ },
+ "westwind.ticket.triaged": {
+  "properties": {
+   "category": {
+    "enum": [
+     "remake",
+     "refund",
+     "address",
+     "lost",
+     "noise"
+    ],
+    "type": "string"
+   },
+   "order_id": {
+    "type": "string"
+   },
+   "ticket": {
+    "type": "string"
+   }
+  },
+  "required": [
+   "ticket",
+   "order_id",
+   "category"
+  ],
+  "type": "object"
+ }
+}

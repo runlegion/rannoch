@@ -1,0 +1,3 @@
+{"flow": "aftership", "domain": "westwind", "carry": 64, "correlation": {"westwind.order.delivered": "/order_id", "westwind.aftership.window_closed": "/order_id"}}
+{"id": "delivered", "on": "westwind.order.delivered", "step": "after", "delay_ms": 1209600000, "type": "westwind.aftership.window_closed"}
+{"id": "closed", "on": "westwind.aftership.window_closed", "step": "emit", "type": "westwind.order.closed"}

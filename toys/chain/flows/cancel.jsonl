@@ -1,0 +1,8 @@
+{"flow": "cancel", "domain": "westwind", "carry": 64, "correlation": {"westwind.order.accepted": "/order_id", "westwind.line.allocated": "/order_id", "westwind.order.shipped": "/order_id", "westwind.order.cancel_requested": "/order_id"}}
+{"id": "accepted", "on": "westwind.order.accepted"}
+{"id": "allocated", "on": "westwind.line.allocated", "step": "host", "action": "track_allocated"}
+{"id": "shipped", "on": "westwind.order.shipped"}
+{"id": "request", "on": "westwind.order.cancel_requested", "guard": {"seen": ["westwind.order.shipped"]}, "step": "emit", "type": "westwind.cancel.refused", "else": "cancel"}
+{"id": "cancel", "step": "emit", "type": "westwind.order.cancelled", "next": "refund"}
+{"id": "refund", "guard": {"seen": ["westwind.order.accepted"]}, "step": "emit", "type": "westwind.refund.issued", "next": "release", "else": "release"}
+{"id": "release", "step": "emit_each", "each": "/vars/allocated", "type": "westwind.stock.released"}

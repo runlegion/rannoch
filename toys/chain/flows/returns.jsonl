@@ -1,0 +1,6 @@
+{"flow": "returns", "domain": "westwind", "carry": 64, "correlation": {"westwind.return.authorized": "/ticket", "westwind.return.shipped": "/ticket", "westwind.returns.due": "/ticket"}}
+{"id": "authorized", "on": "westwind.return.authorized", "step": "host", "action": "remember_return", "next": "wait"}
+{"id": "wait", "step": "after", "delay_ms": 1209600000, "type": "westwind.returns.due"}
+{"id": "shipped", "on": "westwind.return.shipped", "step": "emit", "type": "westwind.return.received", "next": "refund"}
+{"id": "refund", "guard": {"vars": {"category": "refund"}}, "step": "emit", "type": "westwind.refund.issued"}
+{"id": "due", "on": "westwind.returns.due", "guard": {"unseen": ["westwind.return.shipped"]}, "step": "emit", "type": "westwind.return.expired"}

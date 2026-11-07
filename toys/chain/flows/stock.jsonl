@@ -1,0 +1,9 @@
+{"flow": "stock", "domain": "westwind", "carry": 64, "correlation": {"westwind.product.listed": "/id", "westwind.line.requested": "/product_id", "westwind.supplier.delivered": "/product_id", "westwind.stock.released": "/product_id"}}
+{"id": "listed", "on": "westwind.product.listed", "step": "host", "action": "stock_listed"}
+{"id": "request", "on": "westwind.line.requested", "step": "host", "action": "reserve", "next": "allocated"}
+{"id": "allocated", "guard": {"answer": {"allocated": true}}, "step": "emit", "type": "westwind.line.allocated", "else": "backordered"}
+{"id": "backordered", "step": "emit", "type": "westwind.line.backordered", "next": "reorder"}
+{"id": "reorder", "guard": {"answer": {"reorder": true}}, "step": "emit", "type": "westwind.supplier.ordered"}
+{"id": "delivered", "on": "westwind.supplier.delivered", "step": "host", "action": "restock", "next": "release"}
+{"id": "release", "step": "emit_each", "each": "/answer/released", "type": "westwind.line.allocated"}
+{"id": "released", "on": "westwind.stock.released", "step": "host", "action": "unreserve"}

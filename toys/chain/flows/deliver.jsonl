@@ -1,0 +1,11 @@
+{"flow": "deliver", "domain": "westwind", "carry": 64, "correlation": {"westwind.order.accepted": "/order_id", "westwind.order.shipped": "/order_id", "westwind.carrier.delivered": "/order_id", "westwind.carrier.lost": "/order_id", "westwind.deliver.spoil_check": "/order_id", "westwind.order.delivered": "/order_id"}}
+{"id": "accepted", "on": "westwind.order.accepted", "step": "host", "action": "remember_delivery"}
+{"id": "shipped", "on": "westwind.order.shipped", "guard": {"vars": {"perishable": true}}, "step": "host", "action": "spoil_after", "next": "spoil"}
+{"id": "spoil", "step": "after", "delay_from": "/answer/delay_ms", "type": "westwind.deliver.spoil_check"}
+{"id": "delivered", "on": "westwind.carrier.delivered", "step": "emit", "type": "westwind.order.delivered", "next": "late"}
+{"id": "late", "step": "host", "action": "is_late", "next": "late_sent"}
+{"id": "late_sent", "guard": {"answer": {"late": true}}, "step": "emit", "type": "westwind.order.late"}
+{"id": "lost", "on": "westwind.carrier.lost", "step": "emit", "type": "westwind.order.lost", "next": "refund"}
+{"id": "refund", "step": "emit", "type": "westwind.refund.issued"}
+{"id": "spoil_check", "on": "westwind.deliver.spoil_check", "guard": {"unseen": ["westwind.order.delivered"]}, "step": "emit", "type": "westwind.order.spoiled"}
+{"id": "seen_delivered", "on": "westwind.order.delivered"}
