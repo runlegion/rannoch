@@ -1,0 +1,36 @@
+seed.sql sha256 matches 6d38971dc46a9677b46d8b6b072c88fdc6af67d381b4d731316064c166e60e71; nothing else building; load { 3.49 4.24 4.19 }
+ran in 1.1s: 12080 lines read, 156581 units, 37 rounds, 0 held at end; load { 3.49 4.24 4.19 }
+P1 Cersei                     trail of   30 events matches
+P1 Jon Snow                   trail of   43 events matches
+P1 Davos                      trail of   16 events matches
+P1 Tyrion                     trail of 1921 events matches
+P1 Arya, before paying        trail of    4 events matches
+P1 Arya, after packing        trail of   17 events matches
+P1 Arya, while backordered    trail of   10 events matches
+P1 Arya, after shipping       trail of   17 events matches
+P1 Daenerys                   trail of    6 events matches
+P1 Hodor                      trail of   21 events matches
+P1 Lion, abandoned            trail of    3 events matches
+P1 Lion, unanswered           trail of   23 events matches
+P1 Tin Man                    trail of   18 events matches
+P1 13 of 13 trails match
+P1 seed orders: 320 of 320 match SQL over the seed
+    emitted events invalid: 0; bins {"another domain": 4, "later than the declared lateness": 2, "malformed": 4}
+      later than the declared lateness   208800000 ms behind: {"causation":"0196c1ca-9000-7e18-b131-1d09eefc3b43","data":{"order_id":"0196c1ca-9000-771
+      another domain                     type westwind.order.placed is westwind's, source oz/emerald-city is oz's: {"data":{"customer_id":"00000000-000
+      another domain                     type westwind.ticket.opened is westwind's, source oz/emerald-city is oz's: {"data":{"order_id":"019751fc-a000-
+      another domain                     type oz.order.placed is oz's, source westwind/web is westwind's: {"data":{"citizen_id":"00000000-0000-7410-965
+      another domain                     type oz.citizen.joined is oz's, source westwind/web is westwind's: {"data":{"id":"00000000-0000-7c63-b2ed-5654
+      malformed                          expected ident at line 1 column 2: this is not an event
+      malformed                          specversion 0.3 is not 1.0: {"data":{},"id":"019751fc-a000-7a2d-8d99-fbecc3ff060b","source":"westwind/web","sp
+      malformed                          data.customer_id is missing: {"data":{"order_id":"x"},"id":"019751fc-a000-73a6-8b5b-a8acccaf2635","source":"we
+      malformed                          no schema for westwind.dragon.sighted: {"data":{},"id":"019751fc-a000-7e69-9f0b-20603d80c0d6","source":"westwi
+      later than the declared lateness   813600000 ms behind: {"data":{"city":"Pentos","id":"019751fc-a000-7b57-9f47-483b9897d3f9","name":"Late Larry"}
+    stalls handed again: ["host action triage stalled: no answer within 300 ms"]
+    rows 556 (Oz 4), edges 1417; host answers kept: triage 5; Hodor's identical tickets: 2 rows
+    triage work per ticket in this process: [1, 1, 1, 1, 1]
+P9 Lion, abandoned: ["order.abandoned at day 1"]
+P9 Lion, unanswered: ["remake.expired at day 9", "return.expired at day 20"]
+P9 Tyrion: 120 monthly orders placed by timer, the last at day 3570
+P10 Cersei's return authorized 1 time(s); duplicate ids dropped by the rows' windows
+rows 83330923515380e0, outcomes a8184fc0102a6e76

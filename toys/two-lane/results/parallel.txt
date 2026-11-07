@@ -1,0 +1,10 @@
+extended with the chain: 188020 arrivals, 50000 orders; nothing else building; load { 3.18 3.79 4.05 }
+  starting 1 worker(s), run 0; nothing else building; load { 3.18 3.79 4.05 }
+P8 1 worker(s), run 0: 100.1s, 2175494 units = 21728 units/s; outcomes 48e501467641f5b1; rows 91871c19254d50a1; load { 3.85 3.85 4.04 }
+  starting 4 worker(s), run 0; nothing else building; load { 3.85 3.85 4.04 }
+P8 4 worker(s), run 0: 83.0s, 2175494 units = 26209 units/s; outcomes 48e501467641f5b1; rows 59876501e0edfc8c; load { 3.98 3.85 4.02 }
+  starting 1 worker(s), run 1; nothing else building; load { 3.98 3.85 4.02 }
+P8 1 worker(s), run 1: 105.4s, 2175494 units = 20640 units/s; outcomes 48e501467641f5b1; rows 91871c19254d50a1; load { 6.49 4.69 4.31 }
+  starting 4 worker(s), run 1; nothing else building; load { 6.49 4.69 4.31 }
+P8 4 worker(s), run 1: 86.2s, 2175494 units = 25243 units/s; outcomes 48e501467641f5b1; rows 59876501e0edfc8c; load { 4.78 4.55 4.29 }
+P8 4 workers against 1: 1.21x faster; outcomes all the same: true

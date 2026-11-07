@@ -1,0 +1,11 @@
+extended, fast lane only: 753806 events, 400839 orders, batches of 4096; nothing else building; load { 4.01 4.63 3.96 }
+  load starting (log false, run 0); nothing else building; load { 4.01 4.63 3.96 }
+P2 fast lane, log false: 753806 facts in 22.80s = 33060 facts/s; store file 910.4 MB (inbox 487.9 MB, log 0.0 MB); nothing else building; load { 3.81 4.53 3.94 }
+  load starting (log true, run 0); nothing else building; load { 3.81 4.53 3.94 }
+P2 fast lane, log true: 753806 facts in 23.11s = 32615 facts/s; store file 910.4 MB (inbox 487.9 MB, log 487.9 MB); trickle heard 753806, lag sampled every 20 batches max 0 events (last 0), finished 0.01s after the fast lane; nothing else building; load { 3.58 4.43 3.92 }
+P5 hearings built: 753806 (0.035s to count)
+  load starting (log false, run 1); nothing else building; load { 3.58 4.43 3.92 }
+P2 fast lane, log false: 753806 facts in 22.41s = 33636 facts/s; store file 910.4 MB (inbox 487.9 MB, log 0.0 MB); nothing else building; load { 3.66 4.38 3.92 }
+  load starting (log true, run 1); nothing else building; load { 3.66 4.38 3.92 }
+P2 fast lane, log true: 753806 facts in 22.94s = 32866 facts/s; store file 910.4 MB (inbox 487.9 MB, log 487.9 MB); trickle heard 753806, lag sampled every 20 batches max 0 events (last 0), finished 0.01s after the fast lane; nothing else building; load { 3.33 4.25 3.88 }
+P4 log on against off: +1.8% (mean of 2 runs each, interleaved)
