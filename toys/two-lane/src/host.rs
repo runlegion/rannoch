@@ -125,13 +125,19 @@ pub fn call(name: &str, input: &Value) -> Result<Answer, String> {
             } else if !waiting.contains(&line) {
                 waiting.push(line);
             }
-            let pack = pack_decision(&lines, &picked, &waiting, &packed);
+            // Kept in order, so the row and what it sends do not depend on which line came first.
+            let by_text = |a: &Value, b: &Value| a.as_str().cmp(&b.as_str());
+            picked.sort_by(by_text);
+            waiting.sort_by(by_text);
+            let mut pack = pack_decision(&lines, &picked, &waiting, &packed);
+            pack.sort_by(by_text);
             let mut shipments = int(var(input, "shipments"));
             let answer = if pack.is_empty() {
                 json!({"pack": false})
             } else {
                 shipments += 1;
                 packed.extend(pack.iter().cloned());
+                packed.sort_by(by_text);
                 json!({"pack": true, "packed": {"order_id": data["order_id"], "shipment_no": shipments, "lines": pack}})
             };
             (answer, set(vec![("picked", json!(picked)), ("waiting", json!(waiting)), ("packed", json!(packed)), ("shipments", json!(shipments))]))

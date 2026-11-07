@@ -9,6 +9,7 @@
 //! two-lane-toy parallel <westwind dir> <out dir>   # prediction 8
 //! ```
 
+mod build;
 mod domain;
 mod entrance;
 mod flow;
@@ -569,6 +570,196 @@ fn parallel(westwind: &Path, out: &Path, orders: usize) -> Result<()> {
     Ok(())
 }
 
+/// The disk's durable append rate: 3.3 KB records in batches of 4,096, synced per batch.
+fn append_rate(dir: &Path) -> Result<f64> {
+    use std::io::Write as _;
+    let path = dir.join("append-test.bin");
+    let mut f = std::fs::OpenOptions::new().create(true).truncate(true).write(true).open(&path).map_err(|e| e.to_string())?;
+    let record = vec![b'x'; 3300];
+    let t = Instant::now();
+    let mut bytes = 0usize;
+    for _ in 0..40 {
+        for _ in 0..4096 {
+            f.write_all(&record).map_err(|e| e.to_string())?;
+            bytes += record.len();
+        }
+        f.sync_data().map_err(|e| e.to_string())?;
+    }
+    let rate = bytes as f64 / t.elapsed().as_secs_f64();
+    std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+    Ok(rate)
+}
+
+fn file_bytes(path: &Path) -> Result<u64> {
+    let c = Connection::open(path).map_err(|e| e.to_string())?;
+    c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").map_err(|e| e.to_string())?;
+    drop(c);
+    Ok(["", "-wal", "-shm"].iter().map(|s| std::fs::metadata(format!("{}{s}", path.display())).map(|m| m.len()).unwrap_or(0)).sum())
+}
+
+/// Feeds the build stream from arrival `skip` on, a batch at a time; returns each build's
+/// seconds and the store's size after it.
+fn feed_build(dir: &Path, plan: &build::Plan, log: bool, skip: usize) -> Result<(Lane, Vec<(i64, f64, u64)>)> {
+    let mut lane = Lane::open(dir, Vec::new(), Schemas::load(SCHEMAS)?, LATENESS, 1, log)?;
+    let die_after: Option<u64> = std::env::var("TWO_LANE_DIE_AFTER").ok().and_then(|v| v.parse().ok());
+    let order = plan.order();
+    let mut marks = Vec::new();
+    let mut t = Instant::now();
+    let mut current = order.get(skip).map_or(1, |o| o.0);
+    let mut i = skip;
+    while i < order.len() {
+        let end = (i + 4096).min(order.len());
+        // A batch never spans two builds, so each build's time and size are its own.
+        let end = (i..end).find(|&j| order[j].0 != current).unwrap_or(end);
+        let lines: Vec<String> = order[i..end].iter().map(|&(b, k, f)| plan.line(b, k, f)).collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        lane.take(&refs)?;
+        while lane.round()? {
+            if die_after.is_some_and(|n| lane.rounds >= n) {
+                std::process::abort();
+            }
+        }
+        i = end;
+        if i == order.len() || order[i].0 != current {
+            marks.push((current, t.elapsed().as_secs_f64(), file_bytes(&dir.join("shard-0.db"))?));
+            t = Instant::now();
+            if let Some(next) = order.get(i) {
+                current = next.0;
+            }
+        }
+    }
+    lane.ended = true;
+    lane.drain()?;
+    Ok((lane, marks))
+}
+
+/// Predictions 1 to 6 and 10 on the build stream.
+#[allow(clippy::too_many_lines)]
+fn builds(out: &Path, objects: usize) -> Result<()> {
+    let plan = build::Plan::new(objects);
+    let dir0 = fresh(out, "build-rate")?;
+    println!("disk's durable append rate (3.3 KB records, 4,096 per sync): {:.1} MB/s; {}; load {}", append_rate(&dir0)? / 1e6, building(), load_average());
+    let mut runs = Vec::new();
+    for (run, log) in [(0, false), (0, true), (1, false), (1, true)] {
+        let dir = fresh(out, &format!("build-{}-{run}", if log { "log" } else { "nolog" }))?;
+        println!("  build stream, log {log}, run {run}: starting; {}; load {}", building(), load_average());
+        let (lane, marks) = feed_build(&dir, &plan, log, 0)?;
+        let total: f64 = marks.iter().map(|m| m.1).sum();
+        drop(lane);
+        let shard = store::Shard::open(&dir.join("shard-0.db"))?;
+        let mut last = 0u64;
+        for (b, seconds, size) in &marks {
+            let count: i64 = shard.conn().query_row("SELECT COUNT(*) FROM versions WHERE axis = ?1", [b], |r| r.get(0)).map_err(|e| e.to_string())?;
+            let expected = plan.changed[usize::try_from(*b - 1).unwrap_or(0)].len() + if *b == build::FIX_BUILD { plan.fixed.len() } else { 0 };
+            let changed_bytes = plan.changed_bytes(*b);
+            let growth = size.saturating_sub(last);
+            let sent = if *b == build::FIX_BUILD { objects + plan.fixed.len() } else { objects };
+            println!(
+                "P1/P2 build {b}: {sent} objects sent, {count} versions written, generator changed {expected}; store grew {:.1} MB for {:.1} MB changed ({:.2}x); {seconds:.1}s = {:.0} objects/s, {:.1} MB/s",
+                growth as f64 / 1e6,
+                changed_bytes as f64 / 1e6,
+                growth as f64 / changed_bytes.max(1) as f64,
+                sent as f64 / seconds,
+                sent as f64 * 3300.0 / seconds / 1e6
+            );
+            last = *size;
+        }
+        println!("  run total {total:.1}s; {}; load {}", building(), load_average());
+        runs.push((log, total, dir));
+    }
+    let mean = |log: bool| runs.iter().filter(|r| r.0 == log).map(|r| r.1).sum::<f64>() / 2.0;
+    println!("P10 log on against off, whole stream: {:+.1}% (mean of 2 interleaved runs each)", (mean(true) / mean(false) - 1.0) * 100.0);
+
+    // 4, 5, 6: reads, with the log and the hearings moved out of reach first.
+    let dir = runs[1].2.clone();
+    let hidden = dir.join("hidden");
+    std::fs::create_dir_all(&hidden).map_err(|e| e.to_string())?;
+    for f in ["log.jsonl", "hearings.db"] {
+        if dir.join(f).exists() {
+            std::fs::rename(dir.join(f), hidden.join(f)).map_err(|e| e.to_string())?;
+        }
+    }
+    let shard = store::Shard::open(&dir.join("shard-0.db"))?;
+    let (mut matched, mut total) = (0usize, 0usize);
+    for i in 0..objects {
+        for b in 1..=build::BUILDS {
+            total += 1;
+            let row = shard.as_of("build_object", &build::key(i), b, i64::MAX)?;
+            let want = build::body(i, plan.version_at(i, b, i64::MAX));
+            if row.is_some_and(|r| r.data.get("body") == Some(&want)) {
+                matched += 1;
+            }
+        }
+    }
+    println!("P4 as-of reads equal to the generator: {matched} of {total} (every object at every build)");
+    let mut rng = rows::Rng::new(5);
+    let mut times = Vec::new();
+    for _ in 0..20_000 {
+        let i = usize::try_from(rng.below(objects as u64)).unwrap_or(0);
+        let b = 1 + i64::try_from(rng.below(6)).unwrap_or(0);
+        let t = Instant::now();
+        let _ = std::hint::black_box(shard.as_of("build_object", &build::key(i), b, i64::MAX)?);
+        times.push(t.elapsed().as_secs_f64() * 1e3);
+    }
+    times.sort_by(f64::total_cmp);
+    println!("P4 single-key as-of read: p50 {:.3} ms, p99 {:.3} ms over 20,000 random reads; load {}", times[times.len() / 2], times[times.len() * 99 / 100], load_average());
+    let (mut before, mut after) = (0, 0);
+    for &i in &plan.fixed {
+        let k = plan.fixed_at(i);
+        let pre = shard.as_of("build_object", &build::key(i), build::FIX_BUILD, k - 1)?;
+        let post = shard.as_of("build_object", &build::key(i), build::FIX_BUILD, k)?;
+        if pre.is_some_and(|r| r.data.get("body") == Some(&build::body(i, plan.version_at(i, build::FIX_BUILD, k - 1)))) {
+            before += 1;
+        }
+        if post.is_some_and(|r| r.data.get("body") == Some(&build::body(i, plan.version_at(i, build::FIX_BUILD, k)))) {
+            after += 1;
+        }
+    }
+    println!("P5 fix-pass objects as known before the fix: {before} of {} give the earlier answer; as known after: {after} of {} the fixed one", plan.fixed.len(), plan.fixed.len());
+    println!("P6 every read above ran with log.jsonl and hearings.db moved out of the lane's directory");
+    Ok(())
+}
+
+/// The child the build kill test runs: resumes the build stream in `dir`.
+fn build_child(dir: &Path, objects: usize) -> Result<()> {
+    let plan = build::Plan::new(objects);
+    let taken = std::fs::read_to_string(dir.join("inbox.jsonl")).unwrap_or_default().lines().count();
+    feed_build(dir, &plan, true, taken).map(|_| ())
+}
+
+/// Prediction 8 on the build stream: 10 aborts at random rounds.
+fn build_kills(out: &Path, objects: usize) -> Result<()> {
+    let plan = build::Plan::new(objects);
+    let base = fresh(out, "build-kill-base")?;
+    let (lane, _) = feed_build(&base, &plan, true, 0)?;
+    let rounds = lane.rounds;
+    drop(lane);
+    let want = digest(&store::Shard::open(&base.join("shard-0.db"))?.versions_text()?);
+    let dir = fresh(out, "build-killed")?;
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let mut rng = rows::Rng::new(77);
+    let (mut landed, mut tries) = (0, 0);
+    while landed < 10 && tries < 40 {
+        tries += 1;
+        let after = 1 + rng.below((rounds / 10).max(2));
+        let status = std::process::Command::new(&exe)
+            .args(["build-child", &dir.display().to_string(), &objects.to_string()])
+            .env("TWO_LANE_DIE_AFTER", after.to_string())
+            .status()
+            .map_err(|e| e.to_string())?;
+        if !status.success() {
+            landed += 1;
+        }
+    }
+    let status = std::process::Command::new(&exe).args(["build-child", &dir.display().to_string(), &objects.to_string()]).status().map_err(|e| e.to_string())?;
+    if !status.success() {
+        return Err("the last build child failed".into());
+    }
+    let got = digest(&store::Shard::open(&dir.join("shard-0.db"))?.versions_text()?);
+    println!("P8 build stream: {landed} of {tries} children aborted mid-run; versions {got} against unkilled {want}: equal {}", got == want);
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let arg = |i: usize| args.get(i).map(PathBuf::from).unwrap_or_default();
@@ -579,6 +770,9 @@ fn main() {
         Some("fast") => fast(&arg(2), &arg(3)),
         Some("hearings") => hearings(&arg(2), &arg(3)),
         Some("parallel") => parallel(&arg(2), &arg(3), args.get(4).and_then(|s| s.parse().ok()).unwrap_or(50_000)),
+        Some("builds") => builds(&arg(2), args.get(3).and_then(|s| s.parse().ok()).unwrap_or(200_000)),
+        Some("build-kills") => build_kills(&arg(2), args.get(3).and_then(|s| s.parse().ok()).unwrap_or(200_000)),
+        Some("build-child") => build_child(&arg(2), args.get(3).and_then(|s| s.parse().ok()).unwrap_or(200_000)),
         Some("child") => child(&arg(2), &arg(3), args.get(4).map_or("in", String::as_str)),
         _ => Err("usage: two-lane-toy run|replays|fast|hearings|parallel <westwind dir> <out dir>".into()),
     };

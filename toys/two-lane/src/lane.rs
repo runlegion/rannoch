@@ -26,7 +26,7 @@ use crate::entrance::{Event, admit, to_json};
 use crate::flow::Flow;
 use crate::host::Pool;
 use crate::schema::Schemas;
-use crate::store::{Shard, fact_of};
+use crate::store::{Shard, axis_of, defined, fact_of};
 
 /// What a unit of work is for: an event's own fact, or one flow's handling of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, PartialOrd, Ord)]
@@ -90,6 +90,15 @@ fn worker(path: PathBuf, flows: Arc<Vec<Flow>>, window: i64, jobs: Receiver<Job>
     }
 }
 
+/// The row was made by the latest of the events applied to it, by event time then id, whatever
+/// order they were handed in.
+fn made_by(row: &mut crate::store::Row, event: &Event) {
+    if (event.time, event.id.as_str()) > (row.time, row.event.as_str()) {
+        row.event = event.id.clone();
+    }
+    row.time = row.time.max(event.time);
+}
+
 fn work(shard: &mut Shard, flows: &[Flow], pool: &mut Pool, window: i64, units: Vec<Unit>) -> Outcome {
     let mut out = Outcome::default();
     for unit in units {
@@ -97,20 +106,28 @@ fn work(shard: &mut Shard, flows: &[Flow], pool: &mut Pool, window: i64, units: 
         match unit.target {
             Target::Fact => {
                 let Some(fact) = fact_of(event) else { continue };
+                let axis = axis_of(&unit.kind, event);
                 let Ok(row) = shard.row(&unit.kind, &unit.key) else { continue };
                 if row.facts.contains_key(&event.id) {
                     continue;
                 }
                 if fact.defines {
-                    row.data = event.data.clone();
+                    let data = defined(&unit.kind, event);
+                    // Written again unchanged: nothing is written.
+                    if !row.event.is_empty() && row.data == data {
+                        continue;
+                    }
+                    row.data = data;
                 }
                 row.types.insert(event.ty.clone(), event.time);
                 row.facts.insert(event.id.clone(), event.time);
-                row.event = event.id.clone();
-                row.time = row.time.max(event.time);
+                made_by(row, event);
+                row.axis = row.axis.max(axis);
                 let horizon = row.time.saturating_sub(window);
                 row.facts.retain(|_, t| *t >= horizon);
-                shard.touched(&unit.kind, &unit.key);
+                if shard.touched(&unit.kind, &unit.key, event, axis).is_err() {
+                    continue;
+                }
                 for (rel, kind, to) in fact.edges {
                     shard.edge((fact.kind, &fact.key), rel, (kind, &to), &event.id);
                 }
@@ -134,12 +151,13 @@ fn work(shard: &mut Shard, flows: &[Flow], pool: &mut Pool, window: i64, units: 
                             shard.keep_answer(at, answer);
                         }
                         if !done.again {
+                            let mut axis = 0;
                             if let Ok(row) = shard.row(&unit.kind, &unit.key) {
                                 row.flows.insert(flow.name.clone(), state);
-                                row.event = event.id.clone();
-                                row.time = row.time.max(event.time);
+                                made_by(row, event);
+                                axis = row.axis;
                             }
-                            shard.touched(&unit.kind, &unit.key);
+                            let _ = shard.touched(&unit.kind, &unit.key, event, axis);
                         }
                         out.sent.extend(done.sent);
                     }

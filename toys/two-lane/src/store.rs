@@ -1,5 +1,7 @@
-//! The toy's own store, on SQLite, built to the two-lane shape. One write per fact: the row as it
-//! is now, with the id of the event that made it. Edges join rows. A flow's state is a part of
+//! The toy's own store, on SQLite, built to the two-lane shape, with versions. One write per
+//! changed fact: a version of its row, appended, carrying the value of its kind's declared axis
+//! and the known-at from the clock in its event's id. A fact written again unchanged writes
+//! nothing. The row as it is now is its latest version. Edges join rows. A flow's state is a part of
 //! its row. The host's answers are kept by action and event, in the same transaction as the rows
 //! they changed. No log table, no hearing table, no second copy of a row.
 
@@ -26,6 +28,39 @@ pub struct Row {
     pub flows: BTreeMap<String, State>,
     pub event: String,
     pub time: i64,
+    /// The value of its kind's declared axis at its latest version; 0 for a kind with none.
+    #[serde(default)]
+    pub axis: i64,
+}
+
+/// The known-at of an event: the millisecond in its `UUIDv7` id.
+#[must_use]
+pub fn known_of(event: &Event) -> i64 {
+    uuid::Uuid::parse_str(&event.id)
+        .ok()
+        .and_then(|u| u.get_timestamp())
+        .map_or(event.time, |t| {
+            let (s, n) = t.to_unix();
+            i64::try_from(s).unwrap_or(0) * 1000 + i64::from(n / 1_000_000)
+        })
+}
+
+/// A kind's declared axis: the build, for build objects; none otherwise.
+#[must_use]
+pub fn axis_of(kind: &str, event: &Event) -> i64 {
+    if kind == "build_object" { event.data.get("build").and_then(Value::as_i64).unwrap_or(0) } else { 0 }
+}
+
+/// What a defining event says the row is: for a kind with an axis, its data without the axis.
+#[must_use]
+pub fn defined(kind: &str, event: &Event) -> Value {
+    let mut data = event.data.clone();
+    if kind == "build_object"
+        && let Value::Object(m) = &mut data
+    {
+        m.remove("build");
+    }
+    data
 }
 
 /// Where an event's own fact lands: the row's kind and key, whether the event defines the row,
@@ -70,6 +105,7 @@ pub fn fact_of(event: &Event) -> Option<Fact> {
         "oz.citizen.joined" => fact("oz_citizen", s(d, "id"), true, vec![]),
         "oz.order.placed" => fact("oz_order", s(d, "order_id"), true, vec![("ordered_by", "oz_citizen", s(d, "citizen_id"))]),
         "westwind.clock.tick" => None,
+        "build.object.written" => fact("build_object", s(d, "id"), true, vec![]),
         t if ["ticket.", "remake.", "return.", "returns.", "support.", "compensation."].iter().any(|p| t.starts_with(&format!("westwind.{p}"))) => {
             fact("westwind_ticket", s(d, "ticket"), false, vec![])
         }
@@ -82,7 +118,8 @@ pub fn fact_of(event: &Event) -> Option<Fact> {
 pub struct Shard {
     conn: Connection,
     cache: HashMap<(String, String), Row>,
-    dirty: BTreeSet<(String, String)>,
+    /// Versions to append at the next commit: one per changed fact, each its row as it became.
+    versions: Vec<(String, String, i64, i64, String, String)>,
     edges: Vec<(String, String, String, String, String, String)>,
     answers: Vec<((String, String), Answer)>,
     pub writes: u64,
@@ -100,8 +137,9 @@ impl std::fmt::Debug for Shard {
 }
 
 const SCHEMA: &str = "
-    CREATE TABLE IF NOT EXISTS rows(kind TEXT NOT NULL, key TEXT NOT NULL, event TEXT NOT NULL, time INTEGER NOT NULL,
-        body TEXT NOT NULL, UNIQUE(kind, key));
+    CREATE TABLE IF NOT EXISTS versions(kind TEXT NOT NULL, key TEXT NOT NULL, axis INTEGER NOT NULL,
+        known INTEGER NOT NULL, event TEXT NOT NULL, body TEXT NOT NULL);
+    CREATE INDEX IF NOT EXISTS versions_at ON versions(kind, key, axis, known);
     CREATE TABLE IF NOT EXISTS edges(src TEXT NOT NULL, rel TEXT NOT NULL, dst TEXT NOT NULL,
         PRIMARY KEY(src, rel, dst)) WITHOUT ROWID;
     CREATE INDEX IF NOT EXISTS edges_to ON edges(dst, rel);
@@ -115,9 +153,12 @@ impl Shard {
     pub fn open(path: &Path) -> Result<Shard, String> {
         let conn = Connection::open(path).map_err(|e| e.to_string())?;
         conn.busy_timeout(std::time::Duration::from_secs(30)).map_err(|e| e.to_string())?;
+        // Versions of 3 KB objects fit one to a 4 KB page with most of a page left over; a
+        // larger page packs them. Set before the file has a journal, so it takes.
+        conn.execute_batch("PRAGMA page_size=65536;").map_err(|e| e.to_string())?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA fullfsync=ON;").map_err(|e| e.to_string())?;
         conn.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
-        Ok(Shard { conn, cache: HashMap::new(), dirty: BTreeSet::new(), edges: Vec::new(), answers: Vec::new(), writes: 0, found: 0, absent: 0, from_memory: 0 })
+        Ok(Shard { conn, cache: HashMap::new(), versions: Vec::new(), edges: Vec::new(), answers: Vec::new(), writes: 0, found: 0, absent: 0, from_memory: 0 })
     }
 
     /// The row of `kind` keyed `key`. A row this process has written is handed back from memory,
@@ -132,7 +173,7 @@ impl Shard {
         } else {
             let body: Option<String> = self
                 .conn
-                .prepare_cached("SELECT body FROM rows WHERE kind = ?1 AND key = ?2")
+                .prepare_cached("SELECT body FROM versions WHERE kind = ?1 AND key = ?2 ORDER BY axis DESC, rowid DESC LIMIT 1")
                 .map_err(|e| e.to_string())?
                 .query_row(params![kind, key], |r| r.get(0))
                 .optional()
@@ -152,8 +193,34 @@ impl Shard {
         self.cache.get_mut(&at).ok_or_else(|| "no row".to_string())
     }
 
-    pub fn touched(&mut self, kind: &str, key: &str) {
-        self.dirty.insert((kind.to_string(), key.to_string()));
+    /// Appends a version of the row as it is now, made by `event` at `axis`.
+    ///
+    /// # Errors
+    /// The row cannot be written as JSON.
+    pub fn touched(&mut self, kind: &str, key: &str, event: &Event, axis: i64) -> Result<(), String> {
+        let row = self.cache.get(&(kind.to_string(), key.to_string())).ok_or("no row")?;
+        let body = serde_json::to_string(row).map_err(|e| e.to_string())?;
+        self.versions.push((kind.to_string(), key.to_string(), axis, known_of(event), event.id.clone(), body));
+        Ok(())
+    }
+
+    /// The row of `kind` keyed `key` as of `axis`, as known at `known`: its version with the
+    /// greatest axis at or before `axis`, then the latest known at or before `known`.
+    ///
+    /// # Errors
+    /// The file cannot be read.
+    pub fn as_of(&self, kind: &str, key: &str, axis: i64, known: i64) -> Result<Option<Row>, String> {
+        let body: Option<String> = self
+            .conn
+            .prepare_cached(
+                "SELECT body FROM versions WHERE kind = ?1 AND key = ?2 AND axis <= ?3 AND known <= ?4
+                 ORDER BY axis DESC, known DESC, rowid DESC LIMIT 1",
+            )
+            .map_err(|e| e.to_string())?
+            .query_row(params![kind, key, axis, known], |r| r.get(0))
+            .optional()
+            .map_err(|e| e.to_string())?;
+        body.map(|b| serde_json::from_str(&b).map_err(|e| e.to_string())).transpose()
     }
 
     pub fn edge(&mut self, src: (&str, &str), rel: &str, dst: (&str, &str), event: &str) {
@@ -189,14 +256,10 @@ impl Shard {
         let err = |e: rusqlite::Error| e.to_string();
         let tx = self.conn.transaction().map_err(err)?;
         {
-            let mut put = tx.prepare_cached("INSERT INTO rows(kind, key, event, time, body) VALUES (?1, ?2, ?3, ?4, ?5)
-                ON CONFLICT(kind, key) DO UPDATE SET event = excluded.event, time = excluded.time, body = excluded.body").map_err(err)?;
-            for at in &self.dirty {
-                if let Some(row) = self.cache.get(at) {
-                    let body = serde_json::to_string(row).map_err(|e| e.to_string())?;
-                    put.execute(params![at.0, at.1, row.event, row.time, body]).map_err(err)?;
-                    self.writes += 1;
-                }
+            let mut put = tx.prepare_cached("INSERT INTO versions(kind, key, axis, known, event, body) VALUES (?1, ?2, ?3, ?4, ?5, ?6)").map_err(err)?;
+            for v in &self.versions {
+                put.execute(params![v.0, v.1, v.2, v.3, v.4, v.5]).map_err(err)?;
+                self.writes += 1;
             }
             // An edge's relation names the kinds at both ends, so the edge holds only the keys.
             let mut edge = tx.prepare_cached("INSERT OR IGNORE INTO edges VALUES (?1, ?2, ?3)").map_err(err)?;
@@ -212,7 +275,7 @@ impl Shard {
             }
         }
         tx.commit().map_err(err)?;
-        self.dirty.clear();
+        self.versions.clear();
         self.edges.clear();
         self.answers.clear();
         Ok(())
@@ -224,15 +287,36 @@ impl Shard {
         self.conn.query_row("SELECT v FROM meta WHERE k = 'lane'", [], |r| r.get(0)).optional().ok().flatten()
     }
 
-    /// Every row and edge, by key, as text.
+    /// Every version, in the order it was written, as text.
+    ///
+    /// # Errors
+    /// The file cannot be read.
+    pub fn versions_text(&self) -> Result<String, String> {
+        let err = |e: rusqlite::Error| e.to_string();
+        let mut st = self.conn.prepare("SELECT kind, key, axis, known, event, body FROM versions ORDER BY kind, key, axis, known, rowid").map_err(err)?;
+        let rows = st
+            .query_map([], |r| Ok(format!("{}|{}|{}|{}|{}|{}", r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?, r.get::<_, String>(4)?, r.get::<_, String>(5)?)))
+            .map_err(err)?;
+        let mut out = String::new();
+        for r in rows {
+            out.push_str(&r.map_err(err)?);
+            out.push('\n');
+        }
+        Ok(out)
+    }
+
+    /// Every row as it is now, and every edge, by key, as text.
     ///
     /// # Errors
     /// The file cannot be read.
     pub fn text(&self) -> Result<String, String> {
         let err = |e: rusqlite::Error| e.to_string();
         let mut out = String::new();
-        let mut st = self.conn.prepare("SELECT kind, key, event, time, body FROM rows ORDER BY kind, key").map_err(err)?;
-        let rows = st.query_map([], |r| Ok(format!("{}|{}|{}|{}|{}", r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?, r.get::<_, String>(4)?))).map_err(err)?;
+        let mut st = self
+            .conn
+            .prepare("SELECT kind, key, body FROM versions v WHERE rowid = (SELECT rowid FROM versions w WHERE w.kind = v.kind AND w.key = v.key ORDER BY axis DESC, rowid DESC LIMIT 1) ORDER BY kind, key")
+            .map_err(err)?;
+        let rows = st.query_map([], |r| Ok(format!("{}|{}|{}", r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))).map_err(err)?;
         for r in rows {
             out.push_str(&r.map_err(err)?);
             out.push('\n');

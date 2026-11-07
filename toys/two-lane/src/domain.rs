@@ -10,7 +10,7 @@
 pub fn check(ty: &str, source: &str) -> Result<(), String> {
     let of_type = ty.split_once('.').map_or(ty, |(d, _)| d);
     let of_source = source.split_once('/').map_or(source, |(d, _)| d);
-    if of_type == of_source && (of_type == "westwind" || of_type == "oz") {
+    if of_type == of_source && (of_type == "westwind" || of_type == "oz" || of_type == "build") {
         Ok(())
     } else {
         Err(format!("type {ty} is {of_type}'s, source {source} is {of_source}'s"))

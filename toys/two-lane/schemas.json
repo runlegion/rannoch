@@ -1,4 +1,23 @@
 {
+ "build.object.written": {
+  "properties": {
+   "body": {
+    "type": "object"
+   },
+   "build": {
+    "type": "integer"
+   },
+   "id": {
+    "type": "string"
+   }
+  },
+  "required": [
+   "id",
+   "build",
+   "body"
+  ],
+  "type": "object"
+ },
  "oz.citizen.joined": {
   "properties": {
    "id": {

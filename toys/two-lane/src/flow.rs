@@ -218,7 +218,10 @@ impl Flow {
                     continue;
                 }
                 let sent = |ty: &str, time: i64, data: Value, n: usize| -> Event {
-                    let seed = format!("{}\n{key}\n{}\n{}\n{n}\n{time}", self.name, row.id, event.id);
+                    // Its id is a hash of its content and its cause's key: never of which worker
+                    // or shard answered first, nor of which event happened to come last.
+                    let _ = n;
+                    let seed = format!("{ty}\n{time}\n{data}\n{}\n{key}", self.domain);
                     Event {
                         id: mint(time, seed.as_bytes()),
                         ty: ty.to_string(),
