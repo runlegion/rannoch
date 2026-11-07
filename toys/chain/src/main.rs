@@ -75,6 +75,8 @@ fn chain(dir: &Path, carry: bool) -> Result<Runtime> {
         let mut flow = Flow::parse(text)?;
         if !carry {
             flow.carry = None;
+        } else if let Some(n) = std::env::var("CHAIN_CARRY").ok().and_then(|v| v.parse().ok()) {
+            flow.carry = Some(n);
         }
         let patterns = flow.patterns();
         let histories = dir.join("flows");
@@ -553,8 +555,9 @@ fn age(westwind: &Path, out: &Path) -> Result<()> {
                 }
                 let n = runner.instances.get(&sub_key).map_or(0, |i| i64::try_from(i.handed.len()).unwrap_or(0));
                 println!(
-                    "P10 carry {:5} year {:2}: Tyrion's subscription history {lines:4} lines, rebuild {best:8.1} us (best of 50), {n} ids in its window; load {}",
+                    "P10 carry {:5} (every {} entries) year {:2}: Tyrion's subscription history {lines:4} lines, rebuild {best:8.1} us (best of 50), {n} ids in its window; load {}",
                     carry,
+                    if carry { std::env::var("CHAIN_CARRY").unwrap_or_else(|_| "64".into()) } else { "-".into() },
                     marks[next].0,
                     load_average()
                 );

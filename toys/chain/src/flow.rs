@@ -208,6 +208,9 @@ fn apply_entry(instance: &mut Instance, entry: &Entry, window: i64) {
     instance.clock = instance.clock.max(entry.event.time);
     let horizon = instance.clock.saturating_sub(window);
     instance.handed.retain(|_, (t, _)| *t >= horizon);
+    // A timer due before the instance's clock has been released, whichever flow it went to: one
+    // that went to another flow never comes back to say so, so it is forgotten by its time.
+    instance.timers.retain(|_, t| t.time >= horizon);
     instance.entries += 1;
 }
 
