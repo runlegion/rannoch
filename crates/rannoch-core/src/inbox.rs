@@ -10,7 +10,7 @@ use crate::{Event, Status};
 #[derive(Debug)]
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "name and interval are read by the batch, #3")
+    expect(dead_code, reason = "interval is read by the batch, #3")
 )]
 pub(crate) struct Inbox<T, D> {
     pub(crate) name: String,
@@ -33,6 +33,7 @@ impl<T, D> Inbox<T, D> {
     pub(crate) fn accept(&mut self, mut event: Event<T, D>) -> Status {
         event.id = Uuid::now_v7();
         event.status = Status::Added;
+        log::debug!("accepted {} into {}", event.id, self.name);
         self.heap.push(event);
         Status::Added
     }

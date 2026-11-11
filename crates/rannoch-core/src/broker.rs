@@ -77,6 +77,7 @@ impl<T: PartialEq, D> Rannoch<T, D> {
                 .into_iter()
                 .map(|c| Inbox::new(c.name, c.types, c.interval)),
         );
+        log::debug!("opened with {} inboxes", inboxes.len());
         let broker = Broker {
             inboxes,
             closed: false,
