@@ -17,3 +17,11 @@ Read before predicting: migratr's `Migrator` holds its migrations privately; `em
 5. **One schema.json describes the whole store**: `write_schema` on the combined database lists every crate's tables in one file. Confidence 0.75.
 6. **A change shows at open with nothing run by hand**: after sym gains its predictions migration and the program is rebuilt, opening a database built before the change applies only the new migration. Confidence 0.85.
 7. **A change shows at rebuild**: editing a crate's migration file makes cargo rebuild that crate, because `embed!` uses `include_str!`. Confidence 0.9.
+
+## Round 2: the app's build.rs
+
+Written after round 1's results, before any round 2 code. The shape (operator, 2026-11-10): not the store's build, "the app build. so all in one". Each crate exposes where its migrations directory is. The app lists those crates as build-dependencies; its `build.rs` reads every directory, generates one combined migrator into `OUT_DIR`, and marks each directory `rerun-if-changed`.
+
+8. **No cycle.** The three crates build as build-dependencies of the app. Confidence 0.9.
+9. **One history from build.rs.** The generated migrator applies all three crates' migrations in version order. Confidence 0.8.
+10. **A new file is picked up without a clean build.** Adding a migration file to `sym/migrations` reruns the app's build script, and the app's migrator then holds the new migration. Confidence 0.7.
