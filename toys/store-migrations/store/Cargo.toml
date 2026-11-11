@@ -1,0 +1,12 @@
+[package]
+name = "store"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+migratr.workspace = true
+rusqlite.workspace = true
+ontology = { path = "../ontology" }
+uncertainty = { path = "../uncertainty" }
+sym = { path = "../sym" }

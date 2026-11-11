@@ -1,0 +1,7 @@
+[workspace]
+resolver = "3"
+members = ["ontology", "uncertainty", "sym", "store"]
+
+[workspace.dependencies]
+migratr = { path = "/Volumes/store/projects/rafters-studio/migratr/crates/migratr" }
+rusqlite = { version = "0.41", features = ["bundled"] }

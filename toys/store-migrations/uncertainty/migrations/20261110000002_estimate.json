@@ -1,0 +1,1 @@
+{"up": [{"op": "create_table", "table": "estimate", "columns": [{"name": "id", "type": "TEXT", "primary_key": 1}, {"name": "confidence", "type": "REAL", "not_null": true}]}]}

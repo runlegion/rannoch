@@ -1,0 +1,1 @@
+{"up": [{"op": "create_table", "table": "prediction", "columns": [{"name": "id", "type": "TEXT", "primary_key": 1}, {"name": "symbol", "type": "TEXT", "not_null": true, "references": {"table": "symbol", "column": "id"}}, {"name": "estimate", "type": "TEXT", "not_null": true, "references": {"table": "estimate", "column": "id"}}]}]}
