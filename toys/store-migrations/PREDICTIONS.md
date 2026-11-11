@@ -34,3 +34,12 @@ Written after round 2's results, before any round 3 code. Round 2's generated co
 12. **A new file still shows without a clean build.** Adding a file to a crate's directory reruns `build.rs`, which rewrites the copied directory, and the app recompiles, so `embed!` sees the new file. Confidence 0.65.
 13. **A removed file disappears too**, because `build.rs` clears the copied directory before writing it. Confidence 0.8.
 14. **One schema.json for the whole store lives beside it**: `write_schema` into the copied directory writes one `schema.json`, which `embed!` ignores. Confidence 0.8.
+
+## Round 4: build.rs writes schema.json, and the migrations directory is committed
+
+Written after round 3's results and the operator's correction (forgr reads a committed schema.json in the crate that owns the store; "the crate is a crate and should use the same methods"), before any round 4 code. The app's migrations directory is committed, like Cargo.lock. Its `build.rs` copies every crate's migrations into it, applies them to an in-memory database through migratr's public `load_dir` and `up` (migratr and rusqlite as build-dependencies), and writes `schema.json` there with `write_schema`.
+
+15. **build.rs writes schema.json.** After a build, the app's `schema.json` names every crate's tables. Confidence 0.75.
+16. **A new migration updates schema.json with no clean build.** Adding a file to a crate's directory reruns `build.rs`, and `schema.json` then names the new table. Confidence 0.75.
+17. **No rebuild loop.** A second build with nothing changed reports the app `Fresh`. Confidence 0.8.
+18. **Committed and stable.** A build with nothing changed leaves the committed directory, `schema.json` included, byte for byte the same, so git shows no diff. Confidence 0.7.
