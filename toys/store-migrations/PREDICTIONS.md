@@ -1,0 +1,19 @@
+# Store migrations toy: predictions
+
+Written 2026-11-10, before any toy code exists. Against migratr v0.3.0 (ba45748), unchanged.
+
+The question: can several crates each embed their own migratr migrations, and the store combine them into one database, one ordered history and one schema.json, with a change showing at rebuild and at open and nothing run by hand?
+
+The shape, from the operator's example: three crates. `ontology` (a table that never changes), `uncertainty` (an engine's tables), and `sym` (SCIP-like tables, which later gains a predictions table linked to uncertainty's tables). A fourth part, the store, opens one SQLite database and applies all of them.
+
+Read before predicting: migratr's `Migrator` holds its migrations privately; `embed!` expands to `Migrator::from_validated(&[(file, include_str!(path)), ...])`, a `#[doc(hidden)]` constructor; versions are 14-digit UTC timestamps; the ledger is keyed by version; `status` and `up` refuse a ledger row with no file (`MissingFile`); `write_schema(exec, dir)` writes `schema.json` from `sqlite_master`.
+
+## Predictions
+
+1. **One migrator per crate on one database fails.** Running ontology's migrator, then uncertainty's, on the same database: the second refuses with `MissingFile`, because the ledger holds ontology's versions and uncertainty's migrator has no file for them. Confidence 0.85.
+2. **There is no public way to combine migrators.** Combining needs each crate to hand the store its raw (file, contents) pairs and the store to build one `Migrator` through the hidden `from_validated`. Confidence 0.8.
+3. **A combined migrator applies all three crates' migrations in version order**, so sym's predictions table, whose foreign key points at uncertainty's table and whose version is later, applies after it and the foreign key holds. Confidence 0.7.
+4. **Two crates with the same version collide** with `DuplicateVersion` when combined. Confidence 0.9.
+5. **One schema.json describes the whole store**: `write_schema` on the combined database lists every crate's tables in one file. Confidence 0.75.
+6. **A change shows at open with nothing run by hand**: after sym gains its predictions migration and the program is rebuilt, opening a database built before the change applies only the new migration. Confidence 0.85.
+7. **A change shows at rebuild**: editing a crate's migration file makes cargo rebuild that crate, because `embed!` uses `include_str!`. Confidence 0.9.
