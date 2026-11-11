@@ -25,3 +25,12 @@ Written after round 1's results, before any round 2 code. The shape (operator, 2
 8. **No cycle.** The three crates build as build-dependencies of the app. Confidence 0.9.
 9. **One history from build.rs.** The generated migrator applies all three crates' migrations in version order. Confidence 0.8.
 10. **A new file is picked up without a clean build.** Adding a migration file to `sym/migrations` reruns the app's build script, and the app's migrator then holds the new migration. Confidence 0.7.
+
+## Round 3: only migratr's public API
+
+Written after round 2's results, before any round 3 code. Round 2's generated code calls the hidden `Migrator::from_validated`. Round 3 tries to need nothing hidden: the app's `build.rs` copies every crate's migration files into one directory inside the app crate (generated, not committed), and the app uses the public `migratr::embed!` on that directory.
+
+11. **Public API only.** `embed!` on the copied directory gives one history in version order. Confidence 0.75.
+12. **A new file still shows without a clean build.** Adding a file to a crate's directory reruns `build.rs`, which rewrites the copied directory, and the app recompiles, so `embed!` sees the new file. Confidence 0.65.
+13. **A removed file disappears too**, because `build.rs` clears the copied directory before writing it. Confidence 0.8.
+14. **One schema.json for the whole store lives beside it**: `write_schema` into the copied directory writes one `schema.json`, which `embed!` ignores. Confidence 0.8.
