@@ -50,3 +50,18 @@ Run 2026-11-10. The `app3` crate's `build.rs` clears `app3/migrations/` (keeping
 So the whole shape works on migratr as it is, with no change to migratr: each crate keeps its own migrations directory and exposes where it is; the app's `build.rs` gathers them into one directory and watches each source; the public `embed!` builds one migrator; one `schema.json` describes the whole store for the structs, forgr and `check!`.
 
 Rerun round 3: `cargo test -p app3 -- --nocapture` prints three versions and three tables; copy `sym/later/20261110000004_prediction.json` into `sym/migrations/` and run it again (four, with `prediction`); remove the file and run again (three).
+
+## Round 4: build.rs writes schema.json, and the migrations directory is committed
+
+Run 2026-11-10. The `app4` crate's `build.rs` copies every crate's migrations into `app4/migrations/` (committed), writing a file only when its bytes differ and removing files no crate has any more, then applies them to an in-memory database with migratr's public `load_dir` and `up` (migratr and rusqlite as build-dependencies), and writes `schema.json` there with `write_schema`, again only when its bytes differ. `app4` embeds the directory with the public `embed!`.
+
+| # | Prediction | Result |
+|---|---|---|
+| 15 | build.rs writes schema.json | **Holds.** After the first build, `app4/migrations/` held the three crates' files and a `schema.json` naming concept, estimate and symbol. |
+| 16 | A new migration updates schema.json with no clean build | **Holds.** After copying the predictions migration into `sym/migrations`, the next build added the file to `app4/migrations/` and `schema.json` named prediction; git showed the new file and `M schema.json`, a change to review and commit like any other. |
+| 17 | No rebuild loop | **Holds.** A second build with nothing changed reported `Fresh app4`. |
+| 18 | Committed and stable | **Holds.** After committing the first build's output, an unchanged build left git with no diff; removing the predictions file and building again returned the directory and `schema.json` to the committed bytes. |
+
+So the schema lives in the app, committed: the app's migrations directory and its `schema.json` are written by the app's `build.rs` from every crate's migrations, the same method for rannoch's crates and the app's, and forgr's `schema!` in the app reads a `schema.json` that is always current and always in the repo. 17 of 18 predictions held across four rounds.
+
+Rerun round 4: `cargo build -p app4` writes `app4/migrations/`; copy `sym/later/20261110000004_prediction.json` into `sym/migrations/` and build again (the file and prediction appear, git shows the change); remove it and build again (git clean).
