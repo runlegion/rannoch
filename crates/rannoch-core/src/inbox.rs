@@ -1,6 +1,6 @@
 //! The inbox: it holds accepted events on its heap.
 
-use std::time::Duration;
+use chrono::TimeDelta;
 
 use uuid::Uuid;
 
@@ -15,12 +15,12 @@ use crate::{Event, Status};
 pub(crate) struct Inbox<T, D> {
     pub(crate) name: String,
     pub(crate) types: Vec<T>,
-    pub(crate) interval: Duration,
+    pub(crate) interval: TimeDelta,
     pub(crate) heap: Vec<Event<T, D>>,
 }
 
 impl<T, D> Inbox<T, D> {
-    pub(crate) fn new(name: String, types: Vec<T>, interval: Duration) -> Self {
+    pub(crate) fn new(name: String, types: Vec<T>, interval: TimeDelta) -> Self {
         Self {
             name,
             types,

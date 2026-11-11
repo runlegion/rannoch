@@ -1,7 +1,7 @@
 //! The configuration, open, and the broker that passes each event to its inbox.
 
+use chrono::TimeDelta;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
 
 use crate::inbox::Inbox;
 use crate::{Error, Event, Status};
@@ -10,14 +10,14 @@ use crate::{Error, Event, Status};
 #[derive(Debug, Clone)]
 pub struct Config<T> {
     /// The default inbox's batch interval; every type not listed goes there.
-    pub default_interval: Duration,
+    pub default_interval: TimeDelta,
     pub inboxes: Vec<InboxConfig<T>>,
 }
 
 impl<T> Default for Config<T> {
     fn default() -> Self {
         Self {
-            default_interval: Duration::from_millis(20),
+            default_interval: TimeDelta::milliseconds(20),
             inboxes: Vec::new(),
         }
     }
@@ -28,7 +28,7 @@ impl<T> Default for Config<T> {
 pub struct InboxConfig<T> {
     pub name: String,
     pub types: Vec<T>,
-    pub interval: Duration,
+    pub interval: TimeDelta,
 }
 
 #[derive(Debug)]
@@ -138,7 +138,7 @@ impl<T: PartialEq, D> Sender<T, D> {
 mod tests {
     use super::{Config, InboxConfig, Rannoch, lock};
     use crate::{Error, Event, Status};
-    use std::time::Duration;
+    use chrono::TimeDelta;
     use uuid::Uuid;
 
     #[derive(Debug, Clone, Copy, PartialEq)]
@@ -162,7 +162,7 @@ mod tests {
         InboxConfig {
             name: name.to_owned(),
             types: vec![Ty::Asset],
-            interval: Duration::from_millis(500),
+            interval: TimeDelta::milliseconds(500),
         }
     }
 
@@ -171,7 +171,7 @@ mod tests {
         let rannoch = Rannoch::<Ty, &str>::open(Config::default()).unwrap();
         let broker = lock(&rannoch.broker);
         assert_eq!(broker.inboxes.len(), 1);
-        assert_eq!(broker.inboxes[0].interval, Duration::from_millis(20));
+        assert_eq!(broker.inboxes[0].interval, TimeDelta::milliseconds(20));
     }
 
     #[test]
