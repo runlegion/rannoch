@@ -1,0 +1,20 @@
+{
+  "version": 20261110000003,
+  "objects": [
+    {
+      "type": "table",
+      "name": "concept",
+      "sql": "CREATE TABLE \"concept\" (\"id\" TEXT, \"name\" TEXT NOT NULL, PRIMARY KEY (\"id\"))"
+    },
+    {
+      "type": "table",
+      "name": "estimate",
+      "sql": "CREATE TABLE \"estimate\" (\"id\" TEXT, \"confidence\" REAL NOT NULL, PRIMARY KEY (\"id\"))"
+    },
+    {
+      "type": "table",
+      "name": "symbol",
+      "sql": "CREATE TABLE \"symbol\" (\"id\" TEXT, \"path\" TEXT NOT NULL, PRIMARY KEY (\"id\"))"
+    }
+  ]
+}

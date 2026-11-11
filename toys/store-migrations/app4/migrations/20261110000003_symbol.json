@@ -1,0 +1,1 @@
+{"up": [{"op": "create_table", "table": "symbol", "columns": [{"name": "id", "type": "TEXT", "primary_key": 1}, {"name": "path", "type": "TEXT", "not_null": true}]}]}

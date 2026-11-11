@@ -25,6 +25,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "app4"
+version = "0.0.0"
+dependencies = [
+ "migratr",
+ "ontology",
+ "rusqlite",
+ "sym",
+ "uncertainty",
+]
+
+[[package]]
 name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
