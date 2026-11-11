@@ -35,3 +35,18 @@ Run 2026-11-10. Each crate exposes `MIGRATIONS_DIR`; the `app` crate lists the t
 Round 2 closes round 1's real gap: watching the directories from the app's `build.rs` picks up a new migration file, which `embed!` alone does not. One gap stays: the generated code still calls migratr's `#[doc(hidden)]` `Migrator::from_validated`, the only way to build a migrator from collected files.
 
 Rerun round 2: `cargo test -p app -- --nocapture` prints three versions; copy `sym/later/20261110000004_prediction.json` into `sym/migrations/` and run it again (four, no clean); remove the file afterwards.
+
+## Round 3: only migratr's public API
+
+Run 2026-11-10. The `app3` crate's `build.rs` clears `app3/migrations/` (keeping `schema.json`), copies every crate's migration files into it, and prints `cargo:rerun-if-changed` for each crate's directory. `app3` uses the public `migratr::embed!("migrations")`. The copied directory is generated and ignored by git.
+
+| # | Prediction | Result |
+|---|---|---|
+| 11 | Public API only | **Holds.** `embed!` on the copied directory applied 20261110000001 to 20261110000003 in order. Nothing hidden is called. |
+| 12 | A new file still shows without a clean build | **Holds.** After adding the predictions migration to `sym/migrations`, the next test applied 20261110000001 to 20261110000004. |
+| 13 | A removed file disappears too | **Holds.** After removing it, the next test applied three again. |
+| 14 | One schema.json for the whole store beside it | **Holds.** `write_schema` into the copied directory named every crate's tables, including `prediction` once it existed, and `embed!` ignored the file. A run with nothing changed reported `Fresh app3`: writing `schema.json` there does not trigger a rebuild. |
+
+So the whole shape works on migratr as it is, with no change to migratr: each crate keeps its own migrations directory and exposes where it is; the app's `build.rs` gathers them into one directory and watches each source; the public `embed!` builds one migrator; one `schema.json` describes the whole store for the structs, forgr and `check!`.
+
+Rerun round 3: `cargo test -p app3 -- --nocapture` prints three versions and three tables; copy `sym/later/20261110000004_prediction.json` into `sym/migrations/` and run it again (four, with `prediction`); remove the file and run again (three).
