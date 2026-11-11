@@ -21,3 +21,17 @@ Run 2026-11-10 against migratr v0.3.0 (ba45748), unchanged, rusqlite 0.41 bundle
 ## How to rerun
 
 From this directory: `cargo test -p store -- --nocapture --test-threads=1` runs predictions 1 to 6. For 7: build once, copy `sym/later/20261110000004_prediction.json` into `sym/migrations/`, then `cargo test -p store --test p7_probe -- --nocapture` (prints 1), `cargo clean -p sym`, and run it again (prints 2). Remove the copied file afterwards. The `migratr` path in `Cargo.toml` points at a local migratr checkout at v0.3.0.
+
+## Round 2: the app's build.rs
+
+Run 2026-11-10. Each crate exposes `MIGRATIONS_DIR`; the `app` crate lists the three as build-dependencies, and its `build.rs` reads every directory, generates one migrator into `OUT_DIR` and prints `cargo:rerun-if-changed` for each directory.
+
+| # | Prediction | Result |
+|---|---|---|
+| 8 | No cycle | **Holds.** The three crates build as build-dependencies of the app. |
+| 9 | One history from build.rs | **Holds.** The generated migrator applied 20261110000001 to 20261110000003 in order. |
+| 10 | A new file is picked up without a clean build | **Holds.** After copying the predictions migration into `sym/migrations`, cargo reported `Dirty app ... the file sym/migrations has changed`, reran the build script, and the migrator applied 20261110000001 to 20261110000004. Removing the file reverted it to three, again with no clean. |
+
+Round 2 closes round 1's real gap: watching the directories from the app's `build.rs` picks up a new migration file, which `embed!` alone does not. One gap stays: the generated code still calls migratr's `#[doc(hidden)]` `Migrator::from_validated`, the only way to build a migrator from collected files.
+
+Rerun round 2: `cargo test -p app -- --nocapture` prints three versions; copy `sym/later/20261110000004_prediction.json` into `sym/migrations/` and run it again (four, no clean); remove the file afterwards.

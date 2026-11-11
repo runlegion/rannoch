@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["ontology", "uncertainty", "sym", "store"]
+members = ["ontology", "uncertainty", "sym", "store", "app"]
 
 [workspace.dependencies]
 migratr = { path = "/Volumes/store/projects/rafters-studio/migratr/crates/migratr" }
