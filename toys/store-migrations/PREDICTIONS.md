@@ -43,3 +43,12 @@ Written after round 3's results and the operator's correction (forgr reads a com
 16. **A new migration updates schema.json with no clean build.** Adding a file to a crate's directory reruns `build.rs`, and `schema.json` then names the new table. Confidence 0.75.
 17. **No rebuild loop.** A second build with nothing changed reports the app `Fresh`. Confidence 0.8.
 18. **Committed and stable.** A build with nothing changed leaves the committed directory, `schema.json` included, byte for byte the same, so git shows no diff. Confidence 0.7.
+
+## Round 5: with forgr
+
+Written after round 4's results, before any round 5 code. The operator's doubt: with forgr, would the tests exist before the schema, and would order hold? `app5` is round 4's `app4` plus forgr 0.1.0 from crates.io, set up as forgr's README says: `forgr::schema!("migrations/schema.json")` in `app5`'s library, inside `pub mod forgr` behind a `testing` feature. `app5` holds one query in `src/`. A second crate, `user`, depends on `app5` with `testing` as a dev-dependency and has no forgr dependency of its own.
+
+19. **schema! reads the schema.json build.rs writes.** In a build from no prior target output, `app5`'s `build.rs` writes `schema.json` before `schema!` expands, and a factory for `symbol` inserts into forgr's empty test store. Confidence 0.75.
+20. **Another crate's tests use it.** `user`'s test builds a `symbol` row through `app5::forgr` with no forgr dependency. Confidence 0.8.
+21. **A new migration reaches forgr with no clean build.** After adding the predictions migration to `sym/migrations`, the next `cargo test` compiles a test that uses `prediction::factory()`, linked to a `symbol` and an `estimate`. Confidence 0.7.
+22. **The SQL check passes and catches drift.** forgr's emitted check passes on `app5`'s query, and fails once the query names a column the schema lacks. Confidence 0.7.
