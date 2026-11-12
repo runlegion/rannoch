@@ -1,0 +1,23 @@
+[package]
+name = "app5"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[features]
+testing = ["dep:forgr", "forgr/fake"]
+
+[dependencies]
+migratr.workspace = true
+rusqlite.workspace = true
+forgr = { version = "0.1", optional = true }
+
+[dev-dependencies]
+forgr = { version = "0.1", features = ["fake"] }
+
+[build-dependencies]
+migratr.workspace = true
+rusqlite.workspace = true
+ontology = { path = "../ontology" }
+uncertainty = { path = "../uncertainty" }
+sym = { path = "../sym" }

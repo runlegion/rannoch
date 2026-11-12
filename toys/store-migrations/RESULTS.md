@@ -65,3 +65,18 @@ Run 2026-11-10. The `app4` crate's `build.rs` copies every crate's migrations in
 So the schema lives in the app, committed: the app's migrations directory and its `schema.json` are written by the app's `build.rs` from every crate's migrations, the same method for rannoch's crates and the app's, and forgr's `schema!` in the app reads a `schema.json` that is always current and always in the repo. 17 of 18 predictions held across four rounds.
 
 Rerun round 4: `cargo build -p app4` writes `app4/migrations/`; copy `sym/later/20261110000004_prediction.json` into `sym/migrations/` and build again (the file and prediction appear, git shows the change); remove it and build again (git clean).
+
+## Round 5: with forgr
+
+Run 2026-11-11 with forgr 0.1.0 from crates.io. `app5` is round 4's `app4` plus forgr as its README sets it up: `forgr::schema!("migrations/schema.json")` inside `pub mod forgr` behind a `testing` feature, and one query, `SYMBOL_PATHS`, in `src/lib.rs`. `user` depends on `app5` with `testing` as a dev-dependency and has no forgr dependency.
+
+| # | Prediction | Result |
+|---|---|---|
+| 19 | schema! reads the schema.json build.rs writes | **Holds.** After `cargo clean -p app5`, `cargo test` ran `build.rs` before `schema!` expanded; `symbol::factory().id("s1").path("a.rs")` inserted into `empty_store()`. |
+| 20 | Another crate's tests use it | **Holds.** `user`'s test built a `symbol` row through `app5::forgr`, with no forgr dependency of its own. |
+| 21 | A new migration reaches forgr with no clean build | **Holds.** After adding the predictions migration to `sym/migrations` and a test using `prediction::factory()` linked to a `symbol` and an `estimate`, the next `cargo test` compiled and passed it. |
+| 22 | The SQL check passes and catches drift | **Holds.** forgr emitted `forgr::forgr_sql_matches_schema`, which passed on `SELECT id, path FROM symbol` and failed on `SELECT id, filename FROM symbol` with `app5/src/lib.rs:10: no such column: filename`. |
+
+So the order the operator doubted holds with forgr in the loop: the app's `build.rs` writes `schema.json` before anything in the app compiles, `schema!` expands against it, and every other crate's tests compile after the app. 21 of 22 predictions held across five rounds.
+
+Rerun round 5: `cargo clean -p app5 && cargo test -p app5 -p user -- --nocapture`. For 21, copy `sym/later/20261110000004_prediction.json` into `sym/migrations/` and add a test in `user/tests/` using `app5::forgr::prediction::factory()`. For 22, change `path` to `filename` in `SYMBOL_PATHS` and run `cargo test -p app5`.
