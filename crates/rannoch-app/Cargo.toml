@@ -19,6 +19,7 @@ forgr = { version = "0.1", features = ["fake"] }
 migratr = "0.3"
 rusqlite = { version = "0.41", features = ["bundled"] }
 rannoch-fixture = { path = "../rannoch-fixture" }
+rannoch-events = { path = "../rannoch-events" }
 
 [lints]
 workspace = true

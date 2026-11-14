@@ -392,6 +392,7 @@ version = "0.1.0"
 dependencies = [
  "forgr",
  "migratr",
+ "rannoch-events",
  "rannoch-fixture",
  "rusqlite",
 ]
@@ -402,6 +403,19 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "log",
+ "uuid",
+]
+
+[[package]]
+name = "rannoch-events"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "rannoch-app",
+ "rannoch-core",
+ "rusqlite",
+ "serde",
+ "serde_json",
  "uuid",
 ]
 

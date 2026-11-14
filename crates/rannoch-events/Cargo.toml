@@ -1,0 +1,19 @@
+[package]
+name = "rannoch-events"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["alloc"] }
+rannoch-core = { path = "../rannoch-core" }
+rusqlite = { version = "0.41", features = ["bundled"] }
+serde = "1"
+serde_json = "1"
+
+[dev-dependencies]
+rannoch-app = { path = "../rannoch-app", features = ["testing"] }
+uuid = { version = "1", features = ["v7"] }
+
+[lints]
+workspace = true

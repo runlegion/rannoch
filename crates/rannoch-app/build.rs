@@ -8,7 +8,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// The migrations directory of every crate with tables.
-const CRATES: &[&str] = &[rannoch_fixture::MIGRATIONS_DIR];
+const CRATES: &[&str] = &[
+    rannoch_fixture::MIGRATIONS_DIR,
+    rannoch_events::MIGRATIONS_DIR,
+];
 
 fn main() -> Result<(), Box<dyn Error>> {
     let here = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?).join("migrations");
