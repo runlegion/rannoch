@@ -6,7 +6,7 @@
 mod broker;
 mod inbox;
 
-pub use broker::{Config, InboxConfig, Rannoch, Sender};
+pub use broker::{Config, InboxConfig, Rannoch, Sender, Storage};
 
 use std::fmt;
 

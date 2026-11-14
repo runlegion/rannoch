@@ -403,6 +403,10 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "log",
+ "migratr",
+ "rannoch-app",
+ "rannoch-store",
+ "rusqlite",
  "uuid",
 ]
 
