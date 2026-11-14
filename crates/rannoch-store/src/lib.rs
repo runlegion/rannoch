@@ -1,11 +1,45 @@
 //! The store: opens the app's `SQLite` database against the app's one
 //! migrator, reports pending migrations and never applies them, and hands
-//! back the connection when none are pending.
+//! back the connection when none are pending. Core applies them at start
+//! through [`Store`], its implementation of core's `Storage`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use rannoch_core::Error;
+use rannoch_core::{Error, Storage};
 use rusqlite::Connection;
+
+/// The app's store, for the app's `Config`: the database path and the app's
+/// one migrator, which core applies pending migrations through at start.
+#[derive(Debug)]
+pub struct Store {
+    path: PathBuf,
+    migrator: migratr::Migrator,
+}
+
+impl Store {
+    /// The store for the database at `path`, against the app's one `migrator`.
+    #[must_use]
+    pub fn new(path: PathBuf, migrator: migratr::Migrator) -> Self {
+        Self { path, migrator }
+    }
+}
+
+impl Storage for Store {
+    fn pending(&self) -> Result<bool, Error> {
+        Ok(matches!(
+            open(&self.path, &self.migrator)?,
+            Opened::Pending(_)
+        ))
+    }
+
+    fn apply(&self) -> Result<(), Error> {
+        let conn = Connection::open(&self.path).map_err(|_| Error::Store)?;
+        self.migrator
+            .up(&mut migratr::RusqliteExecutor::new(conn))
+            .map_err(|_| Error::Store)?;
+        Ok(())
+    }
+}
 
 /// What opening the store found.
 #[derive(Debug)]
@@ -49,7 +83,24 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
-    use super::{Error, open};
+    use rannoch_core::Storage;
+
+    use super::{Error, Store, open};
+
+    #[test]
+    fn store_reports_pending_then_applies_through_its_migrator() {
+        let dir =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp/rannoch-store-apply");
+        if dir.exists() {
+            fs::remove_dir_all(&dir).unwrap();
+        }
+        fs::create_dir_all(&dir).unwrap();
+        let store = Store::new(dir.join("store.db"), rannoch_app::migrator());
+
+        assert_eq!(store.pending(), Ok(true));
+        assert_eq!(store.apply(), Ok(()));
+        assert_eq!(store.pending(), Ok(false));
+    }
 
     #[test]
     fn a_plan_that_fails_fails_with_store() {
