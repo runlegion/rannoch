@@ -1,6 +1,11 @@
 {
-  "version": 20261114000003,
+  "version": 20261114000004,
   "objects": [
+    {
+      "type": "table",
+      "name": "_events",
+      "sql": "CREATE TABLE \"_events\" (\"id\" TEXT, \"source\" TEXT, \"ty\" INTEGER NOT NULL, \"data\" TEXT NOT NULL, \"run_at\" TEXT, \"status\" INTEGER NOT NULL CHECK (status IN (-1, 0, 1, 2)), PRIMARY KEY (\"id\"))"
+    },
     {
       "type": "table",
       "name": "fixture",
