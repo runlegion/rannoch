@@ -1,0 +1,10 @@
+{
+  "version": 20261114000001,
+  "objects": [
+    {
+      "type": "table",
+      "name": "fixture",
+      "sql": "CREATE TABLE \"fixture\" (\"id\" TEXT, \"name\" TEXT NOT NULL, PRIMARY KEY (\"id\"))"
+    }
+  ]
+}
