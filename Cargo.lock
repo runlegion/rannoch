@@ -405,6 +405,7 @@ dependencies = [
  "log",
  "migratr",
  "rannoch-app",
+ "rannoch-events",
  "rannoch-store",
  "rusqlite",
  "uuid",

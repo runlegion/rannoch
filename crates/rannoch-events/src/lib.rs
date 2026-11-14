@@ -4,14 +4,41 @@
 mod queries;
 
 use std::sync::mpsc::Sender;
+use std::sync::{Mutex, PoisonError};
 
 use chrono::SecondsFormat;
-use rannoch_core::{Error, Event};
+use rannoch_core::{Append, Error, Event};
 use rusqlite::{Connection, params};
 use serde::Serialize;
 
 /// Where this crate's migratr migrations directory is, for the app's `build.rs`.
 pub const MIGRATIONS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/migrations");
+
+/// The events crate's append for the app's `Config`: the connection it
+/// writes `_events` through and the queue it signals.
+#[derive(Debug)]
+pub struct Events {
+    conn: Mutex<Connection>,
+    queue: Sender<()>,
+}
+
+impl Events {
+    /// The append over `conn`, signalling `queue` after each commit.
+    #[must_use]
+    pub fn new(conn: Connection, queue: Sender<()>) -> Self {
+        Self {
+            conn: Mutex::new(conn),
+            queue,
+        }
+    }
+}
+
+impl<T: Copy + Into<u16>, D: Serialize> Append<T, D> for Events {
+    fn append(&self, batch: &[Event<T, D>]) -> Result<(), Error> {
+        let mut conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
+        append(&mut conn, batch, &self.queue)
+    }
+}
 
 /// Appends `batch` to `_events` in one write, each event as one row with its
 /// fields as given, and signals `queue` once that write has committed.
@@ -61,7 +88,7 @@ mod tests {
     use rannoch_core::{Error, Event, Status};
     use uuid::Uuid;
 
-    use super::append;
+    use super::{Events, append};
 
     #[derive(Debug, Clone, Copy)]
     #[repr(u16)]
@@ -101,6 +128,18 @@ mod tests {
         assert_eq!(append(&mut store, &batch, &queue), Err(Error::Store));
         assert_eq!(count(&store), 0);
         assert!(signals.try_recv().is_err());
+    }
+
+    #[test]
+    fn events_appends_through_core_append_and_signals() {
+        let (queue, signals) = mpsc::channel();
+        let events = Events::new(rannoch_app::forgr::empty_store(), queue);
+        let batch = [event(Uuid::now_v7()), event(Uuid::now_v7())];
+
+        rannoch_core::Append::append(&events, &batch).unwrap();
+
+        assert_eq!(count(&events.conn.lock().unwrap()), 2);
+        assert_eq!(signals.try_recv(), Ok(()));
     }
 
     #[test]
