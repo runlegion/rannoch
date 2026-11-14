@@ -10,6 +10,7 @@ rannoch-core = { path = "../rannoch-core" }
 rusqlite = { version = "0.41", features = ["bundled"] }
 serde = "1"
 serde_json = "1"
+uuid = "1"
 
 [dev-dependencies]
 rannoch-app = { path = "../rannoch-app", features = ["testing"] }
