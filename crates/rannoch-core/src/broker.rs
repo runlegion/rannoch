@@ -2,7 +2,10 @@
 
 use chrono::TimeDelta;
 use std::fmt;
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::thread::{self, JoinHandle};
+use std::{mem, time::Duration};
 
 use crate::inbox::Inbox;
 use crate::{Error, Event, Status};
@@ -24,23 +27,37 @@ pub trait Storage: fmt::Debug {
     fn apply(&self) -> Result<(), Error>;
 }
 
+/// What core needs from the events crate: the append each inbox hands its
+/// batch to.
+pub trait Append<T, D>: fmt::Debug + Send + Sync {
+    /// Appends `batch` as one write.
+    ///
+    /// # Errors
+    ///
+    /// `Store` when the write fails.
+    fn append(&self, batch: &[Event<T, D>]) -> Result<(), Error>;
+}
+
 /// The app's configuration: its inboxes, the default inbox's batch interval,
-/// and the app's store.
+/// the app's store and the events crate's append.
 #[derive(Debug, Clone)]
-pub struct Config<T> {
+pub struct Config<T, D> {
     /// The default inbox's batch interval; every type not listed goes there.
     pub default_interval: TimeDelta,
     pub inboxes: Vec<InboxConfig<T>>,
     /// The app's store; with none, open runs no migration check.
     pub store: Option<Arc<dyn Storage>>,
+    /// The events crate's append; with none, no inbox hands anything over.
+    pub append: Option<Arc<dyn Append<T, D>>>,
 }
 
-impl<T> Default for Config<T> {
+impl<T, D> Default for Config<T, D> {
     fn default() -> Self {
         Self {
             default_interval: TimeDelta::milliseconds(20),
             inboxes: Vec::new(),
             store: None,
+            append: None,
         }
     }
 }
@@ -66,21 +83,44 @@ fn lock<T, D>(broker: &Shared<T, D>) -> MutexGuard<'_, Broker<T, D>> {
     broker.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Hands inbox `index`'s heap to `append` as one batch; a batch that fails is
+/// logged and goes back on the heap, ahead of what arrived since.
+fn hand_over<T, D>(broker: &Shared<T, D>, index: usize, append: &dyn Append<T, D>) {
+    let batch = mem::take(&mut lock(broker).inboxes[index].heap);
+    if batch.is_empty() {
+        return;
+    }
+    if append.append(&batch).is_ok() {
+        log::debug!("handed over {} events from inbox {index}", batch.len());
+    } else {
+        log::error!(
+            "inbox {index} could not hand over {} events: {}",
+            batch.len(),
+            Error::Store
+        );
+        lock(broker).inboxes[index].heap.splice(0..0, batch);
+    }
+}
+
 /// The owner's handle: the only value that can shut rannoch down.
 #[derive(Debug)]
 pub struct Rannoch<T, D> {
     broker: Shared<T, D>,
+    /// Dropping these wakes each inbox's thread for its last hand-over.
+    stops: Vec<mpsc::Sender<()>>,
+    threads: Vec<JoinHandle<()>>,
 }
 
-impl<T: PartialEq, D> Rannoch<T, D> {
+impl<T: PartialEq + Send + 'static, D: Send + 'static> Rannoch<T, D> {
     /// Opens rannoch with a configuration. Before anything else, applies the
     /// store's pending migrations.
     ///
     /// # Errors
     ///
     /// `Store` when the store cannot tell what is pending or applying fails;
-    /// `Config` when the same `ty` is listed in two inboxes.
-    pub fn open(config: Config<T>) -> Result<Self, Error> {
+    /// `Config` when the same `ty` is listed in two inboxes, or an interval
+    /// is negative.
+    pub fn open(config: Config<T, D>) -> Result<Self, Error> {
         if let Some(store) = &config.store
             && store.pending().map_err(|_| Error::Store)?
         {
@@ -107,13 +147,37 @@ impl<T: PartialEq, D> Rannoch<T, D> {
                 .into_iter()
                 .map(|c| Inbox::new(c.name, c.types, c.interval)),
         );
+        let intervals = inboxes
+            .iter()
+            .map(|inbox| inbox.interval.to_std().map_err(|_| Error::Config))
+            .collect::<Result<Vec<Duration>, Error>>()?;
         log::debug!("opened with {} inboxes", inboxes.len());
-        let broker = Broker {
+        let broker = Arc::new(Mutex::new(Broker {
             inboxes,
             closed: false,
-        };
+        }));
+        let (mut stops, mut threads) = (Vec::new(), Vec::new());
+        for (index, every) in intervals.into_iter().enumerate() {
+            let Some(append) = config.append.clone() else {
+                break;
+            };
+            let (stop, wait) = mpsc::channel::<()>();
+            let broker = Arc::clone(&broker);
+            stops.push(stop);
+            threads.push(thread::spawn(move || {
+                loop {
+                    let stopping = wait.recv_timeout(every) != Err(RecvTimeoutError::Timeout);
+                    hand_over(&broker, index, &*append);
+                    if stopping {
+                        return;
+                    }
+                }
+            }));
+        }
         Ok(Self {
-            broker: Arc::new(Mutex::new(broker)),
+            broker,
+            stops,
+            threads,
         })
     }
 
@@ -125,9 +189,14 @@ impl<T: PartialEq, D> Rannoch<T, D> {
         }
     }
 
-    /// Shuts rannoch down; every send after this fails with `Closed`.
+    /// Shuts rannoch down: every send after this fails with `Closed`, each
+    /// inbox hands over what is left on its heap, and its thread is joined.
     pub fn shutdown(self) {
         lock(&self.broker).closed = true;
+        drop(self.stops);
+        for thread in self.threads {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -167,7 +236,7 @@ impl<T: PartialEq, D> Sender<T, D> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, InboxConfig, Rannoch, Storage, lock};
+    use super::{Append, Config, InboxConfig, Rannoch, Storage, hand_over, lock};
     use crate::{Error, Event, Status};
     use chrono::TimeDelta;
     use std::sync::{Arc, Mutex};
@@ -200,7 +269,7 @@ mod tests {
             apply,
             applied: Mutex::new(0),
         });
-        let config = Config::<Ty> {
+        let config = Config::<Ty, &str> {
             store: Some(store.clone()),
             ..Config::default()
         };
@@ -313,5 +382,81 @@ mod tests {
         let sender = rannoch.sender().clone();
         rannoch.shutdown();
         assert_eq!(sender.send(event(Ty::Page)).unwrap_err(), Error::Closed);
+    }
+
+    /// An append that fails while `failing` is set, keeping each batch's
+    /// `ty`s it received.
+    #[derive(Debug, Default)]
+    struct Recorder {
+        failing: Mutex<bool>,
+        batches: Mutex<Vec<Vec<Ty>>>,
+    }
+
+    impl Append<Ty, &'static str> for Recorder {
+        fn append(&self, batch: &[Event<Ty, &'static str>]) -> Result<(), Error> {
+            if *self.failing.lock().unwrap() {
+                return Err(Error::Store);
+            }
+            let tys = batch.iter().map(|e| e.ty).collect();
+            self.batches.lock().unwrap().push(tys);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_failed_batch_goes_back_ahead_of_later_events_and_an_empty_heap_hands_nothing() {
+        let rannoch = Rannoch::open(Config::default()).unwrap();
+        let sender = rannoch.sender();
+        let recorder = Recorder {
+            failing: Mutex::new(true),
+            ..Recorder::default()
+        };
+        sender.send(event(Ty::Asset)).unwrap();
+        hand_over(&rannoch.broker, 0, &recorder);
+        sender.send(event(Ty::Page)).unwrap();
+        let heap: Vec<Ty> = lock(&rannoch.broker).inboxes[0]
+            .heap
+            .iter()
+            .map(|e| e.ty)
+            .collect();
+        assert_eq!(heap, [Ty::Asset, Ty::Page]);
+
+        *recorder.failing.lock().unwrap() = false;
+        hand_over(&rannoch.broker, 0, &recorder);
+        hand_over(&rannoch.broker, 0, &recorder);
+        assert_eq!(
+            *recorder.batches.lock().unwrap(),
+            [vec![Ty::Asset, Ty::Page]]
+        );
+        assert!(lock(&rannoch.broker).inboxes[0].heap.is_empty());
+    }
+
+    #[test]
+    fn shutdown_hands_over_what_is_left_on_each_heap() {
+        let recorder = Arc::new(Recorder::default());
+        let config = Config {
+            default_interval: TimeDelta::hours(1),
+            inboxes: vec![assets("assets")],
+            append: Some(recorder.clone()),
+            ..Config::default()
+        };
+        let rannoch = Rannoch::open(config).unwrap();
+        rannoch.sender().send(event(Ty::Asset)).unwrap();
+        rannoch.sender().send(event(Ty::Page)).unwrap();
+
+        rannoch.shutdown();
+
+        let mut batches = recorder.batches.lock().unwrap().clone();
+        batches.sort_by_key(|b| b[0] as u8);
+        assert_eq!(batches, [vec![Ty::Asset], vec![Ty::Page]]);
+    }
+
+    #[test]
+    fn a_negative_interval_fails_open_with_config() {
+        let config = Config::<Ty, &str> {
+            default_interval: TimeDelta::milliseconds(-1),
+            ..Config::default()
+        };
+        assert_eq!(Rannoch::open(config).unwrap_err(), Error::Config);
     }
 }

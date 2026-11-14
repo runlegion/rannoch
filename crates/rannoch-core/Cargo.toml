@@ -12,6 +12,7 @@ uuid = { version = "1", features = ["v7"] }
 [dev-dependencies]
 migratr = "0.3"
 rannoch-app = { path = "../rannoch-app", features = ["testing"] }
+rannoch-events = { path = "../rannoch-events" }
 rannoch-store = { path = "../rannoch-store" }
 rusqlite = { version = "0.41", features = ["bundled"] }
 
