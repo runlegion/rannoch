@@ -1,0 +1,1 @@
+{"up": [{"op": "create_table", "table": "fixture_child", "columns": [{"name": "id", "type": "TEXT", "primary_key": 1}, {"name": "fixture_id", "type": "TEXT", "not_null": true, "references": {"table": "fixture", "column": "id"}}]}]}

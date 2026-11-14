@@ -1,0 +1,17 @@
+[package]
+name = "rannoch-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+migratr = "0.3"
+rannoch-core = { path = "../rannoch-core" }
+rusqlite = { version = "0.41", features = ["bundled"] }
+
+[dev-dependencies]
+rannoch-app = { path = "../rannoch-app", features = ["testing"] }
+rannoch-fixture = { path = "../rannoch-fixture" }
+
+[lints]
+workspace = true

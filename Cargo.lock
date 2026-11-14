@@ -413,6 +413,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rannoch-store"
+version = "0.1.0"
+dependencies = [
+ "migratr",
+ "rannoch-app",
+ "rannoch-core",
+ "rannoch-fixture",
+ "rusqlite",
+]
+
+[[package]]
 name = "rsqlite-vfs"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,10 +1,15 @@
 {
-  "version": 20261114000001,
+  "version": 20261114000003,
   "objects": [
     {
       "type": "table",
       "name": "fixture",
       "sql": "CREATE TABLE \"fixture\" (\"id\" TEXT, \"name\" TEXT NOT NULL, PRIMARY KEY (\"id\"))"
+    },
+    {
+      "type": "table",
+      "name": "fixture_child",
+      "sql": "CREATE TABLE \"fixture_child\" (\"id\" TEXT, \"fixture_id\" TEXT NOT NULL REFERENCES \"fixture\" (\"id\"), PRIMARY KEY (\"id\"))"
     }
   ]
 }

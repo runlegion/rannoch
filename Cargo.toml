@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/rannoch-core", "crates/rannoch-app", "crates/rannoch-fixture"]
+members = ["crates/rannoch-core", "crates/rannoch-app", "crates/rannoch-fixture", "crates/rannoch-store"]
 
 [workspace.package]
 version = "0.1.0"
