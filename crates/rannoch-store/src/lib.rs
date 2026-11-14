@@ -83,7 +83,24 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
-    use super::{Error, open};
+    use rannoch_core::Storage;
+
+    use super::{Error, Store, open};
+
+    #[test]
+    fn store_reports_pending_then_applies_through_its_migrator() {
+        let dir =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp/rannoch-store-apply");
+        if dir.exists() {
+            fs::remove_dir_all(&dir).unwrap();
+        }
+        fs::create_dir_all(&dir).unwrap();
+        let store = Store::new(dir.join("store.db"), rannoch_app::migrator());
+
+        assert_eq!(store.pending(), Ok(true));
+        assert_eq!(store.apply(), Ok(()));
+        assert_eq!(store.pending(), Ok(false));
+    }
 
     #[test]
     fn a_plan_that_fails_fails_with_store() {

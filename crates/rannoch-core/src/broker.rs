@@ -176,14 +176,14 @@ mod tests {
     /// A store with a fixed answer to `pending` and to `apply`, counting applies.
     #[derive(Debug)]
     struct FakeStore {
-        pending: bool,
+        pending: Result<bool, Error>,
         apply: Result<(), Error>,
         applied: Mutex<usize>,
     }
 
     impl Storage for FakeStore {
         fn pending(&self) -> Result<bool, Error> {
-            Ok(self.pending)
+            self.pending
         }
         fn apply(&self) -> Result<(), Error> {
             *self.applied.lock().unwrap() += 1;
@@ -191,7 +191,10 @@ mod tests {
         }
     }
 
-    fn open_with(pending: bool, apply: Result<(), Error>) -> (Result<(), Error>, usize) {
+    fn open_with(
+        pending: Result<bool, Error>,
+        apply: Result<(), Error>,
+    ) -> (Result<(), Error>, usize) {
         let store = Arc::new(FakeStore {
             pending,
             apply,
@@ -208,17 +211,25 @@ mod tests {
 
     #[test]
     fn pending_migrations_are_applied_once_then_open_succeeds() {
-        assert_eq!(open_with(true, Ok(())), (Ok(()), 1));
+        assert_eq!(open_with(Ok(true), Ok(())), (Ok(()), 1));
     }
 
     #[test]
     fn nothing_pending_applies_nothing() {
-        assert_eq!(open_with(false, Ok(())), (Ok(()), 0));
+        assert_eq!(open_with(Ok(false), Ok(())), (Ok(()), 0));
+    }
+
+    #[test]
+    fn a_failed_pending_check_fails_open_with_store_and_applies_nothing() {
+        assert_eq!(open_with(Err(Error::Queue), Ok(())), (Err(Error::Store), 0));
     }
 
     #[test]
     fn a_failed_apply_fails_open_with_store() {
-        assert_eq!(open_with(true, Err(Error::Queue)), (Err(Error::Store), 1));
+        assert_eq!(
+            open_with(Ok(true), Err(Error::Queue)),
+            (Err(Error::Store), 1)
+        );
     }
 
     #[derive(Debug, Clone, Copy, PartialEq)]
