@@ -1,0 +1,25 @@
+[package]
+name = "rannoch-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+testing = ["dep:forgr", "forgr/fake"]
+
+[dependencies]
+migratr = "0.3"
+rusqlite = { version = "0.41", features = ["bundled"] }
+forgr = { version = "0.1", optional = true }
+
+[dev-dependencies]
+forgr = { version = "0.1", features = ["fake"] }
+
+[build-dependencies]
+migratr = "0.3"
+rusqlite = { version = "0.41", features = ["bundled"] }
+rannoch-fixture = { path = "../rannoch-fixture" }
+
+[lints]
+workspace = true

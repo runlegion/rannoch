@@ -1,0 +1,12 @@
+[package]
+name = "rannoch-fixture"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dev-dependencies]
+rannoch-app = { path = "../rannoch-app", features = ["testing"] }
+
+[lints]
+workspace = true

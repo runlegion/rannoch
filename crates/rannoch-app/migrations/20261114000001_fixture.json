@@ -1,0 +1,1 @@
+{"up": [{"op": "create_table", "table": "fixture", "columns": [{"name": "id", "type": "TEXT", "primary_key": 1}, {"name": "name", "type": "TEXT", "not_null": true}]}]}
