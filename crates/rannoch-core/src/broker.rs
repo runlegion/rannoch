@@ -2,12 +2,12 @@
 
 use chrono::TimeDelta;
 use std::fmt;
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
-use std::{mem, time::Duration};
+use std::time::Duration;
 
-use crate::inbox::Inbox;
+use crate::inbox::{Inbox, run};
 use crate::{Error, Event, Status};
 
 /// What core needs from the app's store at start.
@@ -71,35 +71,16 @@ pub struct InboxConfig<T> {
 }
 
 #[derive(Debug)]
-struct Broker<T, D> {
+pub(crate) struct Broker<T, D> {
     /// The default inbox first, then the configured inboxes.
-    inboxes: Vec<Inbox<T, D>>,
-    closed: bool,
+    pub(crate) inboxes: Vec<Inbox<T, D>>,
+    pub(crate) closed: bool,
 }
 
-type Shared<T, D> = Arc<Mutex<Broker<T, D>>>;
+pub(crate) type Shared<T, D> = Arc<Mutex<Broker<T, D>>>;
 
-fn lock<T, D>(broker: &Shared<T, D>) -> MutexGuard<'_, Broker<T, D>> {
+pub(crate) fn lock<T, D>(broker: &Shared<T, D>) -> MutexGuard<'_, Broker<T, D>> {
     broker.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-/// Hands inbox `index`'s heap to `append` as one batch; a batch that fails is
-/// logged and goes back on the heap, ahead of what arrived since.
-fn hand_over<T, D>(broker: &Shared<T, D>, index: usize, append: &dyn Append<T, D>) {
-    let batch = mem::take(&mut lock(broker).inboxes[index].heap);
-    if batch.is_empty() {
-        return;
-    }
-    if append.append(&batch).is_ok() {
-        log::debug!("handed over {} events from inbox {index}", batch.len());
-    } else {
-        log::error!(
-            "inbox {index} could not hand over {} events: {}",
-            batch.len(),
-            Error::Store
-        );
-        lock(broker).inboxes[index].heap.splice(0..0, batch);
-    }
 }
 
 /// The owner's handle: the only value that can shut rannoch down.
@@ -165,13 +146,7 @@ impl<T: PartialEq + Send + 'static, D: Send + 'static> Rannoch<T, D> {
             let broker = Arc::clone(&broker);
             stops.push(stop);
             threads.push(thread::spawn(move || {
-                loop {
-                    let stopping = wait.recv_timeout(every) != Err(RecvTimeoutError::Timeout);
-                    hand_over(&broker, index, &*append);
-                    if stopping {
-                        return;
-                    }
-                }
+                run(&broker, index, every, &wait, &*append);
             }));
         }
         Ok(Self {
@@ -236,7 +211,7 @@ impl<T: PartialEq, D> Sender<T, D> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Append, Config, InboxConfig, Rannoch, Storage, hand_over, lock};
+    use super::{Append, Config, InboxConfig, Rannoch, Storage, lock};
     use crate::{Error, Event, Status};
     use chrono::TimeDelta;
     use std::sync::{Arc, Mutex};
@@ -401,34 +376,6 @@ mod tests {
             self.batches.lock().unwrap().push(tys);
             Ok(())
         }
-    }
-
-    #[test]
-    fn a_failed_batch_goes_back_ahead_of_later_events_and_an_empty_heap_hands_nothing() {
-        let rannoch = Rannoch::open(Config::default()).unwrap();
-        let sender = rannoch.sender();
-        let recorder = Recorder {
-            failing: Mutex::new(true),
-            ..Recorder::default()
-        };
-        sender.send(event(Ty::Asset)).unwrap();
-        hand_over(&rannoch.broker, 0, &recorder);
-        sender.send(event(Ty::Page)).unwrap();
-        let heap: Vec<Ty> = lock(&rannoch.broker).inboxes[0]
-            .heap
-            .iter()
-            .map(|e| e.ty)
-            .collect();
-        assert_eq!(heap, [Ty::Asset, Ty::Page]);
-
-        *recorder.failing.lock().unwrap() = false;
-        hand_over(&rannoch.broker, 0, &recorder);
-        hand_over(&rannoch.broker, 0, &recorder);
-        assert_eq!(
-            *recorder.batches.lock().unwrap(),
-            [vec![Ty::Asset, Ty::Page]]
-        );
-        assert!(lock(&rannoch.broker).inboxes[0].heap.is_empty());
     }
 
     #[test]
