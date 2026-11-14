@@ -1,16 +1,18 @@
 //! `@criterion-FR-RANNOCH-013-c2` and `-c3`, `@criterion-FR-RANNOCH-014-c1`
-//! and `-c2`, and `@criterion-FR-RANNOCH-015-c1` to `-c3`, from
-//! `tests/features/`. Each store is the app's forgr empty store.
+//! and `-c2`, `@criterion-FR-RANNOCH-015-c1` to `-c3`,
+//! `@criterion-FR-RANNOCH-016-c1` and `-c2`, and `@criterion-FR-RANNOCH-017-c1`
+//! and `-c2`, from `tests/features/`. Each store is the app's forgr empty
+//! store.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
 use rannoch_app::forgr::_events;
 use rannoch_core::{Error, Event, Status};
-use rannoch_events::append;
+use rannoch_events::{append, due, status, waiting};
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -258,4 +260,96 @@ fn fr_rannoch_015_c3() {
     // And the queue is not signalled
     assert_eq!(signals.try_recv(), Err(mpsc::TryRecvError::Empty));
     assert_eq!(ids(&store).unwrap(), Vec::<String>::new());
+}
+
+/// An `_events` row of ty Page (7) through the app's forgr factory, with its
+/// source, status and `run_at` as given.
+fn page(
+    conn: &Connection,
+    source: Option<Uuid>,
+    status: i64,
+    run_at: Option<DateTime<Utc>>,
+) -> Result<Uuid, Box<dyn std::error::Error>> {
+    let id = Uuid::now_v7();
+    let mut factory = _events::factory()
+        .id(id.to_string())
+        .ty(7)
+        .data("{}")
+        .status(status);
+    if let Some(source) = source {
+        factory = factory.source(source.to_string());
+    }
+    if let Some(run_at) = run_at {
+        factory = factory.run_at(run_at.to_rfc3339_opts(SecondsFormat::Millis, true));
+    }
+    factory.insert(conn)?;
+    Ok(id)
+}
+
+#[test]
+fn fr_rannoch_016_c1() {
+    // Given a root event with two status rows and one event its flow produced
+    let store = rannoch_app::forgr::empty_store();
+    let root = page(&store, None, 0, None).unwrap();
+    let first = page(&store, Some(root), 1, None).unwrap();
+    let second = page(&store, Some(root), 2, None).unwrap();
+    let produced = page(&store, Some(root), 0, None).unwrap();
+    page(&store, None, 0, None).unwrap();
+
+    // When the status function is asked for the root's id
+    let (_, tree) = status(&store, root).unwrap();
+
+    // Then it returns the root, its two status rows and the produced event
+    let ids: Vec<Uuid> = tree.iter().map(|e| e.id).collect();
+    assert_eq!(ids, [root, first, second, produced]);
+}
+
+#[test]
+fn fr_rannoch_016_c2() {
+    // Given a root event whose status rows are 1 and then 2
+    let store = rannoch_app::forgr::empty_store();
+    let root = page(&store, None, 0, None).unwrap();
+    page(&store, Some(root), 1, None).unwrap();
+    page(&store, Some(root), 2, None).unwrap();
+
+    // When the status function is asked for the root's id
+    let (current, _) = status(&store, root).unwrap();
+
+    // Then the root's current status is 2
+    assert_eq!(current, Status::Processed);
+}
+
+#[test]
+fn fr_rannoch_017_c1() {
+    // Given two events of type Page that nothing has changed, and one event
+    // of type Page with a state change to 2
+    let store = rannoch_app::forgr::empty_store();
+    let one = page(&store, None, 0, None).unwrap();
+    let two = page(&store, None, 0, None).unwrap();
+    let changed = page(&store, None, 0, None).unwrap();
+    page(&store, Some(changed), 2, None).unwrap();
+
+    // When the events crate is asked for the waiting events of type Page
+    let read = waiting(&store, Ty::Page).unwrap();
+
+    // Then it returns the two that nothing has changed
+    let ids: Vec<Uuid> = read.iter().map(|e| e.id).collect();
+    assert_eq!(ids, [one, two]);
+}
+
+#[test]
+fn fr_rannoch_017_c2() {
+    // Given one waiting event whose run_at has passed and one whose run_at is
+    // an hour away
+    let store = rannoch_app::forgr::empty_store();
+    let now: DateTime<Utc> = "2026-11-14T08:00:00.000Z".parse().unwrap();
+    let passed = page(&store, None, 0, Some(now - TimeDelta::minutes(1))).unwrap();
+    page(&store, None, 0, Some(now + TimeDelta::hours(1))).unwrap();
+
+    // When the events crate is asked for the waiting events due now
+    let read = due(&store, now).unwrap();
+
+    // Then it returns only the one whose run_at has passed
+    let ids: Vec<Uuid> = read.iter().map(|e| e.id).collect();
+    assert_eq!(ids, [passed]);
 }
