@@ -47,30 +47,25 @@ pub fn open(path: &Path, migrator: &migratr::Migrator) -> Result<Opened, Error> 
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::Path;
 
     use super::{Error, open};
 
     #[test]
     fn a_plan_that_fails_fails_with_store() {
-        // A ledger row whose file the app's migrator does not have.
-        let dir = std::env::temp_dir().join(format!("rannoch-store-plan-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        let migrations = dir.join("migrations");
-        fs::create_dir_all(&migrations).unwrap();
+        // A file that is not a database: it opens, and the plan cannot read it.
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp/rannoch-store-plan");
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("store.db");
         fs::write(
-            migrations.join("20261114999999_other.json"),
-            r#"{"up": [{"op": "create_table", "table": "other", "columns": [{"name": "id", "type": "TEXT", "primary_key": 1}]}]}"#,
+            &db,
+            b"not a database, but long enough to be read as one by sqlite",
         )
         .unwrap();
-        let db = dir.join("store.db");
-        let mut exec = migratr::RusqliteExecutor::new(rusqlite::Connection::open(&db).unwrap());
-        migratr::up(&mut exec, &migratr::load_dir(&migrations).unwrap(), None).unwrap();
-        drop(exec);
 
         assert!(matches!(
             open(&db, &rannoch_app::migrator()),
             Err(Error::Store)
         ));
-        fs::remove_dir_all(&dir).unwrap();
     }
 }

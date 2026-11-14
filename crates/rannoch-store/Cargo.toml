@@ -3,7 +3,6 @@ name = "rannoch-store"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-publish = false
 
 [dependencies]
 migratr = "0.3"
