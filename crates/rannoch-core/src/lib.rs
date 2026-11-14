@@ -3,6 +3,11 @@
 //! Rannoch emits through the `log` crate at two levels, `error` and `debug`;
 //! the app chooses where the output goes.
 
+mod broker;
+mod inbox;
+
+pub use broker::{Config, InboxConfig, Rannoch, Sender};
+
 use std::fmt;
 
 use chrono::{DateTime, Utc};
