@@ -4,16 +4,25 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+testing = ["dep:forgr", "forgr/fake"]
+
 [dependencies]
 chrono = { version = "0.4", default-features = false }
+forgr = { version = "0.1", optional = true }
 log = "0.4"
+migratr = "0.3"
 uuid = { version = "1", features = ["v7"] }
 
 [dev-dependencies]
-migratr = "0.3"
-rannoch-app = { path = "../rannoch-app", features = ["testing"] }
+forgr = { version = "0.1", features = ["fake"] }
+rannoch-core = { path = ".", features = ["testing"] }
 rannoch-events = { path = "../rannoch-events" }
 rannoch-store = { path = "../rannoch-store" }
+rusqlite = { version = "0.41", features = ["bundled"] }
+
+[build-dependencies]
+migratr = "0.3"
 rusqlite = { version = "0.41", features = ["bundled"] }
 
 [lints]

@@ -1,25 +1,26 @@
-//! Copies every crate's migrations into the app's committed `migrations/` and
+//! Copies every crate's migrations into core's committed `migrations/` and
 //! writes `schema.json` there, each file only when its bytes differ, so the
-//! directory and `schema.json` are never out of date.
+//! directory and `schema.json` are never out of date. Each crate's
+//! `migrations/` is read by its workspace path: those crates depend on core,
+//! so core cannot build-depend on them.
 
 use std::error::Error;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// The migrations directory of every crate with tables.
-const CRATES: &[&str] = &[
-    rannoch_fixture::MIGRATIONS_DIR,
-    rannoch_events::MIGRATIONS_DIR,
-];
+/// The migrations directory of every crate with tables, from core's own.
+const CRATES: &[&str] = &["../rannoch-events/migrations"];
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let here = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?).join("migrations");
+    let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
+    let here = manifest.join("migrations");
     fs::create_dir_all(&here)?;
     let mut wanted = Vec::new();
-    for dir in CRATES {
-        println!("cargo:rerun-if-changed={dir}");
-        for entry in fs::read_dir(dir)? {
+    for crate_dir in CRATES {
+        let dir = manifest.join(crate_dir);
+        println!("cargo:rerun-if-changed={}", dir.display());
+        for entry in fs::read_dir(&dir)? {
             let from = entry?.path();
             if is_json(&from) {
                 let name = from

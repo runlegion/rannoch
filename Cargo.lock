@@ -387,24 +387,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
-name = "rannoch-app"
-version = "0.1.0"
-dependencies = [
- "forgr",
- "migratr",
- "rannoch-events",
- "rannoch-fixture",
- "rusqlite",
-]
-
-[[package]]
 name = "rannoch-core"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "forgr",
  "log",
  "migratr",
- "rannoch-app",
+ "rannoch-core",
  "rannoch-events",
  "rannoch-store",
  "rusqlite",
@@ -416,7 +406,6 @@ name = "rannoch-events"
 version = "0.1.0"
 dependencies = [
  "chrono",
- "rannoch-app",
  "rannoch-core",
  "rusqlite",
  "serde",
@@ -425,20 +414,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "rannoch-fixture"
-version = "0.1.0"
-dependencies = [
- "rannoch-app",
-]
-
-[[package]]
 name = "rannoch-store"
 version = "0.1.0"
 dependencies = [
  "migratr",
- "rannoch-app",
  "rannoch-core",
- "rannoch-fixture",
+ "rannoch-events",
  "rusqlite",
 ]
 

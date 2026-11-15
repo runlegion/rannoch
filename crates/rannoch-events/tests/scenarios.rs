@@ -10,7 +10,7 @@ use std::sync::mpsc;
 use std::thread;
 
 use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
-use rannoch_app::forgr::_events;
+use rannoch_core::forgr::_events;
 use rannoch_core::{Error, Event, Status};
 use rannoch_events::{append, due, status, waiting};
 use rusqlite::Connection;
@@ -77,14 +77,14 @@ fn file_store(name: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
     }
     fs::create_dir_all(&dir)?;
     let path = dir.join("store.db");
-    rannoch_app::forgr::empty_store().execute("VACUUM INTO ?1", [path.to_string_lossy()])?;
+    rannoch_core::forgr::empty_store().execute("VACUUM INTO ?1", [path.to_string_lossy()])?;
     Ok(path)
 }
 
 #[test]
 fn fr_rannoch_013_c2() {
     // Given an accepted event
-    let mut store = rannoch_app::forgr::empty_store();
+    let mut store = rannoch_core::forgr::empty_store();
     let (queue, _signals) = mpsc::channel();
     let run_at: DateTime<Utc> = "2026-11-14T08:00:00.250Z".parse().unwrap();
     let event = Event {
@@ -112,7 +112,7 @@ fn fr_rannoch_013_c2() {
 
 #[test]
 fn fr_rannoch_013_c3() {
-    let store = rannoch_app::forgr::empty_store();
+    let store = rannoch_core::forgr::empty_store();
 
     // When a row with status 3 is written to _events
     let refused = _events::factory()
@@ -134,7 +134,7 @@ fn fr_rannoch_013_c3() {
 #[test]
 fn fr_rannoch_014_c1() {
     // Given a root event in _events with status 0
-    let mut store = rannoch_app::forgr::empty_store();
+    let mut store = rannoch_core::forgr::empty_store();
     let (queue, _signals) = mpsc::channel();
     let root = _events::factory()
         .id(Uuid::now_v7().to_string())
@@ -167,7 +167,7 @@ fn fr_rannoch_014_c1() {
 #[test]
 fn fr_rannoch_014_c2() {
     // Given a root event with two status rows
-    let mut store = rannoch_app::forgr::empty_store();
+    let mut store = rannoch_core::forgr::empty_store();
     let (queue, _signals) = mpsc::channel();
     let root = accepted(None);
     append(&mut store, std::slice::from_ref(&root), &queue).unwrap();
@@ -204,7 +204,7 @@ fn fr_rannoch_014_c2() {
 #[test]
 fn fr_rannoch_015_c1() {
     // Given a batch of three events
-    let mut store = rannoch_app::forgr::empty_store();
+    let mut store = rannoch_core::forgr::empty_store();
     let (queue, _signals) = mpsc::channel();
     let batch = [accepted(None), accepted(None), accepted(None)];
 
@@ -247,7 +247,7 @@ fn fr_rannoch_015_c2() {
 #[test]
 fn fr_rannoch_015_c3() {
     // Given the events crate cannot write
-    let mut store = rannoch_app::forgr::empty_store();
+    let mut store = rannoch_core::forgr::empty_store();
     store.pragma_update(None, "query_only", true).unwrap();
     let (queue, signals) = mpsc::channel();
 
@@ -289,7 +289,7 @@ fn page(
 #[test]
 fn fr_rannoch_016_c1() {
     // Given a root event with two status rows and one event its flow produced
-    let store = rannoch_app::forgr::empty_store();
+    let store = rannoch_core::forgr::empty_store();
     let root = page(&store, None, 0, None).unwrap();
     let first = page(&store, Some(root), 1, None).unwrap();
     let second = page(&store, Some(root), 2, None).unwrap();
@@ -307,7 +307,7 @@ fn fr_rannoch_016_c1() {
 #[test]
 fn fr_rannoch_016_c2() {
     // Given a root event whose status rows are 1 and then 2
-    let store = rannoch_app::forgr::empty_store();
+    let store = rannoch_core::forgr::empty_store();
     let root = page(&store, None, 0, None).unwrap();
     page(&store, Some(root), 1, None).unwrap();
     page(&store, Some(root), 2, None).unwrap();
@@ -323,7 +323,7 @@ fn fr_rannoch_016_c2() {
 fn fr_rannoch_017_c1() {
     // Given two events of type Page that nothing has changed, and one event
     // of type Page with a state change to 2
-    let store = rannoch_app::forgr::empty_store();
+    let store = rannoch_core::forgr::empty_store();
     let one = page(&store, None, 0, None).unwrap();
     let two = page(&store, None, 0, None).unwrap();
     let changed = page(&store, None, 0, None).unwrap();
@@ -341,7 +341,7 @@ fn fr_rannoch_017_c1() {
 fn fr_rannoch_017_c2() {
     // Given one waiting event whose run_at has passed and one whose run_at is
     // an hour away
-    let store = rannoch_app::forgr::empty_store();
+    let store = rannoch_core::forgr::empty_store();
     let now: DateTime<Utc> = "2026-11-14T08:00:00.000Z".parse().unwrap();
     let passed = page(&store, None, 0, Some(now - TimeDelta::minutes(1))).unwrap();
     page(&store, None, 0, Some(now + TimeDelta::hours(1))).unwrap();

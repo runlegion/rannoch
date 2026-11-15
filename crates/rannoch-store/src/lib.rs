@@ -95,7 +95,7 @@ mod tests {
             fs::remove_dir_all(&dir).unwrap();
         }
         fs::create_dir_all(&dir).unwrap();
-        let store = Store::new(dir.join("store.db"), rannoch_app::migrator());
+        let store = Store::new(dir.join("store.db"), rannoch_core::migrator());
 
         assert_eq!(store.pending(), Ok(true));
         assert_eq!(store.apply(), Ok(()));
@@ -115,7 +115,7 @@ mod tests {
         .unwrap();
 
         assert!(matches!(
-            open(&db, &rannoch_app::migrator()),
+            open(&db, &rannoch_core::migrator()),
             Err(Error::Store)
         ));
     }

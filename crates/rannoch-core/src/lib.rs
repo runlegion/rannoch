@@ -65,6 +65,20 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// Every crate's migrations as one migrator, gathered by `build.rs` into the
+/// committed `migrations/`.
+#[must_use]
+pub fn migrator() -> migratr::Migrator {
+    migratr::embed!("migrations")
+}
+
+/// Test data from the store's schema, for this crate's tests and, through
+/// `testing`, every other crate's.
+#[cfg(any(test, feature = "testing"))]
+pub mod forgr {
+    forgr::schema!("migrations/schema.json");
+}
+
 #[cfg(test)]
 mod tests {
     use super::Status;
