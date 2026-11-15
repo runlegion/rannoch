@@ -3,6 +3,8 @@
 //! of its own: for FR-010 with the app's one migrator, opening rannoch with
 //! the real store in its `Config`; for FR-005 as the app's forgr empty store,
 //! opening rannoch with the events crate's append in its `Config`.
+//! `@criterion-FR-RANNOCH-011-c2` runs cargo on a copy of this workspace, so
+//! a developer's edit never touches the real checkout.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -37,7 +39,7 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 /// The versions of the app's migrations applied to the database at `path`.
 fn applied(path: &Path) -> Result<Vec<u64>> {
-    Ok(rannoch_app::migrator()
+    Ok(rannoch_core::migrator()
         .status(&mut executor(path)?)?
         .iter()
         .filter(|s| s.applied)
@@ -48,7 +50,7 @@ fn applied(path: &Path) -> Result<Vec<u64>> {
 /// The database at `path` with every migration but the newest applied, and
 /// that newest version.
 fn missing_newest(path: &Path) -> Result<u64> {
-    let migrator = rannoch_app::migrator();
+    let migrator = rannoch_core::migrator();
     let mut exec = executor(path)?;
     migrator.up(&mut exec)?;
     let down = migrator.down(&mut exec, 1)?;
@@ -57,10 +59,12 @@ fn missing_newest(path: &Path) -> Result<u64> {
 
 /// What the store reports pending at `path`.
 fn pending(path: &Path) -> Result<Vec<u64>> {
-    Ok(match rannoch_store::open(path, &rannoch_app::migrator())? {
-        Opened::Ready(_) => Vec::new(),
-        Opened::Pending(pending) => pending,
-    })
+    Ok(
+        match rannoch_store::open(path, &rannoch_core::migrator())? {
+            Opened::Ready(_) => Vec::new(),
+            Opened::Pending(pending) => pending,
+        },
+    )
 }
 
 /// The app's `Config`, carrying the real store over the database at `path`.
@@ -68,7 +72,7 @@ fn config(path: &Path) -> Config<u8, ()> {
     Config {
         store: Some(Arc::new(Store::new(
             path.to_owned(),
-            rannoch_app::migrator(),
+            rannoch_core::migrator(),
         ))),
         ..Config::default()
     }
@@ -148,7 +152,7 @@ fn event() -> Event<u8, ()> {
 /// The app's forgr empty store, written to its own file under `name`.
 fn empty_store(name: &str) -> Result<PathBuf> {
     let path = database(name)?;
-    rannoch_app::forgr::empty_store().execute("VACUUM INTO ?1", [path.to_string_lossy()])?;
+    rannoch_core::forgr::empty_store().execute("VACUUM INTO ?1", [path.to_string_lossy()])?;
     Ok(path)
 }
 
@@ -327,4 +331,100 @@ fn fr_rannoch_005_c3() {
     assert_eq!(signalled, Ok(()));
     assert_eq!(events_in(&path).unwrap(), 2);
     rannoch.shutdown();
+}
+
+/// The workspace root, two levels above this crate.
+fn root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+/// A fresh copy of the workspace's manifests and crates under `name`.
+fn copy_workspace(name: &str) -> std::io::Result<PathBuf> {
+    let to = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name).join("ws");
+    if to.exists() {
+        fs::remove_dir_all(&to)?;
+    }
+    fs::create_dir_all(&to)?;
+    for file in ["Cargo.toml", "Cargo.lock", "clippy.toml"] {
+        fs::copy(root().join(file), to.join(file))?;
+    }
+    copy_dir(&root().join("crates"), &to.join("crates"))?;
+    Ok(to)
+}
+
+fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(to)?;
+    for entry in fs::read_dir(from)? {
+        let path = entry?.path();
+        let dest = to.join(entry_name(&path)?);
+        if path.is_dir() {
+            copy_dir(&path, &dest)?;
+        } else {
+            fs::copy(&path, &dest)?;
+        }
+    }
+    Ok(())
+}
+
+fn entry_name(path: &Path) -> std::io::Result<&std::ffi::OsStr> {
+    path.file_name()
+        .ok_or_else(|| std::io::Error::other(format!("{} has no name", path.display())))
+}
+
+/// Runs cargo in `ws` with a target directory of its own: cargo names a
+/// workspace member's build the same at any path, so two copies sharing one
+/// target directory would overwrite each other's build script.
+fn cargo(ws: &Path, args: &[&str]) -> std::io::Result<process::Output> {
+    let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    Command::new(cargo)
+        .args(args)
+        .current_dir(ws)
+        .env("CARGO_TARGET_DIR", ws.with_file_name("target"))
+        .output()
+}
+
+fn text(out: &process::Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+#[test]
+fn fr_rannoch_011_c2() {
+    // Given a crate whose queries all match the app's schema
+    let ws = copy_workspace("fr_rannoch_011_c2").unwrap();
+    let check = [
+        "test",
+        "-p",
+        "rannoch-core",
+        "--lib",
+        "forgr_sql_matches_schema",
+    ];
+    let out = cargo(&ws, &check).unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+
+    // When a developer renames a column in a migration and builds again
+    let migration = ws.join("crates/rannoch-events/migrations/20261114000004_events.json");
+    let renamed = fs::read_to_string(&migration)
+        .unwrap()
+        .replace(r#""name": "ty""#, r#""name": "kind""#);
+    fs::write(&migration, renamed).unwrap();
+    let out = cargo(&ws, &check).unwrap();
+
+    // Then cargo test fails at the query that still names the old column
+    let queries = "crates/rannoch-events/src/queries.rs";
+    let line = fs::read_to_string(root().join(queries))
+        .unwrap()
+        .lines()
+        .position(|l| l.contains("const WAITING"))
+        .unwrap()
+        + 1;
+    let report = text(&out);
+    assert!(!out.status.success(), "{report}");
+    assert!(
+        report.contains(&format!("{queries}:{line}: no such column: e.ty")),
+        "{report}"
+    );
 }

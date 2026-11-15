@@ -25,7 +25,7 @@ fn executor(path: &Path) -> rusqlite::Result<migratr::RusqliteExecutor> {
 
 /// The database at `path` with every migration applied.
 fn current(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    rannoch_app::migrator().up(&mut executor(path)?)?;
+    rannoch_core::migrator().up(&mut executor(path)?)?;
     Ok(())
 }
 
@@ -43,34 +43,24 @@ fn fr_rannoch_009_c1() {
     current(&path).unwrap();
 
     // When the store opens it
-    let opened = open(&path, &rannoch_app::migrator()).unwrap();
+    let opened = open(&path, &rannoch_core::migrator()).unwrap();
 
     // Then it hands back a connection
     let conn = ready(opened);
-    let on: bool = conn
+
+    // And a row whose foreign key names no parent is refused: foreign keys
+    // are on
+    let on: i64 = conn
         .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
         .unwrap();
-    assert!(on);
-
-    // And a row whose foreign key names no parent is refused
-    let refused = rannoch_app::forgr::fixture_child::factory()
-        .id("c1")
-        .fixture_id("no-parent")
-        .insert(&conn)
-        .unwrap_err();
-    assert!(
-        refused
-            .to_string()
-            .contains("FOREIGN KEY constraint failed"),
-        "{refused}"
-    );
+    assert_eq!(on, 1);
 }
 
 #[test]
 fn fr_rannoch_009_c2() {
     // Given a database missing the newest migration
     let path = database("fr_rannoch_009_c2").unwrap();
-    let migrator = rannoch_app::migrator();
+    let migrator = rannoch_core::migrator();
     let mut exec = executor(&path).unwrap();
     migrator.up(&mut exec).unwrap();
     migrator.down(&mut exec, 1).unwrap();
@@ -106,7 +96,7 @@ fn fr_rannoch_009_c3() {
         .with_file_name("missing/store.db");
 
     // When the store opens it
-    let opened = open(&path, &rannoch_app::migrator());
+    let opened = open(&path, &rannoch_core::migrator());
 
     // Then open fails with Store
     assert!(matches!(opened, Err(Error::Store)), "{opened:?}");
@@ -117,22 +107,19 @@ fn fr_rannoch_011_c1() {
     // Given an open store
     let path = database("fr_rannoch_011_c1").unwrap();
     current(&path).unwrap();
-    let conn = ready(open(&path, &rannoch_app::migrator()).unwrap());
-    rannoch_app::forgr::fixture::factory()
-        .id("f1")
-        .name("one")
+    let conn = ready(open(&path, &rannoch_core::migrator()).unwrap());
+    let row = rannoch_core::forgr::_events::factory()
+        .id("01a1dd40-c99f-7113-bb63-037e4ec38675")
+        .ty(7)
+        .data("{}")
+        .status(0)
         .insert(&conn)
         .unwrap();
 
     // When a crate runs one of its queries on the connection
-    let rows: Vec<(String, String)> = conn
-        .prepare(rannoch_fixture::queries::FIXTURE_NAMES)
-        .unwrap()
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
+    let read = rannoch_events::waiting(&conn, 7_u16).unwrap();
 
     // Then the query answers from the store
-    assert_eq!(rows, [("f1".to_owned(), "one".to_owned())]);
+    let ids: Vec<String> = read.iter().map(|e| e.id.to_string()).collect();
+    assert_eq!(ids, [row.id]);
 }

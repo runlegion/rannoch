@@ -216,7 +216,7 @@ mod tests {
 
     #[test]
     fn a_batch_that_fails_part_way_writes_none_of_it() {
-        let mut store = rannoch_app::forgr::empty_store();
+        let mut store = rannoch_core::forgr::empty_store();
         let (queue, signals) = mpsc::channel();
         let first = Uuid::now_v7();
         let batch = [event(first), event(Uuid::now_v7()), event(first)];
@@ -229,7 +229,7 @@ mod tests {
     #[test]
     fn events_appends_through_core_append_and_signals() {
         let (queue, signals) = mpsc::channel();
-        let events = Events::new(rannoch_app::forgr::empty_store(), queue);
+        let events = Events::new(rannoch_core::forgr::empty_store(), queue);
         let batch = [event(Uuid::now_v7()), event(Uuid::now_v7())];
 
         rannoch_core::Append::append(&events, &batch).unwrap();
@@ -240,7 +240,7 @@ mod tests {
 
     #[test]
     fn run_at_is_rfc3339_utc_at_millis() {
-        let mut store = rannoch_app::forgr::empty_store();
+        let mut store = rannoch_core::forgr::empty_store();
         let (queue, _signals) = mpsc::channel();
         let at = chrono::DateTime::from_timestamp_micros(1_763_100_000_123_456).unwrap();
         let batch = [Event {
@@ -260,7 +260,7 @@ mod tests {
     /// source as given.
     fn row(conn: &rusqlite::Connection, source: Option<Uuid>, status: i64) -> Uuid {
         let id = Uuid::now_v7();
-        let factory = rannoch_app::forgr::_events::factory()
+        let factory = rannoch_core::forgr::_events::factory()
             .id(id.to_string())
             .ty(7)
             .data("{}")
@@ -276,7 +276,7 @@ mod tests {
 
     #[test]
     fn the_tree_follows_the_source_chain_past_the_first_level() {
-        let store = rannoch_app::forgr::empty_store();
+        let store = rannoch_core::forgr::empty_store();
         let root = row(&store, None, 0);
         let produced = row(&store, Some(root), 0);
         let grandchild = row(&store, Some(produced), 0);
@@ -290,7 +290,7 @@ mod tests {
 
     #[test]
     fn a_root_with_no_status_rows_has_its_own_status() {
-        let store = rannoch_app::forgr::empty_store();
+        let store = rannoch_core::forgr::empty_store();
         let root = row(&store, None, 0);
         row(&store, Some(root), 0);
 
@@ -299,7 +299,7 @@ mod tests {
 
     #[test]
     fn a_produced_events_state_change_leaves_the_root_unchanged() {
-        let store = rannoch_app::forgr::empty_store();
+        let store = rannoch_core::forgr::empty_store();
         let root = row(&store, None, 0);
         let produced = row(&store, Some(root), 0);
         row(&store, Some(produced), 2);
@@ -312,14 +312,14 @@ mod tests {
 
     #[test]
     fn the_status_of_an_unknown_id_is_a_store_error() {
-        let store = rannoch_app::forgr::empty_store();
+        let store = rannoch_core::forgr::empty_store();
 
         assert_eq!(status(&store, Uuid::now_v7()).unwrap_err(), Error::Store);
     }
 
     #[test]
     fn rows_come_back_as_stored() {
-        let mut store = rannoch_app::forgr::empty_store();
+        let mut store = rannoch_core::forgr::empty_store();
         let (queue, _signals) = mpsc::channel();
         let at = chrono::DateTime::from_timestamp_millis(1_763_100_000_123).unwrap();
         let root = Uuid::now_v7();
@@ -343,7 +343,7 @@ mod tests {
 
     #[test]
     fn a_binned_or_in_progress_event_is_not_waiting() {
-        let store = rannoch_app::forgr::empty_store();
+        let store = rannoch_core::forgr::empty_store();
         let binned = row(&store, None, 0);
         row(&store, Some(binned), -1);
         let started = row(&store, None, 0);
@@ -354,10 +354,10 @@ mod tests {
 
     #[test]
     fn due_is_at_or_before_the_time_and_skips_no_run_at() {
-        let store = rannoch_app::forgr::empty_store();
+        let store = rannoch_core::forgr::empty_store();
         let at: chrono::DateTime<chrono::Utc> = "2026-11-14T08:00:00.000Z".parse().unwrap();
         let on_time = Uuid::now_v7();
-        rannoch_app::forgr::_events::factory()
+        rannoch_core::forgr::_events::factory()
             .id(on_time.to_string())
             .ty(7)
             .data("{}")
