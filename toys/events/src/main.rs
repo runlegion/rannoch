@@ -664,6 +664,25 @@ fn p13(dir: &str) {
     }
 }
 
+fn p14(dir: &str) {
+    let now = Utc::now();
+    let mut c = open(&format!("{dir}/p14.db"), false);
+    c.execute_batch("CREATE INDEX _events_source ON _events (source);").expect("idx");
+    c.execute_batch(WAITING_SET).expect("trigger");
+    c.execute_batch("CREATE TRIGGER _events_waiting_out AFTER DELETE ON _events BEGIN DELETE FROM _waiting WHERE id = OLD.id; END;").expect("del trigger");
+    let all = history(&mut c, 10_000, now);
+    // the app chooses every third root, processed or still waiting
+    let chosen: HashSet<Uuid> = all.iter().filter(|e| e.source.is_none()).step_by(3).map(|e| e.id).collect();
+    let waiting_chosen = { let changed: HashSet<Uuid> = all.iter().filter(|e| e.status != 0).filter_map(|e| e.source).collect(); chosen.iter().filter(|id| !changed.contains(id)).count() };
+    let tx = c.transaction().expect("tx");
+    { let mut del = tx.prepare("DELETE FROM _events WHERE id = ?1 OR (source = ?1 AND status <> 0)").expect("prep"); for id in &chosen { del.execute([id.to_string()]).expect("del"); } }
+    tx.commit().expect("commit");
+    let remain: Vec<Ev> = all.into_iter().filter(|e| !chosen.contains(&e.id) && !(e.status != 0 && e.source.is_some_and(|s| chosen.contains(&s)))).collect();
+    let mut ok = true;
+    for ty in 0..8u16 { let (w, d) = reference(&remain, ty, now); ok &= ids(&c, WAITING_T, &ty) == w; if ty == 0 { ok &= ids(&c, DUE_T, &ts(now)) == d; } }
+    println!("P14 trimmed {} roots ({waiting_chosen} of them waiting): WAITING and DUE from _waiting match the reference: {ok}", chosen.len());
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let dir = args.get(2).cloned().unwrap_or_else(|| ".".into());
@@ -680,6 +699,7 @@ fn main() {
         Some("p11") => p11(&dir),
         Some("p12") => p12(&dir),
         Some("p13") => p13(&dir),
+        Some("p14") => p14(&dir),
         _ => eprintln!("usage: events-toy p1|p2|p4|p5 <dir>"),
     }
 }
