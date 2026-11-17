@@ -565,6 +565,59 @@ fn p10(dir: &str) {
     }
 }
 
+/// Checks, not predictions: does a connection without rannoch_hash write to a table with the expression index;
+/// WAITING and DUE at 1,000,000 events with (source).
+fn p11(dir: &str) {
+    let path = format!("{dir}/p11.db");
+    let _ = std::fs::remove_file(&path);
+    {
+        let c = Connection::open(&path).expect("open");
+        register(&c);
+        c.execute_batch(TABLE).expect("table");
+        c.execute_batch("CREATE UNIQUE INDEX _events_once ON _events (rannoch_hash(quote(ty), quote(source), quote(status), quote(data)));").expect("idx");
+    }
+    let bare = Connection::open(&path).expect("open");
+    let r = bare.execute(APPEND, params![Uuid::now_v7().to_string(), Option::<String>::None, 1, "{}", Option::<String>::None, 0]);
+    println!("P11 insert from a connection without rannoch_hash: {r:?}");
+    let read = bare.query_row("SELECT count(*) FROM _events", [], |r| r.get::<_, i64>(0));
+    println!("P11 read from a connection without rannoch_hash: {read:?}");
+    let now = Utc::now();
+    let mut c = open(&format!("{dir}/p11b.db"), false);
+    history(&mut c, 1_000_000, now);
+    c.execute_batch("CREATE INDEX _events_source ON _events (source);").expect("idx");
+    for (name, run) in [("WAITING ty=0", true), ("DUE", false)] {
+        let f = || if run { ids(&c, WAITING, &0u16).len() } else { ids(&c, DUE, &ts(now)).len() };
+        let rows = f();
+        let v: Vec<f64> = (0..5).map(|_| { let t = Instant::now(); f(); t.elapsed().as_secs_f64() * 1000.0 }).collect();
+        let (med, max) = median_ms(v);
+        println!("P11 history 1000000, (source), {name}: {rows} rows, median {med:.1} ms, max {max:.1} ms");
+    }
+}
+
+const TREE_FIXED: &str = "WITH RECURSIVE tree(id) AS (
+    SELECT id FROM _events WHERE id = ?1
+    UNION SELECT e.id FROM _events e JOIN tree t ON e.source = t.id
+) SELECT e.id, e.source, e.ty, e.data, e.run_at, e.status
+FROM tree CROSS JOIN _events e ON e.id = tree.id ORDER BY e.id";
+
+fn p12(dir: &str) {
+    let now = Utc::now();
+    for n in [100_000usize, 1_000_000] {
+        let mut c = open(&format!("{dir}/p12.db"), false);
+        let hist = history(&mut c, n, now);
+        c.execute_batch("CREATE INDEX _events_source ON _events (source);").expect("idx");
+        let roots: Vec<String> = hist.iter().filter(|e| e.source.is_none()).step_by(997).map(|e| e.id.to_string()).collect();
+        let mut same = true;
+        for r in &roots { same &= ids(&c, TREE, r) == ids(&c, TREE_FIXED, r); }
+        for (label, q) in [("TREE today", TREE), ("TREE from the tree", TREE_FIXED)] {
+            let t = Instant::now();
+            for _ in 0..3 { for r in &roots { let _ = ids(&c, q, r); } }
+            let per = t.elapsed().as_secs_f64() * 1000.0 / (3 * roots.len()) as f64;
+            println!("P12 history {n}, {label}: {per:.3} ms per root over {} roots; same rows: {same}", roots.len());
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let dir = args.get(2).cloned().unwrap_or_else(|| ".".into());
@@ -578,6 +631,8 @@ fn main() {
         Some("p8") => p8(&dir),
         Some("p9") => p9(&dir),
         Some("p10") => p10(&dir),
+        Some("p11") => p11(&dir),
+        Some("p12") => p12(&dir),
         _ => eprintln!("usage: events-toy p1|p2|p4|p5 <dir>"),
     }
 }

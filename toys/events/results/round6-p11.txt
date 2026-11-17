@@ -1,0 +1,4 @@
+P11 insert from a connection without rannoch_hash: Err(SqlInputError { error: Error { code: Unknown, extended_code: 1 }, msg: "unknown function: rannoch_hash()", sql: "INSERT INTO _events (id, source, ty, data, run_at, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", offset: 45 })
+P11 read from a connection without rannoch_hash: Ok(0)
+P11 history 1000000, (source), WAITING ty=0: 26000 rows, median 316.0 ms, max 318.4 ms
+P11 history 1000000, (source), DUE: 1000 rows, median 261.6 ms, max 264.4 ms

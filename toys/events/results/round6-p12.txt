@@ -1,0 +1,4 @@
+P12 history 100000, TREE today: 5.853 ms per root over 101 roots; same rows: true
+P12 history 100000, TREE from the tree: 0.015 ms per root over 101 roots; same rows: true
+P12 history 1000000, TREE today: 66.776 ms per root over 1004 roots; same rows: true
+P12 history 1000000, TREE from the tree: 0.016 ms per root over 1004 roots; same rows: true
