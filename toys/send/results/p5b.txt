@@ -1,0 +1,6 @@
+== cache + checkpoint off
+P1 FR-023 shape (unique rannoch_hash index, INSERT OR IGNORE) with WAL at history 1000000: 2,000 events at 200/s, kept 2000, send to commit p50 14.2 ms, p99 30.7 ms, max 33.1 ms
+P2/P4 FR-023 shape (unique rannoch_hash index, INSERT OR IGNORE) with WAL at history 1000000: 100000 sent in 0.074s (0.74 us a send), all kept (100000) in 0.438s = 228561/s end to end; send to commit p50 437.5 ms, p99 439.2 ms
+== cache + checkpoint off + fullfsync
+P1 FR-023 shape (unique rannoch_hash index, INSERT OR IGNORE) with WAL at history 1000000: 2,000 events at 200/s, kept 2000, send to commit p50 20.3 ms, p99 39.3 ms, max 42.2 ms
+P2/P4 FR-023 shape (unique rannoch_hash index, INSERT OR IGNORE) with WAL at history 1000000: 100000 sent in 0.084s (0.84 us a send), all kept (100000) in 0.486s = 205968/s end to end; send to commit p50 485.1 ms, p99 486.9 ms

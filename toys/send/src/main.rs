@@ -128,6 +128,15 @@ fn conn(path: &str, shape: Shape) -> Connection {
     if shape != Shape::MainAsIs {
         c.execute_batch("PRAGMA journal_mode = WAL;").expect("wal");
     }
+    if let Ok(kib) = std::env::var("TOY_CACHE_KIB") {
+        c.execute_batch(&format!("PRAGMA cache_size = -{kib};")).expect("cache");
+    }
+    if std::env::var("TOY_NOCKPT").is_ok() {
+        c.execute_batch("PRAGMA wal_autocheckpoint = 0;").expect("ckpt");
+    }
+    if std::env::var("TOY_FULLFSYNC").is_ok() {
+        c.execute_batch("PRAGMA fullfsync = ON; PRAGMA checkpoint_fullfsync = ON;").expect("fullfsync");
+    }
     register(&c);
     c
 }
@@ -195,6 +204,7 @@ fn steady(dir: &str, shape: Shape, history: u64) {
     let path = store(dir, shape, history);
     let before = count(&path, shape);
     let (rannoch, timed) = open(&path, shape);
+    let ck = checkpointer(&path);
     let tx = rannoch.sender();
     let t0 = Instant::now();
     for n in 0..2_000u64 {
@@ -205,6 +215,7 @@ fn steady(dir: &str, shape: Shape, history: u64) {
         tx.send(event(n)).expect("send");
     }
     rannoch.shutdown();
+    if let Some((stop, h)) = ck { stop.store(true, Ordering::Relaxed); let _ = h.join(); }
     let mut l = timed.latencies.lock().unwrap_or_else(PoisonError::into_inner).clone();
     let kept = count(&path, shape) - before;
     println!(
@@ -218,6 +229,7 @@ fn flat_out(dir: &str, shape: Shape, history: u64) {
     let path = store(dir, shape, history);
     let before = count(&path, shape);
     let (rannoch, timed) = open(&path, shape);
+    let ck = checkpointer(&path);
     let tx = rannoch.sender();
     let n = 100_000u64;
     let events: Vec<Event<Ty, Payload>> = (0..n).map(event).collect();
@@ -228,6 +240,7 @@ fn flat_out(dir: &str, shape: Shape, history: u64) {
     let sending = t0.elapsed();
     rannoch.shutdown();
     let total = t0.elapsed();
+    if let Some((stop, h)) = ck { stop.store(true, Ordering::Relaxed); let _ = h.join(); }
     let kept = count(&path, shape) - before;
     let mut l = timed.latencies.lock().unwrap_or_else(PoisonError::into_inner).clone();
     println!(
@@ -259,6 +272,20 @@ fn repeat(dir: &str, shape: Shape) {
     }
 }
 
+/// With wal_autocheckpoint 0, a separate connection checkpoints once a second, off the append.
+fn checkpointer(path: &str) -> Option<(Arc<std::sync::atomic::AtomicBool>, thread::JoinHandle<()>)> {
+    std::env::var("TOY_NOCKPT").ok()?;
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (flag, path) = (stop.clone(), path.to_owned());
+    Some((stop, thread::spawn(move || {
+        let c = Connection::open(&path).expect("open");
+        while !flag.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_secs(1));
+            let _ = c.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()));
+        }
+    })))
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let dir = args.get(2).cloned().unwrap_or_else(|| ".".into());
@@ -278,6 +305,10 @@ fn main() {
                     flat_out(&dir, s, h);
                 }
             }
+        }
+        Some("p5") => {
+            steady(&dir, Shape::Fr023Wal, 1_000_000);
+            flat_out(&dir, Shape::Fr023Wal, 1_000_000);
         }
         Some("p3") => {
             repeat(&dir, Shape::Fr023Wal);

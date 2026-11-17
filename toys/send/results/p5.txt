@@ -1,0 +1,19 @@
+== round 4 shape (WAL only)
+P1 FR-023 shape (unique rannoch_hash index, INSERT OR IGNORE) with WAL at history 1000000: 2,000 events at 200/s, kept 2000, send to commit p50 14.5 ms, p99 113.9 ms, max 128.2 ms
+P2/P4 FR-023 shape (unique rannoch_hash index, INSERT OR IGNORE) with WAL at history 1000000: 100000 sent in 0.073s (0.73 us a send), all kept (100000) in 1.799s = 55599/s end to end; send to commit p50 1798.2 ms, p99 1799.9 ms
+== cache 64 MiB
+P1 FR-023 shape (unique rannoch_hash index, INSERT OR IGNORE) with WAL at history 1000000: 2,000 events at 200/s, kept 2000, send to commit p50 14.2 ms, p99 89.7 ms, max 121.8 ms
+P2/P4 FR-023 shape (unique rannoch_hash index, INSERT OR IGNORE) with WAL at history 1000000: 100000 sent in 0.079s (0.79 us a send), all kept (100000) in 1.402s = 71303/s end to end; send to commit p50 1402.5 ms, p99 1404.2 ms
+== checkpoint off the append
+P1 FR-023 shape (unique rannoch_hash index, INSERT OR IGNORE) with WAL at history 1000000: 2,000 events at 200/s, kept 2000, send to commit p50 13.8 ms, p99 30.5 ms, max 32.7 ms
+P2/P4 FR-023 shape (unique rannoch_hash index, INSERT OR IGNORE) with WAL at history 1000000: 100000 sent in 0.075s (0.75 us a send), all kept (100000) in 0.794s = 125993/s end to end; send to commit p50 793.7 ms, p99 795.5 ms
+== cache + checkpoint off
+
+thread 'main' (11119250) panicked at src/main.rs:132:66:
+cache: SqlInputError { error: Error { code: Unknown, extended_code: 1 }, msg: "near \"TOY_NOCKPT\": syntax error", sql: "PRAGMA cache_size = -65536 TOY_NOCKPT=1;", offset: 27 }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+== cache + checkpoint off + fullfsync
+
+thread 'main' (11119255) panicked at src/main.rs:132:66:
+cache: SqlInputError { error: Error { code: Unknown, extended_code: 1 }, msg: "near \"TOY_NOCKPT\": syntax error", sql: "PRAGMA cache_size = -65536 TOY_NOCKPT=1 TOY_FULLFSYNC=1;", offset: 27 }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
