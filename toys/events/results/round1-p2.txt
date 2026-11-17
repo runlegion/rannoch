@@ -1,0 +1,7 @@
+P2 round 0 hashed=false: 306000 events in 0.94s = 326181 events/s, rows 306000
+P2 round 0 hashed=true: 306000 events in 16.62s = 18408 events/s, rows 306000
+P2 round 1 hashed=false: 306000 events in 0.95s = 322398 events/s, rows 306000
+P2 round 1 hashed=true: 306000 events in 16.62s = 18411 events/s, rows 306000
+P2 round 2 hashed=false: 306000 events in 0.95s = 320946 events/s, rows 306000
+P2 round 2 hashed=true: 306000 events in 16.60s = 18436 events/s, rows 306000
+P2 median plain 322398/s, hashed 18411/s, cost 94.3%

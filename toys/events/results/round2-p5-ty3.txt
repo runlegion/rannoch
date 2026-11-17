@@ -1,0 +1,18 @@
+P5 history 1000, no source index, WAITING ty=3: 0 rows, median 3.34 ms, max 4.92 ms
+P5 history 1000, no source index, DUE: 1 rows, median 0.46 ms, max 0.62 ms
+P5 history 1000, (source), WAITING ty=3: 0 rows, median 0.20 ms, max 0.22 ms
+P5 history 1000, (source), DUE: 1 rows, median 0.17 ms, max 0.19 ms
+P5 history 1000, (source)+(id, source), WAITING ty=3: 0 rows, median 0.20 ms, max 0.20 ms
+P5 history 1000, (source)+(id, source), DUE: 1 rows, median 0.17 ms, max 0.17 ms
+P5 history 10000, no source index, WAITING ty=3: 0 rows, median 340.39 ms, max 497.20 ms
+P5 history 10000, no source index, DUE: 10 rows, median 33.26 ms, max 47.70 ms
+P5 history 10000, (source), WAITING ty=3: 0 rows, median 2.81 ms, max 2.82 ms
+P5 history 10000, (source), DUE: 10 rows, median 2.28 ms, max 2.29 ms
+P5 history 10000, (source)+(id, source), WAITING ty=3: 0 rows, median 2.83 ms, max 2.85 ms
+P5 history 10000, (source)+(id, source), DUE: 10 rows, median 2.33 ms, max 2.40 ms
+P5 history 100000, no source index, WAITING ty=3: 0 rows, median 47100.61 ms, max 64987.96 ms
+P5 history 100000, no source index, DUE: 100 rows, median 4146.45 ms, max 5706.01 ms
+P5 history 100000, (source), WAITING ty=3: 0 rows, median 30.71 ms, max 30.92 ms
+P5 history 100000, (source), DUE: 100 rows, median 25.11 ms, max 25.23 ms
+P5 history 100000, (source)+(id, source), WAITING ty=3: 0 rows, median 30.56 ms, max 30.78 ms
+P5 history 100000, (source)+(id, source), DUE: 100 rows, median 25.45 ms, max 26.20 ms

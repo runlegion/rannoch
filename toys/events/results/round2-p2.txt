@@ -1,0 +1,12 @@
+P2/P3 history 1000: with a source, plain: batch of 100 median 2.57 ms, max 3.17 ms
+P2/P3 history 1000: with a source, kept once: batch of 100 median 3.79 ms, max 4.35 ms
+P2/P3 history 1000: roots, plain: batch of 100 median 1.93 ms, max 2.64 ms
+P2/P3 history 1000: roots, kept once: batch of 100 median 41.82 ms, max 50.39 ms
+P2/P3 history 10000: with a source, plain: batch of 100 median 2.43 ms, max 2.86 ms
+P2/P3 history 10000: with a source, kept once: batch of 100 median 2.91 ms, max 3.64 ms
+P2/P3 history 10000: roots, plain: batch of 100 median 2.32 ms, max 2.87 ms
+P2/P3 history 10000: roots, kept once: batch of 100 median 212.09 ms, max 219.33 ms
+P2/P3 history 100000: with a source, plain: batch of 100 median 2.52 ms, max 3.39 ms
+P2/P3 history 100000: with a source, kept once: batch of 100 median 2.98 ms, max 3.67 ms
+P2/P3 history 100000: roots, plain: batch of 100 median 2.35 ms, max 2.86 ms
+P2/P3 history 100000: roots, kept once: batch of 100 median 1951.27 ms, max 1965.75 ms

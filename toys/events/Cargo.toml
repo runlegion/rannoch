@@ -1,0 +1,17 @@
+[package]
+name = "events-toy"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Standalone: not a member of rannoch's workspace.
+[workspace]
+
+[dependencies]
+blake3 = "1"
+chrono = { version = "0.4", default-features = false, features = ["alloc", "clock"] }
+rusqlite = { version = "0.41", features = ["bundled", "functions"] }
+uuid = { version = "1", features = ["v7"] }
+
+[profile.release]
+debug = false
