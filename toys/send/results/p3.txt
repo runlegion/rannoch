@@ -1,0 +1,2 @@
+P3 FR-023 shape (unique rannoch_hash index, INSERT OR IGNORE) with WAL: sent A, then A again with B: rows 2 (want 2: A once and B), failed hand-overs in 300 ms: 0
+P3 main's Events (plain INSERT) with the unique index, WAL: sent A, then A again with B: rows 1 (want 2: A once and B), failed hand-overs in 300 ms: 11

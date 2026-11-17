@@ -1,0 +1,6 @@
+P2/P4 main as it is (Events, plain INSERT, rollback journal) at history 0: 100000 sent in 0.078s (0.78 us a send), all kept (100000) in 0.221s = 452234/s end to end; send to commit p50 221.4 ms, p99 223.9 ms
+P2/P4 main's Events with WAL at history 0: 100000 sent in 0.074s (0.74 us a send), all kept (100000) in 0.271s = 369191/s end to end; send to commit p50 270.6 ms, p99 272.0 ms
+P2/P4 FR-023 shape (unique rannoch_hash index, INSERT OR IGNORE) with WAL at history 0: 100000 sent in 0.074s (0.74 us a send), all kept (100000) in 0.432s = 231659/s end to end; send to commit p50 431.4 ms, p99 432.7 ms
+P2/P4 main as it is (Events, plain INSERT, rollback journal) at history 1000000: 100000 sent in 0.075s (0.75 us a send), all kept (100000) in 0.242s = 413432/s end to end; send to commit p50 241.7 ms, p99 243.0 ms
+P2/P4 main's Events with WAL at history 1000000: 100000 sent in 0.074s (0.74 us a send), all kept (100000) in 0.280s = 356675/s end to end; send to commit p50 280.2 ms, p99 281.5 ms
+P2/P4 FR-023 shape (unique rannoch_hash index, INSERT OR IGNORE) with WAL at history 1000000: 100000 sent in 0.074s (0.74 us a send), all kept (100000) in 1.788s = 55916/s end to end; send to commit p50 1788.0 ms, p99 1789.6 ms

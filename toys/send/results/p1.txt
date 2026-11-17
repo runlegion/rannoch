@@ -1,0 +1,6 @@
+P1 main as it is (Events, plain INSERT, rollback journal) at history 0: 2,000 events at 200/s, kept 2000, send to commit p50 16.4 ms, p99 34.3 ms, max 50.1 ms
+P1 main's Events with WAL at history 0: 2,000 events at 200/s, kept 2000, send to commit p50 13.2 ms, p99 30.2 ms, max 32.0 ms
+P1 FR-023 shape (unique rannoch_hash index, INSERT OR IGNORE) with WAL at history 0: 2,000 events at 200/s, kept 2000, send to commit p50 13.2 ms, p99 30.0 ms, max 32.2 ms
+P1 main as it is (Events, plain INSERT, rollback journal) at history 1000000: 2,000 events at 200/s, kept 2000, send to commit p50 16.5 ms, p99 34.0 ms, max 36.5 ms
+P1 main's Events with WAL at history 1000000: 2,000 events at 200/s, kept 2000, send to commit p50 13.0 ms, p99 30.0 ms, max 31.9 ms
+P1 FR-023 shape (unique rannoch_hash index, INSERT OR IGNORE) with WAL at history 1000000: 2,000 events at 200/s, kept 2000, send to commit p50 14.6 ms, p99 114.1 ms, max 129.5 ms

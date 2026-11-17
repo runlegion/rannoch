@@ -1,0 +1,18 @@
+[package]
+name = "send-toy"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Standalone: not a member of rannoch's workspace; uses main's crates by path.
+[workspace]
+
+[dependencies]
+blake3 = "1"
+chrono = { version = "0.4", default-features = false, features = ["alloc", "clock"] }
+rannoch-core = { path = "../../crates/rannoch-core" }
+rannoch-events = { path = "../../crates/rannoch-events" }
+rusqlite = { version = "0.41", features = ["bundled", "functions"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v7"] }
