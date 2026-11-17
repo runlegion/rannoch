@@ -1,0 +1,6 @@
+P6 history 100,000, with a source, batch 100, plain: 50000 events in 1.03s = 48534/s
+P6 history 100,000, with a source, batch 100, kept once: 50000 events in 1.28s = 39109/s
+P6 history 100,000, with a source, batch 1000, plain: 50000 events in 0.42s = 118726/s
+P6 history 100,000, with a source, batch 1000, kept once: 50000 events in 0.67s = 74337/s
+P6 history 100,000, with a source, batch 10000, plain: 50000 events in 0.38s = 131094/s
+P6 history 100,000, with a source, batch 10000, kept once: 50000 events in 0.71s = 70381/s

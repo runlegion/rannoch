@@ -1,0 +1,20 @@
+P9 1000 per commit, rollback, TEXT, plain per row: 163353/s
+P9 1000 per commit, rollback, TEXT, check per row: 126152/s
+P9 1000 per commit, WAL NORMAL, TEXT, check per row: 150236/s
+P9 1000 per commit, WAL NORMAL, BLOB, plain per row: 274886/s
+P9 1000 per commit, WAL NORMAL, BLOB, check per row: 180308/s
+P9 1000 per commit, WAL NORMAL, BLOB, plain 100 rows per statement: 382348/s
+P9 1000 per commit, WAL NORMAL, BLOB, check 100 rows per statement: 303127/s
+P9 1000 per commit, WAL NORMAL, BLOB, check whole batch in one statement: 287631/s
+P9 1000 per commit, WAL NORMAL, TEXT, check whole batch in one statement: 207224/s
+P9 1000 per commit, rollback, TEXT, check whole batch in one statement: 166786/s
+P9 10000 per commit, rollback, TEXT, plain per row: 257556/s
+P9 10000 per commit, rollback, TEXT, check per row: 166165/s
+P9 10000 per commit, WAL NORMAL, TEXT, check per row: 158198/s
+P9 10000 per commit, WAL NORMAL, BLOB, plain per row: 296080/s
+P9 10000 per commit, WAL NORMAL, BLOB, check per row: 183886/s
+P9 10000 per commit, WAL NORMAL, BLOB, plain 100 rows per statement: 373495/s
+P9 10000 per commit, WAL NORMAL, BLOB, check 100 rows per statement: 302373/s
+P9 10000 per commit, WAL NORMAL, BLOB, check whole batch in one statement: 313397/s
+P9 10000 per commit, WAL NORMAL, TEXT, check whole batch in one statement: 235331/s
+P9 10000 per commit, rollback, TEXT, check whole batch in one statement: 275015/s

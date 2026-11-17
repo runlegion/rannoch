@@ -1,0 +1,12 @@
+P10 history 1000, expression unique index: new roots batch of 100 median 3.39 ms (kept 2000/2000), repeats batch of 100 median 0.38 ms (kept 0/2000); history built at 113634/s in batches of 10,000
+P10 history 1000, stored hash column, unique index: new roots batch of 100 median 3.23 ms (kept 2000/2000), repeats batch of 100 median 0.19 ms (kept 0/2000); history built at 183399/s in batches of 10,000
+P10 history 1000, NOT EXISTS check: new roots batch of 100 median 17.98 ms (kept 2000/2000), repeats batch of 100 median 16.28 ms (kept 0/2000); history built at 22646/s in batches of 10,000
+P10 history 10000, expression unique index: new roots batch of 100 median 6.93 ms (kept 2000/2000), repeats batch of 100 median 0.18 ms (kept 0/2000); history built at 367710/s in batches of 10,000
+P10 history 10000, stored hash column, unique index: new roots batch of 100 median 6.24 ms (kept 2000/2000), repeats batch of 100 median 0.16 ms (kept 0/2000); history built at 360915/s in batches of 10,000
+P10 history 10000, NOT EXISTS check: new roots batch of 100 median 90.30 ms (kept 2000/2000), repeats batch of 100 median 88.70 ms (kept 0/2000); history built at 2468/s in batches of 10,000
+P10 history 100000, expression unique index: new roots batch of 100 median 11.29 ms (kept 2000/2000), repeats batch of 100 median 0.19 ms (kept 0/2000); history built at 177314/s in batches of 10,000
+P10 history 100000, stored hash column, unique index: new roots batch of 100 median 11.27 ms (kept 2000/2000), repeats batch of 100 median 0.19 ms (kept 0/2000); history built at 178854/s in batches of 10,000
+P10 history 100000, NOT EXISTS check: new roots batch of 100 median 984.48 ms (kept 2000/2000), repeats batch of 100 median 992.22 ms (kept 0/2000); history built at 211/s in batches of 10,000
+P10 history 1000000, expression unique index: new roots batch of 100 median 13.12 ms (kept 2000/2000), repeats batch of 100 median 0.28 ms (kept 0/2000); history built at 33967/s in batches of 10,000
+P10 history 1000000, stored hash column, unique index: new roots batch of 100 median 12.95 ms (kept 2000/2000), repeats batch of 100 median 0.26 ms (kept 0/2000); history built at 33071/s in batches of 10,000
+P10 history 1000000, NOT EXISTS check: skipped (1,951 ms per 100 at 100,000)

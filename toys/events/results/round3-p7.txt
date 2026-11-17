@@ -1,0 +1,4 @@
+P7 baseline + (id, source) index: 130804/s (7.6 us per event)
+P7 baseline: TEXT id, rollback journal, sync FULL, one INSERT per row: 161478/s (6.2 us per event)
+P7 no fsync (synchronous OFF), attribution only: 401843/s (2.5 us per event)
+P7 WAL, synchronous NORMAL: 233812/s (4.3 us per event)

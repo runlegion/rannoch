@@ -1,0 +1,12 @@
+== PRAGMA cache_size = -65536;
+P10 history 100000, expression unique index: new roots batch of 100 median 11.34 ms (kept 2000/2000), repeats batch of 100 median 0.18 ms (kept 0/2000); history built at 187809/s in batches of 10,000
+P10 history 1000000, expression unique index: new roots batch of 100 median 13.09 ms (kept 2000/2000), repeats batch of 100 median 0.20 ms (kept 0/2000); history built at 37704/s in batches of 10,000
+== PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;
+P10 history 100000, expression unique index: new roots batch of 100 median 0.72 ms (kept 2000/2000), repeats batch of 100 median 0.21 ms (kept 0/2000); history built at 186967/s in batches of 10,000
+P10 history 1000000, expression unique index: new roots batch of 100 median 0.83 ms (kept 2000/2000), repeats batch of 100 median 0.27 ms (kept 0/2000); history built at 33690/s in batches of 10,000
+== PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA cache_size = -65536;
+P10 history 100000, expression unique index: new roots batch of 100 median 0.66 ms (kept 2000/2000), repeats batch of 100 median 0.18 ms (kept 0/2000); history built at 202073/s in batches of 10,000
+P10 history 1000000, expression unique index: new roots batch of 100 median 0.80 ms (kept 2000/2000), repeats batch of 100 median 0.21 ms (kept 0/2000); history built at 38821/s in batches of 10,000
+== PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;
+P10 history 100000, expression unique index: new roots batch of 100 median 1.42 ms (kept 2000/2000), repeats batch of 100 median 0.20 ms (kept 0/2000); history built at 183245/s in batches of 10,000
+P10 history 1000000, expression unique index: new roots batch of 100 median 1.62 ms (kept 2000/2000), repeats batch of 100 median 0.28 ms (kept 0/2000); history built at 33515/s in batches of 10,000
