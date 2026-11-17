@@ -1,0 +1,4 @@
+P13 history 100000, today's reads: history built 149296/s, append batch of 100 median 2.18 ms; WAITING 2850 rows 16.27 ms (same as today's read: true); DUE 100 rows 11.65 ms (same as today's read: true)
+P13 history 100000, trigger-kept _waiting: history built 39272/s, append batch of 100 median 4.86 ms; WAITING 2850 rows 4.31 ms (same as today's read: true); DUE 100 rows 0.06 ms (same as today's read: true)
+P13 history 1000000, today's reads: history built 146363/s, append batch of 100 median 1.98 ms; WAITING 26250 rows 167.26 ms (same as today's read: true); DUE 1000 rows 118.49 ms (same as today's read: true)
+P13 history 1000000, trigger-kept _waiting: history built 33559/s, append batch of 100 median 5.62 ms; WAITING 26250 rows 54.19 ms (same as today's read: true); DUE 1000 rows 1.83 ms (same as today's read: true)

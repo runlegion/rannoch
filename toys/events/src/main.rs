@@ -141,13 +141,15 @@ fn history(c: &mut Connection, n: usize, now: DateTime<Utc>) -> Vec<Ev> {
     for i in 0..n {
         let run_at = if i % 100 == 0 { Some(now - TimeDelta::minutes(5)) } else { None };
         let r = ev(None, (i % 8) as u16, data(i), run_at, 0);
+        let (rid, rty) = (r.id, r.ty);
+        // the event first, then what follows it, as rannoch appends them
+        all.push(r);
         if i % 1000 != 0 {
-            all.push(ev(Some(r.id), r.ty, "null".into(), None, 2));
+            all.push(ev(Some(rid), rty, "null".into(), None, 2));
         }
         if i % 10 == 0 {
-            all.push(ev(Some(r.id), r.ty, data(i + n), None, 0));
+            all.push(ev(Some(rid), rty, data(i + n), None, 0));
         }
-        all.push(r);
     }
     for b in all.chunks(10_000) {
         append(c, b, false);
@@ -618,6 +620,50 @@ fn p12(dir: &str) {
     }
 }
 
+const WAITING_SET: &str = "CREATE TABLE _waiting (id TEXT PRIMARY KEY, ty INTEGER NOT NULL, run_at TEXT) WITHOUT ROWID;
+CREATE INDEX _waiting_ty ON _waiting (ty);
+CREATE INDEX _waiting_run_at ON _waiting (run_at);
+CREATE TRIGGER _events_waiting AFTER INSERT ON _events BEGIN
+  INSERT INTO _waiting (id, ty, run_at) SELECT NEW.id, NEW.ty, NEW.run_at WHERE NEW.status = 0;
+  DELETE FROM _waiting WHERE NEW.status <> 0 AND id = NEW.source;
+END;";
+const WAITING_T: &str = "SELECT e.id, e.source, e.ty, e.data, e.run_at, e.status FROM _waiting w CROSS JOIN _events e ON e.id = w.id WHERE w.ty = ?1 ORDER BY e.id";
+const DUE_T: &str = "SELECT e.id, e.source, e.ty, e.data, e.run_at, e.status FROM _waiting w CROSS JOIN _events e ON e.id = w.id WHERE w.run_at <= ?1 ORDER BY e.id";
+
+fn p13(dir: &str) {
+    let now = Utc::now();
+    for n in [100_000usize, 1_000_000] {
+        for trig in [false, true] {
+            let mut c = open(&format!("{dir}/p13.db"), false);
+            c.execute_batch("CREATE INDEX _events_source ON _events (source);").expect("idx");
+            if trig { c.execute_batch(WAITING_SET).expect("trigger"); }
+            let t = Instant::now();
+            let hist = history(&mut c, n, now);
+            let build = t.elapsed().as_secs_f64();
+            let roots: Vec<&Ev> = hist.iter().filter(|e| e.source.is_none()).collect();
+            // append cost: 20 batches of 100 sourced events, 1,000 per commit not needed here
+            let mut v = Vec::new();
+            for round in 0..20 {
+                let batch: Vec<Ev> = (0..100).map(|k| { let i = round * 100 + k; let r = roots[i % roots.len()]; ev(Some(r.id), r.ty, data(i + 90_000_000), None, 0) }).collect();
+                let t = Instant::now(); append(&mut c, &batch, false); v.push(t.elapsed().as_secs_f64() * 1000.0);
+            }
+            let (app, _) = median_ms(v);
+            let reads: [(&str, &str, bool); 2] = if trig { [("WAITING", WAITING_T, true), ("DUE", DUE_T, false)] } else { [("WAITING", WAITING, true), ("DUE", DUE, false)] };
+            let mut line = format!("P13 history {n}, {}: history built {:.0}/s, append batch of 100 median {app:.2} ms", if trig { "trigger-kept _waiting" } else { "today's reads" }, n as f64 / build);
+            for (name, q, w) in reads {
+                let f = || if w { ids(&c, q, &0u16) } else { ids(&c, q, &ts(now)) };
+                let rows = f();
+                let mut tv = Vec::new();
+                for _ in 0..5 { let t = Instant::now(); f(); tv.push(t.elapsed().as_secs_f64() * 1000.0); }
+                let (med, _) = median_ms(tv);
+                let refr = if w { ids(&c, WAITING, &0u16) } else { ids(&c, DUE, &ts(now)) };
+                line += &format!("; {name} {} rows {med:.2} ms (same as today's read: {})", rows.len(), rows == refr);
+            }
+            println!("{line}");
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let dir = args.get(2).cloned().unwrap_or_else(|| ".".into());
@@ -633,6 +679,7 @@ fn main() {
         Some("p10") => p10(&dir),
         Some("p11") => p11(&dir),
         Some("p12") => p12(&dir),
+        Some("p13") => p13(&dir),
         _ => eprintln!("usage: events-toy p1|p2|p4|p5 <dir>"),
     }
 }
