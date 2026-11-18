@@ -107,19 +107,23 @@ fn fr_rannoch_011_c1() {
     // Given an open store
     let path = database("fr_rannoch_011_c1").unwrap();
     current(&path).unwrap();
-    let conn = ready(open(&path, &rannoch_core::migrator()).unwrap());
-    let row = rannoch_core::forgr::_events::factory()
-        .id("01a1dd40-c99f-7113-bb63-037e4ec38675")
-        .ty(7)
-        .data("{}")
-        .status(0)
-        .insert(&conn)
-        .unwrap();
+    let mut conn = ready(open(&path, &rannoch_core::migrator()).unwrap());
+    let (queue, _signals) = std::sync::mpsc::channel();
+    let event = rannoch_core::Event {
+        id: "01a1dd40-c99f-7113-bb63-037e4ec38675".parse().unwrap(),
+        source: None,
+        ty: 7_u16,
+        data: "{}",
+        run_at: None,
+        status: rannoch_core::Status::Added,
+    };
 
     // When a crate runs one of its queries on the connection
-    let read = rannoch_events::waiting(&conn, 7_u16).unwrap();
+    rannoch_events::append(&mut conn, std::slice::from_ref(&event), &queue).unwrap();
 
     // Then the query answers from the store
-    let ids: Vec<String> = read.iter().map(|e| e.id.to_string()).collect();
-    assert_eq!(ids, [row.id]);
+    let id: String = conn
+        .query_row("SELECT id FROM _events", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(id, "01a1dd40-c99f-7113-bb63-037e4ec38675");
 }

@@ -1,6 +1,11 @@
 {
-  "version": 20261114000004,
+  "version": 20261117000001,
   "objects": [
+    {
+      "type": "index",
+      "name": "_events_status",
+      "sql": "CREATE INDEX \"_events_status\" ON \"_events\" (\"status\")"
+    },
     {
       "type": "table",
       "name": "_events",
