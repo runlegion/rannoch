@@ -417,6 +417,7 @@ dependencies = [
 name = "rannoch-store"
 version = "0.1.0"
 dependencies = [
+ "log",
  "migratr",
  "rannoch-core",
  "rannoch-events",

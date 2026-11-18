@@ -59,12 +59,12 @@ fn missing_newest(path: &Path) -> Result<u64> {
 
 /// What the store reports pending at `path`.
 fn pending(path: &Path) -> Result<Vec<u64>> {
-    Ok(
-        match rannoch_store::open(path, &rannoch_core::migrator())? {
-            Opened::Ready(_) => Vec::new(),
-            Opened::Pending(pending) => pending,
-        },
-    )
+    Ok(rannoch_core::migrator()
+        .status(&mut executor(path)?)?
+        .iter()
+        .filter(|s| !s.applied)
+        .map(|s| s.version)
+        .collect())
 }
 
 /// The app's `Config`, carrying the real store over the database at `path`.
@@ -429,4 +429,88 @@ fn fr_rannoch_011_c2() {
         )),
         "{report}"
     );
+}
+
+/// One value of `pragma` on `conn`, as text.
+fn pragma(conn: &rusqlite::Connection, pragma: &str) -> rusqlite::Result<String> {
+    conn.query_row(&format!("PRAGMA {pragma}"), [], |r| {
+        r.get::<_, rusqlite::types::Value>(0)
+    })
+    .map(|v| match v {
+        rusqlite::types::Value::Integer(i) => i.to_string(),
+        rusqlite::types::Value::Text(t) => t,
+        other => format!("{other:?}"),
+    })
+}
+
+#[test]
+fn an_app_opens_rannoch_over_its_database() {
+    // Given an app's database without its newest migration
+    let path = database("an_app_opens_rannoch_over_its_database").unwrap();
+    let newest = missing_newest(&path).unwrap();
+
+    // When the app opens rannoch with its store
+    let store = Arc::new(Store::new(path.clone(), rannoch_core::migrator()));
+    let opened = Rannoch::<u8, ()>::open(Config {
+        store: Some(store.clone()),
+        ..Config::default()
+    })
+    .unwrap();
+
+    // Then the newest migration is applied before rannoch accepts an event
+    assert!(applied(&path).unwrap().contains(&newest));
+    assert_eq!(opened.sender().send(event()), Ok(Status::Added));
+    opened.shutdown();
+
+    // And every connection the store opens has foreign keys on, journal mode
+    // WAL, a 64 MiB cache, automatic checkpoints off and fullfsync on
+    let Opened::Ready(conn) = rannoch_store::open(&path, &rannoch_core::migrator()).unwrap() else {
+        panic!("migrations still pending");
+    };
+    assert_eq!(pragma(&conn, "foreign_keys").unwrap(), "1");
+    assert_eq!(pragma(&conn, "journal_mode").unwrap(), "wal");
+    assert_eq!(pragma(&conn, "cache_size").unwrap(), "-65536");
+    assert_eq!(pragma(&conn, "wal_autocheckpoint").unwrap(), "0");
+    assert_eq!(pragma(&conn, "fullfsync").unwrap(), "1");
+
+    // When the app sends events and then sends nothing for two seconds, with
+    // a connection held open throughout so that no close checkpoints the WAL
+    let held = rusqlite::Connection::open(&path).unwrap();
+    held.query_row("SELECT count(*) FROM _events", [], |r| r.get::<_, i64>(0))
+        .unwrap();
+    let (queue, _signals) = mpsc::channel();
+    let rannoch = Rannoch::<u8, ()>::open(Config {
+        store: Some(store.clone()),
+        append: Some(Arc::new(Events::new(conn, queue))),
+        ..Config::default()
+    })
+    .unwrap();
+    let sender = rannoch.sender();
+    for _ in 0..3 {
+        sender.send(event()).unwrap();
+    }
+    rannoch.shutdown();
+    thread::sleep(Duration::from_secs(2));
+
+    // Then the WAL's frames are in the database file: a copy of the file
+    // alone, without its WAL, holds the events
+    let copy = path.with_file_name("database-only.db");
+    fs::copy(&path, &copy).unwrap();
+    let kept: i64 = rusqlite::Connection::open(&copy)
+        .unwrap()
+        .query_row("SELECT count(*) FROM _events", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(kept, 3);
+    drop(held);
+    drop(store);
+
+    // When the app opens rannoch over a path the store cannot open
+    let missing = path.with_file_name("missing/store.db");
+    let refused = Rannoch::<u8, ()>::open(Config {
+        store: Some(Arc::new(Store::new(missing, rannoch_core::migrator()))),
+        ..Config::default()
+    });
+
+    // Then open fails with Store and nothing starts
+    assert!(matches!(refused, Err(Error::Store)), "{refused:?}");
 }

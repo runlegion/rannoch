@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+log = "0.4"
 migratr = "0.3"
 rannoch-core = { path = "../rannoch-core" }
 rusqlite = { version = "0.41", features = ["bundled"] }
