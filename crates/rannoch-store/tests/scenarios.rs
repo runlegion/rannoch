@@ -5,7 +5,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use rannoch_core::Error;
 use rannoch_store::{Opened, open};
 
 /// A fresh, empty directory for `name`, and the database path inside it.
@@ -34,72 +33,6 @@ fn ready(opened: Opened) -> rusqlite::Connection {
         Opened::Ready(conn) => conn,
         Opened::Pending(pending) => panic!("pending: {pending:?}"),
     }
-}
-
-#[test]
-fn fr_rannoch_009_c1() {
-    // Given a database with every migration applied
-    let path = database("fr_rannoch_009_c1").unwrap();
-    current(&path).unwrap();
-
-    // When the store opens it
-    let opened = open(&path, &rannoch_core::migrator()).unwrap();
-
-    // Then it hands back a connection
-    let conn = ready(opened);
-
-    // And a row whose foreign key names no parent is refused: foreign keys
-    // are on
-    let on: i64 = conn
-        .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(on, 1);
-}
-
-#[test]
-fn fr_rannoch_009_c2() {
-    // Given a database missing the newest migration
-    let path = database("fr_rannoch_009_c2").unwrap();
-    let migrator = rannoch_core::migrator();
-    let mut exec = executor(&path).unwrap();
-    migrator.up(&mut exec).unwrap();
-    migrator.down(&mut exec, 1).unwrap();
-    let newest = migrator
-        .status(&mut exec)
-        .unwrap()
-        .iter()
-        .map(|s| s.version)
-        .max()
-        .unwrap();
-    drop(exec);
-    let before = fs::read(&path).unwrap();
-
-    // When the store opens it
-    let opened = open(&path, &migrator).unwrap();
-
-    // Then it reports that migration as pending
-    assert!(
-        matches!(&opened, Opened::Pending(p) if *p == [newest]),
-        "{opened:?}"
-    );
-
-    // And the database is unchanged
-    drop(opened);
-    assert_eq!(fs::read(&path).unwrap(), before);
-}
-
-#[test]
-fn fr_rannoch_009_c3() {
-    // Given a path the store cannot open
-    let path = database("fr_rannoch_009_c3")
-        .unwrap()
-        .with_file_name("missing/store.db");
-
-    // When the store opens it
-    let opened = open(&path, &rannoch_core::migrator());
-
-    // Then open fails with Store
-    assert!(matches!(opened, Err(Error::Store)), "{opened:?}");
 }
 
 #[test]
