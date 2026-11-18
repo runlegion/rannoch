@@ -1,6 +1,11 @@
 {
-  "version": 20261117000001,
+  "version": 20261118000001,
   "objects": [
+    {
+      "type": "index",
+      "name": "_events_source",
+      "sql": "CREATE INDEX \"_events_source\" ON \"_events\" (\"source\")"
+    },
     {
       "type": "index",
       "name": "_events_status",
