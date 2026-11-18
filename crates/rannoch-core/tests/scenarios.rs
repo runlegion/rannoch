@@ -418,13 +418,15 @@ fn fr_rannoch_011_c2() {
     let line = fs::read_to_string(root().join(queries))
         .unwrap()
         .lines()
-        .position(|l| l.contains("const WAITING"))
+        .position(|l| l.contains("INSERT INTO _events"))
         .unwrap()
         + 1;
     let report = text(&out);
     assert!(!out.status.success(), "{report}");
     assert!(
-        report.contains(&format!("{queries}:{line}: no such column: e.ty")),
+        report.contains(&format!(
+            "{queries}:{line}: table _events has no column named ty"
+        )),
         "{report}"
     );
 }
