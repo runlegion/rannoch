@@ -514,3 +514,138 @@ fn an_app_opens_rannoch_over_its_database() {
     // Then open fails with Store and nothing starts
     assert!(matches!(refused, Err(Error::Store)), "{refused:?}");
 }
+
+/// Nanoseconds since the first call, for timing an event from its send to its commit.
+fn nanos() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    u64::try_from(
+        START
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_nanos(),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+/// The events crate's append, recording each event's time from its send (the event's data)
+/// to its append's commit.
+#[derive(Debug)]
+struct Timed {
+    events: Events,
+    send_to_commit: Mutex<Vec<u64>>,
+}
+
+impl Append<u8, u64> for Timed {
+    fn append(&self, batch: &[Event<u8, u64>]) -> std::result::Result<(), Error> {
+        let appended = Append::<u8, u64>::append(&self.events, batch);
+        let committed = nanos();
+        if appended.is_ok()
+            && let Ok(mut times) = self.send_to_commit.lock()
+        {
+            times.extend(batch.iter().map(|e| committed.saturating_sub(e.data)));
+        }
+        appended
+    }
+}
+
+/// The app's database at a fresh path under `name`, opened through the real store, with
+/// 50,000 events already in `_events` from the app's forgr mock, each status picked from
+/// the four values; rannoch open over it with
+/// the timed append.
+/// Rannoch over a kept history, the store it runs on, and its timed append.
+type Kept = (Rannoch<u8, u64>, Arc<Store>, Arc<Timed>);
+
+fn history_kept(name: &str) -> Result<Kept> {
+    let path = database(name)?;
+    let store = Arc::new(Store::new(path.clone(), rannoch_core::migrator()));
+    Rannoch::<u8, ()>::open(Config {
+        store: Some(store.clone()),
+        ..Config::default()
+    })?
+    .shutdown();
+    let Opened::Ready(conn) = rannoch_store::open(&path, &rannoch_core::migrator())? else {
+        return Err("migrations still pending".into());
+    };
+    // One transaction for the whole history, so building it is not a million commits.
+    conn.execute_batch("BEGIN")?;
+    rannoch_core::forgr::_events::mock(50_000)
+        .with(rannoch_core::forgr::_events::Overrides {
+            status: rannoch_core::forgr::Override::Pick(vec![-1, 0, 1, 2]),
+            ..Default::default()
+        })
+        .insert(&conn)?;
+    conn.execute_batch("COMMIT")?;
+    // A store at rest: its history is in the database file, not waiting in the WAL.
+    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+    let (queue, signals) = mpsc::channel();
+    thread::spawn(move || for () in signals {});
+    let timed = Arc::new(Timed {
+        events: Events::new(conn, queue),
+        send_to_commit: Mutex::new(Vec::new()),
+    });
+    let rannoch = Rannoch::open(Config {
+        store: Some(store.clone()),
+        append: Some(timed.clone() as Arc<dyn Append<u8, u64>>),
+        ..Config::default()
+    })?;
+    Ok((rannoch, store, timed))
+}
+
+fn sent_now(n: u64) -> Event<u8, u64> {
+    Event {
+        id: Uuid::nil(),
+        source: None,
+        ty: u8::try_from(n % 8).unwrap_or(0),
+        data: nanos(),
+        run_at: None,
+        status: Status::Added,
+    }
+}
+
+#[test]
+fn rannoch_keeps_up_with_the_peak_load() {
+    // Given rannoch is open over a store at rest already holding 50,000 events
+    let (rannoch, _store, timed) = history_kept("nfr_rannoch_026").unwrap();
+
+    // When the app sends 2,000 events at 200 a second
+    let sender = rannoch.sender();
+    let start = std::time::Instant::now();
+    for n in 0..2_000_u64 {
+        let due = start + Duration::from_millis(n * 5);
+        if let Some(wait) = due.checked_duration_since(std::time::Instant::now()) {
+            thread::sleep(wait);
+        }
+        sender.send(sent_now(n)).unwrap();
+    }
+    rannoch.shutdown();
+
+    // Then all 2,000 are in _events
+    let mut landed = timed.send_to_commit.lock().unwrap().clone();
+    assert_eq!(landed.len(), 2_000);
+    landed.sort_unstable();
+    println!(
+        "send to commit at 200 a second over 50,000 kept: p99 {} us",
+        landed[(landed.len() - 1) * 99 / 100] / 1_000
+    );
+}
+
+#[test]
+fn a_flat_out_producer_beats_the_peak_load() {
+    // Given rannoch is open over a store at rest already holding 50,000 events
+    let (rannoch, _store, timed) = history_kept("nfr_rannoch_027").unwrap();
+
+    // When one producer sends 100,000 events as fast as it can
+    let sender = rannoch.sender();
+    let start = std::time::Instant::now();
+    for n in 0..100_000_u64 {
+        sender.send(sent_now(n)).unwrap();
+    }
+    rannoch.shutdown();
+    let elapsed = start.elapsed().as_secs_f64();
+
+    // Then all 100,000 are in _events at more than 200 a second
+    assert_eq!(timed.send_to_commit.lock().unwrap().len(), 100_000);
+    let rate = 100_000.0 / elapsed;
+    println!("flat out from one producer over 50,000 kept: {rate:.0} events a second");
+    assert!(rate > 200.0, "{rate:.0} a second");
+}
