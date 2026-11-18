@@ -1,0 +1,8 @@
+HOLDS   P1 success: taken 1 then 0, hunt sent 0
+HOLDS   P2 fail once then succeed: before run_at 0, after 1, -1s 1, hunt sent 0
+HOLDS   P3 binned at attempts: -1s in tree 3, retries 2, taken after binning 0
+HOLDS   P7 retry waits for run_at: a retry taken before its run_at: false
+REFUTED P4 output's own attempts: output's -1s 3; original's -1s before 0, after 3
+HOLDS   P6 young 1 left alone: hunt at half the window sent 0
+HOLDS   P5 hunt sends a crash once: first hunt sent 1, second 0
+HOLDS   P8 crash every time is never binned: hunt reruns in 10 rounds 10, -1s 0

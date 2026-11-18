@@ -1,0 +1,12 @@
+[package]
+name = "queue-toy"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Standalone: not a member of rannoch's workspace.
+[workspace]
+
+[dependencies]
+rusqlite = { version = "0.41", features = ["bundled"] }
+uuid = { version = "1", features = ["v7"] }
