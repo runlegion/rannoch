@@ -1,0 +1,9 @@
+HOLDS   P1 success: taken 1 then 0, hunt sent 0
+HOLDS   P2 fail once then succeed: before run_at 0, after 1, attempts in chain 1, hunt sent 0
+HOLDS   P3 binned at attempts: attempts in the last attempt's chain 3, retries 2, taken after binning 0
+HOLDS   P8 retry data is the failure result: every retry's source the failed attempt and data its result: true
+HOLDS   P7 retry waits for run_at: a retry taken before its run_at: false
+HOLDS   P4 output's own attempts: attempts in the output's chain 3; original failed: false
+HOLDS   P6 young 1 left alone: hunt at half the window sent 0
+HOLDS   P5 hunt sends a crash once: first hunt sent 1, second 0
+HOLDS   P9 crash every time is never binned: hunt reruns in 10 rounds 10, original failed: false

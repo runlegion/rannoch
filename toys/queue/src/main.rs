@@ -44,23 +44,25 @@ impl Sim {
     fn row(&self, id: &str) -> (Option<String>, i64, String) {
         self.c.query_row("SELECT source, ty, data FROM _events WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap()
     }
-    /// The original event of an attempt: a retry carries its original's ty and data, with the original as source.
-    fn original(&self, x: &str) -> String {
-        let (source, ty, data) = self.row(x);
-        if let Some(s) = source {
-            let (_, sty, sdata) = self.row(&s);
-            if sty == ty && sdata == data {
-                return s;
+    fn failed(&self, x: &str) -> bool {
+        self.count("SELECT count(*) FROM _events WHERE source = ?1 AND status = -1", x) > 0
+    }
+    /// The attempts in `x`'s chain: `x` and each source before it that has a -1.
+    fn chain(&self, x: &str) -> usize {
+        let mut n = 0;
+        let mut at = Some(x.to_owned());
+        while let Some(a) = at {
+            if !self.failed(&a) {
+                break;
             }
+            n += 1;
+            at = self.row(&a).0;
         }
-        x.to_owned()
+        n
     }
     fn tree(&self, x: &str) -> Vec<(String, i64)> {
         let mut s = self.c.prepare(TREE).unwrap();
         s.query_map([x], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(Result::unwrap).collect()
-    }
-    fn minus_ones(&self, o: &str) -> usize {
-        self.tree(o).iter().filter(|(_, s)| *s == -1).count()
     }
     /// The select: take the due 0s and send a 1 for each.
     fn select(&mut self) -> Vec<String> {
@@ -82,12 +84,11 @@ impl Sim {
     /// A failed attempt: a -1 for it, and a retry while the -1s in the original's tree are fewer than the attempts.
     fn fail(&mut self, x: &str) -> Option<String> {
         let ty = self.row(x).1;
-        self.put(Some(x), ty, "{}", None, -1);
-        let o = self.original(x);
-        if self.minus_ones(&o) < self.attempts {
-            let (_, oty, odata) = self.row(&o);
+        let result = format!("{{\"failed\":\"{x}\"}}");
+        self.put(Some(x), ty, &result, None, -1);
+        if self.chain(x) < self.attempts {
             let due = self.now + self.backoff;
-            return Some(self.put(Some(&o), oty, &odata, Some(due), 0));
+            return Some(self.put(Some(x), ty, &result, Some(due), 0));
         }
         None
     }
@@ -102,11 +103,11 @@ impl Sim {
             if Self::at(&one) + self.window > self.now {
                 continue;
             }
-            let o = self.original(&x);
-            let after = self.tree(&o).iter().any(|(id, _)| *id != one && Self::at(id) > Self::at(&one));
+            let after = self.tree(&x).iter().any(|(id, _)| *id != one && Self::at(id) > Self::at(&one));
             if !after {
-                let (_, oty, odata) = self.row(&o);
-                let id = self.put(Some(&o), oty, &odata, None, 0);
+                let ty = self.row(&x).1;
+                let result = format!("{{\"hung\":\"{x}\"}}");
+                let id = self.put(Some(&x), ty, &result, None, 0);
                 sent.push(id);
             }
         }
@@ -144,8 +145,8 @@ fn main() {
     s.succeed(&r, &[]);
     s.now += 5_000;
     let h = s.hunt();
-    check("P2 fail once then succeed", early.is_empty() && later == [r.clone()] && s.minus_ones(&o) == 1 && h.is_empty(),
-        format!("before run_at {:?}, after {:?}, -1s {}, hunt sent {}", early.len(), later.len(), s.minus_ones(&o), h.len()));
+    check("P2 fail once then succeed", early.is_empty() && later == [r.clone()] && s.chain(&o) == 1 && h.is_empty(),
+        format!("before run_at {:?}, after {:?}, attempts in chain {}, hunt sent {}", early.len(), later.len(), s.chain(&o), h.len()));
 
     // P3 and P7: fail every time, attempts 3
     let mut s = Sim::new(3);
@@ -153,10 +154,12 @@ fn main() {
     let mut x = s.select().pop().unwrap();
     let mut retries = 0;
     let mut early_taken = false;
+    let mut data_ok = true;
     loop {
         match s.fail(&x) {
             Some(r) => {
                 retries += 1;
+                data_ok &= s.row(&r).2 == format!("{{\"failed\":\"{x}\"}}") && s.row(&r).0.as_deref() == Some(x.as_str());
                 early_taken |= s.select().contains(&r);
                 s.now += 200;
                 x = s.select().pop().unwrap();
@@ -166,8 +169,10 @@ fn main() {
     }
     s.now += 500;
     let after = s.select();
-    check("P3 binned at attempts", s.minus_ones(&o) == 3 && retries == 2 && after.is_empty(),
-        format!("-1s in tree {}, retries {retries}, taken after binning {}", s.minus_ones(&o), after.len()));
+    check("P3 binned at attempts", s.chain(&x) == 3 && retries == 2 && after.is_empty(),
+        format!("attempts in the last attempt's chain {}, retries {retries}, taken after binning {}", s.chain(&x), after.len()));
+    check("P8 retry data is the failure result", data_ok, format!("every retry's source the failed attempt and data its result: {data_ok}"));
+    let _ = o;
     check("P7 retry waits for run_at", !early_taken, format!("a retry taken before its run_at: {early_taken}"));
 
     // P4: an output of a successful flow fails every time
@@ -175,17 +180,18 @@ fn main() {
     let o = s.put(None, 1, "{\"n\":4}", None, 0);
     s.select();
     let e = s.succeed(&o, &[5]).pop().unwrap();
-    let before = s.minus_ones(&o);
     let mut x = s.select().pop().unwrap();
+    let mut last = x.clone();
     while let Some(r) = s.fail(&x) {
         let _ = r;
         s.now += 200;
         x = s.select().pop().unwrap();
+        last = x.clone();
     }
-    let e_count = s.minus_ones(&e);
-    let o_after = s.minus_ones(&o);
-    check("P4 output's own attempts", e_count == 3 && o_after == before,
-        format!("output's -1s {e_count}; original's -1s before {before}, after {o_after}"));
+    let e_attempts = s.chain(&last);
+    check("P4 output's own attempts", e_attempts == 3 && !s.failed(&o),
+        format!("attempts in the output's chain {e_attempts}; original failed: {}", s.failed(&o)));
+    let _ = e;
 
     // P5 and P6: crash after the 1
     let mut s = Sim::new(3);
@@ -211,6 +217,6 @@ fn main() {
         reruns += sent.len();
         s.select();
     }
-    check("P8 crash every time is never binned", reruns == 10 && s.minus_ones(&o) == 0, format!("hunt reruns in 10 rounds {reruns}, -1s {}", s.minus_ones(&o)));
+    check("P9 crash every time is never binned", reruns == 10 && !s.failed(&o), format!("hunt reruns in 10 rounds {reruns}, original failed: {}", s.failed(&o)));
     let _ = o;
 }
