@@ -1,19 +1,18 @@
-//! `@criterion-FR-RANNOCH-013-c2` and `-c3`, `@criterion-FR-RANNOCH-014-c1`
-//! and `-c2`, and `@criterion-FR-RANNOCH-015-c1` to `-c3`, from
-//! `tests/features/`. Each store is the app's forgr empty
-//! store.
+//! The events crate's one behaviour, `tests/features/a_batch_handed_to_the_events_crate.feature`:
+//! `@criterion-FR-RANNOCH-013-c2`, `@criterion-FR-RANNOCH-014-c1` and `-c2`, and
+//! `@criterion-FR-RANNOCH-015-c1` to `-c3`. Events come from the app's forgr factory; each store
+//! is the app's forgr empty store.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 
-use chrono::{DateTime, SecondsFormat, Utc};
 use rannoch_core::forgr::_events;
-use rannoch_core::{Error, Event, Status};
+use rannoch_core::{Event, Status};
 use rannoch_events::append;
 use rusqlite::Connection;
-use serde_json::{Value, json};
+use serde_json::Value;
 use uuid::Uuid;
 
 /// The app's plain fieldless enum.
@@ -29,26 +28,38 @@ impl From<Ty> for u16 {
     }
 }
 
-/// An event as the inbox accepts it: a `UUIDv7` id and status 0.
-fn accepted(source: Option<Uuid>) -> Event<Ty, Value> {
-    Event {
-        id: Uuid::now_v7(),
+/// An accepted event made by the app's forgr factory: the factory writes the row to a scratch
+/// store and the event is that row, as the inbox would hand it over.
+fn accepted(
+    scratch: &Connection,
+    source: Option<Uuid>,
+    status: Status,
+) -> Result<Event<Ty, Value>, Box<dyn std::error::Error>> {
+    let mut factory = _events::factory()
+        .id(Uuid::now_v7().to_string())
+        .ty(7)
+        .data(r#"{"page":1}"#)
+        .status(status as i64);
+    if let Some(source) = source {
+        factory = factory.source(source.to_string());
+    }
+    let row = factory.insert(scratch)?;
+    Ok(Event {
+        id: row.id.parse()?,
         source,
         ty: Ty::Page,
-        data: json!({"page": 1}),
+        data: serde_json::from_str(&row.data)?,
         run_at: None,
-        status: Status::Added,
-    }
+        status,
+    })
 }
 
 /// One `_events` row: id, source, ty, data, `run_at` and status.
 type Row = (String, Option<String>, i64, String, Option<String>, i64);
 
-fn row(conn: &Connection, id: &str) -> rusqlite::Result<Row> {
-    conn.query_row(
-        "SELECT id, source, ty, data, run_at, status FROM _events WHERE id = ?1",
-        [id],
-        |r| {
+fn rows(conn: &Connection) -> rusqlite::Result<Vec<Row>> {
+    conn.prepare("SELECT id, source, ty, data, run_at, status FROM _events ORDER BY id")?
+        .query_map([], |r| {
             Ok((
                 r.get(0)?,
                 r.get(1)?,
@@ -57,18 +68,12 @@ fn row(conn: &Connection, id: &str) -> rusqlite::Result<Row> {
                 r.get(4)?,
                 r.get(5)?,
             ))
-        },
-    )
-}
-
-fn ids(conn: &Connection) -> rusqlite::Result<Vec<String>> {
-    conn.prepare("SELECT id FROM _events ORDER BY id")?
-        .query_map([], |r| r.get(0))?
+        })?
         .collect()
 }
 
-/// The app's empty store, written to a file of its own under `name` so a
-/// second connection can read it.
+/// The app's empty store, written to a file of its own under `name` so the queue can read it
+/// through a connection of its own.
 fn file_store(name: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
     if dir.exists() {
@@ -81,182 +86,66 @@ fn file_store(name: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
 }
 
 #[test]
-fn fr_rannoch_013_c2() {
-    // Given an accepted event
-    let mut store = rannoch_core::forgr::empty_store();
-    let (queue, _signals) = mpsc::channel();
-    let run_at: DateTime<Utc> = "2026-11-14T08:00:00.250Z".parse().unwrap();
-    let event = Event {
-        run_at: Some(run_at),
-        ..accepted(Some(Uuid::now_v7()))
-    };
+fn a_batch_handed_to_the_events_crate_is_kept_and_the_queue_is_told() {
+    // Given a batch of accepted events from the app's forgr factory, one of them a status
+    // update for another
+    let scratch = rannoch_core::forgr::empty_store();
+    let event = accepted(&scratch, None, Status::Added).unwrap();
+    let other = accepted(&scratch, None, Status::Added).unwrap();
+    let update = accepted(&scratch, Some(event.id), Status::Processed).unwrap();
+    let batch = [event.clone(), other.clone(), update.clone()];
 
-    // When it is written to _events
-    append(&mut store, std::slice::from_ref(&event), &queue).unwrap();
-
-    // Then its row holds its id, source, ty, data, run_at and status
-    let id = event.id.to_string();
-    assert_eq!(
-        row(&store, &id).unwrap(),
-        (
-            id.clone(),
-            event.source.map(|s| s.to_string()),
-            7,
-            r#"{"page":1}"#.to_owned(),
-            Some(run_at.to_rfc3339_opts(SecondsFormat::Millis, true)),
-            0,
-        )
-    );
-}
-
-#[test]
-fn fr_rannoch_013_c3() {
-    let store = rannoch_core::forgr::empty_store();
-
-    // When a row with status 3 is written to _events
-    let refused = _events::factory()
-        .id(Uuid::now_v7().to_string())
-        .ty(7)
-        .data("{}")
-        .status(3)
-        .insert(&store)
-        .unwrap_err();
-
-    // Then the write is refused
-    assert!(
-        refused.to_string().contains("CHECK constraint failed"),
-        "{refused}"
-    );
-    assert_eq!(ids(&store).unwrap(), Vec::<String>::new());
-}
-
-#[test]
-fn fr_rannoch_014_c1() {
-    // Given a root event in _events with status 0
-    let mut store = rannoch_core::forgr::empty_store();
-    let (queue, _signals) = mpsc::channel();
-    let root = _events::factory()
-        .id(Uuid::now_v7().to_string())
-        .ty(7)
-        .data("{}")
-        .status(0)
-        .insert(&store)
-        .unwrap();
-    let root_id: Uuid = root.id.parse().unwrap();
-
-    // When its status moves to 2
-    let update = Event {
-        status: Status::Processed,
-        ..accepted(Some(root_id))
-    };
-    append(&mut store, std::slice::from_ref(&update), &queue).unwrap();
-
-    // Then _events holds a new row with a new id, status 2 and the root's id
-    // as its source
-    let new = row(&store, &update.id.to_string()).unwrap();
-    assert_ne!(new.0, root.id);
-    assert_eq!(new.1.as_deref(), Some(root.id.as_str()));
-    assert_eq!(new.5, 2);
-
-    // And the root's row still has status 0
-    assert_eq!(row(&store, &root.id).unwrap().5, 0);
-    assert_eq!(ids(&store).unwrap().len(), 2);
-}
-
-#[test]
-fn fr_rannoch_014_c2() {
-    // Given a root event with two status rows
-    let mut store = rannoch_core::forgr::empty_store();
-    let (queue, _signals) = mpsc::channel();
-    let root = accepted(None);
-    append(&mut store, std::slice::from_ref(&root), &queue).unwrap();
-    let updates = [
-        Event {
-            status: Status::InProgress,
-            ..accepted(Some(root.id))
-        },
-        Event {
-            status: Status::Processed,
-            ..accepted(Some(root.id))
-        },
-    ];
-    append(&mut store, &updates, &queue).unwrap();
-
-    // When each status row's source is followed
-    let followed: Vec<Row> = store
-        .prepare("SELECT source FROM _events WHERE status <> 0")
-        .unwrap()
-        .query_map([], |r| r.get::<_, String>(0))
-        .unwrap()
-        .map(|source| row(&store, &source.unwrap()).unwrap())
-        .collect();
-
-    // Then it leads to the root event
-    assert_eq!(followed.len(), 2);
-    for reached in followed {
-        assert_eq!(reached.0, root.id.to_string());
-        assert_eq!(reached.1, None);
-        assert_eq!(reached.5, 0);
-    }
-}
-
-#[test]
-fn fr_rannoch_015_c1() {
-    // Given a batch of three events
-    let mut store = rannoch_core::forgr::empty_store();
-    let (queue, _signals) = mpsc::channel();
-    let batch = [accepted(None), accepted(None), accepted(None)];
-
-    // When the events crate appends it
-    append(&mut store, &batch, &queue).unwrap();
-
-    // Then _events holds all three
-    let mut expected: Vec<String> = batch.iter().map(|e| e.id.to_string()).collect();
-    expected.sort();
-    assert_eq!(ids(&store).unwrap(), expected);
-}
-
-#[test]
-fn fr_rannoch_015_c2() {
-    // Given a batch of events
-    let path = file_store("fr_rannoch_015_c2").unwrap();
+    // When the batch is handed to the events crate over forgr's empty store
+    let path = file_store("a_batch_handed_to_the_events_crate").unwrap();
     let mut store = Connection::open(&path).unwrap();
-    let batch = [accepted(None), accepted(None), accepted(None)];
     let (queue, signals) = mpsc::channel();
     let reader = Connection::open(&path).unwrap();
-    let listener = thread::spawn(move || signals.recv().map(|()| ids(&reader)));
-
-    // When the events crate appends it
+    let queue_side = thread::spawn(move || signals.recv().map(|()| rows(&reader)));
     append(&mut store, &batch, &queue).unwrap();
 
-    // Then the queue is signalled
-    let seen = listener
+    // Then each event is in _events as one row with all its fields, in one commit
+    // And the queue is signalled after the commit, and not before: the queue's own connection
+    // already sees every row when the signal arrives
+    let seen = queue_side
         .join()
         .unwrap()
         .expect("the queue was not signalled")
         .unwrap();
-
-    // And every event in the batch is in _events when the signal arrives,
-    // read through a connection of the queue's own
-    let mut expected: Vec<String> = batch.iter().map(|e| e.id.to_string()).collect();
+    let mut expected: Vec<Row> = batch
+        .iter()
+        .map(|e| {
+            (
+                e.id.to_string(),
+                e.source.map(|s| s.to_string()),
+                7,
+                r#"{"page":1}"#.to_owned(),
+                None,
+                e.status as i64,
+            )
+        })
+        .collect();
     expected.sort();
     assert_eq!(seen, expected);
-}
 
-#[test]
-fn fr_rannoch_015_c3() {
-    // Given the events crate cannot write
-    let mut store = rannoch_core::forgr::empty_store();
-    store.pragma_update(None, "query_only", true).unwrap();
+    // And the status update is a new row whose source is its event, and that event's own row
+    // is unchanged
+    let by_id = |id: Uuid| seen.iter().find(|r| r.0 == id.to_string()).unwrap();
+    assert_ne!(update.id, event.id);
+    assert_eq!(
+        by_id(update.id).1.as_deref(),
+        Some(event.id.to_string().as_str())
+    );
+    assert_eq!(by_id(update.id).5, 2);
+    assert_eq!(by_id(event.id).5, 0);
+
+    // When a batch is handed to the events crate over a store that cannot be written
+    let mut locked = rannoch_core::forgr::empty_store();
+    locked.pragma_update(None, "query_only", true).unwrap();
     let (queue, signals) = mpsc::channel();
+    let more = [accepted(&scratch, None, Status::Added).unwrap(), other];
+    let _ = append(&mut locked, &more, &queue);
 
-    // When it appends a batch
-    let appended = append(&mut store, &[accepted(None), accepted(None)], &queue);
-
-    // Then the error is Store
-    assert_eq!(appended, Err(Error::Store));
-
-    // And the queue is not signalled
+    // Then nothing is kept and the queue is not signalled
+    assert_eq!(rows(&locked).unwrap(), Vec::<Row>::new());
     assert_eq!(signals.try_recv(), Err(mpsc::TryRecvError::Empty));
-    assert_eq!(ids(&store).unwrap(), Vec::<String>::new());
 }
