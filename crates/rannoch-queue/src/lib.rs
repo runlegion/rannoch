@@ -3,7 +3,8 @@
 //! each, and hands each to its processor: runs, whose flow has no job step, one after another;
 //! jobs, whose flow has a job step, each on a thread of its own. Processors send their own
 //! results; the queue sends only the 1s, a retry when a run fails while its chain has attempts
-//! left, and a -1 saying "no processor" for an event whose `ty` has no flow.
+//! left, the hunt's resend of a run a crash dropped, and a -1 saying "no processor" for an event
+//! whose `ty` has no flow.
 
 mod queries;
 
@@ -260,9 +261,6 @@ where
     T: TryFrom<u16> + PartialEq,
     D: From<String>,
 {
-    let Ok(cutoff) = chrono::TimeDelta::from_std(window).map(|w| Utc::now() - w) else {
-        return;
-    };
     let ones = match ones_without_result(conn) {
         Ok(ones) => ones,
         Err(err) => {
@@ -271,7 +269,7 @@ where
         }
     };
     for (one, event, ty) in ones {
-        if taken_at(one).is_none_or(|at| at > cutoff) {
+        if !older_than(one, window, Utc::now()) {
             continue;
         }
         match after(conn, event, one) {
@@ -317,6 +315,14 @@ fn ones_without_result(conn: &Connection) -> rusqlite::Result<Vec<(Uuid, Uuid, u
         }
     }
     Ok(out)
+}
+
+/// Whether the row `id` was accepted at least `window` before `now`.
+fn older_than(id: Uuid, window: Duration, now: DateTime<Utc>) -> bool {
+    let Ok(window) = chrono::TimeDelta::from_std(window) else {
+        return false;
+    };
+    taken_at(id).is_some_and(|at| at <= now - window)
 }
 
 /// When a row was accepted: its `UUIDv7` id's time.
@@ -475,6 +481,60 @@ mod tests {
 
     fn event(conn: &rusqlite::Connection, id: &str) -> super::Row {
         read(conn, queries::EVENT, [id]).unwrap().pop().unwrap()
+    }
+
+    #[test]
+    fn a_row_is_old_once_the_window_has_passed_since_it_was_accepted() {
+        let now = chrono::Utc::now();
+        let at = |ago: i64| {
+            let t = now - chrono::TimeDelta::seconds(ago);
+            let secs = u64::try_from(t.timestamp()).unwrap();
+            Uuid::new_v7(uuid::Timestamp::from_unix(uuid::NoContext, secs, 0))
+        };
+        let window = std::time::Duration::from_secs(20);
+
+        assert!(super::older_than(at(30), window, now));
+        assert!(!super::older_than(at(10), window, now));
+    }
+
+    #[test]
+    fn something_after_a_1_anywhere_in_the_tree_counts() {
+        let store = rannoch_core::forgr::empty_store();
+        let hung = put(&store, None, "{}", 0);
+        let one = put(&store, Some(&hung), "taken", 1);
+        let hung_id: Uuid = hung.parse().unwrap();
+        let one_id: Uuid = one.parse().unwrap();
+
+        assert!(!super::after(&store, hung_id, one_id).unwrap());
+
+        let failed = put(&store, None, "{}", 0);
+        let failed_one = put(&store, Some(&failed), "taken", 1);
+        let retry = put(&store, Some(&failed), "failed", 0);
+        put(&store, Some(&retry), "taken", 1);
+        let failed_id: Uuid = failed.parse().unwrap();
+
+        assert!(super::after(&store, failed_id, failed_one.parse().unwrap()).unwrap());
+    }
+
+    #[test]
+    fn the_hunt_reads_only_the_1s_whose_event_has_no_result() {
+        let store = rannoch_core::forgr::empty_store();
+        let hung = put(&store, None, "{}", 0);
+        let hung_one = put(&store, Some(&hung), "taken", 1);
+        let done = put(&store, None, "{}", 0);
+        put(&store, Some(&done), "taken", 1);
+        put(&store, Some(&done), "made", 2);
+        let failed = put(&store, None, "{}", 0);
+        put(&store, Some(&failed), "taken", 1);
+        put(&store, Some(&failed), "failed", -1);
+
+        let ones: Vec<String> = super::ones_without_result(&store)
+            .unwrap()
+            .into_iter()
+            .map(|(one, event, _)| format!("{one} {event}"))
+            .collect();
+
+        assert_eq!(ones, [format!("{hung_one} {hung}")]);
     }
 
     #[test]
