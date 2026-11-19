@@ -1,0 +1,1 @@
+{"ty":40,"takes":{"text":"string"},"steps":[{"do":"trim","next":{"ty":20,"shape":{"msg":"$text","who":"two"}}},{"do":"classify"}]}

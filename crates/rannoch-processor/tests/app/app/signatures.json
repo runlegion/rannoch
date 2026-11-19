@@ -1,0 +1,4 @@
+[
+  { "action": "note", "takes": { "msg": "string", "who": "string" } },
+  { "action": "classify", "job": true, "takes": { "text": "string" }, "gives": { "category": "string" } }
+]

@@ -2,11 +2,17 @@
 //! flow for an event the queue hands it" (`@criterion-FR-RANNOCH-119-c3` to `-c5`), "A failing
 //! link fails the step, and the retry reruns the chain" (`-c6`), "An action's real output is
 //! checked at run time" (`-c14`) and "A two-step flow sends its next only when every step
-//! succeeds" (`-c11`, `-c13`). The store is the app's database opened through the real store,
-//! its events from the app's forgr factory, handed over by the real queue; the app's flow docs are
-//! compiled in from `tests/flows`, and the test processor crate's actions are fakes.
+//! succeeds" (`-c11`, `-c13`), "The app's build checks its flow docs" (`-c1`, `-c2`, `-c12`,
+//! `-c16`) and "The app's build gathers the signatures a separate processor crate exports"
+//! (`-c10`). The store is the app's database opened through the real store, its events from the
+//! app's forgr factory, handed over by the real queue; the app's flow docs are compiled in from
+//! `tests/flows`, and the test processor crate's actions are fakes. The build scenarios build a
+//! test app from `tests/app` with a nested cargo: its build.rs gathers the signatures of the
+//! separate processor crate proc-text and its own, and checks each flow doc set in
+//! `tests/app/flows`.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -111,6 +117,7 @@ fn actions(calls: &Calls, rating: &Rating) -> Vec<Arc<dyn Action>> {
             sig: Signature {
                 action: name.to_owned(),
                 gives,
+                ..Signature::default()
             },
             calls: calls.clone(),
             act,
@@ -601,4 +608,342 @@ fn a_two_step_flow_sends_its_next_only_when_every_step_succeeds() {
     assert_eq!(nexts, 1, "one next across both attempts");
 
     app.stop();
+}
+
+/// Where the test app is built, by a nested cargo of its own.
+fn app_build() -> PathBuf {
+    Path::new(env!("CARGO_TARGET_TMPDIR")).join("app-build")
+}
+
+/// Copies the directory `from` to `to`, every file in it.
+fn copy(from: &Path, to: &Path) -> Try<()> {
+    fs::create_dir_all(to)?;
+    for entry in fs::read_dir(from)? {
+        let path = entry?.path();
+        let dest = to.join(path.file_name().ok_or("a file has no name")?);
+        if path.is_dir() {
+            copy(&path, &dest)?;
+        } else {
+            // written, not copied, so each copy is newer than every build before it
+            fs::write(&dest, fs::read(&path)?)?;
+        }
+    }
+    Ok(())
+}
+
+/// What a build of the test app gave: whether it succeeded, each error line it listed, and its
+/// whole output.
+struct Build {
+    ok: bool,
+    errors: Vec<String>,
+    output: String,
+}
+
+/// The test app's workspace, from `tests/app`: the app, whose own processor crate is itself, and
+/// proc-text, a processor crate separate from it; both depend on this rannoch-processor, and the
+/// app's build.rs checks the flow doc set it is built with. Both packages are named for the
+/// workspace, so two workspaces never share a build in the one target dir.
+struct Workspace {
+    root: PathBuf,
+    name: String,
+}
+
+impl Workspace {
+    fn new(name: &str) -> Try<Self> {
+        let root = app_build().join(name);
+        if root.exists() {
+            fs::remove_dir_all(&root)?;
+        }
+        let here = Path::new(env!("CARGO_MANIFEST_DIR"));
+        copy(&here.join("tests/app"), &root)?;
+        let crates = here
+            .parent()
+            .ok_or("rannoch-processor is in no crates dir")?;
+        let path = |krate: &str| crates.join(krate).display().to_string();
+        let (core, queue, processor) = (
+            path("rannoch-core"),
+            path("rannoch-queue"),
+            path("rannoch-processor"),
+        );
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nresolver = \"3\"\nmembers = [\"app\", \"proc-text\"]\n",
+        )?;
+        fs::write(
+            root.join("proc-text/Cargo.toml"),
+            format!(
+                "[package]\nname = \"proc-text-{name}\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\
+                 publish = false\n\n[dependencies]\n\
+                 rannoch-processor = {{ path = \"{processor}\" }}\nserde_json = \"1\"\n"
+            ),
+        )?;
+        fs::write(
+            root.join("app/Cargo.toml"),
+            format!(
+                "[package]\nname = \"{name}\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\
+                 publish = false\n\n[dependencies]\n\
+                 proc-text = {{ path = \"../proc-text\", package = \"proc-text-{name}\" }}\n\
+                 rannoch-core = {{ path = \"{core}\" }}\n\
+                 rannoch-processor = {{ path = \"{processor}\" }}\n\
+                 rannoch-queue = {{ path = \"{queue}\" }}\nserde_json = \"1\"\n\
+                 uuid = {{ version = \"1\", features = [\"v7\"] }}\n\n[build-dependencies]\n\
+                 proc-text = {{ path = \"../proc-text\", package = \"proc-text-{name}\" }}\n\
+                 rannoch-processor = {{ path = \"{processor}\" }}\n"
+            ),
+        )?;
+        fs::copy(
+            crates
+                .parent()
+                .ok_or("crates is in no workspace")?
+                .join("Cargo.lock"),
+            root.join("Cargo.lock"),
+        )?;
+        Ok(Self {
+            root,
+            name: name.to_owned(),
+        })
+    }
+
+    /// Builds the app with the flow doc set `set`, from `flows/`.
+    fn build(&self, set: &str) -> Try<Build> {
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
+        let out = Command::new(cargo)
+            .args(["build", "--offline"])
+            .current_dir(&self.root)
+            .env("CARGO_TARGET_DIR", app_build().join("target"))
+            .env("FLOWS", self.root.join("flows").join(set))
+            .output()?;
+        let output = String::from_utf8_lossy(&out.stderr).into_owned();
+        let errors = output
+            .lines()
+            .map(str::trim)
+            .filter(|line| {
+                let b = line.as_bytes();
+                b.len() > 2 && b[0] == b'E' && b[1].is_ascii_digit() && b[2] == b' '
+            })
+            .map(str::to_owned)
+            .collect();
+        Ok(Build {
+            ok: out.status.success(),
+            errors,
+            output,
+        })
+    }
+
+    /// Runs the built app with `args`: each line it printed.
+    fn run(&self, args: &[&str]) -> Try<Vec<String>> {
+        let bin = app_build().join("target/debug").join(format!(
+            "{}{}",
+            self.name,
+            std::env::consts::EXE_SUFFIX
+        ));
+        let out = Command::new(bin).args(args).output()?;
+        if !out.status.success() {
+            return Err(String::from_utf8_lossy(&out.stderr).into_owned().into());
+        }
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_owned)
+            .collect())
+    }
+
+    /// Builds the app with `set`, and the error lines of a build that failed.
+    fn fails(&self, set: &str) -> Try<Vec<String>> {
+        let build = self.build(set)?;
+        assert!(!build.ok, "{set} built");
+        assert!(!build.errors.is_empty(), "{set}: {}", build.output);
+        Ok(build.errors)
+    }
+}
+
+/// Each bad set of flow docs, and every error in it.
+const BAD: [(&str, &[&str]); 10] = [
+    (
+        "bad-e1",
+        &["E1 a.json step 0 link nope: no action named nope"],
+    ),
+    (
+        "bad-e2",
+        &["E2 a.json step 0 link greet: options for greet do not parse: unknown field `salut`"],
+    ),
+    (
+        "bad-e3",
+        &["E3 a.json step 0 link upper: takes text, which nothing before it gives"],
+    ),
+    (
+        "bad-e4",
+        &["E4 a.json step 0 link upper: takes text as string, it is number"],
+    ),
+    (
+        "bad-e5",
+        &["E5 a.json step 0 next: next to 20-notice.json gives no who, which it takes"],
+    ),
+    (
+        "bad-e6",
+        &["E6 a.json step 0 next: next to 20-notice.json gives who as number, it takes string"],
+    ),
+    (
+        "bad-concat",
+        &[
+            "E5 a.json step 0 next: next to 20-notice.json field msg: $greeting names nothing in scope",
+        ],
+    ),
+    (
+        "bad-e7",
+        &["E7 a.json step 0 next: next to ty 99, which no flow takes"],
+    ),
+    (
+        "bad-emit",
+        &["E1 a.json step 0 link emit: no action named emit"],
+    ),
+    (
+        "bad-multi",
+        &[
+            "E1 a.json step 0 link nope: no action named nope",
+            "E7 a.json step 0 next: next to ty 99, which no flow takes",
+            "E4 b.json step 0 link upper: takes text as string, it is number",
+        ],
+    ),
+];
+
+/// The errors `BAD` gives for `set`.
+fn bad(set: &str) -> Vec<String> {
+    BAD.iter()
+        .find(|(name, _)| *name == set)
+        .map_or_default(|(_, errors)| errors.iter().map(|e| (*e).to_owned()).collect())
+}
+
+#[test]
+fn the_apps_build_checks_its_flow_docs() {
+    // Given an app whose flow docs are a valid set over the actions of a test processor crate,
+    // one of whose actions is a job
+    let app = Workspace::new("app-checks").unwrap();
+
+    // When the app is built
+    let build = app.build("valid").unwrap();
+
+    // Then the build succeeds
+    assert!(build.ok, "{}", build.output);
+
+    // And each flow that uses the job action reports a job step, and each flow that uses none
+    // does not
+    assert_eq!(
+        app.run(&["jobs"]).unwrap(),
+        ["10 false", "15 false", "20 false", "40 true"]
+    );
+
+    // And the built app runs its flows with the flow doc files removed from disk
+    fs::remove_dir_all(app.root.join("flows/valid")).unwrap();
+    let lines = app.run(&["run", "10", r#"{"text":"  sam "}"#]).unwrap();
+    let event = json!(lines[0]);
+    let sent: Vec<Value> = lines[1..]
+        .iter()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let sent: Vec<(&Value, &Value, &Value, &Value)> = sent
+        .iter()
+        .map(|e| (&e["ty"], &e["status"], &e["source"], &e["data"]))
+        .collect();
+    assert_eq!(
+        sent,
+        [
+            (
+                &json!(20),
+                &json!(0),
+                &event,
+                &json!({ "msg": "hi SAM!", "who": "friend" })
+            ),
+            (&json!(10), &json!(2), &event, &json!("done")),
+        ]
+    );
+
+    // When the app is built with a flow doc whose step names an action nope that does not exist
+    // Then the build fails listing one error: no action named nope
+    assert_eq!(app.fails("bad-e1").unwrap(), bad("bad-e1"));
+
+    // When the app is built with a flow doc whose options for greet have the unknown field salut
+    // Then the build fails listing one error: the options for greet do not parse
+    assert_eq!(app.fails("bad-e2").unwrap(), bad("bad-e2"));
+
+    // When the app is built with a flow doc whose link upper takes text, which nothing before it
+    // gives
+    // Then the build fails listing one error saying so
+    assert_eq!(app.fails("bad-e3").unwrap(), bad("bad-e3"));
+
+    // When the app is built with a flow doc whose link upper takes text as a string and is given
+    // a number
+    // Then the build fails listing one error saying so
+    assert_eq!(app.fails("bad-e4").unwrap(), bad("bad-e4"));
+
+    // When the app is built with a flow doc whose next to notice gives no who, which notice takes
+    // Then the build fails listing one error saying so
+    assert_eq!(app.fails("bad-e5").unwrap(), bad("bad-e5"));
+
+    // When the app is built with a flow doc whose next to notice gives who as a number, where
+    // notice takes a string
+    // Then the build fails listing one error saying so
+    assert_eq!(app.fails("bad-e6").unwrap(), bad("bad-e6"));
+
+    // When the app is built with a flow doc whose next's $concat names a field greeting that
+    // nothing in scope gives
+    // Then the build fails listing one error: greeting names nothing in scope
+    assert_eq!(app.fails("bad-concat").unwrap(), bad("bad-concat"));
+
+    // When the app is built with a flow doc whose next goes to ty 99, which no flow takes
+    // Then the build fails listing one error saying so
+    assert_eq!(app.fails("bad-e7").unwrap(), bad("bad-e7"));
+
+    // When the app is built with a flow doc whose step names emit
+    // Then the build fails listing one error: no action named emit
+    assert_eq!(app.fails("bad-emit").unwrap(), bad("bad-emit"));
+
+    // When the app is built with two flow docs holding three errors between them
+    // Then the build fails listing all three errors
+    assert_eq!(app.fails("bad-multi").unwrap(), bad("bad-multi"));
+}
+
+#[test]
+fn the_apps_build_gathers_the_signatures_a_separate_processor_crate_exports() {
+    // Given a workspace with a processor crate, separate from the app, that exports its actions'
+    // signatures as data, among them greet
+    // And an app with its own processor crate, whose flow docs use actions of both, including a
+    // next whose template names the field greet gives
+    let app = Workspace::new("app-gathers").unwrap();
+
+    // When the app is built
+    let build = app.build("valid").unwrap();
+
+    // Then its build.rs gathers the signatures of both crates and the build succeeds
+    assert!(build.ok, "{}", build.output);
+    let jobs = app.run(&["jobs"]).unwrap();
+    assert!(
+        jobs.contains(&"40 true".to_owned()),
+        "the app's own job action was not gathered: {jobs:?}"
+    );
+
+    // When the app is built with each bad set of flow docs
+    // Then each build fails listing every error in it
+    for (set, errors) in BAD {
+        assert_eq!(app.fails(set).unwrap(), errors, "{set}");
+    }
+
+    // When the separate crate renames the field greet gives, and the app is built
+    let exported = app.root.join("proc-text/signatures.json");
+    let signatures = fs::read_to_string(&exported).unwrap();
+    let renamed = signatures.replace(
+        r#""gives": { "greeting": "string" }"#,
+        r#""gives": { "hello": "string" }"#,
+    );
+    assert_ne!(renamed, signatures, "greet's gives was not renamed");
+    fs::write(&exported, renamed).unwrap();
+    let build = app.build("valid").unwrap();
+
+    // Then the build fails listing one error: the next's template names a field nothing gives
+    assert!(!build.ok);
+    assert_eq!(
+        build.errors,
+        [
+            "E5 10-greet.json step 0 next: next to 20-notice.json field msg: $greeting names nothing in scope"
+        ]
+    );
 }
