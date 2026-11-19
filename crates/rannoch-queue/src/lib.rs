@@ -343,6 +343,29 @@ fn after(conn: &Connection, event: Uuid, one: Uuid) -> rusqlite::Result<bool> {
     Ok(false)
 }
 
+/// The queue's report: the number of `_events` rows at each status, in status order, over the
+/// app's store connection `conn`.
+///
+/// # Errors
+///
+/// The store's error when the count cannot be read.
+pub fn report(conn: &Connection) -> rusqlite::Result<Vec<(Status, u64)>> {
+    let mut select = conn.prepare_cached(queries::REPORT)?;
+    let rows = select.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (status, count) = row?;
+        if let (Some(status), Ok(count)) = (status_of(status), u64::try_from(count)) {
+            out.push((status, count));
+        } else {
+            log::error!(
+                "the report skipped a row it could not read: status {status}, count {count}"
+            );
+        }
+    }
+    Ok(out)
+}
+
 /// Sends a status event about `source`, with `message` as its data; whether it was accepted.
 fn send<T: PartialEq, D: From<String>>(
     sender: &Sender<T, D>,

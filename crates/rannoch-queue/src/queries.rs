@@ -28,3 +28,7 @@ pub(crate) const TREE: &str = "WITH RECURSIVE tree(id) AS (
     SELECT id FROM _events WHERE source = ?1
     UNION SELECT e.id FROM _events e JOIN tree t ON e.source = t.id
 ) SELECT e.id FROM tree CROSS JOIN _events e ON e.id = tree.id";
+
+/// The number of `_events` rows at each status.
+pub(crate) const REPORT: &str =
+    "SELECT status, count(*) FROM _events GROUP BY status ORDER BY status";

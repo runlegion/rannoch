@@ -33,3 +33,9 @@ Feature: The queue runs the events that are due, in two buckets, and retries wha
     When the hunt runs
     Then the hung event is sent again as a retry, with status 0 and the hung event as its source
     And the failure waiting on its retry is left alone
+
+  @module-rannoch-queue @criterion-FR-RANNOCH-019-c6
+  Scenario: The app reads the queue's report
+    Given a store with rows from the app's forgr factory at each of the four statuses
+    When the app asks the queue for its report
+    Then it gives the number of _events rows at each status
