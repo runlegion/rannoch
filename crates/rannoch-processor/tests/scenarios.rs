@@ -516,7 +516,7 @@ fn branch_and_each_send_their_nexts() {
 
     // Then one next of ty 31, one of ty 32 and one else next are sent, each with its event as
     // source
-    assert_eq!(sent(crash), [(31, json!({}))]);
+    assert_eq!(sent(crash), [(31, json!({ "severity": 1 }))]);
     assert_eq!(sent(question), [(32, json!({}))]);
     assert_eq!(sent(other), [(33, json!({}))]);
 
@@ -526,7 +526,7 @@ fn branch_and_each_send_their_nexts() {
     let string = app.hand(51, &json!({ "level": "1" })).unwrap();
 
     // Then the first sends the case's next and the second sends the else next
-    assert_eq!(sent(number), [(31, json!({}))]);
+    assert_eq!(sent(number), [(31, json!({ "severity": 1 }))]);
     assert_eq!(sent(string), [(33, json!({}))]);
 
     // When the queue hands rannoch-processor an event whose list is 'a b c'
