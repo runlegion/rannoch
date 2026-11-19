@@ -1,5 +1,6 @@
-//! FR-RANNOCH-019's scenarios, from `tests/features/lib.feature`: here "The queue runs what is
-//! due" (`@criterion-FR-RANNOCH-019-c1` to `-c4` and `-c8`). The store is the app's database
+//! FR-RANNOCH-019's scenarios, from `tests/features/lib.feature`: "The queue runs what is due"
+//! (`@criterion-FR-RANNOCH-019-c1` to `-c4` and `-c8`) and "A failing flow is retried, then
+//! binned" (`-c5` and `-c9`). The store is the app's database
 //! opened through the real store, its rows from the app's forgr factory; the flows are fakes.
 
 use std::collections::HashMap;
@@ -13,7 +14,7 @@ use chrono::{SecondsFormat, TimeDelta, Utc};
 use rannoch_core::forgr::_events;
 use rannoch_core::{Append, Config, Event, Rannoch, Status};
 use rannoch_events::Events;
-use rannoch_queue::{Flow, Flows, Queue, Row};
+use rannoch_queue::{Flow, Flows, Queue, Row, Settings};
 use rannoch_store::{Opened, Store};
 use rusqlite::Connection;
 use uuid::Uuid;
@@ -63,6 +64,7 @@ fn processor(job: bool, take: Duration, ran: Ran) -> Arc<Flow<Ty, String>> {
                 run_at: None,
                 status: Status::Processed,
             });
+            Ok(())
         }),
     })
 }
@@ -76,6 +78,17 @@ fn database(name: &str) -> Result<PathBuf> {
     }
     fs::create_dir_all(&dir)?;
     Ok(dir.join("store.db"))
+}
+
+/// The app's store over `path`, with every migration applied by opening rannoch once.
+fn migrated(path: &Path) -> Result<Arc<Store>> {
+    let store = Arc::new(Store::new(path.to_owned(), rannoch_core::migrator()));
+    Rannoch::<Ty, String>::open(Config {
+        store: Some(store.clone()),
+        ..Config::default()
+    })?
+    .shutdown();
+    Ok(store)
 }
 
 fn ready(path: &Path) -> Result<Connection> {
@@ -126,13 +139,7 @@ fn the_queue_runs_what_is_due() {
     // job step, one whose flow has a job step, one whose run_at is a short wait away, and one
     // whose ty has no flow
     let path = database("the_queue_runs_what_is_due").unwrap();
-    let store = Arc::new(Store::new(path.clone(), rannoch_core::migrator()));
-    Rannoch::<Ty, String>::open(Config {
-        store: Some(store.clone()),
-        ..Config::default()
-    })
-    .unwrap()
-    .shutdown();
+    let store = migrated(&path).unwrap();
     let seed = ready(&path).unwrap();
     let run_a = waiting(&seed, 1, None).unwrap();
     let run_b = waiting(&seed, 1, None).unwrap();
@@ -156,7 +163,13 @@ fn the_queue_runs_what_is_due() {
         ..Config::default()
     })
     .unwrap();
-    let queue = Queue::start(ready(&path).unwrap(), wake, rannoch.sender(), flows);
+    let queue = Queue::start(
+        ready(&path).unwrap(),
+        wake,
+        rannoch.sender(),
+        flows,
+        Settings::new(Duration::from_millis(100)),
+    );
 
     // When the events crate signals the queue
     signal.send(()).unwrap();
@@ -248,13 +261,7 @@ fn the_queue_runs_what_is_due() {
 #[test]
 fn an_event_taken_before_its_1_is_kept_is_not_taken_again() {
     let path = database("an_event_taken_before_its_1_is_kept").unwrap();
-    let store = Arc::new(Store::new(path.clone(), rannoch_core::migrator()));
-    Rannoch::<Ty, String>::open(Config {
-        store: Some(store.clone()),
-        ..Config::default()
-    })
-    .unwrap()
-    .shutdown();
+    let store = migrated(&path).unwrap();
     let event = waiting(&ready(&path).unwrap(), 1, None).unwrap();
     let runs = Arc::new(Mutex::new(0_u32));
     let count = runs.clone();
@@ -268,6 +275,7 @@ fn an_event_taken_before_its_1_is_kept_is_not_taken_again() {
                         if let Ok(mut n) = count.lock() {
                             *n += 1;
                         }
+                        Ok(())
                     },
                 ),
             }),
@@ -282,7 +290,13 @@ fn an_event_taken_before_its_1_is_kept_is_not_taken_again() {
         ..Config::default()
     })
     .unwrap();
-    let queue = Queue::start(ready(&path).unwrap(), wake, rannoch.sender(), flows);
+    let queue = Queue::start(
+        ready(&path).unwrap(),
+        wake,
+        rannoch.sender(),
+        flows,
+        Settings::new(Duration::from_millis(100)),
+    );
 
     signal.send(()).unwrap();
     thread::sleep(Duration::from_millis(200));
@@ -290,6 +304,133 @@ fn an_event_taken_before_its_1_is_kept_is_not_taken_again() {
     thread::sleep(Duration::from_millis(200));
 
     assert_eq!(*runs.lock().unwrap(), 1, "event {event} ran more than once");
+    drop(signal);
+    rannoch.shutdown();
+    queue.join();
+}
+
+/// The rows whose source is `id`: id, status, data and `run_at`.
+/// One row about an event: id, status, data and `run_at`.
+type About = (Uuid, i64, String, Option<String>);
+
+fn rows_about(conn: &Connection, id: Uuid) -> rusqlite::Result<Vec<About>> {
+    conn.prepare("SELECT id, status, data, run_at FROM _events WHERE source = ?1 ORDER BY id")?
+        .query_map([id.to_string()], |r| {
+            let id: String = r.get(0)?;
+            Ok((
+                id.parse().unwrap_or_default(),
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+            ))
+        })?
+        .collect()
+}
+
+#[test]
+fn a_failing_flow_is_retried_then_binned() {
+    // Given a store with an event at status 0 whose flow fails every time
+    let path = database("a_failing_flow_is_retried_then_binned").unwrap();
+    let store = migrated(&path).unwrap();
+    let original = waiting(&ready(&path).unwrap(), 4, None).unwrap();
+    let failing: Arc<Flow<Ty, String>> = Arc::new(Flow {
+        job: false,
+        run: Box::new(
+            |event: &Row, _: &Row, sender: &rannoch_core::Sender<Ty, String>| {
+                let failure = format!("failed {}", event.id);
+                let _ = sender.send(Event {
+                    id: Uuid::nil(),
+                    source: Some(event.id),
+                    ty: Ty(event.ty),
+                    data: failure.clone(),
+                    run_at: None,
+                    status: Status::Binned,
+                });
+                Err(failure)
+            },
+        ),
+    });
+    let flows = Arc::new(Fake {
+        flows: HashMap::from([(4, failing)]),
+    });
+
+    // And the queue's settings are 3 attempts and a short first wait
+    let settings = Settings {
+        attempts: 3,
+        ..Settings::new(Duration::from_millis(100))
+    };
+    let (signal, wake) = mpsc::channel();
+    let rannoch = Rannoch::open(Config {
+        store: Some(store.clone()),
+        append: Some(Arc::new(Events::new(ready(&path).unwrap(), signal.clone()))
+            as Arc<dyn Append<Ty, String>>),
+        ..Config::default()
+    })
+    .unwrap();
+    let queue = Queue::start(
+        ready(&path).unwrap(),
+        wake,
+        rannoch.sender(),
+        flows,
+        settings,
+    );
+    let read = ready(&path).unwrap();
+    let retry_of = |id: Uuid| {
+        rows_about(&read, id)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.1 == 0)
+    };
+
+    // When the events crate signals the queue
+    // run_at is kept to the millisecond
+    let before = Utc::now() - TimeDelta::milliseconds(1);
+    signal.send(()).unwrap();
+
+    // Then the processor sends a -1 for the attempt, and the queue sends a retry with status 0,
+    // the attempt as its source, the failure's result as its data and a run_at after the first
+    // wait
+    assert!(until(Duration::from_secs(5), || retry_of(original).is_some()));
+    let failed = format!("\"failed {original}\"");
+    assert!(
+        rows_about(&read, original)
+            .unwrap()
+            .iter()
+            .any(|r| r.1 == -1 && r.2 == failed)
+    );
+    let (first, _, data, run_at) = retry_of(original).unwrap();
+    assert_eq!(data, failed);
+    let run_at: chrono::DateTime<Utc> = run_at.unwrap().parse().unwrap();
+    assert!(
+        run_at >= before + TimeDelta::milliseconds(100),
+        "{run_at} too soon"
+    );
+
+    // When the retry comes due and fails
+    // Then the processor sends a -1 for it, and the queue sends a second retry whose source is
+    // the first retry, not the original event
+    assert!(until(Duration::from_secs(5), || retry_of(first).is_some()));
+    assert!(rows_about(&read, first).unwrap().iter().any(|r| r.1 == -1));
+    let (second, ..) = retry_of(first).unwrap();
+    let pointing_at_original = rows_about(&read, original)
+        .unwrap()
+        .iter()
+        .filter(|r| r.1 == 0)
+        .count();
+    assert_eq!(
+        pointing_at_original, 1,
+        "a retry pointed at the original event"
+    );
+
+    // When the second retry comes due and fails
+    // Then the processor sends a -1 for it, and the queue sends nothing more, because its chain
+    // has reached 3 attempts
+    assert!(until(Duration::from_secs(5), || {
+        rows_about(&read, second).unwrap().iter().any(|r| r.1 == -1)
+    }));
+    thread::sleep(Duration::from_millis(1_000));
+    assert_eq!(retry_of(second), None, "a fourth attempt was sent");
+
     drop(signal);
     rannoch.shutdown();
     queue.join();

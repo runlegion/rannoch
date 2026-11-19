@@ -13,3 +13,14 @@ Feature: The queue runs the events that are due, in two buckets, and retries wha
     Then no event with a status 1 is taken again
     When the event not yet due comes due with nothing else appended
     Then the queue takes it and runs it
+
+  @module-rannoch-queue @criterion-FR-RANNOCH-019-c5 @criterion-FR-RANNOCH-019-c9
+  Scenario: A failing flow is retried, then binned
+    Given a store with an event at status 0 whose flow fails every time
+    And the queue's settings are 3 attempts and a short first wait
+    When the events crate signals the queue
+    Then the processor sends a -1 for the attempt, and the queue sends a retry with status 0, the attempt as its source, the failure's result as its data and a run_at after the first wait
+    When the retry comes due and fails
+    Then the processor sends a -1 for it, and the queue sends a second retry whose source is the first retry, not the original event
+    When the second retry comes due and fails
+    Then the processor sends a -1 for it, and the queue sends nothing more, because its chain has reached 3 attempts

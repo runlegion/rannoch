@@ -2,8 +2,8 @@
 //! status 0 that are due and have no status event whose source is them, sends a status 1 for
 //! each, and hands each to its processor: runs, whose flow has no job step, one after another;
 //! jobs, whose flow has a job step, each on a thread of its own. Processors send their own
-//! results; the queue sends only the 1s, and a -1 saying "no processor" for an event whose `ty`
-//! has no flow.
+//! results; the queue sends only the 1s, a retry when a run fails while its chain has attempts
+//! left, and a -1 saying "no processor" for an event whose `ty` has no flow.
 
 mod queries;
 
@@ -22,14 +22,36 @@ use uuid::Uuid;
 pub type Row = Event<u16, String>;
 
 /// A processor: handed the event it runs, that event's root and a sender, it sends its own
-/// result about the event it runs.
-pub type Processor<T, D> = Box<dyn Fn(&Row, &Row, &Sender<T, D>) + Send + Sync>;
+/// result about the event it runs, and tells the queue whether the run failed, with the
+/// failure's result, so the queue can retry it.
+pub type Processor<T, D> =
+    Box<dyn Fn(&Row, &Row, &Sender<T, D>) -> Result<(), String> + Send + Sync>;
+
+/// The queue's settings.
+#[derive(Debug, Clone, Copy)]
+pub struct Settings {
+    /// How many attempts a chain may have before nothing more is sent; 10 by default.
+    pub attempts: u32,
+    /// The backoff's first wait; each later wait doubles it.
+    pub first_wait: Duration,
+}
+
+impl Settings {
+    /// The settings with `first_wait` and the default attempts.
+    #[must_use]
+    pub fn new(first_wait: Duration) -> Self {
+        Self {
+            attempts: 10,
+            first_wait,
+        }
+    }
+}
 
 /// What runs an event: the processor, and whether its flow has a job step.
 pub struct Flow<T, D> {
     /// Long-running work: a job runs on a thread of its own and never holds up a run.
     pub job: bool,
-    /// The processor: it is handed the event's root and a sender, and sends its own result.
+    /// The processor.
     pub run: Processor<T, D>,
 }
 
@@ -62,13 +84,14 @@ impl Queue {
         signal: Receiver<()>,
         sender: Sender<T, D>,
         flows: Arc<dyn Flows<T, D>>,
+        settings: Settings,
     ) -> Self
     where
         T: TryFrom<u16> + Copy + PartialEq + Send + 'static,
         D: From<String> + Send + 'static,
     {
         Self {
-            thread: thread::spawn(move || run(&conn, &signal, &sender, &*flows)),
+            thread: thread::spawn(move || run(&conn, &signal, &sender, &*flows, settings)),
         }
     }
 
@@ -86,15 +109,16 @@ fn run<T, D>(
     signal: &Receiver<()>,
     sender: &Sender<T, D>,
     flows: &dyn Flows<T, D>,
+    settings: Settings,
 ) where
     T: TryFrom<u16> + Copy + PartialEq + Send + 'static,
     D: From<String> + Send + 'static,
 {
-    let (runs, bucket) = mpsc::channel::<(Arc<Flow<T, D>>, Row, Row)>();
+    let (runs, bucket) = mpsc::channel::<(Arc<Flow<T, D>>, Row, Row, u32)>();
     let run_sender = sender.clone();
     let runs_thread = thread::spawn(move || {
-        for (flow, event, root) in bucket {
-            (flow.run)(&event, &root, &run_sender);
+        for (flow, event, root, before) in bucket {
+            attempt(&flow, &event, &root, before, &run_sender, settings);
         }
     });
     let mut jobs: Vec<JoinHandle<()>> = Vec::new();
@@ -123,8 +147,8 @@ fn run<T, D>(
                 );
                 continue;
             };
-            let root = match root(conn, row.clone()) {
-                Ok(root) => root,
+            let (root, before) = match root(conn, row.clone()) {
+                Ok(found) => found,
                 Err(err) => {
                     log::error!("the queue could not find the root of {}: {err}", row.id);
                     taken.remove(&row.id);
@@ -143,9 +167,9 @@ fn run<T, D>(
             if flow.job {
                 let job_sender = sender.clone();
                 jobs.push(thread::spawn(move || {
-                    (flow.run)(&row, &root, &job_sender);
+                    attempt(&flow, &row, &root, before, &job_sender, settings);
                 }));
-            } else if runs.send((flow, row, root)).is_err() {
+            } else if runs.send((flow, row, root, before)).is_err() {
                 log::error!("the queue's runs have stopped");
             }
         }
@@ -155,6 +179,54 @@ fn run<T, D>(
     let _ = runs_thread.join();
     for job in jobs {
         let _ = job.join();
+    }
+}
+
+/// Runs `event` through its processor. When the run fails and its chain, with `before` failed
+/// attempts behind it, has attempts left, sends a retry: status 0, the failed attempt as its
+/// source, the failure's result as its data, and a `run_at` after the backoff, which doubles the
+/// first wait for each attempt before.
+fn attempt<T, D>(
+    flow: &Flow<T, D>,
+    event: &Row,
+    root: &Row,
+    before: u32,
+    sender: &Sender<T, D>,
+    settings: Settings,
+) where
+    T: TryFrom<u16> + PartialEq,
+    D: From<String>,
+{
+    let Err(failure) = (flow.run)(event, root, sender) else {
+        return;
+    };
+    let attempts = before.saturating_add(1);
+    if attempts >= settings.attempts {
+        return;
+    }
+    let Ok(ty) = T::try_from(event.ty) else {
+        return;
+    };
+    let wait = settings
+        .first_wait
+        .checked_mul(2_u32.saturating_pow(before))
+        .unwrap_or(Duration::MAX);
+    let run_at = chrono::TimeDelta::from_std(wait)
+        .ok()
+        .and_then(|delay| Utc::now().checked_add_signed(delay));
+    let retry = Event {
+        id: Uuid::nil(),
+        source: Some(event.id),
+        ty,
+        data: D::from(failure),
+        run_at,
+        status: Status::Added,
+    };
+    if sender.send(retry).is_err() {
+        log::error!(
+            "the queue could not send a retry for {}: rannoch is closed",
+            event.id
+        );
     }
 }
 
@@ -181,20 +253,25 @@ fn send<T: PartialEq, D: From<String>>(
     sent
 }
 
-/// The root whose data every flow uses: back from `row` through each source that has a -1.
-fn root(conn: &Connection, row: Row) -> rusqlite::Result<Row> {
+/// The root whose data every flow uses, and how many failed attempts are behind `row` in its
+/// chain: back from `row` through each source that has a -1.
+fn root(conn: &Connection, row: Row) -> rusqlite::Result<(Row, u32)> {
     let mut at = row;
+    let mut before = 0_u32;
     while let Some(source) = at.source {
         let failed: bool = conn.query_row(queries::FAILED, [source.to_string()], |r| r.get(0))?;
         if !failed {
             break;
         }
         match read(conn, queries::EVENT, [source.to_string()])?.pop() {
-            Some(earlier) => at = earlier,
+            Some(earlier) => {
+                at = earlier;
+                before = before.saturating_add(1);
+            }
             None => break,
         }
     }
-    Ok(at)
+    Ok((at, before))
 }
 
 /// How long until the earliest `run_at` the queue knows of, or `None` when there is none.
@@ -301,11 +378,19 @@ mod tests {
         let output = put(&store, Some(&first), "{\"out\":1}", 0);
 
         assert_eq!(
-            root(&store, event(&store, &first)).unwrap().id.to_string(),
+            root(&store, event(&store, &first))
+                .unwrap()
+                .0
+                .id
+                .to_string(),
             first
         );
         assert_eq!(
-            root(&store, event(&store, &output)).unwrap().id.to_string(),
+            root(&store, event(&store, &output))
+                .unwrap()
+                .0
+                .id
+                .to_string(),
             output
         );
         let _ = done;
@@ -320,9 +405,10 @@ mod tests {
         put(&store, Some(&first), "failed again", -1);
         let second = put(&store, Some(&first), "failed again", 0);
 
-        let found = root(&store, event(&store, &second)).unwrap();
+        let (found, before) = root(&store, event(&store, &second)).unwrap();
 
         assert_eq!(found.id.to_string(), original);
         assert_eq!(found.data, "{\"in\":1}");
+        assert_eq!(before, 2);
     }
 }
