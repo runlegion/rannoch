@@ -256,7 +256,6 @@ fn an_event_taken_before_its_1_is_kept_is_not_taken_again() {
     .unwrap()
     .shutdown();
     let event = waiting(&ready(&path).unwrap(), 1, None).unwrap();
-    let ran: Ran = Arc::default();
     let runs = Arc::new(Mutex::new(0_u32));
     let count = runs.clone();
     let flows = Arc::new(Fake {
@@ -274,7 +273,6 @@ fn an_event_taken_before_its_1_is_kept_is_not_taken_again() {
             }),
         )]),
     });
-    let _ = ran;
     let (signal, wake) = mpsc::channel();
     let rannoch = Rannoch::open(Config {
         default_interval: TimeDelta::hours(1),

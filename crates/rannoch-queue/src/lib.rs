@@ -99,8 +99,7 @@ fn run<T, D>(
     });
     let mut jobs: Vec<JoinHandle<()>> = Vec::new();
     let mut taken = HashSet::new();
-    // Events already due when the queue starts are taken at once.
-    let mut wait = Duration::ZERO;
+    let mut wait = next_due(conn).unwrap_or(IDLE);
     loop {
         if signal.recv_timeout(wait) == Err(RecvTimeoutError::Disconnected) {
             break;
