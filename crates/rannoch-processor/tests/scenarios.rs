@@ -810,8 +810,7 @@ const BAD: [(&str, &[&str]); 10] = [
 fn bad(set: &str) -> Vec<String> {
     BAD.iter()
         .find(|(name, _)| *name == set)
-        .map(|(_, errors)| errors.iter().map(|e| (*e).to_owned()).collect())
-        .unwrap_or_default()
+        .map_or_default(|(_, errors)| errors.iter().map(|e| (*e).to_owned()).collect())
 }
 
 #[test]
