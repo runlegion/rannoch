@@ -32,3 +32,13 @@ Feature: rannoch-processor runs the app's compiled flows, and the app's build ch
     Then the step's next carries it on
     When the queue hands rannoch-processor an event and the action's output has no severity
     Then the step sends a -1 naming severity, and no next and no 2
+
+  @module-rannoch-processor @criterion-FR-RANNOCH-119-c11 @criterion-FR-RANNOCH-119-c13
+  Scenario: A two-step flow sends its next only when every step succeeds
+    Given an app built with a two-step flow whose step 0 sends a next and whose step 1 runs a test action that fails on the first attempt and succeeds on the next
+    When the queue hands rannoch-processor an event of that flow
+    Then step 1 is passed the options step 0 gave
+    And the processor sends one -1 for the event, and no next
+    When the queue's retry of the event comes due
+    Then step 0's next is sent, and the processor sends its 2
+    And across both attempts exactly one next was sent
