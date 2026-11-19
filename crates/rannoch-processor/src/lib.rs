@@ -615,25 +615,30 @@ mod tests {
         let acts = actions(&[("a", json!({ "x": 1 })), ("b", json!({}))]);
         let steps = [
             step(json!({ "do": "a", "next": { "ty": 20, "shape": { "x": "$x" } } })),
-            step(json!({ "do": "b" })),
+            step(json!({ "do": "b", "next": { "ty": 21, "shape": { "x": "$x" } } })),
         ];
 
         let outs = run(&steps, &acts, Map::new()).unwrap();
 
-        assert_eq!(outs, [(20, obj(json!({ "x": 1 })), 0)]);
+        assert_eq!(
+            outs,
+            [
+                (20, obj(json!({ "x": 1 })), 0),
+                (21, obj(json!({ "x": 1 })), 0)
+            ],
+            "step 1's next was not shaped from step 0's options"
+        );
         let (sent, result): (Vec<Event<u16, Value>>, _) =
             outcome(&steps, &acts, Uuid::now_v7(), 10, "{}", Utc::now());
         assert_eq!(result, Ok(()));
         let sent: Vec<_> = sent.iter().map(|e| (e.ty, e.status)).collect();
-        assert_eq!(sent, [(20, Status::Added), (10, Status::Processed)]);
-        let mut vals = Map::new();
-        for s in &steps {
-            chain(s, &acts, &mut vals).unwrap();
-        }
         assert_eq!(
-            vals["b_saw"]["x"],
-            json!(1),
-            "step 1 was not passed step 0's options"
+            sent,
+            [
+                (20, Status::Added),
+                (21, Status::Added),
+                (10, Status::Processed)
+            ]
         );
     }
 
