@@ -1,6 +1,6 @@
 //! FR-RANNOCH-019's scenarios, from `tests/features/lib.feature`: "The queue runs what is due"
 //! (`@criterion-FR-RANNOCH-019-c1` to `-c4` and `-c8`) and "A failing flow is retried, then
-//! binned" (`-c5` and `-c9`), and "The hunt reruns a dropped run" (`-c7`). The store is the app's database
+//! binned" (`-c5` and `-c9`), "The hunt reruns a dropped run" (`-c7`), and "The app reads the queue's report" (`-c6`). The store is the app's database
 //! opened through the real store, its rows from the app's forgr factory; the flows are fakes.
 
 use std::collections::HashMap;
@@ -532,4 +532,37 @@ fn the_hunt_reruns_a_dropped_run() {
     drop(signal);
     rannoch.shutdown();
     queue.join();
+}
+
+#[test]
+fn the_app_reads_the_queues_report() {
+    // Given a store with rows from the app's forgr factory at each of the four statuses
+    let path = database("the_app_reads_the_queues_report").unwrap();
+    migrated(&path).unwrap();
+    let conn = ready(&path).unwrap();
+    for (status, rows) in [(-1, 1), (0, 2), (1, 3), (2, 4)] {
+        for _ in 0..rows {
+            _events::factory()
+                .id(Uuid::now_v7().to_string())
+                .ty(1)
+                .data("{}")
+                .status(status)
+                .insert(&conn)
+                .unwrap();
+        }
+    }
+
+    // When the app asks the queue for its report
+    let report = rannoch_queue::report(&conn).unwrap();
+
+    // Then it gives the number of _events rows at each status
+    assert_eq!(
+        report,
+        [
+            (Status::Binned, 1),
+            (Status::Added, 2),
+            (Status::InProgress, 3),
+            (Status::Processed, 4),
+        ]
+    );
 }
