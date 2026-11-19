@@ -309,10 +309,10 @@ fn an_event_taken_before_its_1_is_kept_is_not_taken_again() {
     queue.join();
 }
 
-/// The rows whose source is `id`: id, status, data and `run_at`.
 /// One row about an event: id, status, data and `run_at`.
 type About = (Uuid, i64, String, Option<String>);
 
+/// The rows whose source is `id`.
 fn rows_about(conn: &Connection, id: Uuid) -> rusqlite::Result<Vec<About>> {
     conn.prepare("SELECT id, status, data, run_at FROM _events WHERE source = ?1 ORDER BY id")?
         .query_map([id.to_string()], |r| {

@@ -200,17 +200,12 @@ fn attempt<T, D>(
     let Err(failure) = (flow.run)(event, root, sender) else {
         return;
     };
-    let attempts = before.saturating_add(1);
-    if attempts >= settings.attempts {
+    let Some(wait) = backoff(settings, before) else {
         return;
-    }
+    };
     let Ok(ty) = T::try_from(event.ty) else {
         return;
     };
-    let wait = settings
-        .first_wait
-        .checked_mul(2_u32.saturating_pow(before))
-        .unwrap_or(Duration::MAX);
     let run_at = chrono::TimeDelta::from_std(wait)
         .ok()
         .and_then(|delay| Utc::now().checked_add_signed(delay));
@@ -228,6 +223,20 @@ fn attempt<T, D>(
             event.id
         );
     }
+}
+
+/// The wait before retrying a run that failed with `before` failed attempts behind it: the first
+/// wait doubled once for each of them, or `None` when the chain has reached the attempts setting.
+fn backoff(settings: Settings, before: u32) -> Option<Duration> {
+    if before.saturating_add(1) >= settings.attempts {
+        return None;
+    }
+    Some(
+        settings
+            .first_wait
+            .checked_mul(2_u32.saturating_pow(before))
+            .unwrap_or(Duration::MAX),
+    )
 }
 
 /// Sends a status event about `source`, with `message` as its data; whether it was accepted.
@@ -368,6 +377,19 @@ mod tests {
 
     fn event(conn: &rusqlite::Connection, id: &str) -> super::Row {
         read(conn, queries::EVENT, [id]).unwrap().pop().unwrap()
+    }
+
+    #[test]
+    fn the_backoff_doubles_and_stops_at_the_attempts_setting() {
+        let settings = super::Settings {
+            attempts: 3,
+            ..super::Settings::new(std::time::Duration::from_millis(100))
+        };
+        let ms = |n| Some(std::time::Duration::from_millis(n));
+
+        assert_eq!(super::backoff(settings, 0), ms(100));
+        assert_eq!(super::backoff(settings, 1), ms(200));
+        assert_eq!(super::backoff(settings, 2), None);
     }
 
     #[test]
