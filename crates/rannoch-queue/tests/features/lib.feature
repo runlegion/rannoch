@@ -1,0 +1,15 @@
+# Generated from FR-RANNOCH-019 (document 01a1d941-e1c3-7f61-a267-cf7aeac8a904, revision 15). Do not hand-edit.
+Feature: The queue runs the events that are due, in two buckets, and retries what fails
+
+  @module-rannoch-queue @criterion-FR-RANNOCH-019-c1 @criterion-FR-RANNOCH-019-c2 @criterion-FR-RANNOCH-019-c3 @criterion-FR-RANNOCH-019-c4 @criterion-FR-RANNOCH-019-c8
+  Scenario: The queue runs what is due
+    Given a store with events from the app's forgr factory at status 0: two whose flow has no job step, one whose flow has a job step, one whose run_at is a short wait away, and one whose ty has no flow
+    When the events crate signals the queue
+    Then the queue sends a status 1 for each due event, with that event as its source, and none for the one not yet due
+    And the two runs run one after the other while the job runs beside them
+    And each processor sends its own result, a 2 with its log line
+    And for the event with no flow the queue sends a -1 saying "no processor", and no retry
+    When the signal comes again
+    Then no event with a status 1 is taken again
+    When the event not yet due comes due with nothing else appended
+    Then the queue takes it and runs it
