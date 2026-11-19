@@ -514,6 +514,13 @@ mod tests {
         let failed_id: Uuid = failed.parse().unwrap();
 
         assert!(super::after(&store, failed_id, failed_one.parse().unwrap()).unwrap());
+        // Only a grandchild comes after this 1, so only the walk down the tree finds it.
+        let deep = put(&store, None, "{}", 0);
+        let child = put(&store, Some(&deep), "{}", 0);
+        let deep_one = put(&store, Some(&deep), "taken", 1);
+        put(&store, Some(&child), "later", 0);
+        let deep_id: Uuid = deep.parse().unwrap();
+        assert!(super::after(&store, deep_id, deep_one.parse().unwrap()).unwrap());
     }
 
     #[test]
