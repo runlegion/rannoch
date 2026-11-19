@@ -1,0 +1,6 @@
+[
+  { "action": "trim", "takes": { "text": "string" }, "gives": { "text": "string" } },
+  { "action": "upper", "takes": { "text": "string" }, "gives": { "text": "string" } },
+  { "action": "greet", "options": { "salutation": "string" }, "takes": { "text": "string" }, "gives": { "greeting": "string" } },
+  { "action": "limit", "options": { "max": "number" }, "takes": { "text": "string" } }
+]

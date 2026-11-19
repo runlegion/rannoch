@@ -5,7 +5,12 @@
 //! reading the root's data; each action's real output is checked against what it declares it
 //! gives. A failing link sends one -1 and nothing more; otherwise the flow's nexts are sent, then
 //! its 2.
+//!
+//! Each processor crate exports its actions' signatures as data; the app's build.rs gathers them
+//! with [`gather`], its own included, and checks its flow docs against them with [`check`], which
+//! lists every error or gives the docs to compile in, each with its job flag set.
 
+mod check;
 mod doc;
 
 use std::collections::HashMap;
@@ -14,20 +19,32 @@ use std::sync::Arc;
 use chrono::{DateTime, TimeDelta, Utc};
 use rannoch_core::{Event, Sender, Status};
 use rannoch_queue::{Flow, Flows, Row};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
+pub use check::{check, gather};
 pub use doc::{FlowDoc, Next, Shape, Step};
 
-/// An action's signature: its name, and what it declares it gives.
-#[derive(Debug, Clone, Deserialize)]
+/// An action's signature: its name, its typed options, what it takes, what it declares it gives,
+/// and whether it is a job. A processor crate exports its actions' signatures as data.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Signature {
     /// The name a step's chain calls it by.
     pub action: String,
+    /// Each option a step gives it, with the option's type.
+    #[serde(default)]
+    pub options: Shape,
+    /// Each field it takes, with the field's type.
+    #[serde(default)]
+    pub takes: Shape,
     /// Each field its output gives, with the field's type.
     #[serde(default)]
     pub gives: Shape,
+    /// Long-running work: a flow with a step that uses it has a job step.
+    #[serde(default)]
+    pub job: bool,
 }
 
 /// One processor action, from a processor crate the app uses.
@@ -66,7 +83,8 @@ where
     T: TryFrom<u16> + PartialEq + 'static,
     D: From<Value> + 'static,
 {
-    /// The processor for the flow docs `docs`, each a flow doc's JSON text, over `actions`.
+    /// The processor for the flow docs `docs`, each a flow doc's JSON text as [`check`] gives
+    /// it, over `actions`; each flow's job step is the doc's job flag.
     ///
     /// # Errors
     ///
@@ -82,10 +100,10 @@ where
         for text in docs {
             let doc: FlowDoc =
                 serde_json::from_str(text).map_err(|err| format!("a flow doc: {err}"))?;
-            let ty = doc.ty;
+            let (ty, job) = (doc.ty, doc.job);
             let actions = actions.clone();
             let flow = Flow {
-                job: false,
+                job,
                 run: Box::new(move |event: &Row, root: &Row, sender: &Sender<T, D>| {
                     process(&doc.steps, &actions, event, root, sender)
                 }),
@@ -211,7 +229,7 @@ fn chain(
             .cloned()
             .unwrap_or_else(|| Value::Object(Map::new()));
         let out = action.run(&options, &input)?;
-        check(&out, &action.signature().gives, link)?;
+        check_gives(&out, &action.signature().gives, link)?;
         input.extend(out.clone());
         result.extend(out);
     }
@@ -226,7 +244,7 @@ fn chain(
 
 /// Whether `out`, the real output of `action`, gives every field it declares in `gives`, each
 /// of its declared type; the mismatch names the field.
-fn check(out: &Map<String, Value>, gives: &Shape, action: &str) -> Result<(), String> {
+fn check_gives(out: &Map<String, Value>, gives: &Shape, action: &str) -> Result<(), String> {
     for (field, declared) in gives {
         match out.get(field) {
             None => return Err(format!("{action} gave no {field}")),
@@ -253,7 +271,7 @@ fn matches(value: &Value, declared: &str) -> bool {
 }
 
 /// The type of a JSON value, in the signature vocabulary.
-fn type_of(value: &Value) -> &'static str {
+pub(crate) fn type_of(value: &Value) -> &'static str {
     match value {
         Value::String(_) => "string",
         Value::Number(_) => "number",
@@ -321,7 +339,9 @@ mod tests {
     use serde_json::{Map, Value, json};
     use uuid::Uuid;
 
-    use super::{Action, Signature, Step, chain, check, next, outcome, run};
+    use rannoch_queue::Flows;
+
+    use super::{Action, Processor, Signature, Step, chain, check_gives, next, outcome, run};
 
     fn obj(v: Value) -> Map<String, Value> {
         match v {
@@ -378,6 +398,7 @@ mod tests {
                             .keys()
                             .map(|k| (k.clone(), super::type_of(&out[k]).to_owned()))
                             .collect(),
+                        ..Signature::default()
                     },
                     out: out.clone(),
                     calls: calls.clone(),
@@ -467,15 +488,15 @@ mod tests {
             .collect();
 
         assert_eq!(
-            check(&obj(json!({ "severity": 2 })), &gives, "rate"),
+            check_gives(&obj(json!({ "severity": 2 })), &gives, "rate"),
             Ok(())
         );
         assert_eq!(
-            check(&obj(json!({})), &gives, "rate"),
+            check_gives(&obj(json!({})), &gives, "rate"),
             Err("rate gave no severity".to_owned())
         );
         assert_eq!(
-            check(&obj(json!({ "severity": "2" })), &gives, "rate"),
+            check_gives(&obj(json!({ "severity": "2" })), &gives, "rate"),
             Err("rate gave severity as string, not number".to_owned())
         );
     }
@@ -499,7 +520,11 @@ mod tests {
             json!({}),
             json!(null),
         ] {
-            assert_eq!(check(&obj(json!({ "v": v })), &gives, "a"), Ok(()), "{v}");
+            assert_eq!(
+                check_gives(&obj(json!({ "v": v })), &gives, "a"),
+                Ok(()),
+                "{v}"
+            );
         }
     }
 
@@ -507,9 +532,9 @@ mod tests {
     fn a_bool_is_checked_as_a_bool() {
         let gives = declares(json!({ "v": "bool" }));
 
-        assert_eq!(check(&obj(json!({ "v": true })), &gives, "a"), Ok(()));
+        assert_eq!(check_gives(&obj(json!({ "v": true })), &gives, "a"), Ok(()));
         assert_eq!(
-            check(&obj(json!({ "v": 1 })), &gives, "a"),
+            check_gives(&obj(json!({ "v": 1 })), &gives, "a"),
             Err("a gave v as number, not bool".to_owned())
         );
     }
@@ -519,16 +544,22 @@ mod tests {
         let numbers = declares(json!({ "v": "list<number>" }));
         let strings = declares(json!({ "v": "list<string>" }));
 
-        assert_eq!(check(&obj(json!({ "v": [1, 2] })), &numbers, "a"), Ok(()));
-        assert_eq!(check(&obj(json!({ "v": ["x"] })), &strings, "a"), Ok(()));
-        assert_eq!(check(&obj(json!({ "v": [] })), &numbers, "a"), Ok(()));
-        assert_eq!(check(&obj(json!({ "v": [] })), &strings, "a"), Ok(()));
         assert_eq!(
-            check(&obj(json!({ "v": ["x"] })), &numbers, "a"),
+            check_gives(&obj(json!({ "v": [1, 2] })), &numbers, "a"),
+            Ok(())
+        );
+        assert_eq!(
+            check_gives(&obj(json!({ "v": ["x"] })), &strings, "a"),
+            Ok(())
+        );
+        assert_eq!(check_gives(&obj(json!({ "v": [] })), &numbers, "a"), Ok(()));
+        assert_eq!(check_gives(&obj(json!({ "v": [] })), &strings, "a"), Ok(()));
+        assert_eq!(
+            check_gives(&obj(json!({ "v": ["x"] })), &numbers, "a"),
             Err("a gave v as list<string>, not list<number>".to_owned())
         );
         assert_eq!(
-            check(&obj(json!({ "v": [1] })), &strings, "a"),
+            check_gives(&obj(json!({ "v": [1] })), &strings, "a"),
             Err("a gave v as list<number>, not list<string>".to_owned())
         );
     }
@@ -689,6 +720,20 @@ mod tests {
         let outs = run(&steps, &acts, Map::new()).unwrap();
 
         assert_eq!(outs, [(20, obj(json!({ "msg": "hi!" })), 500)]);
+    }
+
+    #[test]
+    fn each_flows_job_step_is_its_compiled_docs_job_flag() {
+        let docs = [
+            json!({ "ty": 10, "job": true }).to_string(),
+            json!({ "ty": 20 }).to_string(),
+        ];
+        let docs: Vec<&str> = docs.iter().map(String::as_str).collect();
+
+        let processor: Processor<u16, Value> = Processor::new(&docs, Vec::new()).unwrap();
+
+        let job = |ty| processor.flow(ty).map(|flow| flow.job);
+        assert_eq!((job(10), job(20)), (Some(true), Some(false)));
     }
 
     #[test]

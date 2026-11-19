@@ -3,14 +3,14 @@
 
 use std::collections::BTreeMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 /// What a flow takes, or an action gives: each field's type, in the signature vocabulary.
 pub type Shape = BTreeMap<String, String>;
 
 /// One flow doc.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FlowDoc {
     /// The `ty` of the events the flow runs.
@@ -21,10 +21,13 @@ pub struct FlowDoc {
     /// The steps, run in order on one event.
     #[serde(default)]
     pub steps: Vec<Step>,
+    /// Whether any step uses a job action: set by the app's build from the signatures.
+    #[serde(default)]
+    pub job: bool,
 }
 
 /// One step: the chain it runs, then its next.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Step {
     /// The links, in dot notation, as `trim.upper.greet`.
@@ -43,7 +46,7 @@ pub struct Step {
 
 /// A next: a new event of `ty`, its data the step's result shaped by `shape`, due after
 /// `delay_ms`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Next {
     /// The `ty` of the work it hands to.
