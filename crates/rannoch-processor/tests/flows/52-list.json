@@ -1,0 +1,1 @@
+{"ty":52,"takes":{"list":"list<string>"},"steps":[{"do":"note","next":{"ty":41,"each":"list","shape":{"item":"$item"}}}]}

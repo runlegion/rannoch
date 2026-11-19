@@ -24,7 +24,7 @@ use serde_json::{Map, Value};
 use uuid::Uuid;
 
 pub use check::{check, gather};
-pub use doc::{FlowDoc, Next, Shape, Step};
+pub use doc::{Branch, Case, FlowDoc, Next, Route, Shape, Step};
 
 /// An action's signature: its name, its typed options, what it takes, what it declares it gives,
 /// and whether it is a job. A processor crate exports its actions' signatures as data.
@@ -202,11 +202,47 @@ fn run(
     let mut outs = Vec::new();
     for step in steps {
         chain(step, actions, &mut vals)?;
-        if let Some(next) = &step.next {
-            outs.push((next.ty, doc::shaped(next, &vals), next.delay_ms));
+        if let Some(route) = &step.next {
+            outs.extend(sends(pick(route, &vals), &vals));
         }
     }
     Ok(outs)
+}
+
+/// The next `route` sends over `vals`: its one next, or the next of the branch's first case whose
+/// `when` equals the option by JSON value, or else the else next.
+fn pick<'a>(route: &'a Route, vals: &Map<String, Value>) -> &'a Next {
+    match route {
+        Route::Next(next) => next,
+        Route::Branch { branch } => {
+            let on = vals.get(&branch.on).unwrap_or(&Value::Null);
+            branch
+                .cases
+                .iter()
+                .find(|case| case.when == *on)
+                .map_or(&branch.otherwise, |case| &case.next)
+        }
+    }
+}
+
+/// What `next` sends over `vals`: one next, or with `each`, one per item of that list, the item
+/// as `item`.
+fn sends(next: &Next, vals: &Map<String, Value>) -> Vec<Out> {
+    let Some(list) = &next.each else {
+        return vec![(next.ty, doc::shaped(next, vals), next.delay_ms)];
+    };
+    let items = vals
+        .get(list)
+        .and_then(Value::as_array)
+        .map_or_default(Vec::as_slice);
+    items
+        .iter()
+        .map(|item| {
+            let mut vals = vals.clone();
+            vals.insert("item".to_owned(), item.clone());
+            (next.ty, doc::shaped(next, &vals), next.delay_ms)
+        })
+        .collect()
 }
 
 /// Runs `step`'s links on `vals`, each link's output merged into what the next link is passed,
@@ -341,7 +377,10 @@ mod tests {
 
     use rannoch_queue::Flows;
 
-    use super::{Action, Processor, Signature, Step, chain, check_gives, next, outcome, run};
+    use super::{
+        Action, Out, Processor, Route, Signature, Step, chain, check_gives, next, outcome, pick,
+        run, sends,
+    };
 
     fn obj(v: Value) -> Map<String, Value> {
         match v {
@@ -746,5 +785,95 @@ mod tests {
         assert_eq!(sent.status, Status::Added);
         assert_eq!(sent.data, json!({ "m": 1 }));
         assert_eq!(sent.run_at, Some(now + TimeDelta::milliseconds(500)));
+    }
+
+    fn route(v: Value) -> Route {
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn a_branch_sends_the_next_of_the_case_whose_when_equals_the_option_by_json_value() {
+        let level = route(json!({ "branch": { "on": "level",
+            "cases": [{ "when": 1, "next": { "ty": 31 } }], "else": { "ty": 32 } } }));
+        let ty = |vals: Value| pick(&level, &obj(vals)).ty;
+
+        assert_eq!(ty(json!({ "level": 1 })), 31);
+        assert_eq!(ty(json!({ "level": "1" })), 32, "\"1\" met when 1");
+        assert_eq!(ty(json!({ "level": 2 })), 32);
+        assert_eq!(ty(json!({})), 32);
+    }
+
+    #[test]
+    fn a_branch_takes_the_first_case_that_holds() {
+        let value = route(json!({ "branch": { "on": "value", "cases": [
+            { "when": "crash", "next": { "ty": 31 } },
+            { "when": "question", "next": { "ty": 32 } },
+            { "when": "crash", "next": { "ty": 34 } }
+        ], "else": { "ty": 33 } } }));
+        let ty = |vals: Value| pick(&value, &obj(vals)).ty;
+
+        assert_eq!(ty(json!({ "value": "crash" })), 31);
+        assert_eq!(ty(json!({ "value": "question" })), 32);
+        assert_eq!(ty(json!({ "value": "other" })), 33);
+    }
+
+    #[test]
+    fn each_sends_one_next_per_item_shaped_with_the_item() {
+        let Route::Next(words) = route(json!({ "ty": 41, "each": "list", "delay_ms": 5,
+            "shape": { "word": "$item", "n": "$n" } }))
+        else {
+            panic!("each is not a next");
+        };
+
+        assert_eq!(
+            sends(&words, &obj(json!({ "list": ["a", "b", "c"], "n": 1 }))),
+            [
+                (41, obj(json!({ "word": "a", "n": 1 })), 5),
+                (41, obj(json!({ "word": "b", "n": 1 })), 5),
+                (41, obj(json!({ "word": "c", "n": 1 })), 5),
+            ]
+        );
+        assert_eq!(
+            sends(&words, &obj(json!({ "list": [] }))),
+            Vec::<Out>::new()
+        );
+        assert_eq!(sends(&words, &obj(json!({}))), Vec::<Out>::new());
+    }
+
+    #[test]
+    fn a_flows_branch_and_each_nexts_are_each_sourced_at_the_event() {
+        let acts = actions(&[("a", json!({}))]);
+        let steps = [
+            step(json!({ "do": "a", "next": { "branch": { "on": "v",
+                "cases": [{ "when": "crash", "next": { "ty": 31 } }], "else": { "ty": 33 } } } })),
+            step(
+                json!({ "do": "a", "next": { "ty": 41, "each": "list", "shape": { "w": "$item" } } }),
+            ),
+        ];
+        let source = Uuid::now_v7();
+
+        let (sent, result): (Vec<Event<u16, Value>>, _) = outcome(
+            &steps,
+            &acts,
+            source,
+            10,
+            &json!({ "v": "crash", "list": ["a", "b"] }).to_string(),
+            Utc::now(),
+        );
+
+        assert_eq!(result, Ok(()));
+        let sent: Vec<_> = sent
+            .iter()
+            .map(|e| (e.ty, e.status, e.source, e.data.clone()))
+            .collect();
+        assert_eq!(
+            sent,
+            [
+                (31, Status::Added, Some(source), json!({})),
+                (41, Status::Added, Some(source), json!({ "w": "a" })),
+                (41, Status::Added, Some(source), json!({ "w": "b" })),
+                (10, Status::Processed, Some(source), json!("done")),
+            ]
+        );
     }
 }

@@ -1,5 +1,5 @@
 //! The flow doc: a flow names the `ty` it runs on and its steps in order; a step is a dot chain
-//! of actions, with options per link, an optional `as` and an optional next.
+//! of actions, with options per link, an optional `as` and an optional next or branch.
 
 use std::collections::BTreeMap;
 
@@ -39,13 +39,51 @@ pub struct Step {
     /// The field the step's result goes under, beside the input; with none, it is merged in.
     #[serde(default, rename = "as")]
     pub under: Option<String>,
-    /// The send that hands the step's result on; with none, the step is the end.
+    /// The send that hands the step's result on, or the branch that picks it; with none, the step
+    /// is the end.
     #[serde(default)]
-    pub next: Option<Next>,
+    pub next: Option<Route>,
+}
+
+/// Where a step's result goes: a branch, or one next.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum Route {
+    /// The next of the first case whose `when` holds, or the else next.
+    Branch {
+        /// The cases and the else.
+        branch: Branch,
+    },
+    /// One next.
+    Next(Next),
+}
+
+/// A branch: each case is a `when` on the option `on`, compared by JSON value equality, naming
+/// its next; `else` is the next when no case holds.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Branch {
+    /// The option the cases are compared with.
+    pub on: String,
+    /// The cases, in order.
+    pub cases: Vec<Case>,
+    /// The next when no case holds.
+    #[serde(rename = "else")]
+    pub otherwise: Next,
+}
+
+/// One case of a branch: when the option equals `when`, its next is sent.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Case {
+    /// The value the option must equal.
+    pub when: Value,
+    /// The next it sends.
+    pub next: Next,
 }
 
 /// A next: a new event of `ty`, its data the step's result shaped by `shape`, due after
-/// `delay_ms`.
+/// `delay_ms`; with `each`, one per item of that list, the item read as `$item`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Next {
@@ -57,6 +95,9 @@ pub struct Next {
     /// How long after the run the next is due, in milliseconds.
     #[serde(default)]
     pub delay_ms: u64,
+    /// The list option to send one next per item of.
+    #[serde(default)]
+    pub each: Option<String>,
 }
 
 /// The value of a shape expression over `vals`: `"$field"` reads a field; `{"$concat": [..]}`
@@ -97,7 +138,7 @@ pub(crate) fn shaped(next: &Next, vals: &Map<String, Value>) -> Map<String, Valu
 
 #[cfg(test)]
 mod tests {
-    use super::{FlowDoc, eval};
+    use super::{FlowDoc, Route, eval};
     use serde_json::{Map, Value, json};
 
     fn vals(v: Value) -> Map<String, Value> {
@@ -145,7 +186,36 @@ mod tests {
 
         assert_eq!(doc.steps[0].chain, "trim.upper");
         assert_eq!(doc.steps[0].under.as_deref(), Some("shout"));
-        let next = doc.steps[0].next.as_ref().unwrap();
+        let Some(Route::Next(next)) = &doc.steps[0].next else {
+            panic!("the next is not a next");
+        };
         assert_eq!((next.ty, next.delay_ms), (20, 5));
+    }
+
+    #[test]
+    fn a_step_parses_a_branch_or_a_next_with_each() {
+        let doc: FlowDoc = serde_json::from_value(json!({ "ty": 30, "steps": [
+            { "do": "a", "next": { "branch": { "on": "level",
+                "cases": [{ "when": 1, "next": { "ty": 31 } }], "else": { "ty": 32 } } } },
+            { "do": "b", "next": { "ty": 41, "each": "list", "shape": { "w": "$item" } } }
+        ] }))
+        .unwrap();
+
+        let Some(Route::Branch { branch }) = &doc.steps[0].next else {
+            panic!("step 0 is not a branch");
+        };
+        assert_eq!(
+            (
+                &branch.on,
+                &branch.cases[0].when,
+                branch.cases[0].next.ty,
+                branch.otherwise.ty
+            ),
+            (&"level".to_owned(), &json!(1), 31, 32)
+        );
+        let Some(Route::Next(next)) = &doc.steps[1].next else {
+            panic!("step 1 is not a next");
+        };
+        assert_eq!((next.ty, next.each.as_deref()), (41, Some("list")));
     }
 }

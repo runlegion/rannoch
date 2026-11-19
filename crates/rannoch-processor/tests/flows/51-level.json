@@ -1,0 +1,1 @@
+{"ty":51,"takes":{"level":"any"},"steps":[{"do":"note","next":{"branch":{"on":"level","cases":[{"when":1,"next":{"ty":31}}],"else":{"ty":33}}}}]}

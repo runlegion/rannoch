@@ -1,6 +1,7 @@
 //! FR-RANNOCH-119's scenarios, from `tests/features/lib.feature`: "rannoch-processor runs the
 //! flow for an event the queue hands it" (`@criterion-FR-RANNOCH-119-c3` to `-c5`), "A failing
-//! link fails the step, and the retry reruns the chain" (`-c6`), "An action's real output is
+//! link fails the step, and the retry reruns the chain" (`-c6`), "branch and each send their
+//! nexts" (`-c7`), "An action's real output is
 //! checked at run time" (`-c14`) and "A two-step flow sends its next only when every step
 //! succeeds" (`-c11`, `-c13`), "The app's build checks its flow docs" (`-c1`, `-c2`, `-c12`,
 //! `-c16`) and "The app's build gathers the signatures a separate processor crate exports"
@@ -46,7 +47,7 @@ impl TryFrom<u16> for Ty {
 }
 
 /// The app's flow docs, compiled in.
-const FLOWS: [&str; 8] = [
+const FLOWS: [&str; 14] = [
     include_str!("flows/10-greet.json"),
     include_str!("flows/12-shout.json"),
     include_str!("flows/15-limited.json"),
@@ -54,7 +55,13 @@ const FLOWS: [&str; 8] = [
     include_str!("flows/22-shouted.json"),
     include_str!("flows/30-rate.json"),
     include_str!("flows/31-rated.json"),
+    include_str!("flows/32-question.json"),
+    include_str!("flows/33-else.json"),
     include_str!("flows/40-two.json"),
+    include_str!("flows/41-item.json"),
+    include_str!("flows/50-value.json"),
+    include_str!("flows/51-level.json"),
+    include_str!("flows/52-list.json"),
 ];
 
 /// Every link run, in order: the action and the input it was passed.
@@ -474,6 +481,65 @@ fn a_failing_link_fails_the_step_and_the_retry_reruns_the_chain() {
             .iter()
             .any(|r| r.status == -1 && r.data == json!(failed)),
         "the retry did not run on the root's data: {again:?}"
+    );
+
+    app.stop();
+}
+
+#[test]
+fn branch_and_each_send_their_nexts() {
+    // Given an app built with a flow whose branch has a case when crash naming ty 31, a case when
+    // question naming ty 32, and an else
+    // And a flow whose branch has a case when level is the number 1, and an else
+    // And a flow whose each sends one next per item of a list
+    let app = App::start(
+        "branch_and_each_send_their_nexts",
+        Settings::new(Duration::from_millis(100)),
+    )
+    .unwrap();
+    // the nexts sent with `id` as their source, once its flow has sent its 2
+    let sent = |id: Uuid| -> Vec<(i64, Value)> {
+        assert!(until(WAIT, || app.statuses(id).contains(&2)));
+        app.about(id)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.status == 0)
+            .map(|r| (r.ty, r.data))
+            .collect()
+    };
+
+    // When the queue hands rannoch-processor an event whose value is crash, one whose value is
+    // question, and one whose value has no case
+    let crash = app.hand(50, &json!({ "value": "crash" })).unwrap();
+    let question = app.hand(50, &json!({ "value": "question" })).unwrap();
+    let other = app.hand(50, &json!({ "value": "hang" })).unwrap();
+
+    // Then one next of ty 31, one of ty 32 and one else next are sent, each with its event as
+    // source
+    assert_eq!(sent(crash), [(31, json!({}))]);
+    assert_eq!(sent(question), [(32, json!({}))]);
+    assert_eq!(sent(other), [(33, json!({}))]);
+
+    // When the queue hands rannoch-processor an event whose level is the number 1, and one whose
+    // level is the string "1"
+    let number = app.hand(51, &json!({ "level": 1 })).unwrap();
+    let string = app.hand(51, &json!({ "level": "1" })).unwrap();
+
+    // Then the first sends the case's next and the second sends the else next
+    assert_eq!(sent(number), [(31, json!({}))]);
+    assert_eq!(sent(string), [(33, json!({}))]);
+
+    // When the queue hands rannoch-processor an event whose list is 'a b c'
+    let list = app.hand(52, &json!({ "list": ["a", "b", "c"] })).unwrap();
+
+    // Then three nexts are sent, one per item, each with that event as source
+    assert_eq!(
+        sent(list),
+        [
+            (41, json!({ "item": "a" })),
+            (41, json!({ "item": "b" })),
+            (41, json!({ "item": "c" })),
+        ]
     );
 
     app.stop();

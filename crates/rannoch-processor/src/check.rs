@@ -16,7 +16,7 @@
 
 use serde_json::{Map, Value};
 
-use crate::doc::{FlowDoc, Next, Shape};
+use crate::doc::{FlowDoc, Next, Route, Shape};
 use crate::{Signature, type_of};
 
 /// The signatures the processor crates export, each export a JSON list of signatures.
@@ -119,15 +119,27 @@ fn flow_errors(
             }
             None => scope = given,
         }
-        if let Some(next) = &step.next {
+        if let Some(route) = &step.next {
             let at = format!("{file} step {index} next");
-            errors.extend(next_errors(&at, next, &scope, flows));
+            let nexts: Vec<&Next> = match route {
+                Route::Next(next) => vec![next],
+                Route::Branch { branch } => branch
+                    .cases
+                    .iter()
+                    .map(|case| &case.next)
+                    .chain([&branch.otherwise])
+                    .collect(),
+            };
+            for next in nexts {
+                errors.extend(next_errors(&at, next, &scope, flows));
+            }
         }
     }
     errors
 }
 
-/// Every error in `next`, sent with the fields `scope` holds, among `flows`.
+/// Every error in `next`, sent with the fields `scope` holds, among `flows`; with `each`, `item`
+/// is in scope as the type of that list's items.
 fn next_errors(at: &str, next: &Next, scope: &Shape, flows: &[(&str, FlowDoc)]) -> Vec<String> {
     let Some((to, receiving)) = flows.iter().find(|(_, f)| f.ty == next.ty) else {
         return vec![format!(
@@ -135,10 +147,23 @@ fn next_errors(at: &str, next: &Next, scope: &Shape, flows: &[(&str, FlowDoc)]) 
             next.ty
         )];
     };
+    let mut scope = scope.clone();
+    let item = next
+        .each
+        .as_ref()
+        .and_then(|list| scope.get(list))
+        .and_then(|ty| {
+            ty.strip_prefix("list<")
+                .and_then(|ty| ty.strip_suffix('>'))
+                .map(str::to_owned)
+        });
+    if let Some(item) = item {
+        scope.insert("item".to_owned(), item);
+    }
     let mut errors = Vec::new();
     let mut shaped = Shape::new();
     for (field, expr) in &next.shape {
-        match type_expr(expr, scope) {
+        match type_expr(expr, &scope) {
             Ok(ty) => {
                 shaped.insert(field.clone(), ty);
             }
@@ -489,6 +514,52 @@ mod tests {
             gather(&[&json!([{ "action": "a", "gave": {} }]).to_string()])
                 .unwrap_err()
                 .starts_with("signatures do not parse")
+        );
+    }
+
+    #[test]
+    fn every_next_of_a_branch_is_checked() {
+        let found = errors(
+            json!({ "ty": 1, "takes": { "text": "string", "v": "string" },
+            "steps": [{ "do": "trim", "next": { "branch": { "on": "v", "cases": [
+                { "when": "crash", "next": { "ty": 20, "shape": { "msg": "$text", "who": "x" } } },
+                { "when": "question", "next": { "ty": 99 } }
+            ], "else": { "ty": 20, "shape": { "msg": "$text" } } } } }] }),
+        );
+
+        assert_eq!(
+            found,
+            [
+                "E7 a.json step 0 next: next to ty 99, which no flow takes",
+                "E5 a.json step 0 next: next to 20-notice.json gives no who, which it takes",
+            ]
+        );
+    }
+
+    #[test]
+    fn each_puts_item_in_scope_as_the_type_of_its_lists_items() {
+        let each = |list: &str| {
+            errors(
+                json!({ "ty": 1, "takes": { "text": "string", "words": list, "n": "number" },
+                "steps": [{ "do": "trim", "next": { "ty": 20, "each": "words",
+                    "shape": { "msg": "$item", "who": "x" } } }] }),
+            )
+        };
+
+        assert!(
+            each("list<string>").is_empty(),
+            "{:?}",
+            each("list<string>")
+        );
+        assert_eq!(
+            each("list<number>"),
+            ["E6 a.json step 0 next: next to 20-notice.json gives msg as number, it takes string"]
+        );
+        assert_eq!(
+            each("string"),
+            [
+                "E5 a.json step 0 next: next to 20-notice.json field msg: $item names nothing in scope"
+            ]
         );
     }
 }
