@@ -1,11 +1,13 @@
 //! FR-RANNOCH-119's scenarios, from `tests/features/lib.feature`: "rannoch-processor runs the
 //! flow for an event the queue hands it" (`@criterion-FR-RANNOCH-119-c3` to `-c5`), "A failing
-//! link fails the step, and the retry reruns the chain" (`-c6`) and "An action's real output is
-//! checked at run time" (`-c14`). The store is the app's database opened through the real store,
+//! link fails the step, and the retry reruns the chain" (`-c6`), "An action's real output is
+//! checked at run time" (`-c14`) and "A two-step flow sends its next only when every step
+//! succeeds" (`-c11`, `-c13`). The store is the app's database opened through the real store,
 //! its events from the app's forgr factory, handed over by the real queue; the app's flow docs are
 //! compiled in from `tests/flows`, and the test processor crate's actions are fakes.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -38,7 +40,7 @@ impl TryFrom<u16> for Ty {
 }
 
 /// The app's flow docs, compiled in.
-const FLOWS: [&str; 7] = [
+const FLOWS: [&str; 8] = [
     include_str!("flows/10-greet.json"),
     include_str!("flows/12-shout.json"),
     include_str!("flows/15-limited.json"),
@@ -46,6 +48,7 @@ const FLOWS: [&str; 7] = [
     include_str!("flows/22-shouted.json"),
     include_str!("flows/30-rate.json"),
     include_str!("flows/31-rated.json"),
+    include_str!("flows/40-two.json"),
 ];
 
 /// Every link run, in order: the action and the input it was passed.
@@ -96,7 +99,8 @@ fn text(input: &Map<String, Value>) -> String {
         .to_owned()
 }
 
-/// The test processor crate: trim, upper, greet, limit, note and rate.
+/// The test processor crate: trim, upper, greet, limit, note, rate and classify, which fails on
+/// its first run and succeeds on every run after.
 fn actions(calls: &Calls, rating: &Rating) -> Vec<Arc<dyn Action>> {
     let fake = |name: &str, gives: Value, act: Act| -> Arc<dyn Action> {
         let gives = obj(gives)
@@ -113,6 +117,7 @@ fn actions(calls: &Calls, rating: &Rating) -> Vec<Arc<dyn Action>> {
         })
     };
     let rating = rating.clone();
+    let runs = Arc::new(AtomicUsize::new(0));
     vec![
         fake(
             "trim",
@@ -149,6 +154,16 @@ fn actions(calls: &Calls, rating: &Rating) -> Vec<Arc<dyn Action>> {
             "rate",
             json!({ "severity": "number" }),
             Box::new(move |_, _| Ok(rating.lock().map_or_default(|r| r.clone()))),
+        ),
+        fake(
+            "classify",
+            json!({ "category": "string" }),
+            Box::new(move |_, _| {
+                if runs.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err("classify: no answer".to_owned());
+                }
+                Ok(obj(json!({ "category": "bug" })))
+            }),
         ),
     ]
 }
@@ -502,6 +517,88 @@ fn an_actions_real_output_is_checked_at_run_time() {
         "{:?}",
         rows[1].data
     );
+
+    app.stop();
+}
+
+#[test]
+fn a_two_step_flow_sends_its_next_only_when_every_step_succeeds() {
+    // Given an app built with a two-step flow whose step 0 sends a next and whose step 1 runs a
+    // test action that fails on the first attempt and succeeds on the next
+    let app = App::start(
+        "a_two_step_flow_sends_its_next",
+        Settings {
+            attempts: 2,
+            ..Settings::new(Duration::from_millis(100))
+        },
+    )
+    .unwrap();
+
+    // When the queue hands rannoch-processor an event of that flow
+    let event = app.hand(40, &json!({ "text": "  sam " })).unwrap();
+
+    // Then step 1 is passed the options step 0 gave
+    assert!(until(WAIT, || app.statuses(event).contains(&-1)));
+    let calls = app.calls();
+    assert_eq!(names(&calls), ["trim", "classify"]);
+    assert_eq!(calls[1].1["text"], json!("sam"));
+
+    // And the processor sends one -1 for the event, and no next
+    let failed = "classify: no answer";
+    let rows = app.about(event).unwrap();
+    let ones: Vec<&Value> = rows
+        .iter()
+        .filter(|r| r.status == -1)
+        .map(|r| &r.data)
+        .collect();
+    assert_eq!(ones, [&json!(failed)]);
+    assert!(!rows.iter().any(|r| r.status == 2));
+    // the only 0 is the queue's retry, of the event's own ty
+    let zeros: Vec<&About> = rows.iter().filter(|r| r.status == 0).collect();
+    assert!(
+        zeros.iter().all(|r| r.ty == 40 && r.data == json!(failed)),
+        "a next was sent: {zeros:?}"
+    );
+
+    // When the queue's retry of the event comes due
+    assert!(until(WAIT, || app
+        .about(event)
+        .unwrap()
+        .iter()
+        .any(|r| r.status == 0)));
+    let retry = app
+        .about(event)
+        .unwrap()
+        .into_iter()
+        .find(|r| r.status == 0)
+        .unwrap()
+        .id;
+
+    // Then step 0's next is sent, and the processor sends its 2
+    assert!(until(WAIT, || app.statuses(retry).contains(&2)));
+    // the next's own flow, notice, may already have run its note
+    assert_eq!(
+        names(&app.calls())[..4],
+        ["trim", "classify", "trim", "classify"]
+    );
+    let rows = app.about(retry).unwrap();
+    let sent: Vec<(i64, &Value)> = rows
+        .iter()
+        .filter(|r| r.status == 0)
+        .map(|r| (r.ty, &r.data))
+        .collect();
+    assert_eq!(sent, [(20, &json!({ "msg": "sam", "who": "two" }))]);
+
+    // And across both attempts exactly one next was sent
+    let nexts = app
+        .read
+        .query_row(
+            "SELECT count(*) FROM _events WHERE ty = 20 AND status = 0",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap();
+    assert_eq!(nexts, 1, "one next across both attempts");
 
     app.stop();
 }

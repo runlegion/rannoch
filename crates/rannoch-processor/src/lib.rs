@@ -594,6 +594,50 @@ mod tests {
     }
 
     #[test]
+    fn a_later_steps_failure_sends_no_earlier_steps_next() {
+        let acts = actions(&[("a", json!({})), ("b", json!({}))]);
+        let steps = [
+            step(json!({ "do": "a", "next": { "ty": 20 } })),
+            step(json!({ "do": "b", "with": { "b": { "fail": true } } })),
+        ];
+        let source = Uuid::now_v7();
+
+        let (sent, result): (Vec<Event<u16, Value>>, _) =
+            outcome(&steps, &acts, source, 10, "{}", Utc::now());
+
+        assert_eq!(result, Err("b failed".to_owned()));
+        let sent: Vec<_> = sent.iter().map(|e| (e.ty, e.status)).collect();
+        assert_eq!(sent, [(10, Status::Binned)]);
+    }
+
+    #[test]
+    fn options_carry_from_step_to_step_and_each_steps_next_is_sent_after_the_last() {
+        let acts = actions(&[("a", json!({ "x": 1 })), ("b", json!({}))]);
+        let steps = [
+            step(json!({ "do": "a", "next": { "ty": 20, "shape": { "x": "$x" } } })),
+            step(json!({ "do": "b" })),
+        ];
+
+        let outs = run(&steps, &acts, Map::new()).unwrap();
+
+        assert_eq!(outs, [(20, obj(json!({ "x": 1 })), 0)]);
+        let (sent, result): (Vec<Event<u16, Value>>, _) =
+            outcome(&steps, &acts, Uuid::now_v7(), 10, "{}", Utc::now());
+        assert_eq!(result, Ok(()));
+        let sent: Vec<_> = sent.iter().map(|e| (e.ty, e.status)).collect();
+        assert_eq!(sent, [(20, Status::Added), (10, Status::Processed)]);
+        let mut vals = Map::new();
+        for s in &steps {
+            chain(s, &acts, &mut vals).unwrap();
+        }
+        assert_eq!(
+            vals["b_saw"]["x"],
+            json!(1),
+            "step 1 was not passed step 0's options"
+        );
+    }
+
+    #[test]
     fn a_root_whose_data_is_not_a_json_object_is_refused_with_one_minus_1() {
         let calls = Calls::default();
         let acts = recorded(&[("a", json!({}))], &calls);
