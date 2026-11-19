@@ -148,7 +148,7 @@ fn actions(calls: &Calls, rating: &Rating) -> Vec<Arc<dyn Action>> {
         fake(
             "rate",
             json!({ "severity": "number" }),
-            Box::new(move |_, _| Ok(rating.lock().map(|r| r.clone()).unwrap_or_default())),
+            Box::new(move |_, _| Ok(rating.lock().map_or_default(|r| r.clone()))),
         ),
     ]
 }
@@ -267,7 +267,7 @@ impl App {
     }
 
     fn calls(&self) -> Vec<(String, Map<String, Value>)> {
-        self.calls.lock().map(|c| c.clone()).unwrap_or_default()
+        self.calls.lock().map_or_default(|c| c.clone())
     }
 
     fn stop(self) {

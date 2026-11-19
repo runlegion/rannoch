@@ -118,38 +118,57 @@ where
     T: TryFrom<u16> + PartialEq,
     D: From<Value>,
 {
-    let ty = T::try_from(event.ty).map_err(|_| format!("ty {} is not the app's", event.ty))?;
-    let now = Utc::now();
-    let data = match serde_json::from_str(&root.data) {
-        Ok(Value::Object(data)) => data,
-        _ => Map::new(),
+    let (events, result) = outcome(steps, actions, event.id, event.ty, &root.data, Utc::now());
+    for event in events {
+        send(sender, event);
+    }
+    result
+}
+
+/// What running `steps` on the event `source` of `ty`, whose root's data is `root`, sends at
+/// `now`: one -1 when the root's data is not a JSON object or a step fails, otherwise every
+/// next, then the 2; and the failure, if any.
+fn outcome<T, D>(
+    steps: &[Step],
+    actions: &HashMap<String, Arc<dyn Action>>,
+    source: Uuid,
+    ty: u16,
+    root: &str,
+    now: DateTime<Utc>,
+) -> (Vec<Event<T, D>>, Result<(), String>)
+where
+    T: TryFrom<u16>,
+    D: From<Value>,
+{
+    let Ok(event_ty) = T::try_from(ty) else {
+        return (Vec::new(), Err(format!("ty {ty} is not the app's")));
     };
-    let nexts = run(steps, actions, data).and_then(|outs| {
+    let nexts = match serde_json::from_str(root) {
+        Ok(Value::Object(data)) => run(steps, actions, data),
+        _ => Err("root data is not a JSON object".to_owned()),
+    }
+    .and_then(|outs| {
         outs.into_iter()
             .map(|(next_ty, data, delay)| {
                 let next_ty = T::try_from(next_ty)
                     .map_err(|_| format!("next ty {next_ty} is not the app's"))?;
-                Ok(next(event.id, next_ty, data, now, delay))
+                Ok(next(source, next_ty, data, now, delay))
             })
             .collect::<Result<Vec<_>, String>>()
     });
     match nexts {
-        Err(failure) => {
-            send(
-                sender,
-                status(event.id, ty, failure.clone(), Status::Binned),
-            );
-            Err(failure)
-        }
-        Ok(nexts) => {
-            for next in nexts {
-                send(sender, next);
-            }
-            send(
-                sender,
-                status(event.id, ty, "done".to_owned(), Status::Processed),
-            );
-            Ok(())
+        Err(failure) => (
+            vec![status(source, event_ty, failure.clone(), Status::Binned)],
+            Err(failure),
+        ),
+        Ok(mut events) => {
+            events.push(status(
+                source,
+                event_ty,
+                "done".to_owned(),
+                Status::Processed,
+            ));
+            (events, Ok(()))
         }
     }
 }
@@ -211,7 +230,7 @@ fn check(out: &Map<String, Value>, gives: &Shape, action: &str) -> Result<(), St
     for (field, declared) in gives {
         match out.get(field) {
             None => return Err(format!("{action} gave no {field}")),
-            Some(value) if type_of(value) != declared => {
+            Some(value) if !matches(value, declared) => {
                 return Err(format!(
                     "{action} gave {field} as {}, not {declared}",
                     type_of(value)
@@ -221,6 +240,16 @@ fn check(out: &Map<String, Value>, gives: &Shape, action: &str) -> Result<(), St
         }
     }
     Ok(())
+}
+
+/// Whether `value` is of the `declared` type: `any` matches every value, and an empty list
+/// matches either list type.
+fn matches(value: &Value, declared: &str) -> bool {
+    match value {
+        _ if declared == "any" => true,
+        Value::Array(items) if items.is_empty() => declared.starts_with("list<"),
+        _ => type_of(value) == declared,
+    }
 }
 
 /// The type of a JSON value, in the signature vocabulary.
@@ -285,14 +314,14 @@ fn send<T: PartialEq, D>(sender: &Sender<T, D>, event: Event<T, D>) {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use chrono::{TimeDelta, Utc};
     use rannoch_core::{Event, Status};
     use serde_json::{Map, Value, json};
     use uuid::Uuid;
 
-    use super::{Action, Signature, Step, chain, check, next, run};
+    use super::{Action, Signature, Step, chain, check, next, outcome, run};
 
     fn obj(v: Value) -> Map<String, Value> {
         match v {
@@ -301,10 +330,15 @@ mod tests {
         }
     }
 
-    /// An action that gives `out`, and a marker of what it was passed.
+    /// The names of the actions run, in order.
+    type Calls = Arc<Mutex<Vec<String>>>;
+
+    /// An action that gives `out`, and a marker of what it was passed; each run is recorded in
+    /// `calls`.
     struct Gives {
         sig: Signature,
         out: Value,
+        calls: Calls,
     }
     impl Action for Gives {
         fn signature(&self) -> &Signature {
@@ -315,6 +349,9 @@ mod tests {
             options: &Value,
             input: &Map<String, Value>,
         ) -> Result<Map<String, Value>, String> {
+            if let Ok(mut calls) = self.calls.lock() {
+                calls.push(self.sig.action.clone());
+            }
             let mut out = obj(self.out.clone());
             out.insert(
                 format!("{}_saw", self.sig.action),
@@ -328,6 +365,10 @@ mod tests {
     }
 
     fn actions(list: &[(&str, Value)]) -> HashMap<String, Arc<dyn Action>> {
+        recorded(list, &Calls::default())
+    }
+
+    fn recorded(list: &[(&str, Value)], calls: &Calls) -> HashMap<String, Arc<dyn Action>> {
         list.iter()
             .map(|(name, out)| {
                 let action: Arc<dyn Action> = Arc::new(Gives {
@@ -339,6 +380,7 @@ mod tests {
                             .collect(),
                     },
                     out: out.clone(),
+                    calls: calls.clone(),
                 });
                 ((*name).to_owned(), action)
             })
@@ -370,7 +412,11 @@ mod tests {
 
     #[test]
     fn a_failing_link_stops_the_chain() {
-        let acts = actions(&[("a", json!({})), ("b", json!({})), ("c", json!({}))]);
+        let calls = Calls::default();
+        let acts = recorded(
+            &[("a", json!({})), ("b", json!({})), ("c", json!({}))],
+            &calls,
+        );
         let mut vals = Map::new();
 
         let failed = chain(
@@ -383,6 +429,11 @@ mod tests {
         assert!(
             vals.is_empty(),
             "the step's options were kept after a failure"
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            ["a", "b"],
+            "a link ran after b failed"
         );
     }
 
@@ -427,6 +478,155 @@ mod tests {
             check(&obj(json!({ "severity": "2" })), &gives, "rate"),
             Err("rate gave severity as string, not number".to_owned())
         );
+    }
+
+    fn declares(v: Value) -> super::Shape {
+        obj(v)
+            .into_iter()
+            .map(|(k, v)| (k, v.as_str().unwrap_or_default().to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn a_field_declared_any_takes_every_value() {
+        let gives = declares(json!({ "v": "any" }));
+
+        for v in [
+            json!("s"),
+            json!(1),
+            json!(true),
+            json!([1]),
+            json!({}),
+            json!(null),
+        ] {
+            assert_eq!(check(&obj(json!({ "v": v })), &gives, "a"), Ok(()), "{v}");
+        }
+    }
+
+    #[test]
+    fn a_bool_is_checked_as_a_bool() {
+        let gives = declares(json!({ "v": "bool" }));
+
+        assert_eq!(check(&obj(json!({ "v": true })), &gives, "a"), Ok(()));
+        assert_eq!(
+            check(&obj(json!({ "v": 1 })), &gives, "a"),
+            Err("a gave v as number, not bool".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_list_is_checked_by_what_it_holds_and_an_empty_list_is_either() {
+        let numbers = declares(json!({ "v": "list<number>" }));
+        let strings = declares(json!({ "v": "list<string>" }));
+
+        assert_eq!(check(&obj(json!({ "v": [1, 2] })), &numbers, "a"), Ok(()));
+        assert_eq!(check(&obj(json!({ "v": ["x"] })), &strings, "a"), Ok(()));
+        assert_eq!(check(&obj(json!({ "v": [] })), &numbers, "a"), Ok(()));
+        assert_eq!(check(&obj(json!({ "v": [] })), &strings, "a"), Ok(()));
+        assert_eq!(
+            check(&obj(json!({ "v": ["x"] })), &numbers, "a"),
+            Err("a gave v as list<string>, not list<number>".to_owned())
+        );
+        assert_eq!(
+            check(&obj(json!({ "v": [1] })), &strings, "a"),
+            Err("a gave v as list<number>, not list<string>".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_flow_that_runs_sends_its_nexts_then_its_2() {
+        let acts = actions(&[("a", json!({ "greeting": "hi" }))]);
+        let steps = [step(json!({
+            "do": "a",
+            "next": { "ty": 20, "delay_ms": 500, "shape": { "msg": { "$concat": ["$greeting", "!"] } } }
+        }))];
+        let (source, now) = (Uuid::now_v7(), Utc::now());
+
+        let (sent, result): (Vec<Event<u16, Value>>, _) =
+            outcome(&steps, &acts, source, 10, &json!({}).to_string(), now);
+
+        assert_eq!(result, Ok(()));
+        let sent: Vec<_> = sent
+            .iter()
+            .map(|e| (e.ty, e.status, e.source, e.data.clone(), e.run_at))
+            .collect();
+        assert_eq!(
+            sent,
+            [
+                (
+                    20,
+                    Status::Added,
+                    Some(source),
+                    json!({ "msg": "hi!" }),
+                    Some(now + TimeDelta::milliseconds(500))
+                ),
+                (10, Status::Processed, Some(source), json!("done"), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_flow_that_fails_sends_one_minus_1_and_no_next() {
+        let acts = actions(&[("a", json!({}))]);
+        let steps = [step(json!({
+            "do": "a", "with": { "a": { "fail": true } }, "next": { "ty": 20 }
+        }))];
+        let source = Uuid::now_v7();
+
+        let (sent, result): (Vec<Event<u16, Value>>, _) = outcome(
+            &steps,
+            &acts,
+            source,
+            10,
+            &json!({}).to_string(),
+            Utc::now(),
+        );
+
+        assert_eq!(result, Err("a failed".to_owned()));
+        let sent: Vec<_> = sent
+            .iter()
+            .map(|e| (e.ty, e.status, e.source, e.data.clone()))
+            .collect();
+        assert_eq!(
+            sent,
+            [(10, Status::Binned, Some(source), json!("a failed"))]
+        );
+    }
+
+    #[test]
+    fn a_root_whose_data_is_not_a_json_object_is_refused_with_one_minus_1() {
+        let calls = Calls::default();
+        let acts = recorded(&[("a", json!({}))], &calls);
+        let steps = [step(json!({ "do": "a", "next": { "ty": 20 } }))];
+        let source = Uuid::now_v7();
+
+        let (sent, result): (Vec<Event<u16, Value>>, _) = outcome(
+            &steps,
+            &acts,
+            source,
+            10,
+            &json!("hung").to_string(),
+            Utc::now(),
+        );
+
+        let refused = "root data is not a JSON object".to_owned();
+        assert_eq!(result, Err(refused.clone()));
+        let sent: Vec<_> = sent.iter().map(|e| (e.status, e.data.clone())).collect();
+        assert_eq!(sent, [(Status::Binned, json!(refused))]);
+        assert!(calls.lock().unwrap().is_empty(), "the flow ran on no data");
+    }
+
+    #[test]
+    fn a_next_whose_ty_is_not_the_apps_fails_the_flow() {
+        let acts = actions(&[("a", json!({}))]);
+        let steps = [step(json!({ "do": "a", "next": { "ty": 300 } }))];
+
+        let (sent, result): (Vec<Event<u8, Value>>, _) =
+            outcome(&steps, &acts, Uuid::now_v7(), 10, "{}", Utc::now());
+
+        assert_eq!(result, Err("next ty 300 is not the app's".to_owned()));
+        let sent: Vec<_> = sent.iter().map(|e| (e.ty, e.status)).collect();
+        assert_eq!(sent, [(10, Status::Binned)]);
     }
 
     #[test]

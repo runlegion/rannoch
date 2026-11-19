@@ -65,10 +65,7 @@ pub(crate) fn eval(expr: &Value, vals: &Map<String, Value>) -> Value {
             vals.get(&field[1..]).cloned().unwrap_or(Value::Null)
         }
         Value::Object(o) if o.contains_key("$concat") => {
-            let parts = o["$concat"]
-                .as_array()
-                .map(Vec::as_slice)
-                .unwrap_or_default();
+            let parts = o["$concat"].as_array().map_or_default(Vec::as_slice);
             Value::String(
                 parts
                     .iter()
