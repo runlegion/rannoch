@@ -1,0 +1,456 @@
+//! rannoch-processor runs the app's flows. The app compiles its flow docs in and hands them, with
+//! the actions of the processor crates it uses, to [`Processor::new`]; the queue hands each event
+//! to the flow for its `ty` through [`Flows`]. A step's chain runs its links within the one
+//! event, each link's output merged into the options passed on, the later winning, every link
+//! reading the root's data; each action's real output is checked against what it declares it
+//! gives. A failing link sends one -1 and nothing more; otherwise the flow's nexts are sent, then
+//! its 2.
+
+mod doc;
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use chrono::{DateTime, TimeDelta, Utc};
+use rannoch_core::{Event, Sender, Status};
+use rannoch_queue::{Flow, Flows, Row};
+use serde::Deserialize;
+use serde_json::{Map, Value};
+use uuid::Uuid;
+
+pub use doc::{FlowDoc, Next, Shape, Step};
+
+/// An action's signature: its name, and what it declares it gives.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Signature {
+    /// The name a step's chain calls it by.
+    pub action: String,
+    /// Each field its output gives, with the field's type.
+    #[serde(default)]
+    pub gives: Shape,
+}
+
+/// One processor action, from a processor crate the app uses.
+pub trait Action: Send + Sync {
+    /// The action's signature.
+    fn signature(&self) -> &Signature;
+
+    /// Runs the action with its own `options` from the step, on `input`: the root's data with the
+    /// options the links before it gave merged over it.
+    ///
+    /// # Errors
+    ///
+    /// The failure, which fails the step.
+    fn run(
+        &self,
+        options: &Value,
+        input: &Map<String, Value>,
+    ) -> Result<Map<String, Value>, String>;
+}
+
+/// The app's flows, compiled in, run by `ty`.
+pub struct Processor<T, D> {
+    flows: HashMap<u16, Arc<Flow<T, D>>>,
+}
+
+impl<T, D> std::fmt::Debug for Processor<T, D> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Processor")
+            .field("flows", &self.flows.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+impl<T, D> Processor<T, D>
+where
+    T: TryFrom<u16> + PartialEq + 'static,
+    D: From<Value> + 'static,
+{
+    /// The processor for the flow docs `docs`, each a flow doc's JSON text, over `actions`.
+    ///
+    /// # Errors
+    ///
+    /// The doc that does not parse, and why.
+    pub fn new(docs: &[&str], actions: Vec<Arc<dyn Action>>) -> Result<Self, String> {
+        let actions: Arc<HashMap<String, Arc<dyn Action>>> = Arc::new(
+            actions
+                .into_iter()
+                .map(|a| (a.signature().action.clone(), a))
+                .collect(),
+        );
+        let mut flows = HashMap::new();
+        for text in docs {
+            let doc: FlowDoc =
+                serde_json::from_str(text).map_err(|err| format!("a flow doc: {err}"))?;
+            let ty = doc.ty;
+            let actions = actions.clone();
+            let flow = Flow {
+                job: false,
+                run: Box::new(move |event: &Row, root: &Row, sender: &Sender<T, D>| {
+                    process(&doc.steps, &actions, event, root, sender)
+                }),
+            };
+            flows.insert(ty, Arc::new(flow));
+        }
+        Ok(Self { flows })
+    }
+}
+
+impl<T, D> Flows<T, D> for Processor<T, D> {
+    fn flow(&self, ty: u16) -> Option<Arc<Flow<T, D>>> {
+        self.flows.get(&ty).cloned()
+    }
+}
+
+/// A next to send: its `ty`, its data and its delay.
+type Out = (u16, Map<String, Value>, u64);
+
+/// Runs `steps` on `event`, whose root is `root`, and sends the result: one -1 when a step
+/// fails, otherwise every next, then the 2.
+fn process<T, D>(
+    steps: &[Step],
+    actions: &HashMap<String, Arc<dyn Action>>,
+    event: &Row,
+    root: &Row,
+    sender: &Sender<T, D>,
+) -> Result<(), String>
+where
+    T: TryFrom<u16> + PartialEq,
+    D: From<Value>,
+{
+    let ty = T::try_from(event.ty).map_err(|_| format!("ty {} is not the app's", event.ty))?;
+    let now = Utc::now();
+    let data = match serde_json::from_str(&root.data) {
+        Ok(Value::Object(data)) => data,
+        _ => Map::new(),
+    };
+    let nexts = run(steps, actions, data).and_then(|outs| {
+        outs.into_iter()
+            .map(|(next_ty, data, delay)| {
+                let next_ty = T::try_from(next_ty)
+                    .map_err(|_| format!("next ty {next_ty} is not the app's"))?;
+                Ok(next(event.id, next_ty, data, now, delay))
+            })
+            .collect::<Result<Vec<_>, String>>()
+    });
+    match nexts {
+        Err(failure) => {
+            send(
+                sender,
+                status(event.id, ty, failure.clone(), Status::Binned),
+            );
+            Err(failure)
+        }
+        Ok(nexts) => {
+            for next in nexts {
+                send(sender, next);
+            }
+            send(
+                sender,
+                status(event.id, ty, "done".to_owned(), Status::Processed),
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Runs `steps` in order on the root's `data`, the options carrying from step to step; the
+/// nexts to send, or the first failure.
+fn run(
+    steps: &[Step],
+    actions: &HashMap<String, Arc<dyn Action>>,
+    data: Map<String, Value>,
+) -> Result<Vec<Out>, String> {
+    let mut vals = data;
+    let mut outs = Vec::new();
+    for step in steps {
+        chain(step, actions, &mut vals)?;
+        if let Some(next) = &step.next {
+            outs.push((next.ty, doc::shaped(next, &vals), next.delay_ms));
+        }
+    }
+    Ok(outs)
+}
+
+/// Runs `step`'s links on `vals`, each link's output merged into what the next link is passed,
+/// the later winning; the step's result is merged into `vals`, or put under its `as`. A failing
+/// link fails the step and no later link runs.
+fn chain(
+    step: &Step,
+    actions: &HashMap<String, Arc<dyn Action>>,
+    vals: &mut Map<String, Value>,
+) -> Result<(), String> {
+    let mut input = vals.clone();
+    let mut result = Map::new();
+    for link in step.chain.split('.') {
+        let action = actions
+            .get(link)
+            .ok_or_else(|| format!("no action named {link}"))?;
+        let options = step
+            .with
+            .get(link)
+            .cloned()
+            .unwrap_or_else(|| Value::Object(Map::new()));
+        let out = action.run(&options, &input)?;
+        check(&out, &action.signature().gives, link)?;
+        input.extend(out.clone());
+        result.extend(out);
+    }
+    match &step.under {
+        Some(field) => {
+            vals.insert(field.clone(), Value::Object(result));
+        }
+        None => *vals = input,
+    }
+    Ok(())
+}
+
+/// Whether `out`, the real output of `action`, gives every field it declares in `gives`, each
+/// of its declared type; the mismatch names the field.
+fn check(out: &Map<String, Value>, gives: &Shape, action: &str) -> Result<(), String> {
+    for (field, declared) in gives {
+        match out.get(field) {
+            None => return Err(format!("{action} gave no {field}")),
+            Some(value) if type_of(value) != declared => {
+                return Err(format!(
+                    "{action} gave {field} as {}, not {declared}",
+                    type_of(value)
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// The type of a JSON value, in the signature vocabulary.
+fn type_of(value: &Value) -> &'static str {
+    match value {
+        Value::String(_) => "string",
+        Value::Number(_) => "number",
+        Value::Bool(_) => "bool",
+        Value::Array(items) if !items.is_empty() && items.iter().all(Value::is_number) => {
+            "list<number>"
+        }
+        Value::Array(_) => "list<string>",
+        Value::Object(_) | Value::Null => "any",
+    }
+}
+
+/// A next: a new event whose data is `data`, whose source is `source`, at status 0, due `delay`
+/// milliseconds after `now`.
+fn next<T, D: From<Value>>(
+    source: Uuid,
+    ty: T,
+    data: Map<String, Value>,
+    now: DateTime<Utc>,
+    delay: u64,
+) -> Event<T, D> {
+    let delay = i64::try_from(delay)
+        .ok()
+        .and_then(TimeDelta::try_milliseconds)
+        .unwrap_or(TimeDelta::MAX);
+    Event {
+        id: Uuid::nil(),
+        source: Some(source),
+        ty,
+        data: D::from(Value::Object(data)),
+        run_at: Some(
+            now.checked_add_signed(delay)
+                .unwrap_or(DateTime::<Utc>::MAX_UTC),
+        ),
+        status: Status::Added,
+    }
+}
+
+/// The processor's status event about `source`, with `message` as its data.
+fn status<T, D: From<Value>>(source: Uuid, ty: T, message: String, status: Status) -> Event<T, D> {
+    Event {
+        id: Uuid::nil(),
+        source: Some(source),
+        ty,
+        data: D::from(Value::String(message)),
+        run_at: None,
+        status,
+    }
+}
+
+fn send<T: PartialEq, D>(sender: &Sender<T, D>, event: Event<T, D>) {
+    let source = event.source;
+    if sender.send(event).is_err() {
+        log::error!("the processor could not send about {source:?}: rannoch is closed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use chrono::{TimeDelta, Utc};
+    use rannoch_core::{Event, Status};
+    use serde_json::{Map, Value, json};
+    use uuid::Uuid;
+
+    use super::{Action, Signature, Step, chain, check, next, run};
+
+    fn obj(v: Value) -> Map<String, Value> {
+        match v {
+            Value::Object(m) => m,
+            _ => Map::new(),
+        }
+    }
+
+    /// An action that gives `out`, and a marker of what it was passed.
+    struct Gives {
+        sig: Signature,
+        out: Value,
+    }
+    impl Action for Gives {
+        fn signature(&self) -> &Signature {
+            &self.sig
+        }
+        fn run(
+            &self,
+            options: &Value,
+            input: &Map<String, Value>,
+        ) -> Result<Map<String, Value>, String> {
+            let mut out = obj(self.out.clone());
+            out.insert(
+                format!("{}_saw", self.sig.action),
+                Value::Object(input.clone()),
+            );
+            if !options.is_null() && options.get("fail").is_some() {
+                return Err(format!("{} failed", self.sig.action));
+            }
+            Ok(out)
+        }
+    }
+
+    fn actions(list: &[(&str, Value)]) -> HashMap<String, Arc<dyn Action>> {
+        list.iter()
+            .map(|(name, out)| {
+                let action: Arc<dyn Action> = Arc::new(Gives {
+                    sig: Signature {
+                        action: (*name).to_owned(),
+                        gives: obj(out.clone())
+                            .keys()
+                            .map(|k| (k.clone(), super::type_of(&out[k]).to_owned()))
+                            .collect(),
+                    },
+                    out: out.clone(),
+                });
+                ((*name).to_owned(), action)
+            })
+            .collect()
+    }
+
+    fn step(v: Value) -> Step {
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn each_link_is_passed_the_root_and_what_the_links_before_it_gave_the_later_winning() {
+        let acts = actions(&[
+            ("a", json!({ "x": 1, "y": 1 })),
+            ("b", json!({ "y": 2 })),
+            ("c", json!({})),
+        ]);
+        let mut vals = obj(json!({ "root": "r" }));
+
+        chain(&step(json!({ "do": "a.b.c" })), &acts, &mut vals).unwrap();
+
+        let saw = &vals["c_saw"];
+        assert_eq!(
+            (&saw["root"], &saw["x"], &saw["y"]),
+            (&json!("r"), &json!(1), &json!(2))
+        );
+        assert_eq!(vals["a_saw"], json!({ "root": "r" }));
+    }
+
+    #[test]
+    fn a_failing_link_stops_the_chain() {
+        let acts = actions(&[("a", json!({})), ("b", json!({})), ("c", json!({}))]);
+        let mut vals = Map::new();
+
+        let failed = chain(
+            &step(json!({ "do": "a.b.c", "with": { "b": { "fail": true } } })),
+            &acts,
+            &mut vals,
+        );
+
+        assert_eq!(failed, Err("b failed".to_owned()));
+        assert!(
+            vals.is_empty(),
+            "the step's options were kept after a failure"
+        );
+    }
+
+    #[test]
+    fn as_puts_the_result_under_its_field_and_keeps_the_input() {
+        let acts = actions(&[("a", json!({ "text": "SAM" }))]);
+        let mut vals = obj(json!({ "text": "sam" }));
+
+        chain(&step(json!({ "do": "a", "as": "shout" })), &acts, &mut vals).unwrap();
+
+        assert_eq!(vals["text"], json!("sam"));
+        assert_eq!(vals["shout"]["text"], json!("SAM"));
+    }
+
+    #[test]
+    fn a_link_naming_no_action_fails_the_step() {
+        let failed = chain(
+            &step(json!({ "do": "nope" })),
+            &HashMap::new(),
+            &mut Map::new(),
+        );
+
+        assert_eq!(failed, Err("no action named nope".to_owned()));
+    }
+
+    #[test]
+    fn real_output_is_checked_against_what_the_action_declares_it_gives() {
+        let gives = obj(json!({ "severity": "number" }))
+            .into_iter()
+            .map(|(k, v)| (k, v.as_str().unwrap_or_default().to_owned()))
+            .collect();
+
+        assert_eq!(
+            check(&obj(json!({ "severity": 2 })), &gives, "rate"),
+            Ok(())
+        );
+        assert_eq!(
+            check(&obj(json!({})), &gives, "rate"),
+            Err("rate gave no severity".to_owned())
+        );
+        assert_eq!(
+            check(&obj(json!({ "severity": "2" })), &gives, "rate"),
+            Err("rate gave severity as string, not number".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_flow_gives_each_steps_next_shaped_from_the_options() {
+        let acts = actions(&[("a", json!({ "greeting": "hi" }))]);
+        let steps = [step(json!({
+            "do": "a",
+            "next": { "ty": 20, "delay_ms": 500, "shape": { "msg": { "$concat": ["$greeting", "!"] } } }
+        }))];
+
+        let outs = run(&steps, &acts, Map::new()).unwrap();
+
+        assert_eq!(outs, [(20, obj(json!({ "msg": "hi!" })), 500)]);
+    }
+
+    #[test]
+    fn a_next_is_sourced_at_status_0_and_due_after_its_delay() {
+        let (source, now) = (Uuid::now_v7(), Utc::now());
+
+        let sent: Event<u16, Value> = next(source, 20, obj(json!({ "m": 1 })), now, 500);
+
+        assert_eq!(sent.source, Some(source));
+        assert_eq!(sent.status, Status::Added);
+        assert_eq!(sent.data, json!({ "m": 1 }));
+        assert_eq!(sent.run_at, Some(now + TimeDelta::milliseconds(500)));
+    }
+}

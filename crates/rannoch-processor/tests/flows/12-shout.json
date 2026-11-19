@@ -1,0 +1,1 @@
+{"ty":12,"takes":{"text":"string"},"steps":[{"do":"upper","as":"shout","next":{"ty":22,"shape":{"shout":"$shout","text":"$text"}}}]}
