@@ -357,6 +357,10 @@ pub fn report(conn: &Connection) -> rusqlite::Result<Vec<(Status, u64)>> {
         let (status, count) = row?;
         if let (Some(status), Ok(count)) = (status_of(status), u64::try_from(count)) {
             out.push((status, count));
+        } else {
+            log::error!(
+                "the report skipped a row it could not read: status {status}, count {count}"
+            );
         }
     }
     Ok(out)
