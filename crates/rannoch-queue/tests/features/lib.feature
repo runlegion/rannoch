@@ -24,3 +24,12 @@ Feature: The queue runs the events that are due, in two buckets, and retries wha
     Then the processor sends a -1 for it, and the queue sends a second retry whose source is the first retry, not the original event
     When the second retry comes due and fails
     Then the processor sends a -1 for it, and the queue sends nothing more, because its chain has reached 3 attempts
+
+  @module-rannoch-queue @criterion-FR-RANNOCH-019-c7
+  Scenario: The hunt reruns a dropped run
+    Given a store with an event from the app's forgr factory whose status 1 is older than the retry window, with no 2 or -1 after it, as a crash leaves it
+    And the queue's settings are a short retry window and a short hunt interval
+    And an event whose status 1 is older than the retry window and is followed by a -1 and a retry waiting on its run_at
+    When the hunt runs
+    Then the hung event is sent again as a retry, with status 0 and the hung event as its source
+    And the failure waiting on its retry is left alone

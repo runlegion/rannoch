@@ -3,7 +3,8 @@
 //! each, and hands each to its processor: runs, whose flow has no job step, one after another;
 //! jobs, whose flow has a job step, each on a thread of its own. Processors send their own
 //! results; the queue sends only the 1s, a retry when a run fails while its chain has attempts
-//! left, and a -1 saying "no processor" for an event whose `ty` has no flow.
+//! left, the hunt's resend of a run a crash dropped, and a -1 saying "no processor" for an event
+//! whose `ty` has no flow.
 
 mod queries;
 
@@ -11,7 +12,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use rannoch_core::{Event, Sender, Status};
@@ -34,6 +35,11 @@ pub struct Settings {
     pub attempts: u32,
     /// The backoff's first wait; each later wait doubles it.
     pub first_wait: Duration,
+    /// How old a 1 with nothing after it must be before the hunt sends its event again; 20
+    /// minutes by default.
+    pub window: Duration,
+    /// How often the hunt runs; one hour by default.
+    pub hunt: Duration,
 }
 
 impl Settings {
@@ -43,6 +49,8 @@ impl Settings {
         Self {
             attempts: 10,
             first_wait,
+            window: Duration::from_mins(20),
+            hunt: Duration::from_hours(1),
         }
     }
 }
@@ -123,12 +131,17 @@ fn run<T, D>(
     });
     let mut jobs: Vec<JoinHandle<()>> = Vec::new();
     let mut taken = HashSet::new();
-    let mut wait = next_due(conn).unwrap_or(IDLE);
+    let mut next_hunt = Instant::now() + settings.hunt;
+    let mut wait = next_due(conn).unwrap_or(IDLE).min(settings.hunt);
     loop {
         if signal.recv_timeout(wait) == Err(RecvTimeoutError::Disconnected) {
             break;
         }
         jobs.retain(|job| !job.is_finished());
+        if Instant::now() >= next_hunt {
+            hunt(conn, sender, settings.window);
+            next_hunt = Instant::now() + settings.hunt;
+        }
         let Ok(due) = read(conn, queries::DUE, [now()]) else {
             log::error!("the queue could not read the due events");
             continue;
@@ -173,7 +186,9 @@ fn run<T, D>(
                 log::error!("the queue's runs have stopped");
             }
         }
-        wait = next_due(conn).unwrap_or(IDLE);
+        wait = next_due(conn)
+            .unwrap_or(IDLE)
+            .min(next_hunt.saturating_duration_since(Instant::now()));
     }
     drop(runs);
     let _ = runs_thread.join();
@@ -237,6 +252,95 @@ fn backoff(settings: Settings, before: u32) -> Option<Duration> {
             .checked_mul(2_u32.saturating_pow(before))
             .unwrap_or(Duration::MAX),
     )
+}
+
+/// The hunt: sends again, as a retry with that event as its source, each event whose 1 is
+/// older than `window` with nothing after it in the event's tree, as a crash leaves it.
+fn hunt<T, D>(conn: &Connection, sender: &Sender<T, D>, window: Duration)
+where
+    T: TryFrom<u16> + PartialEq,
+    D: From<String>,
+{
+    let ones = match ones_without_result(conn) {
+        Ok(ones) => ones,
+        Err(err) => {
+            log::error!("the hunt could not read the 1s: {err}");
+            return;
+        }
+    };
+    for (one, event, ty) in ones {
+        if !older_than(one, window, Utc::now()) {
+            continue;
+        }
+        match after(conn, event, one) {
+            Ok(false) => {}
+            Ok(true) => continue,
+            Err(err) => {
+                log::error!("the hunt could not read the tree of {event}: {err}");
+                continue;
+            }
+        }
+        let Ok(ty) = T::try_from(ty) else {
+            continue;
+        };
+        let retry = Event {
+            id: Uuid::nil(),
+            source: Some(event),
+            ty,
+            data: D::from("hung".to_owned()),
+            run_at: None,
+            status: Status::Added,
+        };
+        if sender.send(retry).is_err() {
+            log::error!("the hunt could not send {event} again: rannoch is closed");
+        }
+    }
+}
+
+/// The 1s whose event has no 2 or -1 yet: the 1's id, its event's id and the event's `ty`.
+fn ones_without_result(conn: &Connection) -> rusqlite::Result<Vec<(Uuid, Uuid, u16)>> {
+    let mut select = conn.prepare_cached(queries::ONES)?;
+    let rows = select.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, u16>(2)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (one, event, ty) = row?;
+        if let (Ok(one), Ok(event)) = (one.parse(), event.parse()) {
+            out.push((one, event, ty));
+        }
+    }
+    Ok(out)
+}
+
+/// Whether the row `id` was accepted at least `window` before `now`.
+fn older_than(id: Uuid, window: Duration, now: DateTime<Utc>) -> bool {
+    let Ok(window) = chrono::TimeDelta::from_std(window) else {
+        return false;
+    };
+    taken_at(id).is_some_and(|at| at <= now - window)
+}
+
+/// When a row was accepted: its `UUIDv7` id's time.
+fn taken_at(id: Uuid) -> Option<DateTime<Utc>> {
+    let (secs, nanos) = id.get_timestamp()?.to_unix();
+    DateTime::from_timestamp(i64::try_from(secs).ok()?, nanos)
+}
+
+/// Whether anything follows the 1 `one` in `event`'s tree.
+fn after(conn: &Connection, event: Uuid, one: Uuid) -> rusqlite::Result<bool> {
+    let mut select = conn.prepare_cached(queries::TREE)?;
+    let ids = select.query_map([event.to_string()], |r| r.get::<_, String>(0))?;
+    for id in ids {
+        if id?.as_str() > one.to_string().as_str() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Sends a status event about `source`, with `message` as its data; whether it was accepted.
@@ -377,6 +481,67 @@ mod tests {
 
     fn event(conn: &rusqlite::Connection, id: &str) -> super::Row {
         read(conn, queries::EVENT, [id]).unwrap().pop().unwrap()
+    }
+
+    #[test]
+    fn a_row_is_old_once_the_window_has_passed_since_it_was_accepted() {
+        let now = chrono::Utc::now();
+        let at = |ago: i64| {
+            let t = now - chrono::TimeDelta::seconds(ago);
+            let secs = u64::try_from(t.timestamp()).unwrap();
+            Uuid::new_v7(uuid::Timestamp::from_unix(uuid::NoContext, secs, 0))
+        };
+        let window = std::time::Duration::from_secs(20);
+
+        assert!(super::older_than(at(30), window, now));
+        assert!(!super::older_than(at(10), window, now));
+    }
+
+    #[test]
+    fn something_after_a_1_anywhere_in_the_tree_counts() {
+        let store = rannoch_core::forgr::empty_store();
+        let hung = put(&store, None, "{}", 0);
+        let one = put(&store, Some(&hung), "taken", 1);
+        let hung_id: Uuid = hung.parse().unwrap();
+        let one_id: Uuid = one.parse().unwrap();
+
+        assert!(!super::after(&store, hung_id, one_id).unwrap());
+
+        let failed = put(&store, None, "{}", 0);
+        let failed_one = put(&store, Some(&failed), "taken", 1);
+        let retry = put(&store, Some(&failed), "failed", 0);
+        put(&store, Some(&retry), "taken", 1);
+        let failed_id: Uuid = failed.parse().unwrap();
+
+        assert!(super::after(&store, failed_id, failed_one.parse().unwrap()).unwrap());
+        // Only a grandchild comes after this 1, so only the walk down the tree finds it.
+        let deep = put(&store, None, "{}", 0);
+        let child = put(&store, Some(&deep), "{}", 0);
+        let deep_one = put(&store, Some(&deep), "taken", 1);
+        put(&store, Some(&child), "later", 0);
+        let deep_id: Uuid = deep.parse().unwrap();
+        assert!(super::after(&store, deep_id, deep_one.parse().unwrap()).unwrap());
+    }
+
+    #[test]
+    fn the_hunt_reads_only_the_1s_whose_event_has_no_result() {
+        let store = rannoch_core::forgr::empty_store();
+        let hung = put(&store, None, "{}", 0);
+        let hung_one = put(&store, Some(&hung), "taken", 1);
+        let done = put(&store, None, "{}", 0);
+        put(&store, Some(&done), "taken", 1);
+        put(&store, Some(&done), "made", 2);
+        let failed = put(&store, None, "{}", 0);
+        put(&store, Some(&failed), "taken", 1);
+        put(&store, Some(&failed), "failed", -1);
+
+        let ones: Vec<String> = super::ones_without_result(&store)
+            .unwrap()
+            .into_iter()
+            .map(|(one, event, _)| format!("{one} {event}"))
+            .collect();
+
+        assert_eq!(ones, [format!("{hung_one} {hung}")]);
     }
 
     #[test]
