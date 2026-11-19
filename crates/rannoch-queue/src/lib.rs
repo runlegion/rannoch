@@ -15,14 +15,15 @@ use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use rannoch_core::{Event, Sender, Status};
-use rusqlite::{Connection, OptionalExtension, Params};
+use rusqlite::{Connection, Params};
 use uuid::Uuid;
 
 /// An event as `_events` holds it: `ty` as its `u16`, data as its JSON text.
 pub type Row = Event<u16, String>;
 
-/// A processor: handed the event's root and a sender, it sends its own result.
-pub type Processor<T, D> = Box<dyn Fn(&Row, &Sender<T, D>) + Send + Sync>;
+/// A processor: handed the event it runs, that event's root and a sender, it sends its own
+/// result about the event it runs.
+pub type Processor<T, D> = Box<dyn Fn(&Row, &Row, &Sender<T, D>) + Send + Sync>;
 
 /// What runs an event: the processor, and whether its flow has a job step.
 pub struct Flow<T, D> {
@@ -89,20 +90,22 @@ fn run<T, D>(
     T: TryFrom<u16> + Copy + PartialEq + Send + 'static,
     D: From<String> + Send + 'static,
 {
-    let (runs, bucket) = mpsc::channel::<(Arc<Flow<T, D>>, Row)>();
+    let (runs, bucket) = mpsc::channel::<(Arc<Flow<T, D>>, Row, Row)>();
     let run_sender = sender.clone();
     let runs_thread = thread::spawn(move || {
-        for (flow, root) in bucket {
-            (flow.run)(&root, &run_sender);
+        for (flow, event, root) in bucket {
+            (flow.run)(&event, &root, &run_sender);
         }
     });
-    let mut jobs = Vec::new();
+    let mut jobs: Vec<JoinHandle<()>> = Vec::new();
     let mut taken = HashSet::new();
+    // Events already due when the queue starts are taken at once.
+    let mut wait = Duration::ZERO;
     loop {
-        let wait = next_due(conn).unwrap_or(IDLE);
         if signal.recv_timeout(wait) == Err(RecvTimeoutError::Disconnected) {
             break;
         }
+        jobs.retain(|job| !job.is_finished());
         let Ok(due) = read(conn, queries::DUE, [now()]) else {
             log::error!("the queue could not read the due events");
             continue;
@@ -121,19 +124,33 @@ fn run<T, D>(
                 );
                 continue;
             };
-            send(sender, row.id, ty, "taken", Status::InProgress);
+            let root = match root(conn, row.clone()) {
+                Ok(root) => root,
+                Err(err) => {
+                    log::error!("the queue could not find the root of {}: {err}", row.id);
+                    taken.remove(&row.id);
+                    continue;
+                }
+            };
+            // An event whose 1 was not accepted stays at 0 and is not run.
+            if !send(sender, row.id, ty, "taken", Status::InProgress) {
+                taken.remove(&row.id);
+                continue;
+            }
             let Some(flow) = flows.flow(row.ty) else {
                 send(sender, row.id, ty, "no processor", Status::Binned);
                 continue;
             };
-            let root = root(conn, row);
             if flow.job {
                 let job_sender = sender.clone();
-                jobs.push(thread::spawn(move || (flow.run)(&root, &job_sender)));
-            } else if runs.send((flow, root)).is_err() {
+                jobs.push(thread::spawn(move || {
+                    (flow.run)(&row, &root, &job_sender);
+                }));
+            } else if runs.send((flow, row, root)).is_err() {
                 log::error!("the queue's runs have stopped");
             }
         }
+        wait = next_due(conn).unwrap_or(IDLE);
     }
     drop(runs);
     let _ = runs_thread.join();
@@ -142,14 +159,14 @@ fn run<T, D>(
     }
 }
 
-/// Sends a status event about `source`, with `message` as its data.
+/// Sends a status event about `source`, with `message` as its data; whether it was accepted.
 fn send<T: PartialEq, D: From<String>>(
     sender: &Sender<T, D>,
     source: Uuid,
     ty: T,
     message: &str,
     status: Status,
-) {
+) -> bool {
     let event = Event {
         id: Uuid::nil(),
         source: Some(source),
@@ -158,38 +175,45 @@ fn send<T: PartialEq, D: From<String>>(
         run_at: None,
         status,
     };
-    if sender.send(event).is_err() {
+    let sent = sender.send(event).is_ok();
+    if !sent {
         log::error!("the queue could not send a status for {source}: rannoch is closed");
     }
+    sent
 }
 
 /// The root whose data every flow uses: back from `row` through each source that has a -1.
-fn root(conn: &Connection, row: Row) -> Row {
+fn root(conn: &Connection, row: Row) -> rusqlite::Result<Row> {
     let mut at = row;
     while let Some(source) = at.source {
-        let failed: bool = conn
-            .query_row(queries::FAILED, [source.to_string()], |r| r.get(0))
-            .unwrap_or(false);
+        let failed: bool = conn.query_row(queries::FAILED, [source.to_string()], |r| r.get(0))?;
         if !failed {
             break;
         }
-        match read(conn, queries::EVENT, [source.to_string()]).map(|mut rows| rows.pop()) {
-            Ok(Some(earlier)) => at = earlier,
-            _ => break,
+        match read(conn, queries::EVENT, [source.to_string()])?.pop() {
+            Some(earlier) => at = earlier,
+            None => break,
         }
     }
-    at
+    Ok(at)
 }
 
 /// How long until the earliest `run_at` the queue knows of, or `None` when there is none.
 fn next_due(conn: &Connection) -> Option<Duration> {
-    let next: Option<String> = conn
-        .query_row(queries::NEXT_RUN_AT, [now()], |r| r.get(0))
-        .optional()
-        .ok()
-        .flatten()
-        .flatten();
-    let at: DateTime<Utc> = next?.parse().ok()?;
+    let next: Option<String> = match conn.query_row(queries::NEXT_RUN_AT, [now()], |r| r.get(0)) {
+        Ok(next) => next,
+        Err(err) => {
+            log::error!("the queue could not read the next run_at: {err}");
+            return None;
+        }
+    };
+    let at: DateTime<Utc> = match next?.parse() {
+        Ok(at) => at,
+        Err(err) => {
+            log::error!("the queue could not read a run_at: {err}");
+            return None;
+        }
+    };
     Some((at - Utc::now()).to_std().unwrap_or(Duration::ZERO))
 }
 
@@ -277,8 +301,14 @@ mod tests {
         let done = put(&store, Some(&first), "made", 2);
         let output = put(&store, Some(&first), "{\"out\":1}", 0);
 
-        assert_eq!(root(&store, event(&store, &first)).id.to_string(), first);
-        assert_eq!(root(&store, event(&store, &output)).id.to_string(), output);
+        assert_eq!(
+            root(&store, event(&store, &first)).unwrap().id.to_string(),
+            first
+        );
+        assert_eq!(
+            root(&store, event(&store, &output)).unwrap().id.to_string(),
+            output
+        );
         let _ = done;
     }
 
@@ -291,7 +321,7 @@ mod tests {
         put(&store, Some(&first), "failed again", -1);
         let second = put(&store, Some(&first), "failed again", 0);
 
-        let found = root(&store, event(&store, &second));
+        let found = root(&store, event(&store, &second)).unwrap();
 
         assert_eq!(found.id.to_string(), original);
         assert_eq!(found.data, "{\"in\":1}");

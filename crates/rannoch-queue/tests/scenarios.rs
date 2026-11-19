@@ -49,17 +49,17 @@ impl Flows<Ty, String> for Fake {
 fn processor(job: bool, take: Duration, ran: Ran) -> Arc<Flow<Ty, String>> {
     Arc::new(Flow {
         job,
-        run: Box::new(move |root: &Row, sender| {
+        run: Box::new(move |event: &Row, _root: &Row, sender| {
             let start = Instant::now();
             thread::sleep(take);
             if let Ok(mut times) = ran.lock() {
-                times.insert(root.id, (start, Instant::now()));
+                times.insert(event.id, (start, Instant::now()));
             }
             let _ = sender.send(Event {
                 id: Uuid::nil(),
-                source: Some(root.id),
-                ty: Ty(root.ty),
-                data: format!("ran {}", root.id),
+                source: Some(event.id),
+                ty: Ty(event.ty),
+                data: format!("ran {}", event.id),
                 run_at: None,
                 status: Status::Processed,
             });
@@ -102,16 +102,10 @@ fn waiting(conn: &Connection, ty: i64, run_at: Option<chrono::DateTime<Utc>>) ->
 }
 
 /// The statuses, with their data, of the rows whose source is `id`.
-fn about(conn: &Connection, id: Uuid) -> Vec<(i64, String)> {
-    let Ok(mut select) =
-        conn.prepare("SELECT status, data FROM _events WHERE source = ?1 ORDER BY id")
-    else {
-        return Vec::new();
-    };
-    select
-        .query_map([id.to_string()], |r| Ok((r.get(0)?, r.get(1)?)))
-        .map(|rows| rows.filter_map(std::result::Result::ok).collect())
-        .unwrap_or_default()
+fn about(conn: &Connection, id: Uuid) -> rusqlite::Result<Vec<(i64, String)>> {
+    conn.prepare("SELECT status, data FROM _events WHERE source = ?1 ORDER BY id")?
+        .query_map([id.to_string()], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect()
 }
 
 /// Waits up to `limit` for `done`.
@@ -173,8 +167,12 @@ fn the_queue_runs_what_is_due() {
     let due = [run_a, run_b, job, unknown];
     assert!(until(Duration::from_secs(5), || due
         .iter()
-        .all(|id| about(&read, *id).iter().any(|r| r.0 == 1))));
-    assert!(about(&read, later).is_empty(), "{:?}", about(&read, later));
+        .all(|id| about(&read, *id).unwrap().iter().any(|r| r.0 == 1))));
+    assert!(
+        about(&read, later).unwrap().is_empty(),
+        "{:?}",
+        about(&read, later).unwrap()
+    );
 
     // And the two runs run one after the other while the job runs beside them
     assert!(until(Duration::from_secs(5), || ran.lock().unwrap().len() == 3));
@@ -191,12 +189,14 @@ fn the_queue_runs_what_is_due() {
     assert!(until(Duration::from_secs(5), || [run_a, run_b, job]
         .iter()
         .all(|id| {
-            about(&read, *id).contains(&(2, format!("\"ran {id}\"")))
+            about(&read, *id)
+                .unwrap()
+                .contains(&(2, format!("\"ran {id}\"")))
         })));
 
     // And for the event with no flow the queue sends a -1 saying "no processor", and no retry
     assert_eq!(
-        about(&read, unknown),
+        about(&read, unknown).unwrap(),
         [
             (1, "\"taken\"".to_owned()),
             (-1, "\"no processor\"".to_owned())
@@ -210,21 +210,88 @@ fn the_queue_runs_what_is_due() {
     // Then no event with a status 1 is taken again
     for id in due {
         assert_eq!(
-            about(&read, id).iter().filter(|r| r.0 == 1).count(),
+            about(&read, id)
+                .unwrap()
+                .iter()
+                .filter(|r| r.0 == 1)
+                .count(),
             1,
             "{id} taken twice"
         );
     }
 
     // When the event not yet due comes due with nothing else appended
-    assert_eq!(about(&read, later), Vec::<(i64, String)>::new());
+    assert_eq!(about(&read, later).unwrap(), Vec::<(i64, String)>::new());
 
     // Then the queue takes it and runs it
     assert!(until(Duration::from_secs(5), || {
-        about(&read, later).contains(&(2, format!("\"ran {later}\"")))
+        about(&read, later)
+            .unwrap()
+            .contains(&(2, format!("\"ran {later}\"")))
     }));
-    assert_eq!(about(&read, later).iter().filter(|r| r.0 == 1).count(), 1);
+    assert_eq!(
+        about(&read, later)
+            .unwrap()
+            .iter()
+            .filter(|r| r.0 == 1)
+            .count(),
+        1
+    );
 
+    drop(signal);
+    rannoch.shutdown();
+    queue.join();
+}
+
+/// Not a scenario: the queue's own memory of what it took. With an hour-long inbox interval each
+/// 1 stays on the inbox's heap, so only that memory stops a second signal taking the event again.
+#[test]
+fn an_event_taken_before_its_1_is_kept_is_not_taken_again() {
+    let path = database("an_event_taken_before_its_1_is_kept").unwrap();
+    let store = Arc::new(Store::new(path.clone(), rannoch_core::migrator()));
+    Rannoch::<Ty, String>::open(Config {
+        store: Some(store.clone()),
+        ..Config::default()
+    })
+    .unwrap()
+    .shutdown();
+    let event = waiting(&ready(&path).unwrap(), 1, None).unwrap();
+    let ran: Ran = Arc::default();
+    let runs = Arc::new(Mutex::new(0_u32));
+    let count = runs.clone();
+    let flows = Arc::new(Fake {
+        flows: HashMap::from([(
+            1,
+            Arc::new(Flow {
+                job: false,
+                run: Box::new(
+                    move |_: &Row, _: &Row, _: &rannoch_core::Sender<Ty, String>| {
+                        if let Ok(mut n) = count.lock() {
+                            *n += 1;
+                        }
+                    },
+                ),
+            }),
+        )]),
+    });
+    let _ = ran;
+    let (signal, wake) = mpsc::channel();
+    let rannoch = Rannoch::open(Config {
+        default_interval: TimeDelta::hours(1),
+        store: Some(store.clone()),
+        append: Some(Arc::new(Events::new(ready(&path).unwrap(), signal.clone()))
+            as Arc<dyn Append<Ty, String>>),
+        ..Config::default()
+    })
+    .unwrap();
+    let queue = Queue::start(ready(&path).unwrap(), wake, rannoch.sender(), flows);
+
+    signal.send(()).unwrap();
+    thread::sleep(Duration::from_millis(200));
+    signal.send(()).unwrap();
+    thread::sleep(Duration::from_millis(200));
+
+    assert_eq!(*runs.lock().unwrap(), 1, "event {event} ran more than once");
     drop(signal);
     rannoch.shutdown();
     queue.join();
