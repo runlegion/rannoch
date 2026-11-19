@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use rannoch_core::{Event, Sender, Status};
@@ -34,6 +34,11 @@ pub struct Settings {
     pub attempts: u32,
     /// The backoff's first wait; each later wait doubles it.
     pub first_wait: Duration,
+    /// How old a 1 with nothing after it must be before the hunt sends its event again; 20
+    /// minutes by default.
+    pub window: Duration,
+    /// How often the hunt runs; one hour by default.
+    pub hunt: Duration,
 }
 
 impl Settings {
@@ -43,6 +48,8 @@ impl Settings {
         Self {
             attempts: 10,
             first_wait,
+            window: Duration::from_mins(20),
+            hunt: Duration::from_hours(1),
         }
     }
 }
@@ -123,12 +130,17 @@ fn run<T, D>(
     });
     let mut jobs: Vec<JoinHandle<()>> = Vec::new();
     let mut taken = HashSet::new();
-    let mut wait = next_due(conn).unwrap_or(IDLE);
+    let mut next_hunt = Instant::now() + settings.hunt;
+    let mut wait = next_due(conn).unwrap_or(IDLE).min(settings.hunt);
     loop {
         if signal.recv_timeout(wait) == Err(RecvTimeoutError::Disconnected) {
             break;
         }
         jobs.retain(|job| !job.is_finished());
+        if Instant::now() >= next_hunt {
+            hunt(conn, sender, settings.window);
+            next_hunt = Instant::now() + settings.hunt;
+        }
         let Ok(due) = read(conn, queries::DUE, [now()]) else {
             log::error!("the queue could not read the due events");
             continue;
@@ -173,7 +185,9 @@ fn run<T, D>(
                 log::error!("the queue's runs have stopped");
             }
         }
-        wait = next_due(conn).unwrap_or(IDLE);
+        wait = next_due(conn)
+            .unwrap_or(IDLE)
+            .min(next_hunt.saturating_duration_since(Instant::now()));
     }
     drop(runs);
     let _ = runs_thread.join();
@@ -237,6 +251,90 @@ fn backoff(settings: Settings, before: u32) -> Option<Duration> {
             .checked_mul(2_u32.saturating_pow(before))
             .unwrap_or(Duration::MAX),
     )
+}
+
+/// The hunt: sends again, as a retry with that event as its source, each event whose 1 is
+/// older than `window` with nothing after it in the event's tree, as a crash leaves it.
+fn hunt<T, D>(conn: &Connection, sender: &Sender<T, D>, window: Duration)
+where
+    T: TryFrom<u16> + PartialEq,
+    D: From<String>,
+{
+    let Ok(cutoff) = chrono::TimeDelta::from_std(window).map(|w| Utc::now() - w) else {
+        return;
+    };
+    let ones = match ones_without_result(conn) {
+        Ok(ones) => ones,
+        Err(err) => {
+            log::error!("the hunt could not read the 1s: {err}");
+            return;
+        }
+    };
+    for (one, event, ty) in ones {
+        if taken_at(one).is_none_or(|at| at > cutoff) {
+            continue;
+        }
+        match after(conn, event, one) {
+            Ok(false) => {}
+            Ok(true) => continue,
+            Err(err) => {
+                log::error!("the hunt could not read the tree of {event}: {err}");
+                continue;
+            }
+        }
+        let Ok(ty) = T::try_from(ty) else {
+            continue;
+        };
+        let retry = Event {
+            id: Uuid::nil(),
+            source: Some(event),
+            ty,
+            data: D::from("hung".to_owned()),
+            run_at: None,
+            status: Status::Added,
+        };
+        if sender.send(retry).is_err() {
+            log::error!("the hunt could not send {event} again: rannoch is closed");
+        }
+    }
+}
+
+/// The 1s whose event has no 2 or -1 yet: the 1's id, its event's id and the event's `ty`.
+fn ones_without_result(conn: &Connection) -> rusqlite::Result<Vec<(Uuid, Uuid, u16)>> {
+    let mut select = conn.prepare_cached(queries::ONES)?;
+    let rows = select.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, u16>(2)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (one, event, ty) = row?;
+        if let (Ok(one), Ok(event)) = (one.parse(), event.parse()) {
+            out.push((one, event, ty));
+        }
+    }
+    Ok(out)
+}
+
+/// When a row was accepted: its `UUIDv7` id's time.
+fn taken_at(id: Uuid) -> Option<DateTime<Utc>> {
+    let (secs, nanos) = id.get_timestamp()?.to_unix();
+    DateTime::from_timestamp(i64::try_from(secs).ok()?, nanos)
+}
+
+/// Whether anything follows the 1 `one` in `event`'s tree.
+fn after(conn: &Connection, event: Uuid, one: Uuid) -> rusqlite::Result<bool> {
+    let mut select = conn.prepare_cached(queries::TREE)?;
+    let ids = select.query_map([event.to_string()], |r| r.get::<_, String>(0))?;
+    for id in ids {
+        if id?.as_str() > one.to_string().as_str() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Sends a status event about `source`, with `message` as its data; whether it was accepted.

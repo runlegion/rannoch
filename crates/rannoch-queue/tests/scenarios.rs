@@ -1,6 +1,6 @@
 //! FR-RANNOCH-019's scenarios, from `tests/features/lib.feature`: "The queue runs what is due"
 //! (`@criterion-FR-RANNOCH-019-c1` to `-c4` and `-c8`) and "A failing flow is retried, then
-//! binned" (`-c5` and `-c9`). The store is the app's database
+//! binned" (`-c5` and `-c9`), and "The hunt reruns a dropped run" (`-c7`). The store is the app's database
 //! opened through the real store, its rows from the app's forgr factory; the flows are fakes.
 
 use std::collections::HashMap;
@@ -430,6 +430,104 @@ fn a_failing_flow_is_retried_then_binned() {
     }));
     thread::sleep(Duration::from_millis(1_000));
     assert_eq!(retry_of(second), None, "a fourth attempt was sent");
+
+    drop(signal);
+    rannoch.shutdown();
+    queue.join();
+}
+
+/// A row from the app's forgr factory about `source`, with its status and, when given, `run_at`.
+fn status_row(
+    conn: &Connection,
+    source: Uuid,
+    ty: i64,
+    status: i64,
+    run_at: Option<chrono::DateTime<Utc>>,
+) -> Result<Uuid> {
+    let id = Uuid::now_v7();
+    let row = _events::factory()
+        .id(id.to_string())
+        .source(source.to_string())
+        .ty(ty)
+        .data("{}")
+        .status(status);
+    match run_at {
+        Some(at) => row.run_at(at.to_rfc3339_opts(SecondsFormat::Millis, true)),
+        None => row,
+    }
+    .insert(conn)?;
+    Ok(id)
+}
+
+#[test]
+fn the_hunt_reruns_a_dropped_run() {
+    // Given a store with an event from the app's forgr factory whose status 1 is older than the
+    // retry window, with no 2 or -1 after it, as a crash leaves it
+    let path = database("the_hunt_reruns_a_dropped_run").unwrap();
+    let store = migrated(&path).unwrap();
+    let seed = ready(&path).unwrap();
+    let hung = waiting(&seed, 1, None).unwrap();
+    status_row(&seed, hung, 1, 1, None).unwrap();
+
+    // And the queue's settings are a short retry window and a short hunt interval
+    let settings = Settings {
+        window: Duration::from_millis(100),
+        hunt: Duration::from_millis(300),
+        ..Settings::new(Duration::from_millis(100))
+    };
+
+    // And an event whose status 1 is older than the retry window and is followed by a -1 and a
+    // retry waiting on its run_at
+    let failed = waiting(&seed, 4, None).unwrap();
+    status_row(&seed, failed, 4, 1, None).unwrap();
+    status_row(&seed, failed, 4, -1, None).unwrap();
+    status_row(&seed, failed, 4, 0, Some(Utc::now() + TimeDelta::hours(1))).unwrap();
+    thread::sleep(Duration::from_millis(150));
+
+    let ran: Ran = Arc::default();
+    let flows = Arc::new(Fake {
+        flows: HashMap::from([(1, processor(false, Duration::from_millis(10), ran))]),
+    });
+    let (signal, wake) = mpsc::channel();
+    let rannoch = Rannoch::open(Config {
+        store: Some(store.clone()),
+        append: Some(Arc::new(Events::new(ready(&path).unwrap(), signal.clone()))
+            as Arc<dyn Append<Ty, String>>),
+        ..Config::default()
+    })
+    .unwrap();
+    let queue = Queue::start(
+        ready(&path).unwrap(),
+        wake,
+        rannoch.sender(),
+        flows,
+        settings,
+    );
+    let read = ready(&path).unwrap();
+    let resent = |id: Uuid| {
+        rows_about(&read, id)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.1 == 0)
+            .collect::<Vec<_>>()
+    };
+
+    // When the hunt runs
+    // Then the hung event is sent again as a retry, with status 0 and the hung event as its
+    // source
+    assert!(until(Duration::from_secs(5), || resent(hung).len() == 1));
+    assert_eq!(resent(hung)[0].2, "\"hung\"");
+
+    // And the failure waiting on its retry is left alone
+    assert_eq!(
+        resent(failed).len(),
+        1,
+        "the waiting failure was sent again"
+    );
+
+    // and a hunt after that finds the retry after the 1, so sends the hung event only once
+    thread::sleep(Duration::from_millis(700));
+    assert_eq!(resent(hung).len(), 1, "the hung event was sent again twice");
 
     drop(signal);
     rannoch.shutdown();
