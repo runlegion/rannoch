@@ -455,22 +455,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rannoch-processor"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "log",
- "rannoch-core",
- "rannoch-events",
- "rannoch-queue",
- "rannoch-store",
- "rusqlite",
- "serde",
- "serde_json",
- "uuid",
-]
-
-[[package]]
 name = "rannoch-queue"
 version = "0.1.0"
 dependencies = [
