@@ -125,13 +125,11 @@ pub fn check(docs: &[(String, FlowDoc)], sigs: &[Sig]) -> Result<String, Vec<Str
                     tos.chain([&branch.otherwise]).map(|t| (t, None)).collect()
                 }
                 Some(Next::Wait { wait }) => {
-                    let (for_ty, key) = (wait.for_ty, &wait.key);
-                    let got = docs.iter().find(|(_, f)| f.ty == for_ty);
-                    let got = got.map(|(_, f)| &f.takes);
+                    let (ty, key) = (wait.for_ty, &wait.key);
+                    let got = docs.iter().find(|d| d.1.ty == ty).map(|d| &d.1.takes);
+                    let e7 = format!("E7 {at}: wait for ty {ty}, which no flow takes");
                     match got.map(|g| (type_expr(key, &scope), type_expr(key, g))) {
-                        None => errors.push(format!(
-                            "E7 {at}: wait for ty {for_ty}, which no flow takes"
-                        )),
+                        None => errors.push(e7),
                         Some((Ok(a), Ok(b))) if a == b => {}
                         Some((a, b)) => errors.push(format!(
                             "E3 {at}: wait key {key} does not render the same on both sides \

@@ -1,9 +1,7 @@
 mod check;
 mod doc;
 
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::{collections::HashMap, sync::Arc, sync::Mutex, sync::PoisonError, time::Duration};
 
 use chrono::{TimeDelta, Utc};
 use rannoch_core::{Event, Sender, Status};
@@ -48,8 +46,6 @@ pub struct Processor<T, D> {
     flows: HashMap<u16, Arc<Flow<T, D>>>,
 }
 
-type Out = (Uuid, u16, Map<String, Value>, u64); // a next to send: source, ty, data, delay
-
 impl<T: TryFrom<u16> + PartialEq + 'static, D: From<Value> + 'static> Processor<T, D> {
     /// `flows` is the JSON array of flow docs the app compiles in; `events` reads `_events`.
     /// # Errors
@@ -64,24 +60,23 @@ impl<T: TryFrom<u16> + PartialEq + 'static, D: From<Value> + 'static> Processor<
             by_name.insert(action.sig().action.clone(), action);
         }
         let docs: Arc<Vec<FlowDoc>> = Arc::new(serde_json::from_str(flows)?);
-        let (events, answered) = (Arc::new(Mutex::new(events)), Arc::new(Mutex::default()));
+        let (conn, seen) = (Arc::new(Mutex::new(events)), Arc::new(Mutex::default()));
         let mut by_ty: HashMap<u16, Arc<Flow<T, D>>> = HashMap::new();
         for doc in docs.iter().cloned() {
             let (actions, ty, job) = (by_name.clone(), doc.ty, doc.job);
-            let (docs, events, answered) = (docs.clone(), events.clone(), answered.clone());
+            let (docs, conn, seen) = (docs.clone(), conn.clone(), seen.clone());
             let process = move |event: &Row, root: &Row, sender: &Sender<T, D>| {
+                let (id, at) = (event.id, (event.id, event.ty));
                 let ty = |ty| T::try_from(ty).map_err(|_| format!("ty {ty} is not the app's"));
                 let sends = serde_json::from_str(&root.data)
                     .map_err(|e| format!("root data: {e}"))
                     .and_then(|data: Map<String, Value>| {
-                        let (id, at) = (event.id, (event.id, event.ty));
-                        let (mut outs, said) =
-                            waits(&lock(&events), &lock(&answered), &docs, at, &data)?;
+                        let (mut outs, said) = waits(&lock(&conn), &lock(&seen), &docs, at, &data)?;
                         if said == "done" {
                             let nexts = run(&doc, &actions, data)?.into_iter();
                             outs.extend(nexts.map(|(to, data, delay)| (id, to, data, delay)));
                         }
-                        lock(&answered).extend(outs.iter().map(|o| o.0).filter(|s| *s != id));
+                        lock(&seen).extend(outs.iter().map(|o| o.0).filter(|s| *s != id));
                         let done =
                             ty(event.ty).map(|t| (id, t, said.into(), None, Status::Processed));
                         let nexts = outs.into_iter().map(|(source, to, data, delay)| {
@@ -94,8 +89,7 @@ impl<T: TryFrom<u16> + PartialEq + 'static, D: From<Value> + 'static> Processor<
                 let (sends, result) = match sends {
                     Ok(sends) => (sends, Ok(())),
                     Err(e) => {
-                        let t = ty(event.ty)?;
-                        let binned = (event.id, t, e.as_str().into(), None, Status::Binned);
+                        let binned = (id, ty(event.ty)?, e.as_str().into(), None, Status::Binned);
                         (vec![binned], Err(e))
                     }
                 };
@@ -141,52 +135,47 @@ fn waits_for(
     let sql = "SELECT w.id, w.data, json_group_array(json_array(s.status, s.data))
         FILTER (WHERE s.id IS NOT NULL) FROM _events w LEFT JOIN _events s ON s.source = w.id
         WHERE json_extract(w.data, '$.\"$wait\".for') = ?1 GROUP BY w.id ORDER BY w.id";
-    let mut select = conn.prepare_cached(sql)?;
-    let row = |r: &rusqlite::Row<'_>| Ok((r.get(0)?, r.get(1)?, r.get(2)?));
-    let rows = select.query_map([ty], row)?.map(|row| {
-        let (id, data, about): (String, String, String) = row?;
+    let row = |r: &rusqlite::Row<'_>| {
+        let (id, data, about): (String, String, String) = (r.get(0)?, r.get(1)?, r.get(2)?);
         let (data, about) = (serde_json::from_str(&data), serde_json::from_str(&about));
         let id = id.parse().unwrap_or_default();
         Ok((id, data.unwrap_or_default(), about.unwrap_or_default()))
-    });
-    rows.collect()
+    };
+    conn.prepare_cached(sql)?.query_map([ty], row)?.collect()
 }
 
-/// What the event `id` of `ty` sends about waits, and its 2's data: a due wait its timeout unless
-/// matched; any other event, per wait its `data` keys, the match next, or late after "timeout".
+/// What `id` of `ty` sends about waits as (source, ty, data, delay), and its 2's data.
+#[expect(clippy::type_complexity, reason = "a next with its source")]
 fn waits<'d>(
     conn: &Connection,
-    answered: &HashSet<Uuid>,
+    answered: &std::collections::HashSet<Uuid>,
     docs: &'d [FlowDoc],
     (id, ty): (Uuid, u16),
     data: &Map<String, Value>,
-) -> Result<(Vec<Out>, &'static str), String> {
+) -> Result<(Vec<(Uuid, u16, Map<String, Value>, u64)>, &'static str), String> {
     let due = data.get("$wait");
     let ty = due.map_or(Some(ty), |at| at["for"].as_u64()?.try_into().ok());
     let (mut outs, mut said) = (Vec::new(), if due.is_some() { "matched" } else { "done" });
     for (wait_id, w, rows) in waits_for(conn, ty.unwrap_or(0)).map_err(|e| e.to_string())? {
         let step: Option<usize> = w["$wait"]["step"].as_u64().and_then(|s| s.try_into().ok());
         let at = |d: &'d FlowDoc| d.steps.get(step?)?.next.as_ref();
-        let mut nexts = docs.iter().filter_map(at);
         let fits = |wait: &Wait| due.map_or(eval(&wait.key, data) == w["key"], |_| wait_id == id);
-        let waiting =
-            |n: &&Next| matches!(n, Next::Wait { wait } if Some(wait.for_ty) == ty && fits(wait));
-        let Some(Next::Wait { wait }) = nexts.find(waiting) else {
-            continue;
-        };
-        let zeros = rows.iter().filter(|r| r.0 == 0).count();
-        let two = rows.iter().find(|r| r.0 == 2).map(|r| r.1.as_str());
-        let to = match (due.is_some(), answered.contains(&wait_id), zeros, two) {
-            (true, false, 0, _) => Some(&wait.timeout).inspect(|_| said = "timeout"),
-            (false, false, 0, None) => Some(&wait.next),
-            (false, false, 1, Some("\"timeout\"")) => wait.late.as_ref(),
-            _ => None,
-        };
-        let mut vals = w["vals"].as_object().cloned().unwrap_or_default();
-        let got = data.iter().filter(|_| due.is_none());
-        vals.extend(got.map(|(k, v)| (format!("got.{k}"), v.clone())));
-        let nexts = to.into_iter().flat_map(|to| shaped(to, &vals));
-        outs.extend(nexts.map(|(to, d, delay)| (wait_id, to, d, delay)));
+        let is = |n: &&Next| matches!(n, Next::Wait { wait: x } if Some(x.for_ty) == ty && fits(x));
+        if let Some(Next::Wait { wait }) = docs.iter().filter_map(at).find(is) {
+            let zeros = rows.iter().filter(|r| r.0 == 0).count();
+            let two = rows.iter().find(|r| r.0 == 2).map(|r| r.1.as_str());
+            let to = match (due.is_some(), answered.contains(&wait_id), zeros, two) {
+                (true, false, 0, _) => Some(&wait.timeout).inspect(|_| said = "timeout"),
+                (false, false, 0, None) => Some(&wait.next),
+                (false, false, 1, Some("\"timeout\"")) => wait.late.as_ref(),
+                _ => None,
+            };
+            let mut vals = w["vals"].as_object().cloned().unwrap_or_default();
+            let got = data.iter().filter(|_| due.is_none());
+            vals.extend(got.map(|(k, v)| (format!("got.{k}"), v.clone())));
+            let nexts = to.into_iter().flat_map(|to| shaped(to, &vals));
+            outs.extend(nexts.map(|(to, d, delay)| (wait_id, to, d, delay)));
+        }
     }
     Ok((outs, said))
 }
@@ -206,11 +195,7 @@ fn run(
         let (mut input, mut result) = (vals.clone(), Map::new());
         for link in step.chain.split('.') {
             let action = actions.get(link).ok_or(format!("no action named {link}"))?;
-            let options = step
-                .with
-                .get(link)
-                .cloned()
-                .unwrap_or(Value::Object(Map::new()));
+            let options = step.with.get(link).cloned().unwrap_or(json!({}));
             let out = action.run(&options, &input)?;
             for (field, ty) in &action.sig().gives {
                 match out.get(field).map(type_of) {
@@ -235,13 +220,10 @@ fn run(
                 case.map_or(&branch.otherwise, |c| &c.next)
             }
             Some(Next::Wait { wait }) => {
-                let (at, key) = (
-                    json!({ "step": i, "for": wait.for_ty }),
-                    eval(&wait.key, &vals),
-                );
-                if let Value::Object(data) = json!({ "$wait": at, "key": key, "vals": vals }) {
-                    nexts.push((flow.ty, data, wait.within_ms));
-                }
+                let at = json!({ "step": i, "for": wait.for_ty });
+                let data = json!({ "$wait": at, "key": eval(&wait.key, &vals), "vals": vals });
+                let Value::Object(data) = data else { continue };
+                nexts.push((flow.ty, data, wait.within_ms));
                 continue;
             }
         };
@@ -269,11 +251,15 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::sync::{Arc, Mutex};
 
+    use rannoch_core::{Append, Config, Event, Rannoch, Status};
+    use rannoch_queue::Flows;
     use rusqlite::Connection;
     use serde_json::{Map, Value, json};
     use uuid::Uuid;
 
-    use super::{Action, FlowDoc, Out, Sig};
+    use super::{Action, FlowDoc, Processor, Sig};
+
+    type Out = (Uuid, u16, Map<String, Value>, u64);
 
     type Calls = Vec<(String, Map<String, Value>)>;
     type Ran = Result<Vec<(u16, Map<String, Value>, u64)>, String>;
@@ -472,6 +458,48 @@ mod tests {
         super::waits(conn, &HashSet::new(), &waiting(), (w, 60), &data).unwrap()
     }
 
+    /// What rannoch hands over, as (ty, source), kept off `_events`.
+    #[derive(Debug, Default)]
+    struct Kept(Mutex<Vec<(u16, Option<Uuid>)>>);
+    impl Append<u16, Value> for Kept {
+        fn append(&self, batch: &[Event<u16, Value>]) -> Result<(), rannoch_core::Error> {
+            let mut kept = self.0.lock().unwrap();
+            kept.extend(batch.iter().map(|e| (e.ty, e.source)));
+            Ok(())
+        }
+    }
+
+    /// Runs each payment for `orders` through the processor's flow 61 over `conn`, its sends
+    /// never reaching `conn`; returns what was sent, as (ty, source).
+    fn through(conn: Connection, orders: &[&str]) -> Vec<(u16, Option<Uuid>)> {
+        let kept = Arc::new(Kept::default());
+        let append = Some(kept.clone() as Arc<dyn Append<u16, Value>>);
+        let rannoch = Rannoch::open(Config {
+            append,
+            ..Config::default()
+        })
+        .unwrap();
+        let docs = serde_json::to_string(&waiting()).unwrap();
+        let processor = Processor::<u16, Value>::new(&docs, vec![], conn).unwrap();
+        let flow = processor.flow(61).unwrap();
+        for order in orders {
+            let data = json!({ "order": order, "amount": 5 }).to_string();
+            let (id, source, run_at, status) = (Uuid::now_v7(), None, None, Status::Added);
+            let row = Event {
+                id,
+                source,
+                ty: 61,
+                data,
+                run_at,
+                status,
+            };
+            (flow.run)(&row, &row, &rannoch.sender()).unwrap();
+        }
+        rannoch.shutdown();
+        let sent = kept.0.lock().unwrap().clone();
+        sent.into_iter().filter(|s| s.0 != 61).collect()
+    }
+
     #[test]
     fn a_wait_is_an_event_of_the_flows_ty_with_its_step_key_and_vals_due_within_ms() {
         let (ran, _) = run(
@@ -497,6 +525,8 @@ mod tests {
         assert_eq!(pay(&conn, &HashSet::from([w]), "o1"), (vec![], "done"));
         let conn = events(w, &[(0, Value::Object(next.2))]);
         assert_eq!(pay(&conn, &HashSet::new(), "o1"), (vec![], "done"));
+        // Through the processor, the first match's next still on its way: sent once.
+        assert_eq!(through(events(w, &[]), &["o1", "o1"]), [(62, Some(w))]);
     }
 
     #[test]
