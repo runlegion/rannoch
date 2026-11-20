@@ -11,6 +11,7 @@ renamed = ["proc-text/renamed"]
 proc-text = { path = "../proc-text" }
 rannoch-processor = { path = "../../.." }
 rannoch-queue = { path = "../../../../rannoch-queue" }
+rusqlite = { version = "0.41", features = ["bundled"] }
 serde_json = "1"
 
 [build-dependencies]

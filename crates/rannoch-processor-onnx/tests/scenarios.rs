@@ -86,7 +86,7 @@ impl App {
             ..Config::default()
         };
         Rannoch::<u16, Value>::open(config(None))?.shutdown();
-        let processor = Arc::new(Processor::new(&flows()?, actions)?);
+        let processor = Arc::new(Processor::new(&flows()?, actions, ready(&path)?)?);
         let (signal, wake) = mpsc::channel();
         let events = Events::new(ready(&path)?, signal.clone());
         let rannoch = Rannoch::open(config(Some(Arc::new(events) as Arc<dyn Append<_, _>>)))?;

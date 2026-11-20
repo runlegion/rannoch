@@ -1,16 +1,21 @@
 mod check;
 mod doc;
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use chrono::{TimeDelta, Utc};
 use rannoch_core::{Event, Sender, Status};
 use rannoch_queue::{Flow, Flows, Row};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
+use uuid::Uuid;
 
 pub use check::{check, compile};
-pub use doc::{Branch, Case, Flow as FlowDoc, Next, Shape, Step, To, eval, type_expr, type_of};
+pub use doc::{Branch, Case, Flow as FlowDoc, Next, Shape, Step, To, Wait};
+pub use doc::{eval, type_expr, type_of};
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -43,42 +48,59 @@ pub struct Processor<T, D> {
     flows: HashMap<u16, Arc<Flow<T, D>>>,
 }
 
+type Out = (Uuid, u16, Map<String, Value>, u64); // a next to send: source, ty, data, delay
+
 impl<T: TryFrom<u16> + PartialEq + 'static, D: From<Value> + 'static> Processor<T, D> {
-    /// `flows` is the JSON array of flow docs the app compiles in.
+    /// `flows` is the JSON array of flow docs the app compiles in; `events` reads `_events`.
     /// # Errors
     /// The error of a flow doc that does not parse.
-    pub fn new(flows: &str, actions: Vec<Arc<dyn Action>>) -> Result<Self, serde_json::Error> {
+    pub fn new(
+        flows: &str,
+        actions: Vec<Arc<dyn Action>>,
+        events: Connection,
+    ) -> Result<Self, serde_json::Error> {
         let mut by_name = HashMap::new();
         for action in actions {
             by_name.insert(action.sig().action.clone(), action);
         }
+        let docs: Arc<Vec<FlowDoc>> = Arc::new(serde_json::from_str(flows)?);
+        let (events, answered) = (Arc::new(Mutex::new(events)), Arc::new(Mutex::default()));
         let mut by_ty: HashMap<u16, Arc<Flow<T, D>>> = HashMap::new();
-        for doc in serde_json::from_str::<Vec<FlowDoc>>(flows)? {
+        for doc in docs.iter().cloned() {
             let (actions, ty, job) = (by_name.clone(), doc.ty, doc.job);
+            let (docs, events, answered) = (docs.clone(), events.clone(), answered.clone());
             let process = move |event: &Row, root: &Row, sender: &Sender<T, D>| {
                 let ty = |ty| T::try_from(ty).map_err(|_| format!("ty {ty} is not the app's"));
                 let sends = serde_json::from_str(&root.data)
                     .map_err(|e| format!("root data: {e}"))
-                    .and_then(|data| run(&doc, &actions, data))
-                    .and_then(|nexts| {
+                    .and_then(|data: Map<String, Value>| {
+                        let (id, at) = (event.id, (event.id, event.ty));
+                        let (mut outs, said) =
+                            waits(&lock(&events), &lock(&answered), &docs, at, &data)?;
+                        if said == "done" {
+                            let nexts = run(&doc, &actions, data)?.into_iter();
+                            outs.extend(nexts.map(|(to, data, delay)| (id, to, data, delay)));
+                        }
+                        lock(&answered).extend(outs.iter().map(|o| o.0).filter(|s| *s != id));
                         let done =
-                            ty(event.ty).map(|t| (t, "done".into(), None, Status::Processed));
-                        let nexts = nexts.into_iter().map(|(to, data, delay)| {
+                            ty(event.ty).map(|t| (id, t, said.into(), None, Status::Processed));
+                        let nexts = outs.into_iter().map(|(source, to, data, delay)| {
                             let at = TimeDelta::from_std(Duration::from_millis(delay)).ok();
                             let at = at.and_then(|d| Utc::now().checked_add_signed(d));
-                            Ok((ty(to)?, Value::Object(data), at, Status::Added))
+                            Ok((source, ty(to)?, Value::Object(data), at, Status::Added))
                         });
                         nexts.chain([done]).collect::<Result<Vec<_>, String>>()
                     });
                 let (sends, result) = match sends {
                     Ok(sends) => (sends, Ok(())),
-                    Err(failure) => {
-                        let binned = (ty(event.ty)?, failure.as_str().into(), None, Status::Binned);
-                        (vec![binned], Err(failure))
+                    Err(e) => {
+                        let t = ty(event.ty)?;
+                        let binned = (event.id, t, e.as_str().into(), None, Status::Binned);
+                        (vec![binned], Err(e))
                     }
                 };
-                for (ty, data, run_at, status) in sends {
-                    let (id, source, data) = (uuid::Uuid::nil(), Some(event.id), D::from(data));
+                for (source, ty, data, run_at, status) in sends {
+                    let (id, source, data) = (Uuid::nil(), Some(source), D::from(data));
                     let sent = Event {
                         id,
                         source,
@@ -106,10 +128,73 @@ impl<T, D> Flows<T, D> for Processor<T, D> {
     }
 }
 
+fn lock<X>(mutex: &Mutex<X>) -> std::sync::MutexGuard<'_, X> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The waits in `_events` waiting for `ty`: (id, data), and the rows about each.
+#[expect(clippy::type_complexity, reason = "the issue's signature")]
+fn waits_for(
+    conn: &Connection,
+    ty: u16,
+) -> rusqlite::Result<Vec<(Uuid, Value, Vec<(i8, String)>)>> {
+    let sql = "SELECT w.id, w.data, json_group_array(json_array(s.status, s.data))
+        FILTER (WHERE s.id IS NOT NULL) FROM _events w LEFT JOIN _events s ON s.source = w.id
+        WHERE json_extract(w.data, '$.\"$wait\".for') = ?1 GROUP BY w.id ORDER BY w.id";
+    let mut select = conn.prepare_cached(sql)?;
+    let row = |r: &rusqlite::Row<'_>| Ok((r.get(0)?, r.get(1)?, r.get(2)?));
+    let rows = select.query_map([ty], row)?.map(|row| {
+        let (id, data, about): (String, String, String) = row?;
+        let (data, about) = (serde_json::from_str(&data), serde_json::from_str(&about));
+        let id = id.parse().unwrap_or_default();
+        Ok((id, data.unwrap_or_default(), about.unwrap_or_default()))
+    });
+    rows.collect()
+}
+
+/// What the event `id` of `ty` sends about waits, and its 2's data: a due wait its timeout unless
+/// matched; any other event, per wait its `data` keys, the match next, or late after "timeout".
+fn waits<'d>(
+    conn: &Connection,
+    answered: &HashSet<Uuid>,
+    docs: &'d [FlowDoc],
+    (id, ty): (Uuid, u16),
+    data: &Map<String, Value>,
+) -> Result<(Vec<Out>, &'static str), String> {
+    let due = data.get("$wait");
+    let ty = due.map_or(Some(ty), |at| at["for"].as_u64()?.try_into().ok());
+    let (mut outs, mut said) = (Vec::new(), if due.is_some() { "matched" } else { "done" });
+    for (wait_id, w, rows) in waits_for(conn, ty.unwrap_or(0)).map_err(|e| e.to_string())? {
+        let step: Option<usize> = w["$wait"]["step"].as_u64().and_then(|s| s.try_into().ok());
+        let at = |d: &'d FlowDoc| d.steps.get(step?)?.next.as_ref();
+        let mut nexts = docs.iter().filter_map(at);
+        let fits = |wait: &Wait| due.map_or(eval(&wait.key, data) == w["key"], |_| wait_id == id);
+        let waiting =
+            |n: &&Next| matches!(n, Next::Wait { wait } if Some(wait.for_ty) == ty && fits(wait));
+        let Some(Next::Wait { wait }) = nexts.find(waiting) else {
+            continue;
+        };
+        let zeros = rows.iter().filter(|r| r.0 == 0).count();
+        let two = rows.iter().find(|r| r.0 == 2).map(|r| r.1.as_str());
+        let to = match (due.is_some(), answered.contains(&wait_id), zeros, two) {
+            (true, false, 0, _) => Some(&wait.timeout).inspect(|_| said = "timeout"),
+            (false, false, 0, None) => Some(&wait.next),
+            (false, false, 1, Some("\"timeout\"")) => wait.late.as_ref(),
+            _ => None,
+        };
+        let mut vals = w["vals"].as_object().cloned().unwrap_or_default();
+        let got = data.iter().filter(|_| due.is_none());
+        vals.extend(got.map(|(k, v)| (format!("got.{k}"), v.clone())));
+        let nexts = to.into_iter().flat_map(|to| shaped(to, &vals));
+        outs.extend(nexts.map(|(to, d, delay)| (wait_id, to, d, delay)));
+    }
+    Ok((outs, said))
+}
+
 /// Runs `flow` on the root's data: per step, each link of the chain in order, its options
 /// from `with`, its input the options so far, its output checked against its sig's gives and
 /// merged in (later wins), the step's result put under `as` when set; then the step's next is
-/// shaped with `eval`. Returns the nexts as (ty, data, `delay_ms`), or the first failure.
+/// shaped with `eval`, a wait as an event of the flow's ty. Returns them as (ty, data, delay).
 #[expect(clippy::type_complexity, reason = "the issue's signature")]
 fn run(
     flow: &FlowDoc,
@@ -117,7 +202,7 @@ fn run(
     data: Map<String, Value>,
 ) -> Result<Vec<(u16, Map<String, Value>, u64)>, String> {
     let (mut vals, mut nexts) = (data, Vec::new());
-    for step in &flow.steps {
+    for (i, step) in flow.steps.iter().enumerate() {
         let (mut input, mut result) = (vals.clone(), Map::new());
         for link in step.chain.split('.') {
             let action = actions.get(link).ok_or(format!("no action named {link}"))?;
@@ -149,6 +234,16 @@ fn run(
                 let case = branch.cases.iter().find(|c| &c.when == on);
                 case.map_or(&branch.otherwise, |c| &c.next)
             }
+            Some(Next::Wait { wait }) => {
+                let (at, key) = (
+                    json!({ "step": i, "for": wait.for_ty }),
+                    eval(&wait.key, &vals),
+                );
+                if let Value::Object(data) = json!({ "$wait": at, "key": key, "vals": vals }) {
+                    nexts.push((flow.ty, data, wait.within_ms));
+                }
+                continue;
+            }
         };
         nexts.extend(shaped(to, &vals));
     }
@@ -171,12 +266,14 @@ fn shaped(to: &To, vals: &Map<String, Value>) -> Vec<(u16, Map<String, Value>, u
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::{Arc, Mutex};
 
+    use rusqlite::Connection;
     use serde_json::{Map, Value, json};
+    use uuid::Uuid;
 
-    use super::{Action, FlowDoc, Sig};
+    use super::{Action, FlowDoc, Out, Sig};
 
     type Calls = Vec<(String, Map<String, Value>)>;
     type Ran = Result<Vec<(u16, Map<String, Value>, u64)>, String>;
@@ -320,5 +417,118 @@ mod tests {
         let nexts = super::shaped(&to, &obj(&json!({ "list": ["a", "b", "c"], "n": 7 })));
         let words = ["a", "b", "c"].map(|w| (41, obj(&json!({ "word": w, "n": 7 })), 0));
         assert_eq!(nexts, words);
+    }
+
+    /// The order flow 60 waits for a payment, 61, keyed by its order; and the payment flow.
+    fn waiting() -> Vec<FlowDoc> {
+        let wait = json!({ "for": 61, "key": "$order", "within_ms": 2000,
+            "next": { "ty": 62, "shape": { "order": "$order", "paid": "$got.amount" } },
+            "timeout": { "ty": 63, "shape": { "order": "$order" } },
+            "late": { "ty": 64, "shape": { "paid": "$got.amount" } } });
+        serde_json::from_value(json!([
+            { "name": "order", "ty": 60, "takes": {}, "steps": [{ "do": "a", "next": { "wait": wait } }] },
+            { "name": "payment", "ty": 61, "takes": {}, "steps": [] }
+        ]))
+        .unwrap()
+    }
+
+    /// `_events` as the store's migration makes it, holding the wait `w` for order o1 and the
+    /// `rows` about it, as (status, data).
+    fn events(w: Uuid, rows: &[(i8, Value)]) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE _events (id TEXT PRIMARY KEY, source TEXT, ty INTEGER NOT NULL,
+            data TEXT NOT NULL, run_at TEXT, status INTEGER NOT NULL)",
+        )
+        .unwrap();
+        let wait = json!({ "$wait": { "step": 0, "for": 61 }, "key": "o1",
+            "vals": { "order": "o1" } });
+        let rows = rows
+            .iter()
+            .map(|(s, d)| (Uuid::now_v7(), Some(w), *s, d.clone()));
+        for (id, source, status, data) in [(w, None, 0, wait)].into_iter().chain(rows) {
+            let (id, source) = (id.to_string(), source.map(|s| s.to_string()));
+            let row = (id, source, data.to_string(), status);
+            conn.execute("INSERT INTO _events VALUES (?1, ?2, 60, ?3, NULL, ?4)", row)
+                .unwrap();
+        }
+        conn
+    }
+
+    fn pay(conn: &Connection, answered: &HashSet<Uuid>, order: &str) -> (Vec<Out>, &'static str) {
+        let data = obj(&json!({ "order": order, "amount": 5 }));
+        super::waits(conn, answered, &waiting(), (Uuid::now_v7(), 61), &data).unwrap()
+    }
+
+    fn due(conn: &Connection, w: Uuid) -> (Vec<Out>, &'static str) {
+        let data: String = conn
+            .query_row(
+                "SELECT data FROM _events WHERE id = ?1",
+                [w.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let data = serde_json::from_str(&data).unwrap();
+        super::waits(conn, &HashSet::new(), &waiting(), (w, 60), &data).unwrap()
+    }
+
+    #[test]
+    fn a_wait_is_an_event_of_the_flows_ty_with_its_step_key_and_vals_due_within_ms() {
+        let (ran, _) = run(
+            &serde_json::to_value(&waiting()[0]).unwrap(),
+            &json!({ "order": "o1" }),
+            &[("a", &[], |_| Ok(Map::new()))],
+        );
+        let data = obj(&json!({ "$wait": { "step": 0, "for": 61 }, "key": "o1",
+            "vals": { "order": "o1" } }));
+        assert_eq!(ran.unwrap(), [(60, data, 2000)]);
+    }
+
+    #[test]
+    fn a_matching_event_adds_the_match_next_once_and_a_second_adds_none() {
+        let w = Uuid::now_v7();
+        let conn = events(w, &[]);
+        let next = (w, 62, obj(&json!({ "order": "o1", "paid": 5 })), 0);
+        assert_eq!(
+            pay(&conn, &HashSet::new(), "o1"),
+            (vec![next.clone()], "done")
+        );
+        assert_eq!(pay(&conn, &HashSet::new(), "o2"), (vec![], "done"));
+        assert_eq!(pay(&conn, &HashSet::from([w]), "o1"), (vec![], "done"));
+        let conn = events(w, &[(0, Value::Object(next.2))]);
+        assert_eq!(pay(&conn, &HashSet::new(), "o1"), (vec![], "done"));
+    }
+
+    #[test]
+    fn a_due_wait_with_no_match_sends_its_timeout_and_says_timeout() {
+        let w = Uuid::now_v7();
+        let timeout = (w, 63, obj(&json!({ "order": "o1" })), 0);
+        assert_eq!(due(&events(w, &[]), w), (vec![timeout], "timeout"));
+        let matched = events(w, &[(0, json!({ "order": "o1", "paid": 5 }))]);
+        assert_eq!(due(&matched, w), (vec![], "matched"));
+    }
+
+    #[test]
+    fn a_match_after_timeout_sends_late_once() {
+        let w = Uuid::now_v7();
+        let timed_out = [(0, json!({ "order": "o1" })), (2, json!("timeout"))];
+        let late = (w, 64, obj(&json!({ "paid": 5 })), 0);
+        assert_eq!(
+            pay(&events(w, &timed_out), &HashSet::new(), "o1"),
+            (vec![late], "done")
+        );
+        let sent = [
+            timed_out[0].clone(),
+            timed_out[1].clone(),
+            (0, json!({ "paid": 5 })),
+        ];
+        assert_eq!(
+            pay(&events(w, &sent), &HashSet::new(), "o1"),
+            (vec![], "done")
+        );
+        assert_eq!(
+            pay(&events(w, &timed_out), &HashSet::from([w]), "o1"),
+            (vec![], "done")
+        );
     }
 }

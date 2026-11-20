@@ -1,5 +1,5 @@
 //! FR-RANNOCH-119's scenarios from `tests/features/lib.feature` (`@criterion-FR-RANNOCH-119-c3`
-//! to `-c7`, `-c11`, `-c13`, `-c14`). The store is the app's database through the real store,
+//! to `-c9`, `-c11`, `-c13`, `-c14`). The store is the app's database through the real store,
 //! events from the app's forgr factory, handed over by the real queue; the flow docs are
 //! `tests/flows.json` and the test processor crate's actions are `Fake`s. The build scenarios
 //! (`-c1`, `-c2`, `-c10`, `-c12`, `-c16`) build the test app of `tests/app` with cargo.
@@ -158,11 +158,15 @@ struct App {
 
 impl App {
     fn start(name: &str, attempts: u32) -> Result<Self> {
-        let path = database(name)?;
+        Self::open(database(name)?, attempts)
+    }
+
+    /// The app over the store at `path`, as it is.
+    fn open(path: PathBuf, attempts: u32) -> Result<Self> {
         let store = migrated(&path)?;
         let (calls, rating) = (Calls::default(), Arc::default());
-        let flows = include_str!("flows.json");
-        let processor: Processor<Ty, Value> = Processor::new(flows, actions(&calls, &rating))?;
+        let (flows, actions) = (include_str!("flows.json"), actions(&calls, &rating));
+        let processor: Processor<Ty, Value> = Processor::new(flows, actions, ready(&path)?)?;
         let (signal, wake) = mpsc::channel();
         let append =
             Arc::new(Events::new(ready(&path)?, signal.clone())) as Arc<dyn Append<Ty, Value>>;
@@ -654,4 +658,79 @@ fn the_apps_build_gathers_the_signatures_a_separate_processor_crate_exports() ->
     let renamed = "E5 10-greet.json step 0 next: $greeting names nothing in scope".to_owned();
     assert_eq!(app.build("valid", true)?, Err(vec![renamed]));
     Ok(())
+}
+
+#[test]
+fn a_wait_kept_in_events_matches_times_out_and_sends_a_late_match_to_late_across_a_restart() {
+    // Given an app built with a flow whose step waits for a payment keyed by its order, with a
+    // timeout, a match next, a timeout next and a late next
+    let app = App::start("a_wait_kept_in_events", 1).unwrap();
+
+    // When orders o1 and o2 start waiting
+    let before = Utc::now() - TimeDelta::milliseconds(1);
+    let o1 = app.hand(70, &json!({ "order": "o1" })).unwrap();
+    let o2 = app.hand(70, &json!({ "order": "o2" })).unwrap();
+
+    // Then each wait is kept in _events as an event whose source is the waiting event and whose
+    // run_at is its timeout
+    let wait = |order: Uuid, key: &str| {
+        assert!(until(WAIT, || app.statuses(order).contains(&2)));
+        let after = Utc::now();
+        let wait = app.about(order).into_iter().find(|r| r.2 == 0).unwrap();
+        let data = json!({ "$wait": { "step": 0, "for": 71 }, "key": key,
+            "vals": { "order": key } });
+        assert_eq!((wait.1, &wait.3), (70, &data));
+        let run_at: DateTime<Utc> = wait.4.unwrap().parse().unwrap();
+        let within = TimeDelta::milliseconds(2500);
+        assert!(run_at >= before + within && run_at <= after + within);
+        wait.0
+    };
+    let (w1, w2) = (wait(o1, "o1"), wait(o2, "o2"));
+
+    // When the app's process is dropped and its _events file reopened
+    let path = app.path.clone();
+    app.stop();
+    let app = App::open(path, 1).unwrap();
+
+    // And two payments for o1 arrive before o1's timeout
+    let pay = |order: &str, amount: u64| {
+        let paid = app.hand(71, &json!({ "order": order, "amount": amount }));
+        let paid = paid.unwrap();
+        assert!(until(WAIT, || app.statuses(paid).contains(&2)));
+    };
+    pay("o1", 5);
+    pay("o1", 6);
+
+    // Then o1's match next is sent once, with the wait as its source
+    let matched = (72, json!({ "order": "o1", "paid": 5 }));
+    assert!(until(WAIT, || !app.sent(w1, 0).is_empty()));
+    assert!(
+        app.statuses(w1).iter().all(|s| *s == 0),
+        "o1 is not due yet"
+    );
+    assert_eq!(app.sent(w1, 0), std::slice::from_ref(&matched));
+
+    // When the waits come due, and the due events are run again
+    let due = |w| until(WAIT, || app.statuses(w).contains(&2));
+    assert!(due(w1) && due(w2));
+
+    // Then o1's wait sends no timeout, and o2's wait sends its timeout next once
+    assert_eq!(app.sent(w1, 0), [matched]);
+    assert_eq!(app.sent(w1, 2), [(70, json!("matched"))]);
+    let timeout = (73, json!({ "order": "o2" }));
+    assert_eq!(app.sent(w2, 0), std::slice::from_ref(&timeout));
+    assert_eq!(app.sent(w2, 2), [(70, json!("timeout"))]);
+
+    // When a payment for o2 arrives after its timeout, and the due events are run again
+    pay("o2", 7);
+
+    // Then o2's late next is sent once, and no match next
+    let late = (74, json!({ "order": "o2", "paid": 7 }));
+    assert!(until(WAIT, || app.sent(w2, 0).len() > 1));
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(app.sent(w2, 0), [timeout, late]);
+    let sent = app.count("SELECT count(*) FROM _events WHERE ty = 72 AND status = 0");
+    assert_eq!(sent, 1, "o1's match only");
+
+    app.stop();
 }

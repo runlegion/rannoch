@@ -59,18 +59,28 @@ fn until(done: impl Fn() -> bool) -> bool {
 /// The app's store, rannoch, and the queue handing events to rannoch-processor.
 struct App(PathBuf, mpsc::Sender<()>, Rannoch<u16, Value>, Queue);
 
+/// A fresh store for the app, with every migration applied by opening rannoch once.
+fn migrated() -> Result<PathBuf> {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("retrieve");
+    drop(fs::remove_dir_all(&dir));
+    fs::create_dir_all(&dir)?;
+    let path = dir.join("store.db");
+    let store = Some(Arc::new(Store::new(path.clone(), rannoch_core::migrator())) as _);
+    Rannoch::<u16, Value>::open(Config {
+        store,
+        ..Config::default()
+    })?
+    .shutdown();
+    Ok(path)
+}
+
 impl App {
-    fn start(processor: Processor<u16, Value>) -> Result<Self> {
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("retrieve");
-        drop(fs::remove_dir_all(&dir));
-        fs::create_dir_all(&dir)?;
-        let path = dir.join("store.db");
+    fn start(path: PathBuf, processor: Processor<u16, Value>) -> Result<Self> {
         let store = Arc::new(Store::new(path.clone(), rannoch_core::migrator()));
         let config = || Config::<u16, Value> {
             store: Some(store.clone()),
             ..Config::default()
         };
-        Rannoch::open(config())?.shutdown();
         let (signal, wake) = mpsc::channel();
         let append = Arc::new(Events::new(ready(&path)?, signal.clone()));
         let append = Some(append as Arc<dyn Append<u16, Value>>);
@@ -125,12 +135,14 @@ fn a_flow_step_queries_an_outside_source_the_app_reaches_through_the_retrieve_tr
     let docs: Vec<FlowDoc> = serde_json::from_str(FLOWS).unwrap();
     let docs: Vec<(String, FlowDoc)> = docs.into_iter().map(|d| (d.name.clone(), d)).collect();
     let flows = check(&docs, &[sig]).unwrap();
-    let processor: Processor<u16, Value> = Processor::new(&flows, vec![retrieve]).unwrap();
+    let path = migrated().unwrap();
+    let events = ready(&path).unwrap();
+    let processor: Processor<u16, Value> = Processor::new(&flows, vec![retrieve], events).unwrap();
 
     // Then the flow reports a job step
     assert!(processor.flow(10).unwrap().job);
     assert!(!processor.flow(11).unwrap().job);
-    let app = App::start(processor).unwrap();
+    let app = App::start(path, processor).unwrap();
 
     // When the queue hands rannoch-processor an event the stub answers with an email string
     let found = app.hand(&json!({ "user": "sam@example.com" })).unwrap();

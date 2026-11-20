@@ -13,6 +13,7 @@ onnx = ["dep:rannoch-processor-onnx"]
 rannoch-processor = { path = "../../../rannoch-processor" }
 rannoch-processor-onnx = { path = "../..", optional = true }
 rannoch-queue = { path = "../../../rannoch-queue" }
+rusqlite = { version = "0.41", features = ["bundled"] }
 serde_json = "1"
 
 [build-dependencies]

@@ -93,3 +93,16 @@ Feature: rannoch-processor runs a flow's steps and sends its nexts on success
     Then each build fails listing every error in it
     When the separate crate renames the field greet gives, and the app is built
     Then the build fails listing one error: the next's template names a field nothing gives
+
+  @module-rannoch-processor @criterion-FR-RANNOCH-119-c8 @criterion-FR-RANNOCH-119-c9
+  Scenario: A wait kept in _events matches, times out, and sends a late match to late, across a restart
+    Given an app built with a flow whose step waits for a payment keyed by its order, with a timeout, a match next, a timeout next and a late next
+    When orders o1 and o2 start waiting
+    Then each wait is kept in _events as an event whose source is the waiting event and whose run_at is its timeout
+    When the app's process is dropped and its _events file reopened
+    And two payments for o1 arrive before o1's timeout
+    Then o1's match next is sent once, with the wait as its source
+    When the waits come due, and the due events are run again
+    Then o1's wait sends no timeout, and o2's wait sends its timeout next once
+    When a payment for o2 arrives after its timeout, and the due events are run again
+    Then o2's late next is sent once, and no match next
