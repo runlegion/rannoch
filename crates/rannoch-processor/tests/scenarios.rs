@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
@@ -450,46 +450,23 @@ fn an_actions_real_output_is_checked_at_run_time() {
     app.stop();
 }
 
-/// The flow sets of `tests/app/app/flows` that fail the build, and the errors each lists.
-const BAD: [(&str, &[&str]); 9] = [
-    ("e1", &["E1 a.json step 0 nope: no action named nope"]),
-    (
-        "e2",
-        &["E2 a.json step 0 greet: the options for greet do not parse: unknown field `salut`"],
-    ),
-    (
-        "e3",
-        &["E3 a.json step 0 upper: upper takes text, which nothing before it gives"],
-    ),
-    (
-        "e4",
-        &["E4 a.json step 0 upper: upper takes text as string, it is number"],
-    ),
-    (
-        "e5",
-        &["E5 a.json step 0 next: the next to notice gives no who, which it takes"],
-    ),
-    (
-        "e6",
-        &["E6 a.json step 0 next: the next to notice gives who as number, it takes string"],
-    ),
-    (
-        "e7",
-        &["E7 a.json step 0 next: the next goes to ty 99, which no flow takes"],
-    ),
-    ("emit", &["E1 a.json step 0 emit: no action named emit"]),
-    (
-        "multi",
-        &[
-            "E1 a.json step 0 nope: no action named nope",
-            "E7 a.json step 0 next: the next goes to ty 99, which no flow takes",
-            "E4 b.json step 0 upper: upper takes text as string, it is number",
-        ],
-    ),
+/// The builds of the test app that fail, in the order of the scenario: the flow set, whether
+/// proc-text's `renamed` feature is on, and the errors the build lists, one per line.
+#[rustfmt::skip]
+const BAD: [(&str, bool, &str); 10] = [
+    ("e1", false, "E1 a.json step 0 nope: no action named nope"),
+    ("e2", false, "E2 a.json step 0 greet: the options for greet do not parse: unknown field `salut`"),
+    ("e3", false, "E3 a.json step 0 upper: upper takes text, which nothing before it gives"),
+    ("e4", false, "E4 a.json step 0 upper: upper takes text as string, it is number"),
+    ("e5", false, "E5 a.json step 0 next: the next to notice gives no who, which it takes"),
+    ("e6", false, "E6 a.json step 0 next: the next to notice gives who as number, it takes string"),
+    ("valid", true, "E5 10-greet.json step 0 next: $greeting names nothing in scope"),
+    ("e7", false, "E7 a.json step 0 next: the next goes to ty 99, which no flow takes"),
+    ("emit", false, "E1 a.json step 0 emit: no action named emit"),
+    ("multi", false, "E1 a.json step 0 nope: no action named nope
+E7 a.json step 0 next: the next goes to ty 99, which no flow takes
+E4 b.json step 0 upper: upper takes text as string, it is number"),
 ];
-
-/// The one error of the valid set built with proc-text's `renamed` feature.
-const RENAMED: &str = "E5 10-greet.json step 0 next: $greeting names nothing in scope";
 
 /// One fixture build at a time: every build shares one target dir and one built app.
 static CARGO: Mutex<()> = Mutex::new(());
@@ -562,21 +539,22 @@ impl Fixture {
 
     /// Runs the built app with its flow docs removed from disk: what it prints.
     fn run_without_docs(&self) -> Result<String> {
-        fs::remove_dir_all(self.0.join("app/flows"))?;
+        let (docs, gone) = (self.0.join("app/flows"), self.0.join("app/flows-removed"));
+        fs::rename(&docs, &gone)?;
         let app = Path::new(env!("CARGO_TARGET_TMPDIR")).join("app-target/debug/app");
-        let out = std::process::Command::new(app).output()?;
+        let out = std::process::Command::new(app).output();
+        fs::rename(&gone, &docs)?;
+        let out = out?;
         assert!(out.status.success(), "the app ran");
         Ok(String::from_utf8(out.stdout)?)
     }
 
-    /// Builds each bad set and asserts it fails listing exactly its errors.
-    fn assert_bad_sets(&self) -> Result<()> {
-        for (set, errors) in BAD {
-            assert_eq!(
-                self.build(set, false)?,
-                Err(errors.iter().map(|e| (*e).to_owned()).collect()),
-                "{set}"
-            );
+    /// Builds each of `BAD` (the renamed build only when `renamed`) and asserts it fails
+    /// listing exactly its errors.
+    fn assert_bad(&self, renamed: bool) -> Result<()> {
+        for (set, with_renamed, errors) in BAD.iter().filter(|b| renamed || !b.1) {
+            let errors = errors.lines().map(str::to_owned).collect();
+            assert_eq!(self.build(set, *with_renamed)?, Err(errors), "{set}");
         }
         Ok(())
     }
@@ -584,24 +562,10 @@ impl Fixture {
 
 #[test]
 fn the_apps_build_checks_its_flow_docs() -> Result<()> {
-    let _one = CARGO
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _one = CARGO.lock().unwrap_or_else(PoisonError::into_inner);
     // Given an app whose flow docs are a valid set over the actions of a test processor crate,
     // one of whose actions is a job
     let app = Fixture::copy("the_apps_build_checks")?;
-
-    // When the app is built with each bad set (a step naming nope; options for greet with the
-    // unknown field salut; upper taking text nothing gives; upper taking text as a number; a
-    // next to notice giving no who; a next to notice giving who as a number; a next to ty 99; a
-    // step naming emit; two docs holding three errors)
-    // Then each build fails listing exactly its errors
-    app.assert_bad_sets()?;
-
-    // When the app is built with a flow doc whose next's $concat names a field greeting that
-    // nothing in scope gives
-    // Then the build fails listing one error: greeting names nothing in scope
-    assert_eq!(app.build("valid", true)?, Err(vec![RENAMED.to_owned()]));
 
     // When the app is built
     // Then the build succeeds
@@ -612,14 +576,19 @@ fn the_apps_build_checks_its_flow_docs() -> Result<()> {
     // And the built app runs its flows with the flow doc files removed from disk
     let ran = app.run_without_docs()?;
     assert_eq!(ran, "10 false\n15 false\n20 false\n30 true\n");
-    Ok(())
+
+    // When the app is built with each bad flow doc in turn (a step naming nope; options for
+    // greet with the unknown field salut; upper taking text nothing gives; upper taking text as
+    // a number; a next to notice giving no who; one giving who as a number; a $concat naming
+    // greeting, which nothing in scope gives; a next to ty 99; a step naming emit; two docs
+    // holding three errors)
+    // Then each build fails listing exactly its errors
+    app.assert_bad(true)
 }
 
 #[test]
 fn the_apps_build_gathers_the_signatures_a_separate_processor_crate_exports() -> Result<()> {
-    let _one = CARGO
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _one = CARGO.lock().unwrap_or_else(PoisonError::into_inner);
     // Given a workspace with a processor crate, separate from the app, that exports its
     // actions' signatures as data, among them greet
     // And an app with its own processor crate, whose flow docs use actions of both, including a
@@ -632,10 +601,11 @@ fn the_apps_build_gathers_the_signatures_a_separate_processor_crate_exports() ->
 
     // When the app is built with each bad set of flow docs
     // Then each build fails listing every error in it
-    app.assert_bad_sets()?;
+    app.assert_bad(false)?;
 
     // When the separate crate renames the field greet gives, and the app is built
     // Then the build fails listing one error: the next's template names a field nothing gives
-    assert_eq!(app.build("valid", true)?, Err(vec![RENAMED.to_owned()]));
+    let renamed = "E5 10-greet.json step 0 next: $greeting names nothing in scope".to_owned();
+    assert_eq!(app.build("valid", true)?, Err(vec![renamed]));
     Ok(())
 }

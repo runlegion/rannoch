@@ -57,7 +57,10 @@ pub fn compile(dir: &Path, signatures: &[&str]) {
 pub fn check(docs: &[(String, FlowDoc)], sigs: &[Sig]) -> Result<String, Vec<String>> {
     let (mut errors, mut flows, empty) = (Vec::new(), Vec::new(), Value::Object(Map::new()));
     for (file, flow) in docs {
-        let mut flow = flow.clone();
+        let mut flow = FlowDoc {
+            job: false,
+            ..flow.clone()
+        };
         let mut scope = flow.takes.clone();
         for (i, step) in flow.steps.iter().enumerate() {
             let mut seen = scope.clone();
@@ -142,7 +145,6 @@ mod tests {
 
     use crate::{FlowDoc, Sig};
 
-    /// The test processor crate's signatures: trim, upper, greet, limit and the job index.
     fn sigs() -> Vec<Sig> {
         serde_json::from_value(json!([
             { "action": "trim", "takes": { "text": "string" }, "gives": { "text": "string" } },
@@ -155,18 +157,15 @@ mod tests {
         .unwrap()
     }
 
-    /// The notice flow, ty 20, which takes msg and who as strings.
     fn notice() -> Value {
         json!({ "name": "notice", "ty": 20, "takes": { "msg": "string", "who": "string" },
             "steps": [] })
     }
 
-    /// A flow `a` of ty 1 that takes `takes` and runs `steps`.
     fn flow(takes: &Value, steps: &Value) -> Value {
         json!({ "name": "a", "ty": 1, "takes": takes, "steps": steps })
     }
 
-    /// Checks the docs, each a file name and its JSON, against `sigs`.
     fn check(docs: &[(&str, Value)]) -> Result<String, Vec<String>> {
         let docs: Vec<(String, FlowDoc)> = docs
             .iter()
@@ -175,8 +174,7 @@ mod tests {
         super::check(&docs, &sigs())
     }
 
-    /// The errors of the one doc a.json, a flow taking text as `text` running `steps`, beside
-    /// notice.
+    /// The errors of a.json, taking text as `text` and running `steps`, beside notice.
     fn errors(text: &str, steps: &Value) -> Vec<String> {
         let a = flow(&json!({ "text": text }), steps);
         check(&[("a.json", a), ("n.json", notice())]).unwrap_err()
@@ -269,8 +267,10 @@ mod tests {
             ("i.json", index),
         ];
         let flows: Vec<Value> = serde_json::from_str(&check(&docs).unwrap()).unwrap();
-        let jobs: Vec<(&Value, &Value)> = flows.iter().map(|f| (&f["ty"], &f["job"])).collect();
-        let want = [(1, false), (20, false), (30, true)].map(|(t, j)| (json!(t), json!(j)));
-        assert_eq!(jobs, want.iter().map(|(t, j)| (t, j)).collect::<Vec<_>>());
+        let jobs: Vec<String> = flows
+            .iter()
+            .map(|f| format!("{} {}", f["ty"], f["job"]))
+            .collect();
+        assert_eq!(jobs, ["1 false", "20 false", "30 true"]);
     }
 }
