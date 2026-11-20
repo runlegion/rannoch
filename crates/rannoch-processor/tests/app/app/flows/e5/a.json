@@ -1,0 +1,1 @@
+{"name": "a", "ty": 1, "takes": {"text": "string"}, "steps": [{"do": "upper", "next": {"ty": 20, "shape": {"msg": "$text"}}}]}
