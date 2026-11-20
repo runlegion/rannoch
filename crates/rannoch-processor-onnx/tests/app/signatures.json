@@ -1,0 +1,5 @@
+[
+  { "action": "add", "takes": { "a": "number", "b": "number" }, "gives": { "y": "number" }, "job": true },
+  { "action": "embed", "takes": { "text": "string" }, "gives": { "vector": "list<number>" }, "job": true },
+  { "action": "classify", "takes": { "text": "string" }, "gives": { "label": "string" }, "job": true }
+]

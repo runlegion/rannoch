@@ -1,0 +1,1 @@
+{"name": "add", "ty": 10, "takes": {"a": "number", "b": "number"}, "steps": [{"do": "add", "next": {"ty": 11, "shape": {"sum": "$y"}}}]}
