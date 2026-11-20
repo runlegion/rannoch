@@ -1,0 +1,1 @@
+{"name": "embed", "ty": 20, "takes": {"text": "string"}, "steps": [{"do": "embed", "next": {"ty": 21, "shape": {"vector": "$vector"}}}]}

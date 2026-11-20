@@ -1,0 +1,19 @@
+[package]
+name = "app"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[features]
+onnx = ["dep:rannoch-processor-onnx"]
+
+[dependencies]
+rannoch-processor = { path = "../../../rannoch-processor" }
+rannoch-processor-onnx = { path = "../..", optional = true }
+rannoch-queue = { path = "../../../rannoch-queue" }
+serde_json = "1"
+
+[build-dependencies]
+rannoch-processor = { path = "../../../rannoch-processor" }
