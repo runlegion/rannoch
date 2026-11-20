@@ -1,1 +1,0 @@
-{"ty":15,"takes":{"text":"string"},"steps":[{"do":"trim.limit.upper","with":{"limit":{"max":5}},"next":{"ty":20,"shape":{"msg":"$text","who":"limit"}}}]}
