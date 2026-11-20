@@ -307,11 +307,11 @@ mod tests {
 
     #[test]
     fn nearest_picks_the_label_nearest_by_cosine() {
-        let labels = [("bug", vec![1.0, 0.0]), ("question", vec![0.0, 1.0])];
+        let labels = [("bug", vec![3.0, 0.0]), ("question", vec![0.0, 1.0])];
         let labels: Vec<(String, Vec<f64>)> =
             labels.into_iter().map(|(l, v)| (l.into(), v)).collect();
         assert_eq!(nearest(&[10.0, 1.0], &labels), "bug");
-        assert_eq!(nearest(&[0.2, 0.3], &labels), "question");
+        assert_eq!(nearest(&[1.0, 1.2], &labels), "question");
     }
 
     #[test]
