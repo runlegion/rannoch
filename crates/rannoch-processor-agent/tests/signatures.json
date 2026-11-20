@@ -1,0 +1,1 @@
+[{"action": "classify", "takes": {"text": "string"}, "gives": {"severity": "number"}, "job": true}]
