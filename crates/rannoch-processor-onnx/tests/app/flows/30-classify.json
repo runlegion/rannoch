@@ -1,0 +1,1 @@
+{"name": "classify", "ty": 30, "takes": {"text": "string"}, "steps": [{"do": "classify", "next": {"ty": 31, "shape": {"label": "$label"}}}]}

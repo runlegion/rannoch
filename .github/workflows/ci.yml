@@ -28,3 +28,21 @@ jobs:
       - name: test
         if: steps.ws.outputs.present == 'true'
         run: cargo test
+
+  onnx:
+    name: rannoch-processor-onnx through ort
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: test
+        run: cargo test -p rannoch-processor-onnx
+
+  onnx-tract:
+    name: rannoch-processor-onnx through tract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: test
+        run: cargo test -p rannoch-processor-onnx --features tract
