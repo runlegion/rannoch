@@ -254,6 +254,8 @@ mod tests {
             })],
         );
         assert_eq!(ran.unwrap_err(), "rate gave severity as number, not string");
+        let (ran, _) = run(&flow, &json!({}), &[]);
+        assert_eq!(ran.unwrap_err(), "no action named rate");
     }
 
     #[test]
