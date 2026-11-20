@@ -54,6 +54,7 @@ pub fn compile(dir: &Path, signatures: &[&str]) {
 /// The flows as the JSON array to compile in, or every error.
 /// # Errors
 /// Every error in every doc, one line each, `E<n> <file> step <i> <link name | next>: <what>`.
+#[expect(clippy::too_many_lines, reason = "every check of a doc, in its order")]
 pub fn check(docs: &[(String, FlowDoc)], sigs: &[Sig]) -> Result<String, Vec<String>> {
     let (mut errors, mut flows, empty) = (Vec::new(), Vec::new(), Value::Object(Map::new()));
     for (file, flow) in docs {
@@ -106,28 +107,61 @@ pub fn check(docs: &[(String, FlowDoc)], sigs: &[Sig]) -> Result<String, Vec<Str
                 Some(field) => drop(scope.insert(field.clone(), "any".to_owned())),
                 None => scope = seen,
             }
-            let Some(Next::To(to)) = &step.next else {
+            let Some(next) = &step.next else {
                 continue;
             };
             let at = format!("{file} step {i} next");
-            let Some((_, to_flow)) = docs.iter().find(|(_, f)| f.ty == to.ty) else {
-                errors.push(format!(
-                    "E7 {at}: the next goes to ty {}, which no flow takes",
-                    to.ty
-                ));
-                continue;
+            let tos = match next {
+                Next::To(to) => vec![to],
+                Next::Branch { branch } => {
+                    let (on, cases) = (&branch.on, &branch.cases);
+                    let ty = scope.get(on);
+                    if ty.is_none() {
+                        errors.push(format!("E3 {at}: branch on {on}, which nothing gives"));
+                    }
+                    for when in cases.iter().map(|c| &c.when) {
+                        if let Some(ty) = ty
+                            && type_of(when) != ty
+                        {
+                            errors.push(format!(
+                                "E4 {at}: branch on {on} as {ty}, a case when {when}"
+                            ));
+                        }
+                    }
+                    let tos = cases.iter().map(|c| &c.next);
+                    tos.chain([&branch.otherwise]).collect()
+                }
             };
-            let name = &to_flow.name;
-            for (field, takes) in &to_flow.takes {
-                match to.shape.get(field).map(|e| type_expr(e, &scope)) {
-                    None => errors.push(format!(
-                        "E5 {at}: the next to {name} gives no {field}, which it takes"
-                    )),
-                    Some(Err(why)) => errors.push(format!("E5 {at}: {why}")),
-                    Some(Ok(gives)) if &gives != takes => errors.push(format!(
-                        "E6 {at}: the next to {name} gives {field} as {gives}, it takes {takes}"
-                    )),
-                    Some(Ok(_)) => {}
+            for to in tos {
+                let mut scope = scope.clone();
+                if let Some(list) = &to.each {
+                    let ty = scope.get(list).cloned().unwrap_or_default();
+                    match ty.strip_prefix("list<").and_then(|t| t.strip_suffix('>')) {
+                        Some(item) => drop(scope.insert("item".to_owned(), item.to_owned())),
+                        None => {
+                            errors.push(format!("E4 {at}: each over {list}, which is not a list"));
+                        }
+                    }
+                }
+                let Some((_, to_flow)) = docs.iter().find(|(_, f)| f.ty == to.ty) else {
+                    errors.push(format!(
+                        "E7 {at}: the next goes to ty {}, which no flow takes",
+                        to.ty
+                    ));
+                    continue;
+                };
+                let name = &to_flow.name;
+                for (field, takes) in &to_flow.takes {
+                    match to.shape.get(field).map(|e| type_expr(e, &scope)) {
+                        None => errors.push(format!(
+                            "E5 {at}: the next to {name} gives no {field}, which it takes"
+                        )),
+                        Some(Err(why)) => errors.push(format!("E5 {at}: {why}")),
+                        Some(Ok(gives)) if &gives != takes => errors.push(format!(
+                            "E6 {at}: the next to {name} gives {field} as {gives}, it takes {takes}"
+                        )),
+                        Some(Ok(_)) => {}
+                    }
                 }
             }
         }
@@ -272,5 +306,21 @@ mod tests {
             .map(|f| format!("{} {}", f["ty"], f["job"]))
             .collect();
         assert_eq!(jobs, ["1 false", "20 false", "30 true"]);
+    }
+    #[test]
+    fn e3_a_branch_on_a_field_nothing_gives() {
+        let to = json!({ "ty": 20, "shape": { "msg": "$text", "who": "x" } });
+        let branch = json!({ "on": "level", "cases": [], "else": to });
+        let steps = json!([{ "do": "upper", "next": { "branch": branch } }]);
+        let want = "E3 a.json step 0 next: branch on level, which nothing gives";
+        assert_eq!(errors("string", &steps), [want]);
+    }
+
+    #[test]
+    fn e4_each_over_a_non_list() {
+        let next = json!({ "ty": 20, "each": "text", "shape": { "msg": "$text", "who": "x" } });
+        let steps = json!([{ "do": "upper", "next": next }]);
+        let want = "E4 a.json step 0 next: each over text, which is not a list";
+        assert_eq!(errors("string", &steps), [want]);
     }
 }

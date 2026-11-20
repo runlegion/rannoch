@@ -25,6 +25,18 @@ Feature: rannoch-processor runs a flow's steps and sends its nexts on success
     When the queue's retry of the event comes due
     Then the chain runs again from its first link
 
+  @module-rannoch-processor @criterion-FR-RANNOCH-119-c7
+  Scenario: branch and each send their nexts
+    Given an app built with a flow whose branch has a case when crash naming ty 31, a case when question naming ty 32, and an else
+    And a flow whose branch has a case when level is the number 1, and an else
+    And a flow whose each sends one next per item of a list
+    When the queue hands rannoch-processor an event whose value is crash, one whose value is question, and one whose value has no case
+    Then one next of ty 31, one of ty 32 and one else next are sent, each with its event as source
+    When the queue hands rannoch-processor an event whose level is the number 1, and one whose level is the string "1"
+    Then the first sends the case's next and the second sends the else next
+    When the queue hands rannoch-processor an event whose list is 'a b c'
+    Then three nexts are sent, one per item, each with that event as source
+
   @module-rannoch-processor @criterion-FR-RANNOCH-119-c11 @criterion-FR-RANNOCH-119-c13
   Scenario: A two-step flow sends its next only when every step succeeds
     Given an app built with a two-step flow whose step 0 sends a next and whose step 1 runs a test action that fails on the first attempt and succeeds on the next
