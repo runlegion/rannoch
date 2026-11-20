@@ -1,0 +1,128 @@
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+
+/// Field name to type: "string", "number", "bool", "list<string>", "list<number>" or "any".
+pub type Shape = BTreeMap<String, String>;
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Flow {
+    pub name: String,
+    pub ty: u16,
+    pub takes: Shape,
+    pub steps: Vec<Step>,
+    #[serde(default)]
+    pub job: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Step {
+    #[serde(rename = "do")]
+    pub chain: String,
+    #[serde(default)]
+    pub with: BTreeMap<String, Value>,
+    #[serde(default, rename = "as")]
+    pub under: Option<String>,
+    #[serde(default)]
+    pub next: Option<Next>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum Next {
+    To(To),
+}
+
+/// A next to one ty: its data shaped from the options so far, due `delay_ms` after the run.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct To {
+    pub ty: u16,
+    #[serde(default)]
+    pub shape: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub delay_ms: u64,
+}
+
+/// A shape expression's value: "$field" reads the options so far; {"$concat": [..]} joins its
+/// parts as a string; {"$": "$field", "or": default} gives the default when the field is absent;
+/// anything else is itself.
+#[must_use]
+pub fn eval(expr: &Value, vals: &Map<String, Value>) -> Value {
+    match expr {
+        Value::String(r) if r.starts_with('$') => vals.get(&r[1..]).cloned().unwrap_or_default(),
+        Value::Object(o) if o.contains_key("$concat") => {
+            let mut text = String::new();
+            for part in o["$concat"].as_array().cloned().unwrap_or_default() {
+                let v = eval(&part, vals);
+                text.push_str(&v.as_str().map_or(v.to_string(), str::to_owned));
+            }
+            Value::String(text)
+        }
+        Value::Object(o) if o.contains_key("$") => match eval(&o["$"], vals) {
+            Value::Null => o.get("or").cloned().unwrap_or_default(),
+            v => v,
+        },
+        v => v.clone(),
+    }
+}
+
+/// A JSON value's type, in the Shape vocabulary.
+#[must_use]
+pub fn type_of(value: &Value) -> &'static str {
+    match value {
+        Value::String(_) => "string",
+        Value::Number(_) => "number",
+        Value::Bool(_) => "bool",
+        Value::Array(a) if !a.is_empty() && a.iter().all(Value::is_number) => "list<number>",
+        Value::Array(_) => "list<string>",
+        _ => "any",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Map, Value, json};
+
+    fn vals(v: &Value) -> Map<String, Value> {
+        v.as_object().cloned().unwrap_or_default()
+    }
+
+    #[test]
+    fn eval_reads_a_field_joins_a_concat_and_gives_or_for_an_absent_field() {
+        let vals = vals(&json!({ "text": "SAM", "n": 2 }));
+        assert_eq!(super::eval(&json!("$text"), &vals), json!("SAM"));
+        let concat = json!({ "$concat": ["hi ", "$text", "!", "$n"] });
+        assert_eq!(super::eval(&concat, &vals), json!("hi SAM!2"));
+        let or = json!({ "$": "$nick", "or": "friend" });
+        assert_eq!(super::eval(&or, &vals), json!("friend"));
+        assert_eq!(super::eval(&json!(7), &vals), json!(7));
+    }
+
+    #[test]
+    fn type_of_names_each_shape_type() {
+        let named: Vec<&str> = [
+            json!("a"),
+            json!(1),
+            json!(true),
+            json!(["a"]),
+            json!([1, 2]),
+            json!({}),
+        ]
+        .iter()
+        .map(super::type_of)
+        .collect();
+        let shape = [
+            "string",
+            "number",
+            "bool",
+            "list<string>",
+            "list<number>",
+            "any",
+        ];
+        assert_eq!(named, shape);
+    }
+}
