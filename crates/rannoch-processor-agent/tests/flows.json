@@ -1,0 +1,4 @@
+[
+  {"name": "triage", "ty": 60, "takes": {"text": "string"}, "steps": [{"do": "classify", "next": {"ty": 61, "shape": {"severity": "$severity"}}}]},
+  {"name": "rated", "ty": 61, "takes": {"severity": "number"}, "steps": []}
+]

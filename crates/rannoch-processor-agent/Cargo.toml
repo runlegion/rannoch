@@ -1,0 +1,20 @@
+[package]
+name = "rannoch-processor-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rannoch-processor = { path = "../rannoch-processor" }
+serde_json = "1"
+
+[dev-dependencies]
+rannoch-core = { path = "../rannoch-core", features = ["testing"] }
+rannoch-events = { path = "../rannoch-events" }
+rannoch-queue = { path = "../rannoch-queue" }
+rannoch-store = { path = "../rannoch-store" }
+rusqlite = { version = "0.41", features = ["bundled"] }
+uuid = { version = "1", features = ["v7"] }
+
+[lints]
+workspace = true
