@@ -246,6 +246,14 @@ mod tests {
             &[("rate", &["severity"], |_| Ok(Map::new()))],
         );
         assert_eq!(ran.unwrap_err(), "rate gave no severity");
+        let (ran, _) = run(
+            &flow,
+            &json!({}),
+            &[("rate", &["severity"], |_| {
+                Ok(obj(&json!({ "severity": 3 })))
+            })],
+        );
+        assert_eq!(ran.unwrap_err(), "rate gave severity as number, not string");
     }
 
     #[test]
