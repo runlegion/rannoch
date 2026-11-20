@@ -35,6 +35,21 @@ pub struct Step {
 pub enum Next {
     To(To),
     Branch { branch: Branch },
+    Wait { wait: Box<Wait> },
+}
+
+/// A wait for an event of `for` with the same `key`: `next` on a match, else `timeout`, `late`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Wait {
+    #[serde(rename = "for")]
+    pub for_ty: u16,
+    pub key: Value,
+    pub within_ms: u64,
+    pub next: To,
+    pub timeout: To,
+    #[serde(default)]
+    pub late: Option<To>,
 }
 
 /// A next to one ty: its data shaped from the options so far, due `delay_ms` after the run;

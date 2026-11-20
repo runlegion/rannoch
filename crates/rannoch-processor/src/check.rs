@@ -110,7 +110,7 @@ pub fn check(docs: &[(String, FlowDoc)], sigs: &[Sig]) -> Result<String, Vec<Str
             let at = format!("{file} step {i} next");
             let tos = match &step.next {
                 None => continue,
-                Some(Next::To(to)) => vec![to],
+                Some(Next::To(to)) => vec![(to, None)],
                 Some(Next::Branch { branch }) => {
                     let (on, cases) = (&branch.on, &branch.cases);
                     let ty = scope.get(on).map_or("", String::as_str);
@@ -122,11 +122,29 @@ pub fn check(docs: &[(String, FlowDoc)], sigs: &[Sig]) -> Result<String, Vec<Str
                     let e4 = |w| format!("E4 {at}: branch on {on} as {ty}, a case when {w}");
                     errors.extend(bad.map(e4));
                     let tos = cases.iter().map(|c| &c.next);
-                    tos.chain([&branch.otherwise]).collect()
+                    tos.chain([&branch.otherwise]).map(|t| (t, None)).collect()
+                }
+                Some(Next::Wait { wait }) => {
+                    let (ty, key) = (wait.for_ty, &wait.key);
+                    let got = docs.iter().find(|d| d.1.ty == ty).map(|d| &d.1.takes);
+                    let e7 = format!("E7 {at}: wait for ty {ty}, which no flow takes");
+                    match got.map(|g| (type_expr(key, &scope), type_expr(key, g))) {
+                        None => errors.push(e7),
+                        Some((Ok(a), Ok(b))) if a == b => {}
+                        Some((a, b)) => errors.push(format!(
+                            "E3 {at}: wait key {key} does not render the same on both sides \
+                            ({a:?} / {b:?})"
+                        )),
+                    }
+                    let late = wait.late.iter().map(|l| (l, got));
+                    let tos = [(&wait.next, got), (&wait.timeout, None)];
+                    tos.into_iter().chain(late).collect()
                 }
             };
-            for to in tos {
+            for (to, got) in tos {
                 let mut scope = scope.clone();
+                let got = got.into_iter().flatten();
+                scope.extend(got.map(|(f, t)| (format!("got.{f}"), t.clone())));
                 if let Some(l) = &to.each {
                     let ty = scope.get(l).cloned().unwrap_or_default();
                     match ty.strip_prefix("list<").and_then(|t| t.strip_suffix('>')) {

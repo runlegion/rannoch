@@ -94,7 +94,6 @@ fn a_flow_step_calls_an_agent_the_app_reaches_through_the_agent_trait() -> Resul
     let docs: Vec<FlowDoc> = serde_json::from_str(include_str!("flows.json"))?;
     let docs: Vec<_> = docs.into_iter().map(|d| (d.name.clone(), d)).collect();
     let flows = check(&docs, &sigs).map_err(|e| e.join("\n"))?;
-    let processor = Arc::new(Processor::<Ty, Value>::new(&flows, vec![agent])?);
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("calls_an_agent");
     if dir.exists() {
         fs::remove_dir_all(&dir)?;
@@ -107,6 +106,11 @@ fn a_flow_step_calls_an_agent_the_app_reaches_through_the_agent_trait() -> Resul
         ..Config::default()
     };
     Rannoch::open(config())?.shutdown();
+    let processor = Arc::new(Processor::<Ty, Value>::new(
+        &flows,
+        vec![agent],
+        ready(&path)?,
+    )?);
     let (signal, wake) = mpsc::channel();
     let append = Arc::new(Events::new(ready(&path)?, signal.clone())) as Arc<dyn Append<Ty, Value>>;
     let append = Some(append);
