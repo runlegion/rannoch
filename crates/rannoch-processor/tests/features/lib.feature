@@ -42,3 +42,42 @@ Feature: rannoch-processor runs a flow's steps and sends its nexts on success
     Then the step's next carries it on
     When the queue hands rannoch-processor an event and the action's output has no severity
     Then the step sends a -1 naming severity, and no next and no 2
+
+  @module-rannoch-processor @criterion-FR-RANNOCH-119-c1 @criterion-FR-RANNOCH-119-c2 @criterion-FR-RANNOCH-119-c12 @criterion-FR-RANNOCH-119-c16
+  Scenario: The app's build checks its flow docs
+    Given an app whose flow docs are a valid set over the actions of a test processor crate, one of whose actions is a job
+    When the app is built
+    Then the build succeeds
+    And each flow that uses the job action reports a job step, and each flow that uses none does not
+    And the built app runs its flows with the flow doc files removed from disk
+    When the app is built with a flow doc whose step names an action nope that does not exist
+    Then the build fails listing one error: no action named nope
+    When the app is built with a flow doc whose options for greet have the unknown field salut
+    Then the build fails listing one error: the options for greet do not parse
+    When the app is built with a flow doc whose link upper takes text, which nothing before it gives
+    Then the build fails listing one error saying so
+    When the app is built with a flow doc whose link upper takes text as a string and is given a number
+    Then the build fails listing one error saying so
+    When the app is built with a flow doc whose next to notice gives no who, which notice takes
+    Then the build fails listing one error saying so
+    When the app is built with a flow doc whose next to notice gives who as a number, where notice takes a string
+    Then the build fails listing one error saying so
+    When the app is built with a flow doc whose next's $concat names a field greeting that nothing in scope gives
+    Then the build fails listing one error: greeting names nothing in scope
+    When the app is built with a flow doc whose next goes to ty 99, which no flow takes
+    Then the build fails listing one error saying so
+    When the app is built with a flow doc whose step names emit
+    Then the build fails listing one error: no action named emit
+    When the app is built with two flow docs holding three errors between them
+    Then the build fails listing all three errors
+
+  @module-rannoch-processor @criterion-FR-RANNOCH-119-c10
+  Scenario: The app's build gathers the signatures a separate processor crate exports
+    Given a workspace with a processor crate, separate from the app, that exports its actions' signatures as data, among them greet
+    And an app with its own processor crate, whose flow docs use actions of both, including a next whose template names the field greet gives
+    When the app is built
+    Then its build.rs gathers the signatures of both crates and the build succeeds
+    When the app is built with each bad set of flow docs
+    Then each build fails listing every error in it
+    When the separate crate renames the field greet gives, and the app is built
+    Then the build fails listing one error: the next's template names a field nothing gives

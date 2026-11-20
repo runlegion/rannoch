@@ -83,6 +83,32 @@ pub fn type_of(value: &Value) -> &'static str {
     }
 }
 
+/// The Shape type a shape expression gives against `scope`: a "$field" gives the field's type
+/// or the error "$field names nothing in scope"; {"$concat": [..]} checks every part and gives
+/// "string"; {"$": .., "or": default} gives the field's type, else the default's; a literal
+/// gives `type_of`.
+/// # Errors
+/// "$field names nothing in scope", for the first field named that `scope` does not hold.
+pub fn type_expr(expr: &Value, scope: &Shape) -> Result<String, String> {
+    match expr {
+        Value::String(r) if r.starts_with('$') => scope
+            .get(&r[1..])
+            .cloned()
+            .ok_or(format!("{r} names nothing in scope")),
+        Value::Object(o) if o.contains_key("$concat") => {
+            for part in o["$concat"].as_array().into_iter().flatten() {
+                type_expr(part, scope)?;
+            }
+            Ok("string".to_owned())
+        }
+        Value::Object(o) if o.contains_key("$") => match (type_expr(&o["$"], scope), o.get("or")) {
+            (Err(_), Some(default)) => Ok(type_of(default).to_owned()),
+            (got, _) => got,
+        },
+        v => Ok(type_of(v).to_owned()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::{Map, Value, json};
@@ -100,6 +126,30 @@ mod tests {
         let or = json!({ "$": "$nick", "or": "friend" });
         assert_eq!(super::eval(&or, &vals), json!("friend"));
         assert_eq!(super::eval(&json!(7), &vals), json!(7));
+    }
+
+    #[test]
+    fn type_expr_types_a_field_a_concat_an_or_and_a_literal_and_names_a_missing_field() {
+        let scope = [("text", "string"), ("n", "number")]
+            .map(|(f, t)| (f.to_owned(), t.to_owned()))
+            .into();
+        let typed = |e: Value| super::type_expr(&e, &scope);
+        assert_eq!(typed(json!("$n")), Ok("number".to_owned()));
+        assert_eq!(
+            typed(json!({ "$concat": ["$n", "!"] })),
+            Ok("string".to_owned())
+        );
+        assert_eq!(
+            typed(json!({ "$": "$nick", "or": 1 })),
+            Ok("number".to_owned())
+        );
+        assert_eq!(
+            typed(json!({ "$": "$text", "or": 1 })),
+            Ok("string".to_owned())
+        );
+        assert_eq!(typed(json!(true)), Ok("bool".to_owned()));
+        let missing = Err("$greeting names nothing in scope".to_owned());
+        assert_eq!(typed(json!({ "$concat": ["$greeting", "!"] })), missing);
     }
 
     #[test]

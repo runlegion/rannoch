@@ -1,0 +1,1 @@
+{"name": "index", "ty": 30, "takes": {"text": "string"}, "steps": [{"do": "trim.index"}]}

@@ -1,0 +1,1 @@
+{"name": "greet", "ty": 10, "takes": {"text": "string"}, "steps": [{"do": "trim.upper.greet", "with": {"greet": {"salutation": "hi"}}, "next": {"ty": 20, "delay_ms": 500, "shape": {"msg": {"$concat": ["$greeting", "!"]}, "who": {"$": "$nick", "or": "friend"}}}}]}

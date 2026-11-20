@@ -1,3 +1,4 @@
+mod check;
 mod doc;
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -8,7 +9,8 @@ use rannoch_queue::{Flow, Flows, Row};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-pub use doc::{Flow as FlowDoc, Next, Shape, Step, To, eval, type_of};
+pub use check::{check, compile};
+pub use doc::{Flow as FlowDoc, Next, Shape, Step, To, eval, type_expr, type_of};
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]

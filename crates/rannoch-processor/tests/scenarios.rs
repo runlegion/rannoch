@@ -1,7 +1,8 @@
 //! FR-RANNOCH-119's scenarios from `tests/features/lib.feature` (`@criterion-FR-RANNOCH-119-c3`
 //! to `-c6`, `-c11`, `-c13`, `-c14`). The store is the app's database through the real store,
 //! events from the app's forgr factory, handed over by the real queue; the flow docs are
-//! `tests/flows.json` and the test processor crate's actions are `Fake`s.
+//! `tests/flows.json` and the test processor crate's actions are `Fake`s. The build scenarios
+//! (`-c1`, `-c2`, `-c10`, `-c12`, `-c16`) build the test app of `tests/app` with cargo.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -447,4 +448,194 @@ fn an_actions_real_output_is_checked_at_run_time() {
     );
 
     app.stop();
+}
+
+/// The flow sets of `tests/app/app/flows` that fail the build, and the errors each lists.
+const BAD: [(&str, &[&str]); 9] = [
+    ("e1", &["E1 a.json step 0 nope: no action named nope"]),
+    (
+        "e2",
+        &["E2 a.json step 0 greet: the options for greet do not parse: unknown field `salut`"],
+    ),
+    (
+        "e3",
+        &["E3 a.json step 0 upper: upper takes text, which nothing before it gives"],
+    ),
+    (
+        "e4",
+        &["E4 a.json step 0 upper: upper takes text as string, it is number"],
+    ),
+    (
+        "e5",
+        &["E5 a.json step 0 next: the next to notice gives no who, which it takes"],
+    ),
+    (
+        "e6",
+        &["E6 a.json step 0 next: the next to notice gives who as number, it takes string"],
+    ),
+    (
+        "e7",
+        &["E7 a.json step 0 next: the next goes to ty 99, which no flow takes"],
+    ),
+    ("emit", &["E1 a.json step 0 emit: no action named emit"]),
+    (
+        "multi",
+        &[
+            "E1 a.json step 0 nope: no action named nope",
+            "E7 a.json step 0 next: the next goes to ty 99, which no flow takes",
+            "E4 b.json step 0 upper: upper takes text as string, it is number",
+        ],
+    ),
+];
+
+/// The one error of the valid set built with proc-text's `renamed` feature.
+const RENAMED: &str = "E5 10-greet.json step 0 next: $greeting names nothing in scope";
+
+/// One fixture build at a time: every build shares one target dir and one built app.
+static CARGO: Mutex<()> = Mutex::new(());
+
+/// The test app of `tests/app`, a workspace of proc-text and the app, copied to a dir of its
+/// own so its flow docs can be removed; every copy builds into the one shared target dir.
+struct Fixture(PathBuf);
+
+impl Fixture {
+    fn copy(name: &str) -> Result<Self> {
+        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
+        if dir.exists() {
+            fs::remove_dir_all(&dir)?;
+        }
+        let mut todo = vec![PathBuf::new()];
+        while let Some(rel) = todo.pop() {
+            fs::create_dir_all(dir.join(&rel))?;
+            for entry in fs::read_dir(crate_dir.join("tests/app").join(&rel))? {
+                let rel = rel.join(entry?.file_name());
+                let from = crate_dir.join("tests/app").join(&rel);
+                if from.is_dir() {
+                    todo.push(rel);
+                } else if rel.ends_with("Cargo.toml") {
+                    let toml = fs::read_to_string(from)?;
+                    let toml = toml.replace("\"../../..", &format!("\"{}", crate_dir.display()));
+                    fs::write(dir.join(rel), toml)?;
+                } else {
+                    fs::copy(from, dir.join(rel))?;
+                }
+            }
+        }
+        fs::copy(crate_dir.join("../../Cargo.lock"), dir.join("Cargo.lock"))?;
+        Ok(Self(dir))
+    }
+
+    /// Builds the app with the flow set `set`: Ok when the build succeeds, else every error
+    /// the build lists.
+    fn build(&self, set: &str, renamed: bool) -> Result<std::result::Result<(), Vec<String>>> {
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
+        let mut build = std::process::Command::new(cargo);
+        build
+            .current_dir(&self.0)
+            .args(["build", "-q", "-p", "app"]);
+        if renamed {
+            build.args(["--features", "renamed"]);
+        }
+        let target = Path::new(env!("CARGO_TARGET_TMPDIR")).join("app-target");
+        let out = build
+            .env("CARGO_TARGET_DIR", target)
+            .env("FLOWS", set)
+            .output()?;
+        if out.status.success() {
+            return Ok(Ok(()));
+        }
+        let stderr = String::from_utf8(out.stderr)?;
+        let is_error =
+            |l: &&str| l.starts_with('E') && l[1..].starts_with(|c: char| c.is_ascii_digit());
+        let errors: Vec<String> = stderr
+            .lines()
+            .map(str::trim)
+            .filter(is_error)
+            .map(str::to_owned)
+            .collect();
+        if errors.is_empty() {
+            return Err(stderr.into());
+        }
+        Ok(Err(errors))
+    }
+
+    /// Runs the built app with its flow docs removed from disk: what it prints.
+    fn run_without_docs(&self) -> Result<String> {
+        fs::remove_dir_all(self.0.join("app/flows"))?;
+        let app = Path::new(env!("CARGO_TARGET_TMPDIR")).join("app-target/debug/app");
+        let out = std::process::Command::new(app).output()?;
+        assert!(out.status.success(), "the app ran");
+        Ok(String::from_utf8(out.stdout)?)
+    }
+
+    /// Builds each bad set and asserts it fails listing exactly its errors.
+    fn assert_bad_sets(&self) -> Result<()> {
+        for (set, errors) in BAD {
+            assert_eq!(
+                self.build(set, false)?,
+                Err(errors.iter().map(|e| (*e).to_owned()).collect()),
+                "{set}"
+            );
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn the_apps_build_checks_its_flow_docs() -> Result<()> {
+    let _one = CARGO
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Given an app whose flow docs are a valid set over the actions of a test processor crate,
+    // one of whose actions is a job
+    let app = Fixture::copy("the_apps_build_checks")?;
+
+    // When the app is built with each bad set (a step naming nope; options for greet with the
+    // unknown field salut; upper taking text nothing gives; upper taking text as a number; a
+    // next to notice giving no who; a next to notice giving who as a number; a next to ty 99; a
+    // step naming emit; two docs holding three errors)
+    // Then each build fails listing exactly its errors
+    app.assert_bad_sets()?;
+
+    // When the app is built with a flow doc whose next's $concat names a field greeting that
+    // nothing in scope gives
+    // Then the build fails listing one error: greeting names nothing in scope
+    assert_eq!(app.build("valid", true)?, Err(vec![RENAMED.to_owned()]));
+
+    // When the app is built
+    // Then the build succeeds
+    assert_eq!(app.build("valid", false)?, Ok(()));
+
+    // And each flow that uses the job action reports a job step, and each flow that uses none
+    // does not
+    // And the built app runs its flows with the flow doc files removed from disk
+    let ran = app.run_without_docs()?;
+    assert_eq!(ran, "10 false\n15 false\n20 false\n30 true\n");
+    Ok(())
+}
+
+#[test]
+fn the_apps_build_gathers_the_signatures_a_separate_processor_crate_exports() -> Result<()> {
+    let _one = CARGO
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Given a workspace with a processor crate, separate from the app, that exports its
+    // actions' signatures as data, among them greet
+    // And an app with its own processor crate, whose flow docs use actions of both, including a
+    // next whose template names the field greet gives
+    let app = Fixture::copy("the_apps_build_gathers")?;
+
+    // When the app is built
+    // Then its build.rs gathers the signatures of both crates and the build succeeds
+    assert_eq!(app.build("valid", false)?, Ok(()));
+
+    // When the app is built with each bad set of flow docs
+    // Then each build fails listing every error in it
+    app.assert_bad_sets()?;
+
+    // When the separate crate renames the field greet gives, and the app is built
+    // Then the build fails listing one error: the next's template names a field nothing gives
+    assert_eq!(app.build("valid", true)?, Err(vec![RENAMED.to_owned()]));
+    Ok(())
 }

@@ -1,0 +1,18 @@
+[package]
+name = "app"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[features]
+renamed = ["proc-text/renamed"]
+
+[dependencies]
+proc-text = { path = "../proc-text" }
+rannoch-processor = { path = "../../.." }
+rannoch-queue = { path = "../../../../rannoch-queue" }
+serde_json = "1"
+
+[build-dependencies]
+proc-text = { path = "../proc-text" }
+rannoch-processor = { path = "../../.." }
