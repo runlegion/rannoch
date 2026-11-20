@@ -34,9 +34,11 @@ pub struct Step {
 #[serde(untagged)]
 pub enum Next {
     To(To),
+    Branch { branch: Branch },
 }
 
-/// A next to one ty: its data shaped from the options so far, due `delay_ms` after the run.
+/// A next to one ty: its data shaped from the options so far, due `delay_ms` after the run;
+/// with `each`, one per item of that list field, the item read as "$item".
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct To {
@@ -45,6 +47,24 @@ pub struct To {
     pub shape: BTreeMap<String, Value>,
     #[serde(default)]
     pub delay_ms: u64,
+    #[serde(default)]
+    pub each: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Branch {
+    pub on: String,
+    pub cases: Vec<Case>,
+    #[serde(rename = "else")]
+    pub otherwise: To,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Case {
+    pub when: Value,
+    pub next: To,
 }
 
 /// A shape expression's value: "$field" reads the options so far; {"$concat": [..]} joins its

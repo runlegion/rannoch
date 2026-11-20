@@ -1,5 +1,5 @@
 //! FR-RANNOCH-119's scenarios from `tests/features/lib.feature` (`@criterion-FR-RANNOCH-119-c3`
-//! to `-c6`, `-c11`, `-c13`, `-c14`). The store is the app's database through the real store,
+//! to `-c7`, `-c11`, `-c13`, `-c14`). The store is the app's database through the real store,
 //! events from the app's forgr factory, handed over by the real queue; the flow docs are
 //! `tests/flows.json` and the test processor crate's actions are `Fake`s. The build scenarios
 //! (`-c1`, `-c2`, `-c10`, `-c12`, `-c16`) build the test app of `tests/app` with cargo.
@@ -375,6 +375,52 @@ fn a_failing_link_fails_the_step_and_the_retry_reruns_the_chain() {
         [(15, failed)],
         "the retry ran on the root's data"
     );
+
+    app.stop();
+}
+
+#[test]
+fn branch_and_each_send_their_nexts() {
+    // Given an app built with a flow whose branch has a case when crash naming ty 31, a case when
+    // question naming ty 32, and an else
+    // And a flow whose branch has a case when level is the number 1, and an else
+    // And a flow whose each sends one next per item of a list
+    let app = App::start("branch_and_each", 1).unwrap();
+    // the nexts whose source is `event`, once its flow has sent its 2
+    let nexts = |event| {
+        assert!(until(WAIT, || app.statuses(event).contains(&2)));
+        app.sent(event, 0)
+    };
+
+    // When the queue hands rannoch-processor an event whose value is crash, one whose value is
+    // question, and one whose value has no case
+    let crash = app.hand(50, &json!({ "value": "crash" })).unwrap();
+    let question = app.hand(50, &json!({ "value": "question" })).unwrap();
+    let other = app.hand(50, &json!({ "value": "hang" })).unwrap();
+
+    // Then one next of ty 31, one of ty 32 and one else next are sent, each with its event as
+    // source
+    assert_eq!(nexts(crash), [(31, json!({ "severity": 1 }))]);
+    assert_eq!(nexts(question), [(32, json!({}))]);
+    assert_eq!(nexts(other), [(33, json!({}))]);
+
+    // When the queue hands rannoch-processor an event whose level is the number 1, and one whose
+    // level is the string "1"
+    let number = app.hand(51, &json!({ "level": 1 })).unwrap();
+    let string = app.hand(51, &json!({ "level": "1" })).unwrap();
+
+    // Then the first sends the case's next and the second sends the else next
+    assert_eq!(nexts(number), [(31, json!({ "severity": 1 }))]);
+    assert_eq!(nexts(string), [(33, json!({}))]);
+
+    // When the queue hands rannoch-processor an event whose list is 'a b c'
+    let list = app.hand(52, &json!({ "list": ["a", "b", "c"] })).unwrap();
+
+    // Then three nexts are sent, one per item, each with that event as source
+    let mut sent = nexts(list);
+    sent.sort_by_key(|n| n.1.to_string());
+    let words = ["a", "b", "c"].map(|w| (41, json!({ "word": w })));
+    assert_eq!(sent, words);
 
     app.stop();
 }

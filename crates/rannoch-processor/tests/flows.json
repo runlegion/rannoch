@@ -6,5 +6,11 @@
   {"name": "shouted", "ty": 22, "takes": {"shout": "any", "text": "string"}, "steps": []},
   {"name": "rate", "ty": 30, "takes": {"text": "string"}, "steps": [{"do": "rate", "next": {"ty": 31, "shape": {"severity": "$severity"}}}]},
   {"name": "rated", "ty": 31, "takes": {"severity": "number"}, "steps": []},
+  {"name": "asked", "ty": 32, "takes": {}, "steps": []},
+  {"name": "other", "ty": 33, "takes": {}, "steps": []},
+  {"name": "word", "ty": 41, "takes": {"word": "string"}, "steps": []},
+  {"name": "triage", "ty": 50, "takes": {"value": "string"}, "steps": [{"do": "note", "next": {"branch": {"on": "value", "cases": [{"when": "crash", "next": {"ty": 31, "shape": {"severity": 1}}}, {"when": "question", "next": {"ty": 32}}], "else": {"ty": 33}}}}]},
+  {"name": "level", "ty": 51, "takes": {"level": "number"}, "steps": [{"do": "note", "next": {"branch": {"on": "level", "cases": [{"when": 1, "next": {"ty": 31, "shape": {"severity": 1}}}], "else": {"ty": 33}}}}]},
+  {"name": "words", "ty": 52, "takes": {"list": "list<string>"}, "steps": [{"do": "note", "next": {"ty": 41, "each": "list", "shape": {"word": "$item"}}}]},
   {"name": "two", "ty": 40, "takes": {"text": "string"}, "steps": [{"do": "trim", "next": {"ty": 20, "shape": {"msg": "$text", "who": "two"}}}, {"do": "classify"}]}
 ]

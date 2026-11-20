@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 pub use check::{check, compile};
-pub use doc::{Flow as FlowDoc, Next, Shape, Step, To, eval, type_expr, type_of};
+pub use doc::{Branch, Case, Flow as FlowDoc, Next, Shape, Step, To, eval, type_expr, type_of};
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -141,12 +141,32 @@ fn run(
             Some(field) => drop(vals.insert(field.clone(), Value::Object(result))),
             None => vals = input,
         }
-        if let Some(Next::To(to)) = &step.next {
-            let data = to.shape.iter().map(|(k, e)| (k.clone(), eval(e, &vals)));
-            nexts.push((to.ty, data.collect(), to.delay_ms));
-        }
+        let to = match &step.next {
+            None => continue,
+            Some(Next::To(to)) => to,
+            Some(Next::Branch { branch }) => {
+                let on = vals.get(&branch.on).unwrap_or(&Value::Null);
+                let case = branch.cases.iter().find(|c| &c.when == on);
+                case.map_or(&branch.otherwise, |c| &c.next)
+            }
+        };
+        nexts.extend(shaped(to, &vals));
     }
     Ok(nexts)
+}
+
+/// The nexts `to` sends from `vals`: one, or with `each` one per item of the list it names,
+/// each shaped with the item in scope as "$item".
+fn shaped(to: &To, vals: &Map<String, Value>) -> Vec<(u16, Map<String, Value>, u64)> {
+    let list = |l: &String| vals.get(l).and_then(Value::as_array).into_iter().flatten();
+    let items: Option<Vec<_>> = to.each.as_ref().map(|l| list(l).map(Some).collect());
+    let next = |item: Option<&Value>| {
+        let mut vals = vals.clone();
+        vals.extend(item.map(|item| ("item".to_owned(), item.clone())));
+        let data = to.shape.iter().map(|(k, e)| (k.clone(), eval(e, &vals)));
+        (to.ty, data.collect(), to.delay_ms)
+    };
+    items.unwrap_or(vec![None]).into_iter().map(next).collect()
 }
 
 #[cfg(test)]
@@ -274,5 +294,31 @@ mod tests {
         assert_eq!(ran.unwrap_err(), "fail: no");
         let names: Vec<&str> = calls.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["a", "fail"]);
+    }
+    #[test]
+    fn run_with_a_branch_picks_the_case_by_json_value_and_falls_to_else() {
+        let flow = json!({ "name": "f", "ty": 1, "takes": {}, "steps": [{ "do": "a",
+            "next": { "branch": { "on": "level", "cases": [{ "when": 1, "next": { "ty": 31 } }],
+                "else": { "ty": 33 } } } }] });
+        let ran = |level: Value| {
+            let (ran, _) = run(
+                &flow,
+                &json!({ "level": level }),
+                &[("a", &[], |_| Ok(Map::new()))],
+            );
+            ran.unwrap().iter().map(|n| n.0).collect::<Vec<u16>>()
+        };
+        assert_eq!(ran(json!(1)), [31]);
+        assert_eq!(ran(json!("1")), [33]);
+        assert_eq!(ran(json!(2)), [33]);
+    }
+
+    #[test]
+    fn shaped_with_each_gives_one_next_per_item_with_item() {
+        let to = json!({ "ty": 41, "each": "list", "shape": { "word": "$item", "n": "$n" } });
+        let to: super::To = serde_json::from_value(to).unwrap();
+        let nexts = super::shaped(&to, &obj(&json!({ "list": ["a", "b", "c"], "n": 7 })));
+        let words = ["a", "b", "c"].map(|w| (41, obj(&json!({ "word": w, "n": 7 })), 0));
+        assert_eq!(nexts, words);
     }
 }
