@@ -3,10 +3,9 @@
 //! with the `tract` feature, c5 without it; potion-base-8M is fetched into the target dir.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Arc, mpsc, mpsc::Sender};
 use std::time::{Duration, Instant};
-use std::{fs, thread};
+use std::{fs, process::Command, thread};
 
 use rannoch_core::forgr::_events;
 use rannoch_core::{Append, Config, Rannoch};
@@ -132,9 +131,8 @@ impl App {
 
 /// The app's embed and classify, each over the model file `model`.
 fn text_actions(model: &Path, tokenizer: &str) -> Result<Vec<Arc<dyn Action>>> {
-    let embed = || Embed::new(sig("embed")?, Model::open(model)?, tokenizer).map_err(Into::into);
-    let classify: Result<Embed> = embed();
-    let classify = Classify::new(sig("classify")?, classify?, &LABELS)?;
+    let embed = || -> Result<_> { Ok(Embed::new(sig("embed")?, Model::open(model)?, tokenizer)?) };
+    let classify = Classify::new(sig("classify")?, embed()?, &LABELS)?;
     Ok(vec![Arc::new(embed()?), Arc::new(classify)])
 }
 
@@ -247,7 +245,9 @@ fn a_local_model_gives_the_same_answers_through_tract_as_through_ort() -> Result
     // gives
     for (a, b) in [(2.5f32, 4.0f32), (-1.0, 0.25), (1e6, 3.0), (0.0, 0.0)] {
         let nexts = app.hand(10, &json!({ "a": a, "b": b }))?;
-        assert_eq!(nexts, [(11, json!({ "sum": a + b }))], "{a} + {b}");
+        let by_ort = ort(Path::new(ADD), vec![("a", vec![a]), ("b", vec![b])])?[0];
+        assert_eq!(by_ort, a + b, "{a} + {b} through ort");
+        assert_eq!(nexts, [(11, json!({ "sum": by_ort }))], "{a} + {b}");
     }
     app.stop();
     Ok(())
@@ -255,10 +255,12 @@ fn a_local_model_gives_the_same_answers_through_tract_as_through_ort() -> Result
 
 /// The first output of `model` through ort on `inputs`: what the onnx feature's build gives.
 #[cfg(feature = "tract")]
-fn ort(model: &Path, inputs: Vec<(&'static str, Vec<i64>)>) -> Result<Vec<f32>> {
-    use ort::value::Tensor;
+fn ort<T: ort::tensor::PrimitiveTensorElementType + std::fmt::Debug + Clone + 'static>(
+    model: &Path,
+    inputs: Vec<(&'static str, Vec<T>)>,
+) -> Result<Vec<f32>> {
     let mut session = ort::session::Session::builder()?.commit_from_file(model)?;
-    let tensor = |(k, v): (_, Vec<i64>)| Ok((k, Tensor::from_array(([v.len()], v))?));
+    let tensor = |(k, v): (_, Vec<T>)| Ok((k, ort::value::Tensor::from_array(([v.len()], v))?));
     let inputs: ort::Result<Vec<_>> = inputs.into_iter().map(tensor).collect();
     let outputs = session.run(inputs?)?;
     Ok(outputs[0].try_extract_tensor::<f32>()?.1.to_vec())
@@ -297,9 +299,8 @@ fn export(potion: &Path) -> Result<PathBuf> {
     let shape = Some(TensorShapeProto { dim: vec![dim] });
     let elem_type = DataType::Int64 as i32;
     let tensor = type_proto::Tensor { elem_type, shape };
-    let value = Some(type_proto::Value::TensorType(tensor));
     let mut ty = TypeProto::default();
-    ty.value = value;
+    ty.value = Some(type_proto::Value::TensorType(tensor));
     let input_ids = ValueInfoProto {
         name: "input_ids".into(),
         r#type: Some(ty),
