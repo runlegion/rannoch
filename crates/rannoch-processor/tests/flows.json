@@ -1,0 +1,10 @@
+[
+  {"name": "greet", "ty": 10, "takes": {"text": "string"}, "steps": [{"do": "trim.upper.greet", "with": {"greet": {"salutation": "hi"}}, "next": {"ty": 20, "delay_ms": 500, "shape": {"msg": {"$concat": ["$greeting", "!"]}, "who": {"$": "$nick", "or": "friend"}}}}]},
+  {"name": "shout", "ty": 12, "takes": {"text": "string"}, "steps": [{"do": "upper", "as": "shout", "next": {"ty": 22, "shape": {"shout": "$shout", "text": "$text"}}}]},
+  {"name": "limited", "ty": 15, "takes": {"text": "string"}, "steps": [{"do": "trim.limit.upper", "with": {"limit": {"max": 5}}, "next": {"ty": 20, "shape": {"msg": "$text", "who": "limit"}}}]},
+  {"name": "notice", "ty": 20, "takes": {"msg": "string", "who": "string"}, "steps": [{"do": "note"}]},
+  {"name": "shouted", "ty": 22, "takes": {"shout": "any", "text": "string"}, "steps": []},
+  {"name": "rate", "ty": 30, "takes": {"text": "string"}, "steps": [{"do": "rate", "next": {"ty": 31, "shape": {"severity": "$severity"}}}]},
+  {"name": "rated", "ty": 31, "takes": {"severity": "number"}, "steps": []},
+  {"name": "two", "ty": 40, "takes": {"text": "string"}, "steps": [{"do": "trim", "next": {"ty": 20, "shape": {"msg": "$text", "who": "two"}}}, {"do": "classify"}]}
+]
