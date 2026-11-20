@@ -51,7 +51,6 @@ pub struct To {
     pub each: Option<String>,
 }
 
-/// The next of the first case whose `when` equals the field `on` by JSON value, else `otherwise`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Branch {

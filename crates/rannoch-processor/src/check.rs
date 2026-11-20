@@ -107,40 +107,31 @@ pub fn check(docs: &[(String, FlowDoc)], sigs: &[Sig]) -> Result<String, Vec<Str
                 Some(field) => drop(scope.insert(field.clone(), "any".to_owned())),
                 None => scope = seen,
             }
-            let Some(next) = &step.next else {
-                continue;
-            };
             let at = format!("{file} step {i} next");
-            let tos = match next {
-                Next::To(to) => vec![to],
-                Next::Branch { branch } => {
+            let tos = match &step.next {
+                None => continue,
+                Some(Next::To(to)) => vec![to],
+                Some(Next::Branch { branch }) => {
                     let (on, cases) = (&branch.on, &branch.cases);
-                    let ty = scope.get(on);
-                    if ty.is_none() {
+                    let ty = scope.get(on).map_or("", String::as_str);
+                    if ty.is_empty() {
                         errors.push(format!("E3 {at}: branch on {on}, which nothing gives"));
                     }
-                    for when in cases.iter().map(|c| &c.when) {
-                        if let Some(ty) = ty
-                            && type_of(when) != ty
-                        {
-                            errors.push(format!(
-                                "E4 {at}: branch on {on} as {ty}, a case when {when}"
-                            ));
-                        }
-                    }
+                    let bad = cases.iter().map(|c| &c.when);
+                    let bad = bad.filter(|w| !ty.is_empty() && type_of(w) != ty);
+                    let e4 = |w| format!("E4 {at}: branch on {on} as {ty}, a case when {w}");
+                    errors.extend(bad.map(e4));
                     let tos = cases.iter().map(|c| &c.next);
                     tos.chain([&branch.otherwise]).collect()
                 }
             };
             for to in tos {
                 let mut scope = scope.clone();
-                if let Some(list) = &to.each {
-                    let ty = scope.get(list).cloned().unwrap_or_default();
+                if let Some(l) = &to.each {
+                    let ty = scope.get(l).cloned().unwrap_or_default();
                     match ty.strip_prefix("list<").and_then(|t| t.strip_suffix('>')) {
                         Some(item) => drop(scope.insert("item".to_owned(), item.to_owned())),
-                        None => {
-                            errors.push(format!("E4 {at}: each over {list}, which is not a list"));
-                        }
+                        None => errors.push(format!("E4 {at}: each over {l}, which is not a list")),
                     }
                 }
                 let Some((_, to_flow)) = docs.iter().find(|(_, f)| f.ty == to.ty) else {

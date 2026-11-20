@@ -141,12 +141,10 @@ fn run(
             Some(field) => drop(vals.insert(field.clone(), Value::Object(result))),
             None => vals = input,
         }
-        let Some(next) = &step.next else {
-            continue;
-        };
-        let to = match next {
-            Next::To(to) => to,
-            Next::Branch { branch } => {
+        let to = match &step.next {
+            None => continue,
+            Some(Next::To(to)) => to,
+            Some(Next::Branch { branch }) => {
                 let on = vals.get(&branch.on).unwrap_or(&Value::Null);
                 let case = branch.cases.iter().find(|c| &c.when == on);
                 case.map_or(&branch.otherwise, |c| &c.next)
@@ -160,24 +158,15 @@ fn run(
 /// The nexts `to` sends from `vals`: one, or with `each` one per item of the list it names,
 /// each shaped with the item in scope as "$item".
 fn shaped(to: &To, vals: &Map<String, Value>) -> Vec<(u16, Map<String, Value>, u64)> {
-    let items: Vec<Option<Value>> = match &to.each {
-        None => vec![None],
-        Some(list) => {
-            let items = vals
-                .get(list)
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten();
-            items.cloned().map(Some).collect()
-        }
-    };
-    let next = |item: Option<Value>| {
+    let list = |l: &String| vals.get(l).and_then(Value::as_array).into_iter().flatten();
+    let items: Option<Vec<_>> = to.each.as_ref().map(|l| list(l).map(Some).collect());
+    let next = |item: Option<&Value>| {
         let mut vals = vals.clone();
-        vals.extend(item.map(|item| ("item".to_owned(), item)));
+        vals.extend(item.map(|item| ("item".to_owned(), item.clone())));
         let data = to.shape.iter().map(|(k, e)| (k.clone(), eval(e, &vals)));
         (to.ty, data.collect(), to.delay_ms)
     };
-    items.into_iter().map(next).collect()
+    items.unwrap_or(vec![None]).into_iter().map(next).collect()
 }
 
 #[cfg(test)]
