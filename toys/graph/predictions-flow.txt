@@ -1,0 +1,36 @@
+graph toy, round 2 (the flow path): predictions, written before this code ran (2026-11-21)
+
+Why: round 1 committed one event's graph writes per transaction at 207 events/s under
+rannoch-store's fullfsync; the operator: "Far too slow, add the flow overhead and it's
+abysmal". Rannoch's own writes (each status and next) already go through the inbox and commit
+a batch at a time; a processor action that writes knowledge commits on its own connection.
+
+Setup: rannoch main's real crates (rannoch-core, rannoch-events, rannoch-queue,
+rannoch-processor, rannoch-store) by path. 10,000 events of one ty put in _events at status 0
+in one write, then the queue signalled; one flow, one step, one action. Timed until all 10,000
+have their 2. Three modes:
+  noop   the action writes nothing (the flow path alone)
+  full   the action writes the event's graph rows (3 properties, 1 edge) in one transaction on
+         its own connection with rannoch-store's pragmas (synchronous FULL, fullfsync)
+  normal the same, on a connection with PRAGMA synchronous = NORMAL
+
+The mechanism under test for normal: in WAL mode every connection to the file appends to the
+one WAL; the step's graph rows commit before its 2 is sent, and the 2's batch commit flushes
+the WAL file, which carries the graph rows with it. So the graph rows are on disk whenever
+their 2 is; a crash before that loses both, and the queue reruns the event, which writes the
+same rows. Power loss is not tested here; that argument rests on SQLite's WAL design.
+
+Q1 noop: 3,000 events/s or more to the 2.
+Q2 full: 250 events/s or less (one full flush per event, as round 1).
+Q3 normal: 2,000 events/s or more, and at least half the noop rate.
+Q4 full and normal: after the run, every event with a 2 has its graph rows (10,000 nodes).
+
+Round 2d, written before it ran (2026-11-21). The operator: "Inbox and events are 180k/s so
+you have something wrong in your model". Two new modes:
+  inbox   the inbox and events path alone (rannoch's Sender, Events append; no queue): N
+          events sent, timed until all are in _events
+  batched the graph rows wait in memory by event id, and the append that carries each event's
+          2 writes them in the same transaction (a toy Append beside the events crate's)
+Q5 inbox: 150,000 events/s or more on this machine (the operator's figure is 180,000).
+Q6 batched, with the wait index: 40,000 events/s or more at 100,000 events, and every event
+   with a 2 has its graph rows.

@@ -1,0 +1,37 @@
+graph toy: predictions, written before any toy code ran (2026-11-21)
+
+Spec under test: FR-RANNOCH-123 (draft). Two plain tables in rannoch's SQLite file, beside a
+real _events (the columns of rannoch-events' migrations), opened with rannoch-store's pragmas
+(WAL, fullfsync on). _nodes: one row per property value (node, key, value, event, written,
+retracted). _edges: one row per edge (src, name, dst, props, event, written, retracted). Rows
+are only added; a row's key includes its event. Current = greatest event id; a retracted row
+removes. As of T = only rows written at or before T. written comes from a clock the toy
+controls, so a delayed event can run after a later one.
+
+P0 FTS5 works in rusqlite 0.41 bundled, and Uuid::now_v7() gives 200,000 ids in a tight loop
+   that strictly increase as strings (so ids made in the same millisecond still order).
+P1 A rerun writes nothing: applying the same events again adds no row and changes no written
+   stamp.
+P2 Order does not matter: two events writing one key, applied in either order, give the same
+   current value, the greater event id's.
+P3 As of T leaves out rows written after T: an event accepted at 1,000 that runs at 5,000 does
+   not show as of 3,000, read at 6,000. (Its write to a key that a later-accepted event also
+   wrote loses now, because the later event has the greater id.)
+P4 Correction and retraction: now gives the new value, as of between gives the old, why gives
+   the later event and its source chain through _events; after a retraction the value is gone
+   now and present as of before it.
+P5 describe mirrors a nested shape: named properties and "*", an edge forwards and backwards, a
+   limit per edge, an equality filter on the far node, history marking current and replaced,
+   and at; every value carries event and written.
+P6 walk (a recursive SQL query) returns the same nodes, nearest first, as a breadth-first walk
+   done in Rust over the same edges, stops at cap and says the cap cut it.
+P7 search finds a node by its current text through FTS5; after a correction it finds the new
+   text and not the old.
+P8 A warm hood equals a cold describe after a burst of 5,000 writes that touch it and after a
+   rerun of that burst; a warm describe is at least 10 times faster than a cold one.
+P9 At 100,000 nodes and 500,000 edges, a cold describe of a two-level shape answers at 5 ms
+   p50 or less, and one event's writes, committed one event per transaction, run at 1,000
+   events/s or more.
+P10 (a measure of the cache, not of what apps need) With describe as the only hint, a
+   synthetic Zipf trace of 10,000 describes over 2,000 roots hits a warm hood at least 70% of
+   the time, with no cap on warm hoods.
