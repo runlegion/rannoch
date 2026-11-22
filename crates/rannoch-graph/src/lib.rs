@@ -1,8 +1,11 @@
 //! The crate an app builds its ontology with: two tables in rannoch's file, rows only added.
 
+mod describe;
+mod hoods;
 mod queries;
 
-use std::sync::{Mutex, PoisonError, mpsc::Sender};
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, PoisonError, mpsc::Sender};
 use std::time::UNIX_EPOCH;
 
 use rannoch_core::{Append, Error, Event, Status};
@@ -11,6 +14,9 @@ use rusqlite::{CachedStatement, Connection, OptionalExtension, Params, Result, p
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
+
+pub use describe::{Opts, describe};
+pub use hoods::Hoods;
 
 /// One `$graph` item: what a step writes. Serialized as JSON in an action's `$graph` output.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -60,6 +66,7 @@ pub struct GraphAppend {
     conn: Mutex<Connection>,
     queue: Sender<()>,
     writes: Writes,
+    hoods: Option<Arc<Mutex<Hoods>>>,
 }
 
 impl GraphAppend {
@@ -70,7 +77,15 @@ impl GraphAppend {
             conn: Mutex::new(conn),
             queue,
             writes,
+            hoods: None,
         }
+    }
+
+    /// The append, recomputing after each commit the warm hoods in `hoods` its rows touched.
+    #[must_use]
+    pub fn with_hoods(self, hoods: Arc<Mutex<Hoods>>) -> Self {
+        let hoods = Some(hoods);
+        Self { hoods, ..self }
     }
 }
 
@@ -92,30 +107,44 @@ impl<T: Copy + Into<u16>, D: Serialize> Append<T, D> for GraphAppend {
                 writes.entry(source).or_insert(items);
             }
         }
-        done?;
+        let touched = done?;
+        if let Some(hoods) = &self.hoods {
+            let mut hoods = hoods.lock().unwrap_or_else(PoisonError::into_inner);
+            hoods.rewarm(&conn, &touched);
+        }
         let _ = self.queue.send(());
         Ok(())
     }
 }
 
-/// `batch` and the rows `taken` for its 2s, stamped with each 2's source, in one transaction.
+/// `batch` and the rows `taken` for its 2s, stamped with each 2's source, in one transaction;
+/// the nodes of the rows it added.
 fn commit<T: Copy + Into<u16>, D: Serialize>(
     conn: &mut Connection,
     batch: &[Event<T, D>],
     taken: &[(Uuid, Vec<Value>)],
-) -> Result<(), Error> {
+) -> Result<HashSet<String>, Error> {
     let since = UNIX_EPOCH.elapsed().unwrap_or_default().as_millis();
     let written = i64::try_from(since).unwrap_or(i64::MAX);
     let tx = conn.transaction().map_err(|_| Error::Store)?;
     rannoch_events::append_in(&tx, batch)?;
+    let mut touched = HashSet::new();
     for (source, items) in taken {
         let event = source.to_string();
         for item in items {
             let op = Op::deserialize(item).map_err(|_| Error::Store)?;
-            write(&tx, &event, &op, written).map_err(|_| Error::Store)?;
+            if write(&tx, &event, &op, written).map_err(|_| Error::Store)? == 1 {
+                match op {
+                    Op::Set { node, .. } | Op::Retract { node, .. } => touched.extend([node]),
+                    Op::Link { src, dst, .. } | Op::Unlink { src, dst, .. } => {
+                        touched.extend([src, dst]);
+                    }
+                }
+            }
         }
     }
-    tx.commit().map_err(|_| Error::Store)
+    tx.commit().map_err(|_| Error::Store)?;
+    Ok(touched)
 }
 
 /// Adds `op`'s row, stamped with `event` and `written`; a row its key already holds stays.
@@ -249,12 +278,12 @@ mod tests {
         (v7_at(ms), source.map(|s| s.0), ops)
     }
 
-    fn set(node: &str, key: &str, value: Value) -> Op {
+    pub(crate) fn set(node: &str, key: &str, value: Value) -> Op {
         let (node, key) = (node.to_owned(), key.to_owned());
         Op::Set { node, key, value }
     }
 
-    fn link(src: &str, name: &str, dst: &str, props: Value) -> Op {
+    pub(crate) fn link(src: &str, name: &str, dst: &str, props: Value) -> Op {
         let (src, name, dst) = (src.to_owned(), name.to_owned(), dst.to_owned());
         Op::Link {
             src,
@@ -266,7 +295,7 @@ mod tests {
 
     /// The events' rows and their ops' rows in one transaction, each op's rows written at
     /// `clock`, as the toy's `apply_many`.
-    fn apply(conn: &mut Connection, evs: &[&Ev], clock: i64) {
+    pub(crate) fn apply(conn: &mut Connection, evs: &[&Ev], clock: i64) {
         let tx = conn.transaction().unwrap();
         for (id, source, ops) in evs {
             let row = params![id.to_string(), source.map(|s| s.to_string())];
@@ -290,7 +319,7 @@ mod tests {
 
     /// The toy's small graph: ada wrote doc1..doc3; doc1 cites doc2 and doc3; then ada's name
     /// is corrected and doc3's status retracted. Each event applied at its own time.
-    fn small() -> (Connection, [Ev; 4]) {
+    pub(crate) fn small() -> (Connection, [Ev; 4]) {
         let e0 = ev(1_000, None, vec![]);
         let e1 = ev(
             1_100,
