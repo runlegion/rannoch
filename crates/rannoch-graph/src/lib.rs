@@ -77,28 +77,45 @@ impl GraphAppend {
 impl<T: Copy + Into<u16>, D: Serialize> Append<T, D> for GraphAppend {
     fn append(&self, batch: &[Event<T, D>]) -> Result<(), Error> {
         let mut conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut writes = self.writes.lock().unwrap_or_else(PoisonError::into_inner);
-        let since = UNIX_EPOCH.elapsed().unwrap_or_default().as_millis();
-        let written = i64::try_from(since).unwrap_or(i64::MAX);
-        let tx = conn.transaction().map_err(|_| Error::Store)?;
-        rannoch_events::append_in(&tx, batch)?;
         let twos = batch.iter().filter(|e| e.status == Status::Processed);
-        let sources: Vec<Uuid> = twos.filter_map(|e| e.source).collect();
-        for (source, items) in sources.iter().filter_map(|s| writes.get_key_value(s)) {
-            let event = source.to_string();
-            for item in items {
-                let op = Op::deserialize(item).map_err(|_| Error::Store)?;
-                write(&tx, &event, &op, written).map_err(|_| Error::Store)?;
+        let mut writes = self.writes.lock().unwrap_or_else(PoisonError::into_inner);
+        let taken: Vec<(Uuid, Vec<Value>)> = twos
+            .filter_map(|e| writes.remove_entry(&e.source?))
+            .collect();
+        // Held only to take them, so steps keep putting their writes while this batch commits.
+        drop(writes);
+        let done = commit(&mut conn, batch, &taken);
+        if done.is_err() {
+            // A batch that fails puts its rows back for its retry; a rerun's newer writes stay.
+            let mut writes = self.writes.lock().unwrap_or_else(PoisonError::into_inner);
+            for (source, items) in taken {
+                writes.entry(source).or_insert(items);
             }
         }
-        tx.commit().map_err(|_| Error::Store)?;
-        // Taken only once committed, so a batch that fails keeps its rows for its retry.
-        for source in &sources {
-            writes.remove(source);
-        }
+        done?;
         let _ = self.queue.send(());
         Ok(())
     }
+}
+
+/// `batch` and the rows `taken` for its 2s, stamped with each 2's source, in one transaction.
+fn commit<T: Copy + Into<u16>, D: Serialize>(
+    conn: &mut Connection,
+    batch: &[Event<T, D>],
+    taken: &[(Uuid, Vec<Value>)],
+) -> Result<(), Error> {
+    let since = UNIX_EPOCH.elapsed().unwrap_or_default().as_millis();
+    let written = i64::try_from(since).unwrap_or(i64::MAX);
+    let tx = conn.transaction().map_err(|_| Error::Store)?;
+    rannoch_events::append_in(&tx, batch)?;
+    for (source, items) in taken {
+        let event = source.to_string();
+        for item in items {
+            let op = Op::deserialize(item).map_err(|_| Error::Store)?;
+            write(&tx, &event, &op, written).map_err(|_| Error::Store)?;
+        }
+    }
+    tx.commit().map_err(|_| Error::Store)
 }
 
 /// Adds `op`'s row, stamped with `event` and `written`; a row its key already holds stays.
