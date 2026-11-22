@@ -40,10 +40,14 @@ pub trait Action: Send + Sync {
     ) -> Result<Map<String, Value>, String>;
 }
 
+/// Graph writes by the id of the event they are about, until the append that carries its 2 takes them.
+pub type Writes = Arc<Mutex<HashMap<Uuid, Vec<Value>>>>;
+
 /// The app's flows by ty, each a `rannoch_queue::Flow` whose run closure calls `process`.
 #[derive(Debug)]
 pub struct Processor<T, D> {
     flows: HashMap<u16, Arc<Flow<T, D>>>,
+    writes: Writes,
 }
 
 impl<T: TryFrom<u16> + PartialEq + 'static, D: From<Value> + 'static> Processor<T, D> {
@@ -62,18 +66,20 @@ impl<T: TryFrom<u16> + PartialEq + 'static, D: From<Value> + 'static> Processor<
         let docs: Arc<Vec<FlowDoc>> = Arc::new(serde_json::from_str(flows)?);
         let (conn, seen) = (Arc::new(Mutex::new(events)), Arc::new(Mutex::default()));
         let mut by_ty: HashMap<u16, Arc<Flow<T, D>>> = HashMap::new();
+        let writes = Writes::default();
         for doc in docs.iter().cloned() {
             let (actions, ty, job) = (by_name.clone(), doc.ty, doc.job);
-            let (docs, conn, seen) = (docs.clone(), conn.clone(), seen.clone());
+            let (docs, conn, seen, writes) =
+                (docs.clone(), conn.clone(), seen.clone(), writes.clone());
             let process = move |event: &Row, root: &Row, sender: &Sender<T, D>| {
-                let (id, at) = (event.id, (event.id, event.ty));
+                let (id, at, mut graph) = (event.id, (event.id, event.ty), Vec::new());
                 let ty = |ty| T::try_from(ty).map_err(|_| format!("ty {ty} is not the app's"));
                 let sends = serde_json::from_str(&root.data)
                     .map_err(|e| format!("root data: {e}"))
                     .and_then(|data: Map<String, Value>| {
                         let (mut outs, said) = waits(&lock(&conn), &lock(&seen), &docs, at, &data)?;
                         if said == "done" {
-                            let nexts = run(&doc, &actions, data)?.into_iter();
+                            let nexts = run(&doc, &actions, data, &mut graph)?.into_iter();
                             outs.extend(nexts.map(|(to, data, delay)| (id, to, data, delay)));
                         }
                         lock(&seen).extend(outs.iter().map(|o| o.0).filter(|s| *s != id));
@@ -87,7 +93,12 @@ impl<T: TryFrom<u16> + PartialEq + 'static, D: From<Value> + 'static> Processor<
                         nexts.chain([done]).collect::<Result<Vec<_>, String>>()
                     });
                 let (sends, result) = match sends {
-                    Ok(sends) => (sends, Ok(())),
+                    Ok(sends) => {
+                        if !graph.is_empty() {
+                            lock(&writes).insert(id, graph);
+                        }
+                        (sends, Ok(()))
+                    }
                     Err(e) => {
                         let binned = (id, ty(event.ty)?, e.as_str().into(), None, Status::Binned);
                         (vec![binned], Err(e))
@@ -112,7 +123,18 @@ impl<T: TryFrom<u16> + PartialEq + 'static, D: From<Value> + 'static> Processor<
             let run = Box::new(process);
             by_ty.insert(ty, Arc::new(Flow { job, run }));
         }
-        Ok(Self { flows: by_ty })
+        Ok(Self {
+            flows: by_ty,
+            writes,
+        })
+    }
+}
+
+impl<T, D> Processor<T, D> {
+    /// The processor's writes, to hand to the append that writes them.
+    #[must_use]
+    pub fn writes(&self) -> Writes {
+        self.writes.clone()
     }
 }
 
@@ -184,11 +206,13 @@ fn waits<'d>(
 /// from `with`, its input the options so far, its output checked against its sig's gives and
 /// merged in (later wins), the step's result put under `as` when set; then the step's next is
 /// shaped with `eval`, a wait as an event of the flow's ty. Returns them as (ty, data, delay).
+/// A link's `$graph` list is taken out of its output first and added to `graph`.
 #[expect(clippy::type_complexity, reason = "the issue's signature")]
 fn run(
     flow: &FlowDoc,
     actions: &HashMap<String, Arc<dyn Action>>,
     data: Map<String, Value>,
+    graph: &mut Vec<Value>,
 ) -> Result<Vec<(u16, Map<String, Value>, u64)>, String> {
     let (mut vals, mut nexts) = (data, Vec::new());
     for (i, step) in flow.steps.iter().enumerate() {
@@ -196,7 +220,11 @@ fn run(
         for link in step.chain.split('.') {
             let action = actions.get(link).ok_or(format!("no action named {link}"))?;
             let options = step.with.get(link).cloned().unwrap_or(json!({}));
-            let out = action.run(&options, &input)?;
+            let mut out = action.run(&options, &input)?;
+            if let Some(writes) = out.get_mut("$graph").and_then(Value::as_array_mut) {
+                graph.append(writes);
+                out.remove("$graph");
+            }
             for (field, ty) in &action.sig().gives {
                 match out.get(field).map(type_of) {
                     Some(t) if t == ty => {}
@@ -283,9 +311,11 @@ mod tests {
         v.as_object().cloned().unwrap_or_default()
     }
 
-    /// Runs the flow doc `flow` on `data` over the actions `links` (name, gives, act).
-    fn run(flow: &Value, data: &Value, links: &[(&str, &[&str], Act)]) -> (Ran, Calls) {
-        let calls = Arc::default();
+    /// The actions `links` (name, gives, act), each recording its calls in `calls`.
+    fn actions(
+        links: &[(&str, &[&str], Act)],
+        calls: &Arc<Mutex<Calls>>,
+    ) -> HashMap<String, Arc<dyn Action>> {
         let mut actions: HashMap<String, Arc<dyn Action>> = HashMap::new();
         for (name, gives, act) in links {
             let gives = gives
@@ -299,13 +329,101 @@ mod tests {
             };
             actions.insert(
                 (*name).to_owned(),
-                Arc::new(Link(sig, *act, Arc::clone(&calls))),
+                Arc::new(Link(sig, *act, Arc::clone(calls))),
             );
         }
+        actions
+    }
+
+    /// Runs the flow doc `flow` on `data` over the actions `links` (name, gives, act).
+    fn run(flow: &Value, data: &Value, links: &[(&str, &[&str], Act)]) -> (Ran, Calls) {
+        let calls = Arc::default();
+        let actions = actions(links, &calls);
         let flow: FlowDoc = serde_json::from_value(flow.clone()).unwrap();
-        let ran = super::run(&flow, &actions, obj(data));
+        let ran = super::run(&flow, &actions, obj(data), &mut Vec::new());
         let calls = calls.lock().unwrap().clone();
         (ran, calls)
+    }
+
+    #[test]
+    fn a_links_graph_is_in_neither_the_next_links_options_nor_the_nexts_data() {
+        let flow = json!({ "name": "f", "ty": 1, "takes": {}, "steps": [{ "do": "a.b", "as": "got",
+            "next": { "ty": 2, "shape": { "got": "$got" } } }] });
+        let flow: FlowDoc = serde_json::from_value(flow).unwrap();
+        let calls = Arc::default();
+        let actions = actions(
+            &[
+                ("a", &["x"], |_| {
+                    Ok(obj(&json!({ "x": "a", "$graph": [{ "node": 1 }] })))
+                }),
+                ("b", &[], |_| Ok(obj(&json!({ "$graph": [{ "node": 2 }] })))),
+            ],
+            &calls,
+        );
+        let mut graph = Vec::new();
+
+        let ran = super::run(&flow, &actions, Map::new(), &mut graph);
+
+        assert_eq!(calls.lock().unwrap()[1].1, obj(&json!({ "x": "a" })));
+        assert_eq!(ran.unwrap(), [(2, obj(&json!({ "got": { "x": "a" } })), 0)]);
+        assert_eq!(graph, [json!({ "node": 1 }), json!({ "node": 2 })]);
+    }
+
+    /// Runs an event of `ty`, whose root is another event, through the processor's flow for
+    /// `ty`: 70 gives a write and succeeds, 71 gives a write and then fails. Returns the run's
+    /// result, the event's id and what the processor's writes then hold.
+    fn wrote(ty: u16) -> (Result<(), String>, Uuid, HashMap<Uuid, Vec<Value>>) {
+        let flows = json!([
+            { "name": "writes", "ty": 70, "takes": {}, "steps": [{ "do": "a" }] },
+            { "name": "fails", "ty": 71, "takes": {}, "steps": [{ "do": "a.fail" }] }
+        ]);
+        let links = actions(
+            &[
+                ("a", &[], |_| {
+                    Ok(obj(&json!({ "$graph": [{ "node": "n1" }] })))
+                }),
+                ("fail", &[], |_| Err("fail: no".to_owned())),
+            ],
+            &Arc::default(),
+        );
+        let links = links.into_values().collect();
+        let conn = events(Uuid::now_v7(), &[]);
+        let processor = Processor::<u16, Value>::new(&flows.to_string(), links, conn).unwrap();
+        let append = Some(Arc::new(Kept::default()) as Arc<dyn Append<u16, Value>>);
+        let rannoch = Rannoch::open(Config {
+            append,
+            ..Config::default()
+        })
+        .unwrap();
+        let (root, event) = (Uuid::now_v7(), Uuid::now_v7());
+        let row = |id, source| Event {
+            id,
+            source,
+            ty,
+            data: "{}".to_owned(),
+            run_at: None,
+            status: Status::Added,
+        };
+        let flow = processor.flow(ty).unwrap();
+        let ran = (flow.run)(&row(event, Some(root)), &row(root, None), &rannoch.sender());
+        rannoch.shutdown();
+        let writes = processor.writes().lock().unwrap().clone();
+        (ran, event, writes)
+    }
+
+    #[test]
+    fn a_flow_that_succeeds_leaves_its_writes_under_the_events_id() {
+        let (ran, event, writes) = wrote(70);
+        assert_eq!(ran, Ok(()));
+        let node = json!({ "node": "n1" });
+        assert_eq!(writes, HashMap::from([(event, vec![node])]));
+    }
+
+    #[test]
+    fn a_failing_step_leaves_no_writes() {
+        let (ran, _, writes) = wrote(71);
+        assert_eq!(ran, Err("fail: no".to_owned()));
+        assert!(writes.is_empty());
     }
 
     #[test]
