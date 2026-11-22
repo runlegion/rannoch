@@ -1,0 +1,25 @@
+R0 load: 1,000 import events to their 2 in 120.01146375s: 2916400 statement rows, 3791318 edge rows, 55892 graph rows/s
+seed by describe 2.374867541s: 13198 voices, 27509 statements, 5 places, 40708 relay nodes; control 758.749667ms, equal true
+R1 the judgment is 1 event with 1 graph row
+R3 judge A1 (voice has more): pump 670.167µs (1 delivered), changed true, voices 13198 -> 13198, statements 27509 -> 27508, as predicted true, control 746.566ms equal true
+R3 judge B (voice's only one): pump 628.542µs (1 delivered), changed true, voices 13198 -> 13197, statements 27508 -> 27507, as predicted true, control 753.432708ms equal true
+R7 judge A1 again: pump 1.109875ms (1 delivered), changed false, voices 13197 -> 13197, statements 27507 -> 27507, as predicted true, control 749.948458ms equal true
+R7 the same event folded twice: changed false
+R6 replace B's judgment: pump 640.375µs (1 delivered), changed true, voices 13197 -> 13198, statements 27507 -> 27508, as predicted true, control 754.269ms equal true
+R6 replace A1's judgment: pump 509.5µs (1 delivered), changed true, voices 13198 -> 13198, statements 27508 -> 27509, as predicted true, control 736.00675ms equal true
+noise only: pump 15.208µs (0 delivered), changed false, voices 13198 -> 13198, statements 27509 -> 27509, as predicted true, control 714.217125ms equal true
+R8 new statement, known voice: pump 612.292µs (1 delivered), changed true, voices 13198 -> 13198, statements 27509 -> 27510, as predicted true, control 726.320959ms equal true
+R12 node set grew by 1 (predicted 1)
+R9 new statement, new voice: pump 742.5µs (1 delivered), changed true, voices 13198 -> 13199, statements 27510 -> 27511, as predicted true, control 715.486333ms equal true
+R12 node set grew by 2 (predicted 2; new voice in set true)
+R10 judge the new voice's only statement: pump 510.459µs (1 delivered), changed true, voices 13199 -> 13198, statements 27511 -> 27510, as predicted true, control 728.563083ms equal true
+R10 delivered 1
+R11 other finding, outside voice: pump 2.75µs (0 delivered), changed false, voices 13198 -> 13198, statements 27510 -> 27510, as predicted true, control 717.386792ms equal true
+R11 delivered 0 (predicted 0)
+R11b other finding, a voice in the relay: pump 1.260792ms (1 delivered), changed false, voices 13198 -> 13198, statements 27510 -> 27510, as predicted true, control 714.322625ms equal true
+R11b delivered 1 (predicted 1, changing nothing)
+R5 deliveries seen 210, folded by the relay 9 (judgments on this finding 5, noise 200, T8b 5)
+R2 delivered pumps: min Some(509.5µs), max Some(1.260792ms); control recompute: min Some(714.217125ms), max Some(754.269ms)
+time: command terminated abnormally
+after the last line the process hung in queue.join() for 1 h 33 min at 0% CPU and was killed: the toy's App kept a clone of the queue's wake Sender, so the queue never saw its channel close (the toy's bug).
+at the kill: relay.db 40,960 bytes, relay.db-wal 15,750,504,592 bytes, relay.db-shm 30,605,312 bytes; nothing was checkpointed during the run. Rannoch (crates/rannoch-core/src/broker.rs) keeps broker, stops and threads, and reads config.store only in open, so the Store passed in Config, and the checkpointer it owns, is dropped when open returns unless the app holds another Arc to it.

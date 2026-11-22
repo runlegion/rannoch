@@ -1,0 +1,45 @@
+graph toy, round 3: the T8 relay rerun on the real code. Predictions, written before this code ran
+(2026-11-22).
+
+The operator: "Rerun the toy but on the real code we have done". The original: T8 and T8b
+(/Volumes/store/data/legion/toys/rannoch-toys/t8-neighborhood-eavesdrop, 2026-10-14), a relay
+on the largest finding of T4's file, with its own miniature event, link and touch tables.
+
+This round:
+- Data: T4's file read immutably (1,000 findings, 2,916,404 statements, 100,001 voices,
+  2,916,404 said links, 874,922 supports links), loaded into FR-RANNOCH-123's _nodes and _edges
+  through rannoch main's real crates (queue, processor, events, store): 1,000 import events,
+  each a range of statements, whose step writes the statement's place, its said edge and its
+  supports edges; the rows are written by the append that carries each event's 2 (the toy
+  append of round 2d).
+- A judgment is one event whose step unlinks the statement's supports edge to the finding
+  (not_supports) or links it again (supports); a new statement is one event writing its place,
+  its said edge and its supports edge.
+- The relay is seeded by describe(finding, [{"supports<-": ["place", {"said<-": []}]}]); after
+  each append commit, each event's committed rows and the nodes they touch are handed to the
+  relay once, and the relay folds those that touch its nodes with T8's fold (per-voice counts of
+  active statements). Events enter _events directly with known ids and the queue is signalled,
+  as rannoch's own processor scenarios do.
+- Control: a full recompute from _nodes and _edges after every step.
+
+R0 load: every import event reaches its 2, at 100,000 graph rows/s or more.
+R1 (T8 P1): a judgment is one event; the graph holds one new row for it.
+R2 (T8 P2): each pump that delivered a judgment takes 5 ms or less warm (T8: 14-123 us); the
+   seed is reported apart.
+R3 (T8 P3): judging a statement of a voice with other statements on the finding leaves voices
+   unchanged and drops statements by one; judging a voice's only statement drops both by one.
+R5 (T8 P5): of the judgments after the seed, only the 5 on this finding are delivered; the 200
+   noise judgments on other findings are not.
+R6 (T8 P6): replacing B's judgment restores the counts of before B was judged; replacing A1's
+   restores the seed exactly, by place too.
+R7 (T8 P7): judging A1 not_supports a second time changes nothing; folding an already folded
+   event again changes nothing.
+R8 (T8b P8): a new statement from a voice in the relay is delivered; statements +1, voices same.
+R9 (T8b P9): a new statement from a new voice is delivered; both +1.
+R12 (T8b P12): the relay's node set grows by 1 for R8 and by 2 for R9.
+R10 (T8b P10): judging the new voice's only statement is delivered and drops both by one.
+R11 (T8b P11): a new statement on another finding by a voice outside the relay is not delivered.
+R11b (T8b, found then): a new statement on another finding by a voice in the relay is delivered
+   and changes nothing.
+Control: the recompute equals the relay after every step, and costs at least 100 times a
+   delivered pump (T8: 131-165 ms against 14-123 us).
