@@ -450,9 +450,8 @@ fn an_app_opens_rannoch_over_its_database() {
     let newest = missing_newest(&path).unwrap();
 
     // When the app opens rannoch with its store
-    let store = Arc::new(Store::new(path.clone(), rannoch_core::migrator()));
     let opened = Rannoch::<u8, ()>::open(Config {
-        store: Some(store.clone()),
+        store: Some(Arc::new(Store::new(path.clone(), rannoch_core::migrator()))),
         ..Config::default()
     })
     .unwrap();
@@ -474,13 +473,14 @@ fn an_app_opens_rannoch_over_its_database() {
     assert_eq!(pragma(&conn, "fullfsync").unwrap(), "1");
 
     // When the app sends events and then sends nothing for two seconds, with
-    // a connection held open throughout so that no close checkpoints the WAL
+    // a connection held open throughout so that no close checkpoints the WAL,
+    // and rannoch holding the app's only store
     let held = rusqlite::Connection::open(&path).unwrap();
     held.query_row("SELECT count(*) FROM _events", [], |r| r.get::<_, i64>(0))
         .unwrap();
     let (queue, _signals) = mpsc::channel();
     let rannoch = Rannoch::<u8, ()>::open(Config {
-        store: Some(store.clone()),
+        store: Some(Arc::new(Store::new(path.clone(), rannoch_core::migrator()))),
         append: Some(Arc::new(Events::new(conn, queue))),
         ..Config::default()
     })
@@ -489,11 +489,10 @@ fn an_app_opens_rannoch_over_its_database() {
     for _ in 0..3 {
         sender.send(event()).unwrap();
     }
-    rannoch.shutdown();
     thread::sleep(Duration::from_secs(2));
 
-    // Then the WAL's frames are in the database file: a copy of the file
-    // alone, without its WAL, holds the events
+    // Then the WAL's frames are in the database file while rannoch runs: a
+    // copy of the file alone, without its WAL, holds the events
     let copy = path.with_file_name("database-only.db");
     fs::copy(&path, &copy).unwrap();
     let kept: i64 = rusqlite::Connection::open(&copy)
@@ -501,8 +500,8 @@ fn an_app_opens_rannoch_over_its_database() {
         .query_row("SELECT count(*) FROM _events", [], |r| r.get(0))
         .unwrap();
     assert_eq!(kept, 3);
+    rannoch.shutdown();
     drop(held);
-    drop(store);
 
     // When the app opens rannoch over a path the store cannot open
     let missing = path.with_file_name("missing/store.db");

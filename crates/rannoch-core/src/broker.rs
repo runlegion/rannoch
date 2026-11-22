@@ -45,7 +45,8 @@ pub struct Config<T, D> {
     /// The default inbox's batch interval; every type not listed goes there.
     pub default_interval: TimeDelta,
     pub inboxes: Vec<InboxConfig<T>>,
-    /// The app's store; with none, open runs no migration check.
+    /// The app's store; with none, open runs no migration check. Rannoch
+    /// keeps it for as long as it runs.
     pub store: Option<Arc<dyn Storage>>,
     /// The events crate's append; with none, no inbox hands anything over.
     pub append: Option<Arc<dyn Append<T, D>>>,
@@ -90,6 +91,8 @@ pub struct Rannoch<T, D> {
     /// Dropping these wakes each inbox's thread for its last hand-over.
     stops: Vec<mpsc::Sender<()>>,
     threads: Vec<JoinHandle<()>>,
+    /// The app's store, kept for as long as rannoch runs.
+    _store: Option<Arc<dyn Storage>>,
 }
 
 impl<T: PartialEq + Send + 'static, D: Send + 'static> Rannoch<T, D> {
@@ -153,6 +156,7 @@ impl<T: PartialEq + Send + 'static, D: Send + 'static> Rannoch<T, D> {
             broker,
             stops,
             threads,
+            _store: config.store,
         })
     }
 
