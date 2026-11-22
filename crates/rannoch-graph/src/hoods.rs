@@ -58,11 +58,12 @@ impl Hoods {
         Ok(result)
     }
 
-    /// Recomputes every warm hood that read a node in `touched`; one whose recompute fails goes
-    /// cold, so the next describe of it is a cold one.
-    pub(crate) fn rewarm(&mut self, conn: &Connection, touched: &HashSet<String>) {
+    /// Recomputes every warm hood that read a node in `touched`, and says how many it
+    /// recomputed; one whose recompute fails goes cold, so the next describe of it is a cold one.
+    pub(crate) fn rewarm(&mut self, conn: &Connection, touched: &HashSet<String>) -> usize {
         let keys = touched.iter().filter_map(|n| self.by_node.get(n));
         let keys: HashSet<String> = keys.flatten().cloned().collect();
+        let mut recomputed = 0;
         for key in keys {
             let Some(hood) = self.hoods.remove(&key) else {
                 continue;
@@ -72,8 +73,9 @@ impl Hoods {
                     keys.remove(&key);
                 }
             }
-            let _ = self.warm(conn, hood.node, hood.shape);
+            recomputed += usize::from(self.warm(conn, hood.node, hood.shape).is_ok());
         }
+        recomputed
     }
 }
 
@@ -194,15 +196,6 @@ mod tests {
         hoods.hoods.values().filter(|h| cold(h) == h.result).count()
     }
 
-    /// The hoods a commit's touched nodes recompute, as `rewarm` picks them.
-    fn picked(hoods: &Hoods, touched: &HashSet<String>) -> usize {
-        let keys = touched
-            .iter()
-            .filter_map(|n| hoods.by_node.get(n))
-            .flatten();
-        keys.collect::<HashSet<_>>().len()
-    }
-
     /// 50 warm hoods equal a cold describe after a burst of 5,000 writes that touch them and after
     /// its rerun, which recomputes nothing; a warm describe is at least 10 times faster than a
     /// cold one (the toy's P8 and P9).
@@ -261,8 +254,7 @@ mod tests {
             let mut recomputes = 0;
             for write in &burst {
                 let touched = commit(conn, none, std::slice::from_ref(write)).unwrap();
-                recomputes += picked(hoods, &touched);
-                hoods.rewarm(conn, &touched);
+                recomputes += hoods.rewarm(conn, &touched);
             }
             recomputes
         };

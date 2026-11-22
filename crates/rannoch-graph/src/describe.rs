@@ -16,8 +16,9 @@ pub struct Opts {
 
 /// The node shaped by `shape`; a cold read.
 /// # Errors
-/// As `prop`, or a shape that is not a list of property names, "*", {edge: shape} and
-/// {edge: {shape, limit, where}}.
+/// As `prop`, or rusqlite's `ToSqlConversionFailure` for a shape that is not a list of property
+/// names, "*", {edge: shape} and {edge: {shape, limit, where}}: an item that does not parse is
+/// refused when the walk reaches it.
 pub fn describe(conn: &Connection, node: &str, shape: &Value, opts: Opts) -> Result<Value> {
     shaped(conn, node, shape, opts, &mut HashSet::new()).map(Value::Object)
 }
@@ -34,7 +35,7 @@ pub(crate) fn shaped(
     touched.insert(node.to_owned());
     let mut out = Map::new();
     out.insert("id".to_owned(), json!(node));
-    for item in shape.as_array().ok_or_else(bad)? {
+    for item in shape.as_array().ok_or_else(bad_shape)? {
         match item {
             Value::String(k) if k == "*" => {
                 for (key, _) in props(conn, node, o.at)? {
@@ -56,11 +57,11 @@ pub(crate) fn shaped(
                     let (subshape, limit, filter) = match sub {
                         Value::Array(_) => (sub, None, None),
                         Value::Object(x) => (
-                            x.get("shape").ok_or_else(bad)?,
+                            x.get("shape").ok_or_else(bad_shape)?,
                             x.get("limit").and_then(Value::as_u64),
                             x.get("where").and_then(Value::as_object),
                         ),
-                        _ => return Err(bad()),
+                        _ => return Err(bad_shape()),
                     };
                     let limit = limit.and_then(|l| usize::try_from(l).ok());
                     let mut kids = Vec::new();
@@ -83,7 +84,7 @@ pub(crate) fn shaped(
                     out.insert(spec.clone(), Value::Array(kids));
                 }
             }
-            _ => return Err(bad()),
+            _ => return Err(bad_shape()),
         }
     }
     Ok(out)
@@ -116,7 +117,7 @@ fn stamped(row: &Row, name: &str) -> Value {
 }
 
 /// A shape that does not parse, as rusqlite's conversion failure of what goes in.
-fn bad() -> rusqlite::Error {
+fn bad_shape() -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure("not a describe shape".into())
 }
 
@@ -200,7 +201,8 @@ mod tests {
         );
     }
 
-    /// A shape that is not a list of names, "*" and {edge: shape} items is an error, not a panic.
+    /// A shape that is not a list of names, "*", {edge: shape} and {edge: {shape, limit, where}}
+    /// items is rusqlite's conversion failure, not a panic.
     #[test]
     fn a_shape_that_does_not_parse_is_an_error() {
         let (conn, _) = small();
@@ -210,9 +212,10 @@ mod tests {
             json!([{ "wrote": 1 }]),
             json!([{ "wrote": {} }]),
         ] {
+            let refused = describe(&conn, "ada", &shape, Opts::default());
             assert!(
-                describe(&conn, "ada", &shape, Opts::default()).is_err(),
-                "{shape}"
+                matches!(refused, Err(rusqlite::Error::ToSqlConversionFailure(_))),
+                "{shape}: {refused:?}"
             );
         }
     }
