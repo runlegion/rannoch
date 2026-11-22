@@ -1,6 +1,9 @@
 //! The crate an app builds its ontology with: two tables in rannoch's file, rows only added.
 
 mod queries;
+mod walk;
+
+pub use walk::walk;
 
 use std::sync::{Mutex, PoisonError, mpsc::Sender};
 use std::time::UNIX_EPOCH;
