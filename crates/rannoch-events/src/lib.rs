@@ -56,27 +56,38 @@ where
     D: Serialize,
 {
     let tx = conn.transaction().map_err(|_| Error::Store)?;
-    {
-        let mut insert = tx.prepare(queries::APPEND).map_err(|_| Error::Store)?;
-        for event in batch {
-            let data = serde_json::to_string(&event.data).map_err(|_| Error::Store)?;
-            insert
-                .execute(params![
-                    event.id.to_string(),
-                    event.source.map(|s| s.to_string()),
-                    event.ty.into(),
-                    data,
-                    event
-                        .run_at
-                        .map(|t| t.to_rfc3339_opts(SecondsFormat::Millis, true)),
-                    event.status as i8,
-                ])
-                .map_err(|_| Error::Store)?;
-        }
-    }
+    append_in(&tx, batch)?;
     tx.commit().map_err(|_| Error::Store)?;
     // The events are kept whether or not the queue is still listening.
     let _ = queue.send(());
+    Ok(())
+}
+
+/// Appends `batch` to `_events` inside `tx`; the caller commits and signals the queue.
+///
+/// # Errors
+///
+/// `Error::Store` when an insert fails; the caller then commits nothing.
+pub fn append_in<T: Copy + Into<u16>, D: Serialize>(
+    tx: &rusqlite::Transaction<'_>,
+    batch: &[Event<T, D>],
+) -> Result<(), Error> {
+    let mut insert = tx.prepare(queries::APPEND).map_err(|_| Error::Store)?;
+    for event in batch {
+        let data = serde_json::to_string(&event.data).map_err(|_| Error::Store)?;
+        insert
+            .execute(params![
+                event.id.to_string(),
+                event.source.map(|s| s.to_string()),
+                event.ty.into(),
+                data,
+                event
+                    .run_at
+                    .map(|t| t.to_rfc3339_opts(SecondsFormat::Millis, true)),
+                event.status as i8,
+            ])
+            .map_err(|_| Error::Store)?;
+    }
     Ok(())
 }
 
@@ -139,6 +150,18 @@ mod tests {
 
         assert_eq!(count(&events.conn.lock().unwrap()), 2);
         assert_eq!(signals.try_recv(), Ok(()));
+    }
+
+    #[test]
+    fn append_in_a_transaction_that_is_rolled_back_writes_nothing() {
+        let mut store = rannoch_core::forgr::empty_store();
+        let tx = store.transaction().unwrap();
+
+        super::append_in(&tx, &[event(Uuid::now_v7()), event(Uuid::now_v7())]).unwrap();
+        assert_eq!(count(&tx), 2);
+        tx.rollback().unwrap();
+
+        assert_eq!(count(&store), 0);
     }
 
     #[test]
