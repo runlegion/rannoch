@@ -11,7 +11,7 @@ use crate::inbox::{Inbox, run};
 use crate::{Error, Event, Status};
 
 /// What core needs from the app's store at start.
-pub trait Storage: fmt::Debug {
+pub trait Storage: fmt::Debug + Send + Sync {
     /// Whether migrations are pending.
     ///
     /// # Errors
@@ -400,6 +400,12 @@ mod tests {
         let mut batches = recorder.batches.lock().unwrap().clone();
         batches.sort_by_key(|b| b[0] as u8);
         assert_eq!(batches, [vec![Ty::Asset], vec![Ty::Page]]);
+    }
+
+    #[test]
+    fn rannoch_holding_its_store_is_send_and_sync() {
+        fn send_and_sync<S: Send + Sync>() {}
+        send_and_sync::<Rannoch<Ty, &str>>();
     }
 
     #[test]
