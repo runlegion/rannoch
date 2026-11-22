@@ -1,6 +1,11 @@
 {
-  "version": 20261122000001,
+  "version": 20261122000003,
   "objects": [
+    {
+      "type": "index",
+      "name": "_edges_in",
+      "sql": "CREATE INDEX \"_edges_in\" ON \"_edges\" (\"dst\", \"name\", \"src\", \"event\")"
+    },
     {
       "type": "index",
       "name": "_events_source",
@@ -18,8 +23,18 @@
     },
     {
       "type": "table",
+      "name": "_edges",
+      "sql": "CREATE TABLE \"_edges\" (\"src\" TEXT NOT NULL, \"name\" TEXT NOT NULL, \"dst\" TEXT NOT NULL, \"props\" TEXT, \"event\" TEXT NOT NULL, \"written\" INTEGER NOT NULL, \"retracted\" INTEGER NOT NULL DEFAULT (0), PRIMARY KEY (\"src\", \"name\", \"dst\", \"event\")) WITHOUT ROWID"
+    },
+    {
+      "type": "table",
       "name": "_events",
       "sql": "CREATE TABLE \"_events\" (\"id\" TEXT, \"source\" TEXT, \"ty\" INTEGER NOT NULL, \"data\" TEXT NOT NULL, \"run_at\" TEXT, \"status\" INTEGER NOT NULL CHECK (status IN (-1, 0, 1, 2)), PRIMARY KEY (\"id\"))"
+    },
+    {
+      "type": "table",
+      "name": "_nodes",
+      "sql": "CREATE TABLE \"_nodes\" (\"node\" TEXT NOT NULL, \"key\" TEXT NOT NULL, \"value\" TEXT, \"event\" TEXT NOT NULL, \"written\" INTEGER NOT NULL, \"retracted\" INTEGER NOT NULL DEFAULT (0), PRIMARY KEY (\"node\", \"key\", \"event\")) WITHOUT ROWID"
     }
   ]
 }

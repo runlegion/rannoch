@@ -1253,6 +1253,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "rannoch-graph"
+version = "0.1.0"
+dependencies = [
+ "rannoch-core",
+ "rannoch-events",
+ "rannoch-processor",
+ "rannoch-queue",
+ "rannoch-store",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "rannoch-processor"
 version = "0.1.0"
 dependencies = [
