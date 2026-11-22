@@ -41,10 +41,15 @@ CREATE TABLE IF NOT EXISTS _edges (src TEXT NOT NULL, name TEXT NOT NULL, dst TE
 CREATE INDEX IF NOT EXISTS _edges_in ON _edges(dst, name, src, event);";
 
 fn ready(path: &Path) -> Connection {
-    match rannoch_store::open(path, &rannoch_core::migrator()).expect("open") {
+    let conn = match rannoch_store::open(path, &rannoch_core::migrator()).expect("open") {
         Opened::Ready(conn) => conn,
         Opened::Pending(p) => panic!("pending: {p:?}"),
+    };
+    // Round 4e, BUDGET=1: the budget pragmas of round 4 on every connection.
+    if std::env::var("BUDGET").is_ok() {
+        conn.execute_batch("PRAGMA wal_autocheckpoint = 1280; PRAGMA journal_size_limit = 5242880; PRAGMA cache_size = -2000;").expect("budget");
     }
+    conn
 }
 
 /// The action: writes nothing, or the event's graph rows in one transaction.
@@ -237,6 +242,14 @@ fn main() {
         tx.commit().expect("commit");
     }
     let start = Instant::now();
+    let wal_max = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    {
+        let (w, p) = (wal_max.clone(), format!("{}-wal", path.display()));
+        std::thread::spawn(move || loop {
+            w.fetch_max(std::fs::metadata(&p).map_or(0, |m| m.len()), std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(50));
+        });
+    }
     // Round 2c: once a second, the WAL and database sizes and what a PASSIVE checkpoint
     // reports (busy, frames in the WAL, frames checkpointed).
     if std::env::var("SAMPLE").is_ok() {
@@ -287,6 +300,7 @@ fn main() {
         "{mode}: {twos} of {n} events to their 2 in {elapsed:?} = {:.0} events/s; 1s {ones}; graph nodes {nodes}; events with a 2 and no graph rows {missing}",
         twos as f64 / elapsed.as_secs_f64()
     );
+    println!("{mode}: WAL file largest {:.1} MiB", wal_max.load(std::sync::atomic::Ordering::SeqCst) as f64 / 1_048_576.0);
     drop(signal);
     rannoch.shutdown();
     queue.join();

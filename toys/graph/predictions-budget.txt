@@ -1,0 +1,51 @@
+graph toy, round 4: a resource budget. Predictions, written before this code ran (2026-11-22).
+
+The operator, on warden, a realtime app beside a game that holds most of the machine: "The wal
+can't work this way"; "UUID is time, put a 5mb limit on checkpoints. It's going from one cache
+into a flow, it should not need another cache".
+
+Same run as round 3 (T4's file through rannoch main's real crates into _nodes and _edges, then
+T8's relay), twice, in the same harness:
+  base    rannoch-store's pragmas as built (64 MiB cache per connection, automatic checkpoints
+          off), with the app holding the Store so its 1 s PASSIVE checkpointer runs
+  budget  the same, plus on every connection the toy opens: PRAGMA wal_autocheckpoint = 1280
+          (5 MiB of 4 KiB pages), PRAGMA journal_size_limit = 5242880, PRAGMA cache_size = -2000
+          (SQLite's default, about 2 MB)
+The WAL file is sampled every 100 ms; /usr/bin/time -l gives peak resident memory and block
+output operations; latency is from putting one judgment in _events to its 2 being visible, on the
+single-judgment steps.
+
+B1 budget: the WAL file stays under 5 MiB plus the largest single transaction, and under 64 MiB
+   throughout; base: it grows past 1 GiB, as round 3.
+B2 budget: peak resident memory under 100 MB, and lower than base.
+B3 budget: the load runs within 20% of base's graph rows/s.
+B4 budget: every relay prediction of round 3 holds and the control equals the relay every step.
+B5 budget: a single judgment's latency to its 2 is 50 ms or less at the median.
+B6 budget: block output operations no more than base's (uncertain: small checkpoints copy every
+   page back, which base also does once a second).
+
+Round 4b, written before it ran (2026-11-22), after the budget run's WAL grew to 258 MB, creeping
+about 1 MiB/s (samples in wal-series.txt): BUDGET plus TRUNCATE=1, a thread with its own
+connection (busy_timeout 100 ms) that every 250 ms runs PRAGMA wal_checkpoint(TRUNCATE) when the
+WAL file is over 5 MiB.
+B7 the WAL file stays under 5 MiB plus the largest single transaction, and under 64 MiB
+   throughout.
+B8 the load stays within 20% of the budget run's rows/s, and a single judgment's latency stays
+   50 ms or less at the median.
+B9 the longest TRUNCATE checkpoint takes 100 ms or less.
+
+Round 4c, written before it ran (2026-11-22): what keeps the WAL from restarting. A synthetic
+writer on one connection with the budget pragmas (wal_autocheckpoint 1280, journal_size_limit
+5 MiB, cache 2 MB) commits 300 transactions of 2,000 graph rows each (_nodes and _edges as round
+3, UUIDv7 event ids), with:
+  alone    no other reader
+  same     a describe-sized read on the writer's own connection after every commit
+  other20  a second connection reading every 20 ms
+  other1   a second connection reading every 1 ms
+B10 alone and same: the WAL file stays under 5 MiB plus one transaction (under 16 MiB).
+B11 other1: the WAL file grows past 64 MiB; other20 lies between.
+
+Round 4d, written before it ran (2026-11-22), after round 4c held the WAL at 10.1 MiB in all four
+cases (B10 holds, B11 refuted): the real flow with BUDGET=1 and without KEEP_STORE, so the
+store's own 1 s PASSIVE checkpointer is dropped at open and only the 5 MiB autocheckpoints run.
+B12 over the first 60 s the WAL file stays under 16 MiB.

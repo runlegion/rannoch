@@ -43,10 +43,16 @@ CREATE INDEX IF NOT EXISTS _events_wait ON _events (json_extract(data, '$.\"$wai
   WHERE json_extract(data, '$.\"$wait\".for') IS NOT NULL;";
 
 fn ready(path: &Path) -> Connection {
-    match rannoch_store::open(path, &rannoch_core::migrator()).expect("open") {
+    let conn = match rannoch_store::open(path, &rannoch_core::migrator()).expect("open") {
         Opened::Ready(conn) => conn,
         Opened::Pending(p) => panic!("pending: {p:?}"),
+    };
+    // Round 4, BUDGET=1: checkpoint at 5 MiB, truncate the WAL to 5 MiB, SQLite's default cache.
+    if std::env::var("BUDGET").is_ok() {
+        conn.execute_batch("PRAGMA wal_autocheckpoint = 1280; PRAGMA journal_size_limit = 5242880; PRAGMA cache_size = -2000;")
+            .expect("budget pragmas");
     }
+    conn
 }
 
 fn now_ms() -> i64 {
@@ -495,7 +501,7 @@ impl App {
                 return ids;
             }
             assert!(start.elapsed() < Duration::from_secs(600), "events did not reach their 2");
-            std::thread::sleep(Duration::from_millis(2));
+            std::thread::sleep(Duration::from_millis(std::env::var("POLL_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(2)));
         }
     }
 }
@@ -534,6 +540,42 @@ fn main() {
     let queue = Queue::start(ready(&path), wake, rannoch.sender(), Arc::new(processor), Settings::new(Duration::from_millis(100)));
     let app = App { path: path.clone(), signal: signal.clone(), read: ready(&path) };
 
+    // Round 4: the WAL file's largest size, sampled every 100 ms.
+    let wal_max = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    {
+        let (w, p) = (wal_max.clone(), format!("{}-wal", path.display()));
+        std::thread::spawn(move || loop {
+            let n = std::fs::metadata(&p).map_or(0, |m| m.len());
+            w.fetch_max(n, Ordering::SeqCst);
+            if std::env::var("WAL_SERIES").is_ok() {
+                eprintln!("wal {n}");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        });
+    }
+    // Round 4b, TRUNCATE=1: force the WAL to restart when it passes 5 MiB.
+    let ck_max = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let ck_busy = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let ck_runs = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    if std::env::var("TRUNCATE").is_ok() {
+        let (mx, busy, runs, p) = (ck_max.clone(), ck_busy.clone(), ck_runs.clone(), path.clone());
+        std::thread::spawn(move || {
+            let c = ready(&p);
+            c.execute_batch("PRAGMA busy_timeout = 100").expect("busy");
+            let wal = format!("{}-wal", p.display());
+            loop {
+                std::thread::sleep(Duration::from_millis(250));
+                if std::fs::metadata(&wal).map_or(0, |m| m.len()) <= 5 * 1024 * 1024 {
+                    continue;
+                }
+                let t = Instant::now();
+                let b: i64 = c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0)).unwrap_or(1);
+                mx.fetch_max(t.elapsed().as_micros() as u64, Ordering::SeqCst);
+                runs.fetch_add(1, Ordering::SeqCst);
+                busy.fetch_add(b as u64, Ordering::SeqCst);
+            }
+        });
+    }
     // R0: load T4's data through the real path, 1,000 import events.
     let (lo, hi): (i64, i64) = src.query_row("SELECT min(id), max(id) FROM node WHERE kind = 'statement'", [], |r| Ok((r.get(0)?, r.get(1)?))).expect("range");
     let step = (hi - lo) / 1000 + 1;
@@ -673,6 +715,26 @@ fn main() {
     let _ = step("R11b other finding, a voice in the relay", &mut relay, &|b, n| b == n, &s10);
     println!("R11b delivered {} (predicted 1, changing nothing)", relay.delivered - d2);
     println!("R5 deliveries seen {}, folded by the relay {} (judgments on this finding 5, noise 200, T8b 5)", relay.seen, relay.delivered);
+    let mut lat = Vec::new();
+    for _ in 0..20 {
+        let t = Instant::now();
+        app.hand(vec![judge(&a1, &finding, "not_supports")]);
+        lat.push(t.elapsed());
+        app.hand(vec![judge(&a1, &finding, "supports")]);
+    }
+    lat.sort();
+    println!(
+        "B5 single judgment, put in _events to its 2 visible: p50 {:?}, max {:?} (20 judgments)",
+        lat[lat.len() / 2],
+        lat.last()
+    );
+    println!("B1 the WAL file's largest size, sampled every 100 ms: {} bytes", wal_max.load(Ordering::SeqCst));
+    println!(
+        "B9 TRUNCATE checkpoints run {}, busy {}, longest {} us",
+        ck_runs.load(Ordering::SeqCst),
+        ck_busy.load(Ordering::SeqCst),
+        ck_max.load(Ordering::SeqCst)
+    );
     pumps.sort();
     ctls.sort();
     println!(

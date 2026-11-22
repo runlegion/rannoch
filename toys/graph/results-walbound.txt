@@ -1,0 +1,4 @@
+alone: 300 transactions of 2,000 rows in 24.211106375s; reads 0; WAL file largest 10.1 MiB
+same: 300 transactions of 2,000 rows in 24.141274s; reads 300; WAL file largest 10.1 MiB
+other20: 300 transactions of 2,000 rows in 24.0812385s; reads 847; WAL file largest 10.1 MiB
+other1: 300 transactions of 2,000 rows in 24.090171666s; reads 15970; WAL file largest 10.1 MiB

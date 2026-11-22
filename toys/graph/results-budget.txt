@@ -1,0 +1,11 @@
+== budget (BUDGET=1 KEEP_STORE=1)
+R0 load: 1,000 import events to their 2 in 119.089269917s: 2916400 statement rows, 3791318 edge rows, 56325 graph rows/s
+seed by describe 468.617584ms: 13198 voices, 27509 statements, 5 places, 40708 relay nodes; control 249.200166ms, equal true
+R5 deliveries seen 210, folded by the relay 9 (judgments on this finding 5, noise 200, T8b 5)
+B5 single judgment, put in _events to its 2 visible: p50 31.645167ms, max Some(35.747792ms) (20 judgments)
+B1 the WAL file's largest size, sampled every 100 ms: 258027392 bytes
+R2 delivered pumps: min Some(3.042µs), max Some(31.458µs); control recompute: min Some(247.450292ms), max Some(256.019ms)
+      126.80 real        92.20 user        53.77 sys
+           324124672  maximum resident set size
+                   0  block output operations
+           185647848  peak memory footprint

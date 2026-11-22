@@ -1,0 +1,11 @@
+== budget + truncate (BUDGET=1 KEEP_STORE=1 TRUNCATE=1)
+R0 load: 1,000 import events to their 2 in 136.317004042s: 2916400 statement rows, 3791318 edge rows, 49207 graph rows/s
+seed by describe 480.875958ms: 13198 voices, 27509 statements, 5 places, 40708 relay nodes; control 253.638584ms, equal true
+R5 deliveries seen 210, folded by the relay 9 (judgments on this finding 5, noise 200, T8b 5)
+B5 single judgment, put in _events to its 2 visible: p50 32.754125ms, max Some(38.693625ms) (20 judgments)
+B1 the WAL file's largest size, sampled every 100 ms: 244052352 bytes
+B9 TRUNCATE checkpoints run 390, busy 312, longest 1943729 us
+R2 delivered pumps: min Some(2.292µs), max Some(25.166µs); control recompute: min Some(251.632208ms), max Some(264.30775ms)
+      144.01 real        92.55 user        57.15 sys
+           308953088  maximum resident set size
+           183435984  peak memory footprint
