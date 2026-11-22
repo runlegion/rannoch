@@ -1,0 +1,16 @@
+[package]
+name = "toy-rdf"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+oxilite = "0.10"
+oxrdf = "0.3"
+spareval = "0.2"
+rusqlite = { version = "0.40", features = ["bundled"] }
+uuid = { version = "1", features = ["v7"] }
+spargebra = "0.4"
+chrono = "0.4"

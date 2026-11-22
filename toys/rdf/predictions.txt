@@ -1,0 +1,34 @@
+rdf toy: predictions, written before any toy code ran (2026-11-21)
+
+Question: can rannoch keep its knowledge as RDF in its own SQLite file, read it with SPARQL
+through existing crates (oxilite, or Oxigraph's spareval), and answer now, as of T and why
+with W3C terms only: one named graph per event, described with PROV-O?
+
+Model under test. Each event's facts go in the named graph <urn:uuid:EVENT_ID>. The default
+graph describes that graph: prov:generatedAtTime (the UUIDv7's own time), prov:wasDerivedFrom
+<urn:uuid:SOURCE> when the event has a source, prov:wasRevisionOf <older graph> when it
+corrects one. Nothing is ever written into an older event's graph. The value of (s, p) at T is
+the value in the newest graph generated at or before T that states (s, p).
+
+P1 schema. oxilite's schema SQL runs as one migration in a file that already holds an
+   _events table; oxilite opens that file afterwards and leaves _events untouched. Its tables
+   have no prefix (terms, quads, graphs, stats_*), so they share the app's table names.
+P2 graph per event. One event with 3 facts leaves 3 quads in <urn:uuid:ID> and 1 to 3
+   provenance quads in the default graph; generatedAtTime equals the UUIDv7's millisecond time.
+P3 replay. Writing the same event twice leaves the quad count unchanged when its facts use
+   only IRIs and literals. A blank node gets a fresh id on each write, so a replay adds
+   quads; a blank node named from the event id (urn:uuid:ID#b0) adds none.
+P4 correction. Event 2 corrects event 1's value. now returns event 2's value; as of T, with T
+   between the two events, returns event 1's value; why returns event 2's graph, its time,
+   its source and the graph it revises. Event 1's graph still holds its quads unchanged.
+P5 one SQL statement. oxilite's explain shows the now and as-of queries compiled to SQL,
+   not handed to the spareval fallback. (Least sure: they use FILTER NOT EXISTS.)
+P6 same answers without oxilite. spareval over a SQLite quads table of my own, through
+   QueryableDataset, returns the same rows as oxilite for every P4 query.
+P7 speed, oxilite. 100,000 events of 5 facts each (500,000 fact quads plus provenance):
+   load at 50,000 quads/s or more; now for one subject at 5 ms p50 or less; as of T at
+   10 ms p50 or less.
+P8 speed, spareval over my own table, same data: now at 50 ms p50 or less.
+P9 rannoch's build. Adding oxilite (default features) to a crate in rannoch's workspace
+   fails to resolve: oxilite-rusqlite needs rusqlite 0.40, rannoch uses 0.41, and only one
+   package may link sqlite3.

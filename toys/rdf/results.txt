@@ -1,0 +1,32 @@
+P1 tables after migration + open: _events, datalog_work, graphs, inf_producers, oxilite_guard, oxilite_meta, quads, quads_inf, quads_inf_src, shapes_in, shapes_index, stats_class, stats_po, stats_pred, tbox_closure, terms, triple_terms, update_buffer
+P1 _events rows still: 1 (expected 1)
+P2 e1 graph quads: {"n=\"3\"^^<http://www.w3.org/2001/XMLSchema#integer>"}
+P2 e1 generatedAtTime: {"src=<urn:uuid:01a0c450-6c00-7f74-aa4d-d9707152587e> t=\"2026-09-21T14:13:21.000Z\"^^<http://www.w3.org/2001/XMLSchema#dateTime>"} (UUIDv7 time 2026-09-21T14:13:21.000Z)
+P3 replay of e1 (IRIs and literals): 9 -> 9 quads
+P3 replay with blank node: 11 -> 13 quads
+P3 replay with blank node named from the event id: 15 -> 15 quads
+P4 now: {"g=<urn:uuid:01a0c450-9310-7f0b-b1a7-07c15d9a17d9> o=\"one shared cache\""}
+P6 now: spareval over my table gives the same rows: true
+P4 as of between e1 and e2: {"g=<urn:uuid:01a0c450-6fe8-7700-b7df-f8cccddc8c96> o=\"a cache per repo\""}
+P6 as of between e1 and e2: spareval over my table gives the same rows: true
+P4 why e2: {"rev=<urn:uuid:01a0c450-6fe8-7700-b7df-f8cccddc8c96> src=<urn:uuid:01a0c450-6fe8-7700-b7df-f8cccddc8c96> t=\"2026-09-21T14:13:30.000Z\"^^<http://www.w3.org/2001/XMLSchema#dateTime>"}
+P6 why e2: spareval over my table gives the same rows: true
+P4 e1 graph quads after e2: {"n=\"3\"^^<http://www.w3.org/2001/XMLSchema#integer>"}
+P6 e1 graph quads after e2: spareval over my table gives the same rows: true
+P5 now: mentions fallback/spareval: false; plan starts: -- oxilite: fully compiled to SQL (2 output variable(s)) | -- join order (heuristics, run optimize() for statistics): <http://example.com/design/cache-layout> <http://example.com/value> ?o (~1 rows) | -- join order (heuristics, run optimize() for statistics): ?g <http://www.w3.org/ns/prov#generatedAtTime> ?t (~100000 rows)
+P5 as of: mentions fallback/spareval: false; plan starts: -- oxilite: fully compiled to SQL (2 output variable(s)) | -- join order (heuristics, run optimize() for statistics): <http://example.com/design/cache-layout> <http://example.com/value> ?o (~1 rows) | -- join order (heuristics, run optimize() for statistics): ?g <http://www.w3.org/ns/prov#generatedAtTime> ?t (~100000 rows)
+P7 oxilite load: 699999 quads in 13.107294458s = 53405 quads/s
+P8 my table load: 699999 quads in 2.675992375s = 261585 quads/s
+P7 oxilite now p50 354.125µs, as of p50 284.459µs
+P8 spareval over my table now p50 376.949125ms, as of p50 237.975542ms
+P6 at scale: both engines agree on all 200 subjects, one current value each: true
+sizes: /Volumes/store/tmp/claude-501/-Volumes-store-projects-runlegion-legion/ec75d373-52c6-4e0f-9ad7-591ded47d360/scratchpad/rdf-data/big.sqlite: 157 MB, /Volumes/store/tmp/claude-501/-Volumes-store-projects-runlegion-legion/ec75d373-52c6-4e0f-9ad7-591ded47d360/scratchpad/rdf-data/big-mine.sqlite: 409 MB
+P10 oxilite one event per extend: 10000 events (69999 quads) in 11.560025709s = 865 events/s
+P9 oxilite = "0.10" added to crates/rannoch-store in rannoch main 5fb558f, cargo metadata exit 101:
+      ... required by package `oxilite-rusqlite v0.10.0`
+  package `rusqlite` links to the native library `sqlite3`, but it conflicts with a previous package which links to `sqlite3` as well:
+  package `libsqlite3-sys v0.39.0`
+P11 (not predicted) every rannoch crate moved to rusqlite 0.40 plus oxilite in rannoch-store, cargo check --workspace exit 101:
+      ... which satisfies dependency `rusqlite = "^0.41"` of package `forgr v0.1.0`
+      ... which satisfies dependency `forgr = "^0.1"` of package `rannoch-core v0.1.0 (/Volumes/store/projects/runlegion/rannoch-wt/toys-rdf/crates/rannoch-core)`
+  registry: forgr-0.1.0 and migratr-0.3.0 both depend on rusqlite 0.41; migratr is a normal dependency of rannoch-core
