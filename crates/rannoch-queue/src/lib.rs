@@ -524,24 +524,24 @@ mod tests {
     fn something_after_a_1_anywhere_in_the_tree_counts() {
         let store = rannoch_core::forgr::empty_store();
         let hung = put(&store, None, "{}", 0);
-        let one = put(&store, Some(&hung), "taken", 1);
+        let one = put(&store, Some(&hung), "\"taken\"", 1);
         let hung_id: Uuid = hung.parse().unwrap();
         let one_id: Uuid = one.parse().unwrap();
 
         assert!(!super::after(&store, hung_id, one_id).unwrap());
 
         let failed = put(&store, None, "{}", 0);
-        let failed_one = put(&store, Some(&failed), "taken", 1);
-        let retry = put(&store, Some(&failed), "failed", 0);
-        put(&store, Some(&retry), "taken", 1);
+        let failed_one = put(&store, Some(&failed), "\"taken\"", 1);
+        let retry = put(&store, Some(&failed), "\"failed\"", 0);
+        put(&store, Some(&retry), "\"taken\"", 1);
         let failed_id: Uuid = failed.parse().unwrap();
 
         assert!(super::after(&store, failed_id, failed_one.parse().unwrap()).unwrap());
         // Only a grandchild comes after this 1, so only the walk down the tree finds it.
         let deep = put(&store, None, "{}", 0);
         let child = put(&store, Some(&deep), "{}", 0);
-        let deep_one = put(&store, Some(&deep), "taken", 1);
-        put(&store, Some(&child), "later", 0);
+        let deep_one = put(&store, Some(&deep), "\"taken\"", 1);
+        put(&store, Some(&child), "\"later\"", 0);
         let deep_id: Uuid = deep.parse().unwrap();
         assert!(super::after(&store, deep_id, deep_one.parse().unwrap()).unwrap());
     }
@@ -550,13 +550,13 @@ mod tests {
     fn the_hunt_reads_only_the_1s_whose_event_has_no_result() {
         let store = rannoch_core::forgr::empty_store();
         let hung = put(&store, None, "{}", 0);
-        let hung_one = put(&store, Some(&hung), "taken", 1);
+        let hung_one = put(&store, Some(&hung), "\"taken\"", 1);
         let done = put(&store, None, "{}", 0);
-        put(&store, Some(&done), "taken", 1);
-        put(&store, Some(&done), "made", 2);
+        put(&store, Some(&done), "\"taken\"", 1);
+        put(&store, Some(&done), "\"made\"", 2);
         let failed = put(&store, None, "{}", 0);
-        put(&store, Some(&failed), "taken", 1);
-        put(&store, Some(&failed), "failed", -1);
+        put(&store, Some(&failed), "\"taken\"", 1);
+        put(&store, Some(&failed), "\"failed\"", -1);
 
         let ones: Vec<String> = super::ones_without_result(&store)
             .unwrap()
@@ -584,7 +584,7 @@ mod tests {
     fn an_event_that_is_not_a_retry_is_its_own_root() {
         let store = rannoch_core::forgr::empty_store();
         let first = put(&store, None, "{\"in\":1}", 0);
-        let done = put(&store, Some(&first), "made", 2);
+        let done = put(&store, Some(&first), "\"made\"", 2);
         let output = put(&store, Some(&first), "{\"out\":1}", 0);
 
         assert_eq!(
@@ -610,10 +610,10 @@ mod tests {
     fn a_retry_of_a_retry_walks_back_to_the_original() {
         let store = rannoch_core::forgr::empty_store();
         let original = put(&store, None, "{\"in\":1}", 0);
-        put(&store, Some(&original), "failed", -1);
-        let first = put(&store, Some(&original), "failed", 0);
-        put(&store, Some(&first), "failed again", -1);
-        let second = put(&store, Some(&first), "failed again", 0);
+        put(&store, Some(&original), "\"failed\"", -1);
+        let first = put(&store, Some(&original), "\"failed\"", 0);
+        put(&store, Some(&first), "\"failed again\"", -1);
+        let second = put(&store, Some(&first), "\"failed again\"", 0);
 
         let (found, before) = root(&store, event(&store, &second)).unwrap();
 

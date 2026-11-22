@@ -570,6 +570,8 @@ fn history_kept(name: &str) -> Result<Kept> {
     rannoch_core::forgr::_events::mock(50_000)
         .with(rannoch_core::forgr::_events::Overrides {
             status: rannoch_core::forgr::Override::Pick(vec![-1, 0, 1, 2]),
+            // `_events.data` is JSON, as rannoch's own append writes it.
+            data: rannoch_core::forgr::Override::Fixed("{}".to_owned()),
             ..Default::default()
         })
         .insert(&conn)?;

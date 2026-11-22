@@ -1,5 +1,5 @@
 {
-  "version": 20261118000001,
+  "version": 20261122000001,
   "objects": [
     {
       "type": "index",
@@ -10,6 +10,11 @@
       "type": "index",
       "name": "_events_status",
       "sql": "CREATE INDEX \"_events_status\" ON \"_events\" (\"status\")"
+    },
+    {
+      "type": "index",
+      "name": "_events_wait",
+      "sql": "CREATE INDEX \"_events_wait\" ON \"_events\" (json_extract(data, '$.\"$wait\".for')) WHERE json_extract(data, '$.\"$wait\".for') IS NOT NULL"
     },
     {
       "type": "table",

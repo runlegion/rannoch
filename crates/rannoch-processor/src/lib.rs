@@ -702,4 +702,41 @@ mod tests {
             (vec![], "done")
         );
     }
+
+    #[test]
+    fn waits_for_searches_the_wait_index_on_a_migrated_store() {
+        use rannoch_core::Storage;
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/tmp/rannoch-processor-wait-index");
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("store.db");
+        rannoch_store::Store::new(path.clone(), rannoch_core::migrator())
+            .apply()
+            .unwrap();
+        let rannoch_store::Opened::Ready(conn) =
+            rannoch_store::open(&path, &rannoch_core::migrator()).unwrap()
+        else {
+            panic!("migrations pending");
+        };
+        // A copy of `waits_for`'s SQL, which the issue keeps unchanged.
+        let sql =
+            "EXPLAIN QUERY PLAN SELECT w.id, w.data, json_group_array(json_array(s.status, s.data))
+        FILTER (WHERE s.id IS NOT NULL) FROM _events w LEFT JOIN _events s ON s.source = w.id
+        WHERE json_extract(w.data, '$.\"$wait\".for') = ?1 GROUP BY w.id ORDER BY w.id";
+        let plan: Vec<String> = conn
+            .prepare(sql)
+            .unwrap()
+            .query_map([61], |r| r.get(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|p| p.starts_with("SEARCH w USING INDEX _events_wait")),
+            "{plan:#?}"
+        );
+    }
 }

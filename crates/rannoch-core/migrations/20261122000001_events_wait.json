@@ -1,0 +1,1 @@
+{"up": [{"op": "create_index", "name": "_events_wait", "table": "_events", "columns": [{"expr": "json_extract(data, '$.\"$wait\".for')"}], "where": "json_extract(data, '$.\"$wait\".for') IS NOT NULL"}]}
