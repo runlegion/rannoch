@@ -206,7 +206,7 @@ fn waits<'d>(
 /// from `with`, its input the options so far, its output checked against its sig's gives and
 /// merged in (later wins), the step's result put under `as` when set; then the step's next is
 /// shaped with `eval`, a wait as an event of the flow's ty. Returns them as (ty, data, delay).
-/// A link's `$graph` list is taken out of its output first and added to `graph`.
+/// A link's `$graph` is taken out of its output first: a list joins `graph`; else the step fails.
 #[expect(clippy::type_complexity, reason = "the issue's signature")]
 fn run(
     flow: &FlowDoc,
@@ -221,9 +221,10 @@ fn run(
             let action = actions.get(link).ok_or(format!("no action named {link}"))?;
             let options = step.with.get(link).cloned().unwrap_or(json!({}));
             let mut out = action.run(&options, &input)?;
-            if let Some(writes) = out.get_mut("$graph").and_then(Value::as_array_mut) {
-                graph.append(writes);
-                out.remove("$graph");
+            match out.remove("$graph") {
+                Some(Value::Array(mut writes)) => graph.append(&mut writes),
+                Some(g) => return Err(format!("{link} gave $graph as {}, not list", type_of(&g))),
+                None => {}
             }
             for (field, ty) in &action.sig().gives {
                 match out.get(field).map(type_of) {
@@ -370,12 +371,14 @@ mod tests {
     }
 
     /// Runs an event of `ty`, whose root is another event, through the processor's flow for
-    /// `ty`: 70 gives a write and succeeds, 71 gives a write and then fails. Returns the run's
-    /// result, the event's id and what the processor's writes then hold.
-    fn wrote(ty: u16) -> (Result<(), String>, Uuid, HashMap<Uuid, Vec<Value>>) {
+    /// `ty`: 70 gives a write and succeeds, 71 gives a write and then fails, 72 gives a write and
+    /// then a `$graph` that is not a list. Returns the run's result, the event's id, what the
+    /// processor's writes then hold and what it sent.
+    fn wrote(ty: u16) -> (Result<(), String>, Uuid, HashMap<Uuid, Vec<Value>>, Sent) {
         let flows = json!([
             { "name": "writes", "ty": 70, "takes": {}, "steps": [{ "do": "a" }] },
-            { "name": "fails", "ty": 71, "takes": {}, "steps": [{ "do": "a.fail" }] }
+            { "name": "fails", "ty": 71, "takes": {}, "steps": [{ "do": "a.fail" }] },
+            { "name": "odd", "ty": 72, "takes": {}, "steps": [{ "do": "a.odd", "next": { "ty": 73 } }] }
         ]);
         let links = actions(
             &[
@@ -383,13 +386,15 @@ mod tests {
                     Ok(obj(&json!({ "$graph": [{ "node": "n1" }] })))
                 }),
                 ("fail", &[], |_| Err("fail: no".to_owned())),
+                ("odd", &[], |_| Ok(obj(&json!({ "$graph": "n1" })))),
             ],
             &Arc::default(),
         );
         let links = links.into_values().collect();
         let conn = events(Uuid::now_v7(), &[]);
         let processor = Processor::<u16, Value>::new(&flows.to_string(), links, conn).unwrap();
-        let append = Some(Arc::new(Kept::default()) as Arc<dyn Append<u16, Value>>);
+        let kept = Arc::new(Kept::default());
+        let append = Some(kept.clone() as Arc<dyn Append<u16, Value>>);
         let rannoch = Rannoch::open(Config {
             append,
             ..Config::default()
@@ -408,12 +413,13 @@ mod tests {
         let ran = (flow.run)(&row(event, Some(root)), &row(root, None), &rannoch.sender());
         rannoch.shutdown();
         let writes = processor.writes().lock().unwrap().clone();
-        (ran, event, writes)
+        let sent = kept.0.lock().unwrap().clone();
+        (ran, event, writes, sent)
     }
 
     #[test]
     fn a_flow_that_succeeds_leaves_its_writes_under_the_events_id() {
-        let (ran, event, writes) = wrote(70);
+        let (ran, event, writes, _) = wrote(70);
         assert_eq!(ran, Ok(()));
         let node = json!({ "node": "n1" });
         assert_eq!(writes, HashMap::from([(event, vec![node])]));
@@ -421,8 +427,17 @@ mod tests {
 
     #[test]
     fn a_failing_step_leaves_no_writes() {
-        let (ran, _, writes) = wrote(71);
+        let (ran, _, writes, _) = wrote(71);
         assert_eq!(ran, Err("fail: no".to_owned()));
+        assert!(writes.is_empty());
+    }
+
+    #[test]
+    fn a_graph_that_is_not_a_list_fails_the_step_with_one_binned_no_next_and_no_writes() {
+        let (ran, event, writes, sent) = wrote(72);
+        let failure = "odd gave $graph as string, not list";
+        assert_eq!(ran, Err(failure.to_owned()));
+        assert_eq!(sent, [(72, Some(event), -1, json!(failure))]);
         assert!(writes.is_empty());
     }
 
@@ -576,13 +591,20 @@ mod tests {
         super::waits(conn, &HashSet::new(), &waiting(), (w, 60), &data).unwrap()
     }
 
-    /// What rannoch hands over, as (ty, source), kept off `_events`.
+    /// What rannoch was handed, as (ty, source, status, data).
+    type Sent = Vec<(u16, Option<Uuid>, i8, Value)>;
+
+    /// What rannoch hands over, kept off `_events`.
     #[derive(Debug, Default)]
-    struct Kept(Mutex<Vec<(u16, Option<Uuid>)>>);
+    struct Kept(Mutex<Sent>);
     impl Append<u16, Value> for Kept {
         fn append(&self, batch: &[Event<u16, Value>]) -> Result<(), rannoch_core::Error> {
             let mut kept = self.0.lock().unwrap();
-            kept.extend(batch.iter().map(|e| (e.ty, e.source)));
+            kept.extend(
+                batch
+                    .iter()
+                    .map(|e| (e.ty, e.source, e.status as i8, e.data.clone())),
+            );
             Ok(())
         }
     }
@@ -615,7 +637,8 @@ mod tests {
         }
         rannoch.shutdown();
         let sent = kept.0.lock().unwrap().clone();
-        sent.into_iter().filter(|s| s.0 != 61).collect()
+        let sent = sent.into_iter().filter(|s| s.0 != 61);
+        sent.map(|(ty, source, _, _)| (ty, source)).collect()
     }
 
     #[test]
