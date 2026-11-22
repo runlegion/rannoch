@@ -11,7 +11,7 @@ use crate::inbox::{Inbox, run};
 use crate::{Error, Event, Status};
 
 /// What core needs from the app's store at start.
-pub trait Storage: fmt::Debug {
+pub trait Storage: fmt::Debug + Send + Sync {
     /// Whether migrations are pending.
     ///
     /// # Errors
@@ -45,7 +45,8 @@ pub struct Config<T, D> {
     /// The default inbox's batch interval; every type not listed goes there.
     pub default_interval: TimeDelta,
     pub inboxes: Vec<InboxConfig<T>>,
-    /// The app's store; with none, open runs no migration check.
+    /// The app's store; with none, open runs no migration check. Rannoch
+    /// keeps it for as long as it runs.
     pub store: Option<Arc<dyn Storage>>,
     /// The events crate's append; with none, no inbox hands anything over.
     pub append: Option<Arc<dyn Append<T, D>>>,
@@ -90,6 +91,8 @@ pub struct Rannoch<T, D> {
     /// Dropping these wakes each inbox's thread for its last hand-over.
     stops: Vec<mpsc::Sender<()>>,
     threads: Vec<JoinHandle<()>>,
+    /// The app's store, kept for as long as rannoch runs.
+    _store: Option<Arc<dyn Storage>>,
 }
 
 impl<T: PartialEq + Send + 'static, D: Send + 'static> Rannoch<T, D> {
@@ -153,6 +156,7 @@ impl<T: PartialEq + Send + 'static, D: Send + 'static> Rannoch<T, D> {
             broker,
             stops,
             threads,
+            _store: config.store,
         })
     }
 
@@ -396,6 +400,12 @@ mod tests {
         let mut batches = recorder.batches.lock().unwrap().clone();
         batches.sort_by_key(|b| b[0] as u8);
         assert_eq!(batches, [vec![Ty::Asset], vec![Ty::Page]]);
+    }
+
+    #[test]
+    fn rannoch_holding_its_store_is_send_and_sync() {
+        fn send_and_sync<S: Send + Sync>() {}
+        send_and_sync::<Rannoch<Ty, &str>>();
     }
 
     #[test]
