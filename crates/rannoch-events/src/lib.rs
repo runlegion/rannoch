@@ -27,7 +27,8 @@
 //! NULL, CHECK, foreign key or type rule or a trigger, is rolled back with the rest of its 2's
 //! items, and that 2 is not written: the append returns in its place a -1 for the 2's source, its
 //! data `store: ` and the store's message, as `store: NOT NULL constraint failed:
-//! payments.amount`, which the inbox sends; the rest of the batch commits.
+//! payments.amount`, which the inbox sends; the rest of the batch commits, the 2's nexts
+//! included.
 //!
 //! # Failures
 //!

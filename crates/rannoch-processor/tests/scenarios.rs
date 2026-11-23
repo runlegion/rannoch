@@ -1204,9 +1204,9 @@ fn store_refuses_a_table_it_does_not_have() {
     app.stop();
 }
 
-/// Not a scenario: #102. An invoice whose row `payments` refuses fails its step: it gets a -1
-/// whose data is `reason`, and no 2, no row and no receipt; a later invoice is written, with its
-/// receipt.
+/// Not a scenario: #102. An invoice whose row `payments` refuses gets, in place of its 2 and its
+/// row, a -1 whose data is `reason`, and the receipt its step sent stands; a later invoice of the
+/// same inbox is written.
 fn a_refused_row_gets_a_minus_1(
     name: &str,
     payments: &str,
@@ -1222,15 +1222,16 @@ fn a_refused_row_gets_a_minus_1(
     let first = app.hand(88, refused)?;
     let later = app.hand(88, &json!({ "order": "o2", "amount": 5 }))?;
 
-    // Then the first's step fails: it gets a -1 naming the reason, and no 2, no row and no
-    // receipt; with one attempt, no retry either
+    // Then the first gets a -1 naming the reason, and neither its 2 nor its row is written; the
+    // receipt its step sent stands
     assert!(until(WAIT, || app.statuses(first).contains(&-1)));
     assert_eq!(app.sent(first, -1), [(88, json!(reason))]);
-    assert_eq!(app.statuses(first), [1, -1]);
+    assert_eq!(app.sent(first, 2), []);
     assert_eq!(
         app.count("SELECT count(*) FROM payments WHERE order_id = 'o1'"),
         0
     );
+    assert_eq!(app.sent(first, 0), [(89, json!({ "order": "o1" }))]);
 
     // And the later invoice is written, with its 2, its row and its receipt
     assert!(until(WAIT, || app.statuses(later).contains(&2)));

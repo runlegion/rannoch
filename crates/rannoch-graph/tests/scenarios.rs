@@ -153,7 +153,7 @@ const ORDERS: &str = "CREATE TABLE orders (id TEXT PRIMARY KEY);
 
 /// #92: the README's "With `GraphAppend`, an event's 2 and its graph rows commit together", on
 /// the built-in `store`, whose row is the only kind a built-in step gives; and #102: a row the
-/// table refuses fails its step, so nothing of its run is written but its -1.
+/// table refuses is written neither with its 2 nor in place of the rest of the batch.
 #[test]
 fn with_graph_append_a_2_and_its_rows_commit_together_and_a_refused_row_gets_a_minus_1() {
     // Given an app whose payment flow stores each payment's row, appended by GraphAppend, and
@@ -174,10 +174,7 @@ fn with_graph_append_a_2_and_its_rows_commit_together_and_a_refused_row_gets_a_m
         ..Config::default()
     })
     .unwrap();
-    let settings = Settings {
-        attempts: 1,
-        ..Settings::new(Duration::from_millis(100))
-    };
+    let settings = Settings::new(Duration::from_millis(100));
     let queue = Queue::start(
         ready(&path).unwrap(),
         wake,
@@ -223,8 +220,8 @@ fn with_graph_append_a_2_and_its_rows_commit_together_and_a_refused_row_gets_a_m
     // When a payment for an order the store does not have runs
     let none = pay("none");
 
-    // Then its step fails: it gets a -1 naming the reason, and no 2, no row and no receipt;
-    // with one attempt, no retry either
+    // Then neither its row nor its 2 is written, and it gets a -1 naming the reason in their
+    // place; the rest of its batch, its receipt, is written
     let about = |status| {
         let sql = "SELECT json_group_array(data) FROM _events WHERE source = ?1 AND status = ?2";
         let data = conn.query_row(sql, rusqlite::params![none.to_string(), status], |r| {
@@ -235,7 +232,7 @@ fn with_graph_append_a_2_and_its_rows_commit_together_and_a_refused_row_gets_a_m
     assert!(until(|| about(-1) != "[]"));
     assert_eq!(about(-1), r#"["\"store: FOREIGN KEY constraint failed\""]"#);
     assert_eq!(about(2), "[]");
-    assert_eq!(about(0), "[]");
+    assert_eq!(about(0), r#"["{\"order\":\"none\"}"]"#);
     let row = "SELECT count(*) FROM payments WHERE order_id = 'none'";
     assert_eq!(count(&conn, row), 0);
     assert!(!writes.lock().unwrap().contains_key(&none));

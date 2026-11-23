@@ -258,7 +258,8 @@
 //!   column named <column>`, and leaves the batch alone. A row T refuses, by a NOT NULL, CHECK,
 //!   foreign key or type rule or a trigger, passes the step; the append rolls it back with the
 //!   event's 2, a -1 for the event is sent in their place, its data `store: ` and the store's
-//!   message, and the rest of the batch commits. The queue does not retry that event.
+//!   message, and the rest of the batch commits. The nexts the step sent stand, and the queue does
+//!   not retry the event.
 //!
 //! # What `check` reports
 //!

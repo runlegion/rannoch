@@ -63,7 +63,7 @@ Producers send events with `Sender::send`. To stop, drop any signal sender the a
 - **The last hand-over at shutdown** is not retried: if it fails, the failure is logged and its events are lost.
 - **A crash's resend runs the stalled event's flow on that event's data,** because the queue walks back from the resend to the event it resends.
 - **A step that fails** sends the event's -1, its data the step's message, and the queue retries it as above. An event whose `ty` has no flow gets a -1 saying "no processor".
-- **A `store` row the table refuses,** by a NOT NULL, CHECK, foreign key or type rule or a trigger, is rolled back at the append with its event's 2, and a -1 for the event is sent in their place, its data `store: ` and SQLite's message, as `store: NOT NULL constraint failed: payments.amount`; the rest of the batch commits. The queue does not retry that event.
+- **A `store` row the table refuses,** by a NOT NULL, CHECK, foreign key or type rule or a trigger, is rolled back at the append with its event's 2, and a -1 for the event is sent in their place, its data `store: ` and SQLite's message, as `store: NOT NULL constraint failed: payments.amount`; the rest of the batch commits, and the nexts the event's step sent stand. The queue does not retry that event.
 - **After `shutdown`**, `Sender::send` returns `Closed`. `queue.join()` returns only once every sender of the append's signal is dropped, so a signal sender the app keeps makes it wait for good; it also waits for every run and job the queue started.
 - **A second process** on the same store is not stopped by rannoch.
 
