@@ -37,9 +37,10 @@
 //! # Failures
 //!
 //! An event whose `data` does not serialize is not written, nor, for a 2, are its items: the
-//! append returns in its place a -1 for the event's source, or for the event itself when it has
-//! none, its data `data: ` and serde's message, as `data: key must be a string`, which the inbox
-//! sends; the rest of the batch commits. Apart from that and a 2 whose store row is refused, a
+//! append returns in its place a -1, for a 2 for its source, as for a refused store row, and for
+//! any other event for the event itself, by the id it was accepted with; its data is `data: ` and
+//! serde's message, as `data: key must be a string`, and the inbox sends it. The rest of the batch
+//! commits. Apart from that and a 2 whose store row is refused, a
 //! batch is written whole or not at all: when a row cannot be inserted, as with an id already in
 //! `_events`, the append fails with `Error::Store`, writes nothing, and sends no signal. The free
 //! [`append`], which returns no -1, fails the same way on data that does not serialize.
@@ -277,8 +278,8 @@ where
 /// cannot write, the savepoint is rolled back and that 2 is not written: returned in its place is
 /// a -1 for its source, its data naming the reason, for the caller to send. An event whose data
 /// does not serialize is not written either, nor are a 2's items with it: returned in its place is
-/// a -1 for its source, or for the event itself when it has none, its data `data: ` and serde's
-/// message. The caller commits.
+/// a -1, for a 2 for its source and for any other event for the event itself, its data `data: `
+/// and serde's message. The caller commits.
 /// # Errors
 /// `Error::Store` when an event cannot be inserted, `other` returns `Err`, or a store row fails
 /// for a reason other than a constraint, as an item with a `store` key that is not a
