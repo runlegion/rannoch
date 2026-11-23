@@ -9,14 +9,13 @@
 //!
 //! # Taking an event
 //!
-//! The queue runs on a thread of its own. It wakes on each signal, when the earliest `run_at`
-//! among the waiting events comes, and when the hunt is due. For each due event it sends a 1
-//! with the data `"taken"`, then asks [`Flows::flow`] for the event's flow; an event whose `ty`
-//! has no flow gets a -1 with the data `"no processor"` and no retry. When rannoch refuses the
-//! 1, the event stays at 0 and is not run. An event whose `ty` does not convert to the app's `T`
-//! is logged and left at 0. Every status the queue sends goes through the app's
-//! [`rannoch_core::Sender`], so it is written at its inbox's next hand-over, like any other
-//! event.
+//! The queue runs on a thread of its own. It wakes when it starts, on each signal, when the
+//! earliest `run_at` among the waiting events comes, and when the hunt is due. For each due event
+//! it sends a 1 with the data `"taken"`, then asks [`Flows::flow`] for the event's flow; an event
+//! whose `ty` has no flow gets a -1 with the data `"no processor"` and no retry. When rannoch
+//! refuses the 1, the event stays at 0 and is not run. An event whose `ty` does not convert to the
+//! app's `T` is logged and left at 0. Every status the queue sends goes through the app's
+//! [`rannoch_core::Sender`], so it is written at its inbox's next hand-over, like any other event.
 //!
 //! # Retries
 //!
@@ -334,7 +333,8 @@ fn run<T, D>(
     let mut jobs: Vec<JoinHandle<()>> = Vec::new();
     let mut taken = HashSet::new();
     let mut next_hunt = Instant::now() + settings.hunt;
-    let mut wait = next_due(conn).unwrap_or(IDLE).min(settings.hunt);
+    // The first pass takes the events already due when the queue starts.
+    let mut wait = Duration::ZERO;
     loop {
         if signal.recv_timeout(wait) == Err(RecvTimeoutError::Disconnected) {
             break;

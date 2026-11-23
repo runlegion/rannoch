@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
 use rannoch_core::forgr::_events;
 use rannoch_core::{Append, Config, Rannoch};
 use rannoch_events::Events;
@@ -1002,6 +1002,46 @@ fn a_wait_the_queue_retries_sends_late_on_the_first_match_after_its_timeout() {
     // When two payments for o9 arrive
     // Then the wait's late is sent once, for the first, with the wait as its source
     pays_late(&app, wait, (70, failed), 7).unwrap();
+
+    app.stop();
+}
+
+/// Not a scenario: #97. A queue that starts over a store holding due events takes them without
+/// a signal.
+#[test]
+fn a_queue_that_starts_takes_the_events_already_due_without_a_signal() {
+    // Given a store with two events at 0 with nothing after them, as a crash leaves them: one
+    // with no run_at, and one whose run_at has passed
+    let path = database("a_queue_that_starts").unwrap();
+    migrated(&path).unwrap();
+    let seed = ready(&path).unwrap();
+    let (unset, passed) = (Uuid::now_v7(), Uuid::now_v7());
+    let event = |id: Uuid| {
+        let data = json!({ "ticket": id.to_string() }).to_string();
+        _events::factory()
+            .id(id.to_string())
+            .ty(81)
+            .data(data)
+            .status(0)
+    };
+    event(unset).insert(&seed).unwrap();
+    let past = (Utc::now() - TimeDelta::hours(1)).to_rfc3339_opts(SecondsFormat::Millis, true);
+    event(passed).run_at(past).insert(&seed).unwrap();
+
+    // When the queue starts, and nothing signals it
+    let settings = Settings {
+        attempts: 1,
+        ..Settings::new(Duration::from_millis(100))
+    };
+    let app = App::over(path, &built_in().unwrap(), |_, _| Vec::new(), settings).unwrap();
+
+    // Then it takes both, and rannoch-processor runs each
+    for event in [unset, passed] {
+        assert!(
+            until(WAIT, || app.statuses(event) == [1, 2]),
+            "{event} was not taken"
+        );
+    }
 
     app.stop();
 }

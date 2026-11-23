@@ -332,7 +332,6 @@ fn a_failing_flow_is_retried_then_binned() {
     // Given a store with an event at status 0 whose flow fails every time
     let path = database("a_failing_flow_is_retried_then_binned").unwrap();
     let store = migrated(&path).unwrap();
-    let original = waiting(&ready(&path).unwrap(), 4, None).unwrap();
     let failing: Arc<Flow<Ty, String>> = Arc::new(Flow {
         job: false,
         run: Box::new(
@@ -385,6 +384,8 @@ fn a_failing_flow_is_retried_then_binned() {
     // When the events crate signals the queue
     // run_at is kept to the millisecond
     let before = Utc::now() - TimeDelta::milliseconds(1);
+    // The event is written after the queue starts, so the signal is what takes it.
+    let original = waiting(&ready(&path).unwrap(), 4, None).unwrap();
     signal.send(()).unwrap();
 
     // Then the processor sends a -1 for the attempt, and the queue sends a retry with status 0,
