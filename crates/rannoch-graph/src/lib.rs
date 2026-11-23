@@ -139,9 +139,9 @@
 //!
 //! A store row that rannoch-processor's `store` step carries, `{"store": {"table": T, "row":
 //! {..}}}`, is not an `Op`: rannoch-events' `write_in` inserts it in the same transaction, each
-//! 2's items inside a savepoint. When T refuses it there, a row the `store` step found T would
-//! take, that 2's rows are rolled back and the 2 is not written; the append returns a -1 for its
-//! source naming the reason, which the inbox sends, and the rest of the batch commits. Any other item that does not parse as an `Op` fails the append
+//! 2's items inside a savepoint. When T refuses it, that 2's rows are rolled back and the 2 is not
+//! written; the append returns a -1 for its source naming the reason, which the inbox sends, and
+//! the rest of the batch commits. Any other item that does not parse as an `Op` fails the append
 //! with [`Error::Store`]: nothing in the batch is written, and `Writes` gets the batch's items
 //! back, unless that same event has items there again by then. Rannoch's inbox puts the failed
 //! batch back ahead of later events and tries it again each interval, so while the bad item is in
