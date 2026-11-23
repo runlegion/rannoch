@@ -14,7 +14,11 @@ serde_json = "1"
 uuid = "1"
 
 [dev-dependencies]
+chrono = { version = "0.4", default-features = false, features = ["alloc", "clock"] }
+log = "0.4"
 rannoch-core = { path = "../rannoch-core", features = ["testing"] }
+rannoch-processor-agent = { path = "../rannoch-processor-agent" }
+rannoch-processor-retrieve = { path = "../rannoch-processor-retrieve" }
 rannoch-queue = { path = "../rannoch-queue" }
 rannoch-store = { path = "../rannoch-store" }
 uuid = { version = "1", features = ["v7"] }

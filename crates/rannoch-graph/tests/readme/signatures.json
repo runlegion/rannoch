@@ -1,0 +1,6 @@
+[
+  {"action": "triage", "takes": {"ticket": "string", "text": "string"}, "gives": {"severity": "number"}},
+  {"action": "lookup", "takes": {"user": "string"}, "gives": {"email": "string"}},
+  {"action": "hold"},
+  {"action": "page", "job": true}
+]

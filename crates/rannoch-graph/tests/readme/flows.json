@@ -1,0 +1,10 @@
+[
+  {"name": "ticket", "ty": 10, "takes": {"ticket": "string", "text": "string"},
+   "steps": [{"do": "triage", "next": {"ty": 11, "shape": {"ticket": "$ticket", "severity": "$severity"}}}]},
+  {"name": "rated", "ty": 11, "takes": {"ticket": "string", "severity": "number"}, "steps": []},
+  {"name": "invite", "ty": 20, "takes": {"user": "string"},
+   "steps": [{"do": "lookup", "next": {"ty": 21, "shape": {"email": "$email"}}}]},
+  {"name": "mail", "ty": 21, "takes": {"email": "string"}, "steps": []},
+  {"name": "hold", "ty": 40, "takes": {}, "steps": [{"do": "hold"}]},
+  {"name": "page", "ty": 41, "takes": {}, "steps": [{"do": "page"}]}
+]

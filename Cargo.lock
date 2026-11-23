@@ -1257,9 +1257,13 @@ dependencies = [
 name = "rannoch-graph"
 version = "0.1.0"
 dependencies = [
+ "chrono",
+ "log",
  "rannoch-core",
  "rannoch-events",
  "rannoch-processor",
+ "rannoch-processor-agent",
+ "rannoch-processor-retrieve",
  "rannoch-queue",
  "rannoch-store",
  "rusqlite",
