@@ -22,7 +22,7 @@ An action is a type that implements `rannoch_processor::Action`:
 - `sig()` returns its `Sig`: the name a step's `do` calls it by (`action`), the `options` a step's `with` gives it, the fields it `takes` and `gives`, each with its type, and whether it is a `job`, work long enough to run on a thread of its own.
 - `run(options, input)` returns the action's output fields, or `Err` with a message. An error fails the step: the processor sends the event's -1 with the message as its data, and the queue retries the event while its chain has attempts left. An output that lacks a field its `gives` names, or holds it as another type, fails the step too.
 
-An action that writes graph rows puts them in its output's `$graph` field, a list of rannoch-graph's ops (`set`, `retract`, `link`, `unlink`). They are written with the event's 2 only when the app's append is `GraphAppend`. An action cannot give a `store` row: only the built-in `store` step can, and a step whose action gives one fails.
+An action that writes graph rows puts them in its output's `$graph` field, a list of rannoch-graph's ops (`set`, `retract`, `link`, `unlink`). They are written with the event's 2 when the app's append is `GraphAppend`. `Events` writes no graph rows: under it, the event gets a -1 instead, its data `graph: Events writes no graph rows`. An action cannot give a `store` row: only the built-in `store` step can, and a step whose action gives one fails.
 
 ### Its exports
 
