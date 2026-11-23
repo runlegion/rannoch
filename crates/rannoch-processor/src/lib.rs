@@ -1,3 +1,16 @@
+//! The processor: it runs the app's flows. A flow is a JSON document ([`FlowDoc`]) of steps for
+//! one `ty`. A step's `do` names one or more of the app's [`Action`]s, joined by `.`, each
+//! declaring what it takes and gives in its [`Sig`]; a step's [`Next`] sends further events,
+//! branches on a value or waits for another event. The processor sends the event's 2 when its
+//! flow runs to the end, and its -1 when a step fails.
+//!
+//! - [`compile`] checks the app's flow documents from its `build.rs` and writes them as one JSON
+//!   array for the app to `include_str!`; [`check`] is the check it runs.
+//! - [`Processor::new`] takes that array, the app's actions and a connection; the processor is
+//!   the queue's `Flows`.
+//! - [`Processor::writes`] holds the graph rows a step gives as `$graph` until the append that
+//!   carries the event's 2 takes them.
+
 mod check;
 mod doc;
 

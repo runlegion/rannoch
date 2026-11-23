@@ -3,7 +3,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-/// Field name to type: "string", "number", "bool", "list<string>", "list<number>" or "any".
+/// Field name to type: `"string"`, `"number"`, `"bool"`, `"list<string>"`, `"list<number>"` or
+/// `"any"`.
 pub type Shape = BTreeMap<String, String>;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

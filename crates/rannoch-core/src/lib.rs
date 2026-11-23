@@ -1,4 +1,11 @@
-//! Rannoch's core types: the event, its status and the error vocabulary.
+//! Rannoch's core types: the event, its status and the error vocabulary, and the broker an app
+//! opens rannoch with.
+//!
+//! An app opens [`Rannoch`] with a [`Config`]: its inboxes, the default inbox's batch interval,
+//! its store as a [`Storage`] and the events crate's [`Append`]. [`Rannoch::open`] applies the
+//! store's pending migrations before anything else; [`Rannoch::sender`] gives each producer a
+//! [`Sender`], and [`Rannoch::shutdown`] stops it. [`migrator`] is every crate's migrations as
+//! one migrator, for the app's store.
 //!
 //! Rannoch emits through the `log` crate at two levels, `error` and `debug`;
 //! the app chooses where the output goes.
