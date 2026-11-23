@@ -25,15 +25,6 @@ jobs:
       - name: clippy
         if: steps.ws.outputs.present == 'true'
         run: cargo clippy --all-targets -- -D warnings
-      - name: cache potion-base-8M
-        uses: actions/cache@v6
-        if: steps.ws.outputs.present == 'true'
-        with:
-          path: |
-            target/tmp/potion/model.safetensors
-            target/tmp/potion/tokenizer.json
-            target/tmp/potion/onnx/model.onnx
-          key: potion-base-8M
       - name: test
         if: steps.ws.outputs.present == 'true'
         run: cargo test
@@ -44,14 +35,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: cache potion-base-8M
-        uses: actions/cache@v6
-        with:
-          path: |
-            target/tmp/potion/model.safetensors
-            target/tmp/potion/tokenizer.json
-            target/tmp/potion/onnx/model.onnx
-          key: potion-base-8M
       - name: test
         run: cargo test -p rannoch-processor-onnx
 
@@ -61,13 +44,5 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: cache potion-base-8M
-        uses: actions/cache@v6
-        with:
-          path: |
-            target/tmp/potion/model.safetensors
-            target/tmp/potion/tokenizer.json
-            target/tmp/potion/onnx/model.onnx
-          key: potion-base-8M
       - name: test
         run: cargo test -p rannoch-processor-onnx --features tract
