@@ -301,9 +301,13 @@ where
     for event in batch {
         match serde_json::to_string(&event.data) {
             Ok(data) => rows.push((event, data)),
-            // The event cannot be stored: its -1 is for its source, or for itself without one.
+            // The event cannot be stored. A 2 records its source's run, so its -1 is for that
+            // source, as for a refused store row; any other event's -1 is for the event itself.
             Err(e) => {
-                let source = event.source.unwrap_or(event.id);
+                let source = match event.source {
+                    Some(source) if event.status == Status::Processed => source,
+                    _ => event.id,
+                };
                 binned.push((source, event.ty, format!("data: {e}")));
             }
         }
