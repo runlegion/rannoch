@@ -126,21 +126,28 @@
 //! | `{"link": {"src": "ada", "name": "wrote", "dst": "doc1", "props": {}}}` | a `name` edge from `src` to `dst`, carrying `props`, any JSON value |
 //! | `{"unlink": {"src": "ada", "name": "wrote", "dst": "doc1"}}` | no `name` edge from `src` to `dst` |
 //!
+//! Each item takes effect as its key's or edge's current row only when its event has the greatest
+//! id among that key's or edge's rows, as **Now** below says.
+//!
 //! A `set` with `"value": null` holds `null`; only `retract` takes a key's value away. A row's
 //! primary key includes its event, so one event writes each node's key, and each edge by its
 //! `src`, `name` and `dst`, at most once: when its items write the same one twice, the first is
 //! written and the later one is left out. A flow that sets a key and then retracts it keeps the
-//! set. For the same reason, a rerun of an event adds no row and moves no stamp.
+//! set. For the same reason, applying the same event's items again adds no row and moves no
+//! stamp. A retry or a hunt's resend is a new event: its items add rows stamped with its own id,
+//! and they become current.
 //!
 //! An item that does not parse as an `Op` fails the append with [`Error::Store`]: nothing in the
-//! batch is written, and `Writes` gets the batch's items back, unless an event has newer ones
-//! there by then.
+//! batch is written, and `Writes` gets the batch's items back, unless that same event has items
+//! there again by then. Rannoch's inbox puts the failed batch back ahead of later events and
+//! tries it again each interval, so while the bad item is in it, nothing more from that inbox is
+//! written.
 //!
 //! # What the reads return: now, as of T and why
 //!
-//! A read returns each row as a [`Row`]: its `value` (an edge's `props`), the `event` whose flow
-//! wrote it, and `written`, when the append that wrote it ran, in milliseconds since the Unix
-//! epoch.
+//! [`prop`], [`props`], [`history`] and [`edges`] return each row as a [`Row`]: its `value` (an
+//! edge's `props`), the `event` whose flow wrote it, and `written`, when the append that wrote it
+//! ran, in milliseconds since the Unix epoch; [`why`] returns event ids.
 //!
 //! - **Now.** The current row of a node's key, or of an edge, is its row with the greatest event
 //!   id, unless that row is a retraction, which leaves it no current row. Rannoch's event ids
@@ -171,7 +178,7 @@
 //! | `{"wrote": {"shape": shape, "limit": 2, "where": {"status": "open"}}}` | the same, keeping only the far nodes whose current value of each `where` key equals the JSON given, and only the first `limit` of those |
 //!
 //! One object can name several edges. In `{"shape", "limit", "where"}` only `shape` is required;
-//! `limit` is ignored when it is not a whole number, and `where` when it is not an object.
+//! `limit` is ignored unless it is a non-negative integer, and `where` when it is not an object.
 //!
 //! The result is an object with the node's `"id"` and what each item reads; each far node also
 //! carries `"edge"`, the edge's `{"props", "event", "written"}`. A key named `id` replaces the
@@ -199,7 +206,8 @@
 //! hood whose recompute fails goes cold, and its next describe is a cold one.
 //!
 //! `Hoods` warms only describes with default [`Opts`]; a describe with `at` or `history` goes
-//! through [`describe`] and is always cold. Nothing evicts a warm hood.
+//! through [`describe`] and is always cold. Only a failed recompute drops a warm hood; nothing
+//! else evicts one.
 //!
 //! With the store, `open` and `run` of the example above, and an append made with hoods:
 //!
