@@ -252,10 +252,12 @@
 //!   each value worked out with [`eval`] from the step's input; it never updates, deletes or reads
 //!   a row. It gives the row as `$graph`, `{"store": {"table": T, "row": {column: value}}}`, and
 //!   the append that writes the event's 2, `GraphAppend` or `Events` made `with_writes`, inserts
-//!   it in the same transaction with `INSERT OR IGNORE`, so T's own keys decide whether a rerun
-//!   adds a row and a flow that fails writes none. A table or a column the store does not have
-//!   fails the step, as `store: no such table: <T>` or `store: table <T> has no column named
-//!   <column>`, and leaves the batch alone.
+//!   it in the same transaction with `INSERT ... ON CONFLICT DO NOTHING`, so T's own keys decide
+//!   whether a rerun adds a row and a flow that fails writes none. A table or a column the store
+//!   does not have fails the step, as `store: no such table: <T>` or `store: table <T> has no
+//!   column named <column>`, and leaves the batch alone. A row that breaks any other constraint
+//!   of T, as NOT NULL or CHECK, passes the step and fails the append of the batch that holds the
+//!   2, which goes back for its retry as any batch that cannot be written.
 //!
 //! # What `check` reports
 //!

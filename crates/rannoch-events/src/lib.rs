@@ -21,9 +21,10 @@
 //! [`store_in`] inserts each [`StoreRow`] in the batch's transaction, so every 2 has its rows. An
 //! item with a `store` key that is not a `StoreRow` fails the batch, and an item with none, as a
 //! graph `Op`, is not written. A batch that fails puts the items back for its retry. The row is
-//! inserted with `INSERT OR IGNORE`, so T's own keys decide whether a rerun adds a row: a string
-//! is bound as text, an integer or a float as an integer or a real, a bool as 0 or 1, null as
-//! NULL, and an array or an object as its JSON text.
+//! inserted with `INSERT ... ON CONFLICT DO NOTHING`, so T's own keys decide whether a rerun adds
+//! a row: a string is bound as text, an integer or a float as an integer or a real, a bool as 0
+//! or 1, null as NULL, and an array or an object as its JSON text. A row that breaks any other
+//! constraint of T, as NOT NULL or CHECK, fails the batch.
 //!
 //! # Failures
 //!
@@ -144,8 +145,8 @@ pub enum StoreRow {
 }
 
 impl StoreRow {
-    /// The `INSERT OR IGNORE` of the row, a parameter for each column in order, prepared on
-    /// `conn` and not run; each name is quoted.
+    /// The `INSERT ... ON CONFLICT DO NOTHING` of the row, a parameter for each column in order,
+    /// prepared on `conn` and not run; each name is quoted.
     /// # Errors
     /// The store's error, as `no such table: <table>` or `table <table> has no column named
     /// <column>`.
@@ -155,7 +156,7 @@ impl StoreRow {
         let columns: Vec<String> = row.keys().map(|c| quote(c)).collect();
         let (columns, marks) = (columns.join(", "), vec!["?"; row.len()].join(", "));
         let sql = format!(
-            "INSERT OR IGNORE INTO {} ({columns}) VALUES ({marks})",
+            "INSERT INTO {} ({columns}) VALUES ({marks}) ON CONFLICT DO NOTHING",
             quote(table)
         );
         conn.prepare_cached(&sql)
@@ -262,8 +263,8 @@ fn commit<'i, T: Copy + Into<u16>, D: Serialize>(
 /// Inserts `item` on `conn` when it has a `store` key, as a [`StoreRow`], so T's own keys decide
 /// whether it adds a row: true; false for an item with no `store` key, left to the caller.
 /// # Errors
-/// `Error::Store` for an item with a `store` key that is not a `StoreRow`, or a table or a column
-/// the store does not have.
+/// `Error::Store` for an item with a `store` key that is not a `StoreRow`, a table or a column the
+/// store does not have, or a row that breaks a constraint of T other than its keys.
 pub fn store_in(conn: &Connection, item: &Value) -> Result<bool, Error> {
     if item.get("store").is_none() {
         return Ok(false);
@@ -434,6 +435,30 @@ mod tests {
         let item = json!({ "store": { "table": "t" } });
         writes.lock().unwrap().insert(near, vec![item]);
         assert_eq!(Append::append(&events, &[two(near)]), Err(Error::Store));
+    }
+
+    #[test]
+    fn a_store_row_that_breaks_not_null_fails_the_batch_and_is_put_back() {
+        let store = rannoch_core::forgr::empty_store();
+        let sql = "CREATE TABLE t (k TEXT PRIMARY KEY, n INTEGER NOT NULL)";
+        store.execute_batch(sql).unwrap();
+        let (queue, signals) = mpsc::channel();
+        let writes = Arc::new(Mutex::new(HashMap::new()));
+        let events = Events::new(store, queue).with_writes(writes.clone());
+        // `n` is null, as `eval` gives for a field the input lacks.
+        let item = json!({ "store": { "table": "t", "row": { "k": "a", "n": null } } });
+        let source = Uuid::now_v7();
+        writes.lock().unwrap().insert(source, vec![item.clone()]);
+        let two = Event {
+            source: Some(source),
+            status: Status::Processed,
+            ..event(Uuid::now_v7())
+        };
+
+        assert_eq!(Append::append(&events, &[two]), Err(Error::Store));
+        assert!(signals.try_recv().is_err());
+        assert_eq!(count(&events.conn.lock().unwrap()), 0);
+        assert_eq!(writes.lock().unwrap()[&source], [item]);
     }
 
     #[test]
