@@ -1259,6 +1259,14 @@ fn a_row_that_breaks_a_foreign_key_gets_a_minus_1_and_no_2() {
     a_refused_row_gets_a_minus_1("refused_foreign_key", &payments, &unknown, reason).unwrap();
 }
 
+#[test]
+fn a_number_above_i64_max_gets_a_minus_1_and_no_2() {
+    let payments = "CREATE TABLE payments (order_id TEXT PRIMARY KEY, amount INTEGER NOT NULL)";
+    let above = json!({ "order": "o1", "amount": u64::MAX });
+    let reason = "store: 18446744073709551615 cannot be held exactly: payments.amount";
+    a_refused_row_gets_a_minus_1("refused_above_i64_max", payments, &above, reason).unwrap();
+}
+
 /// How many payments #102's measurement runs to their 2.
 const RATE_EVENTS: u32 = 100_000;
 
