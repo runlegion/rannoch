@@ -2,7 +2,8 @@
 //! to `-c9`, `-c11`, `-c13`, `-c14`). The store is the app's database through the real store,
 //! events from the app's forgr factory, handed over by the real queue; the flow docs are
 //! `tests/flows.json` and the test processor crate's actions are `Fake`s. The build scenarios
-//! (`-c1`, `-c2`, `-c10`, `-c12`, `-c16`) build the test app of `tests/app` with cargo.
+//! (`-c1`, `-c2`, `-c10`, `-c12`, `-c16`) build the test app of `tests/app` with cargo; #122's
+//! ontology path builds and runs pay-app of the same workspace, over onto-pay's table.
 //! FR-RANNOCH-124's scenarios, from `tests/features/fr_rannoch_124.feature`, run `BUILT_IN`'s
 //! flows on the built-in steps alone, `check`ed with no signature, the append an `Events` made
 //! `with_writes`.
@@ -582,8 +583,9 @@ E4 b.json step 0 upper: upper takes text as string, it is number"),
 /// One fixture build at a time: every build shares one target dir and one built app.
 static CARGO: Mutex<()> = Mutex::new(());
 
-/// The test app of `tests/app`, a workspace of proc-text and the app, copied to a dir of its
-/// own so its flow docs can be removed; every copy builds into the one shared target dir.
+/// The test app of `tests/app`, a workspace of proc-text and the app, with onto-pay and
+/// pay-app, copied to a dir of its own so its flow docs can be removed; every copy builds into
+/// the one shared target dir.
 struct Fixture(PathBuf);
 
 impl Fixture {
@@ -660,6 +662,27 @@ impl Fixture {
         Ok(String::from_utf8(out.stdout)?)
     }
 
+    /// Builds pay-app and runs it over the store at `path`: Ok, or the stderr of the build or
+    /// the run that failed.
+    fn run_pay_app(&self, path: &Path) -> Result<()> {
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
+        let target = Path::new(env!("CARGO_TARGET_TMPDIR")).join("app-target");
+        let built = std::process::Command::new(cargo)
+            .current_dir(&self.0)
+            .args(["build", "-q", "-p", "pay-app"])
+            .env("CARGO_TARGET_DIR", &target)
+            .output()?;
+        if !built.status.success() {
+            return Err(String::from_utf8(built.stderr)?.into());
+        }
+        let app = target.join("debug/pay-app");
+        let ran = std::process::Command::new(app).arg(path).output()?;
+        if !ran.status.success() {
+            return Err(String::from_utf8(ran.stderr)?.into());
+        }
+        Ok(())
+    }
+
     /// Builds each of `BAD` (the renamed build only when `renamed`) and asserts it fails
     /// listing exactly its errors.
     fn assert_bad(&self, renamed: bool) -> Result<()> {
@@ -718,6 +741,37 @@ fn the_apps_build_gathers_the_signatures_a_separate_processor_crate_exports() ->
     // Then the build fails listing one error: the next's template names a field nothing gives
     let renamed = "E5 10-greet.json step 0 next: $greeting names nothing in scope".to_owned();
     assert_eq!(app.build("valid", true)?, Err(vec![renamed]));
+    Ok(())
+}
+
+#[test]
+fn an_apps_ontology_crate_holds_the_table_its_store_step_writes() -> Result<()> {
+    let _one = CARGO.lock().unwrap_or_else(PoisonError::into_inner);
+    // Given an ontology crate, separate from the app, with a payments table in its own
+    // migrations and its own MIGRATIONS_DIR
+    // And an app whose build.rs gathers rannoch-events', rannoch-graph's and the ontology
+    // crate's migrations into its migrations directory and embeds them
+    let app = Fixture::copy("an_apps_ontology_crate")?;
+    let path = app.0.join("store.db");
+
+    // When the app is built and run: it opens its store with that migrator, and sends a payment
+    // whose flow's built-in store step writes a row into the payments table
+    app.run_pay_app(&path)?;
+
+    // Then the payment has its 2, and the payments table its row
+    let store = Connection::open(&path)?;
+    let count = |sql: &str| store.query_row(sql, [], |r| r.get::<_, i64>(0));
+    let twos = "SELECT count(*) FROM _events e JOIN _events s ON s.source = e.id
+        WHERE e.ty = 1 AND e.status = 0 AND s.status = 2";
+    assert_eq!(count(twos)?, 1);
+    let row: (String, i64) = store.query_row("SELECT order_id, amount FROM payments", [], |r| {
+        Ok((r.get(0)?, r.get(1)?))
+    })?;
+    assert_eq!(row, ("o1".to_owned(), 10));
+
+    // And rannoch-graph's tables are in the store beside it
+    let graph = "SELECT count(*) FROM sqlite_master WHERE name IN ('_nodes', '_edges')";
+    assert_eq!(count(graph)?, 2);
     Ok(())
 }
 
