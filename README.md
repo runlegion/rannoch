@@ -24,7 +24,7 @@ The queue hands each due event at status 0 to the flow for its `ty`. A flow is a
 | `rannoch-core` | The `Event` and its `Status`, and `Rannoch`: opened with a `Config`, it applies the store's pending migrations, then passes each event sent through a `Sender` to the inbox for its `ty`; each inbox hands its batches to the `Append`. `migrator()` is every crate's migrations as one migrator. |
 | `rannoch-store` | Opens the app's SQLite file against that migrator, and reports pending migrations without applying them. `Store` is core's `Storage`: it applies them, and checkpoints the WAL once a second while it lives. |
 | `rannoch-events` | Owns `_events`. `Events` is core's `Append`: it writes each batch in one transaction, then signals the queue. |
-| `rannoch-queue` | Takes the due events at status 0, sends a 1 for each, and hands each to its processor; retries a failed run while its chain has attempts left, resends a run a crash dropped, and sends a -1 for an event whose `ty` has no flow. |
+| `rannoch-queue` | Takes the due events at status 0, sends a 1 for each, and hands each to its processor; retries a failed run while its chain has attempts left, resends a run a crash dropped, and sends a -1 naming the reason for each failure about an event, such as an event whose `ty` has no flow. |
 | `rannoch-processor` | Runs the app's flow documents: steps that call the app's `Action`s, and nexts, branches and waits. `compile` checks the documents when the app builds. |
 | `rannoch-processor-agent` | A step that calls an agent the app reaches through `Agent`, checked against what the agent takes and gives. |
 | `rannoch-processor-onnx` | Steps that run a local ONNX model: `Infer`, `Embed` and `Classify`, through ort, or through tract with the `tract` feature. |
@@ -63,7 +63,7 @@ Producers send events with `Sender::send`. To stop, drop any signal sender the a
 - **The last hand-over at shutdown** is not retried: if it fails, the failure is logged and its events are lost.
 - **A crash's resend runs the stalled event's flow on that event's data,** because the queue walks back from the resend to the event it resends.
 - **A step that fails** sends the event's -1, its data the step's message, and the queue retries it as above. An event whose `ty` has no flow gets a -1 saying "no processor".
-- **After `shutdown`**, `Sender::send` returns `Closed`. `queue.join()` returns only once every sender of the append's signal is dropped, so a signal sender the app keeps makes it wait for good; it also waits for every run and job the queue started.
+- **After `shutdown`**, `Sender::send` returns `Closed`. `queue.join()` returns only once every sender of the append's signal is dropped, so a signal sender the app keeps makes it wait for good; it also waits for every run and job the queue started, and returns `Error::Queue` when the queue's thread panicked.
 - **A second process** on the same store is not stopped by rannoch.
 
 ## What was measured

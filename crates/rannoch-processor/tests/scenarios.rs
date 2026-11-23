@@ -327,7 +327,7 @@ impl App {
     fn stop(self) {
         drop(self.signal);
         self.rannoch.shutdown();
-        self.queue.join();
+        assert_eq!(self.queue.join(), Ok(()));
     }
 }
 
@@ -1577,7 +1577,7 @@ fn a_batch_the_store_never_takes_stops_its_inbox_and_is_lost_at_shutdown() {
     let tried = failed_hand_overs().len();
     thread::sleep(Duration::from_millis(400));
     assert_eq!(failed_hand_overs().len(), tried);
-    app.queue.join();
+    app.queue.join().unwrap();
 
     // And the batch and every event after it are lost
     let read = ready(&app.path).unwrap();
@@ -1816,7 +1816,7 @@ fn after_shutdown_a_send_is_closed_and_join_waits_for_signal_senders_and_runs() 
     // drop, and none after join, each keeping the row its 2 could not carry. This needs the
     // backlog's runs still pending at shutdown, 20 ms in with 5,000 to run; `at_join > at_drop`
     // checks that they were.
-    app.queue.join();
+    app.queue.join().unwrap();
     let at_join = held();
     thread::sleep(Duration::from_millis(300));
     assert_eq!(held(), at_join, "a run went on after join returned");
@@ -1831,7 +1831,7 @@ fn after_shutdown_a_send_is_closed_and_join_waits_for_signal_senders_and_runs() 
     let (returned, done) = mpsc::channel();
     let queue = app.queue;
     let waiting = thread::spawn(move || {
-        queue.join();
+        queue.join().unwrap();
         let _ = returned.send(());
     });
     let kept = done.recv_timeout(Duration::from_millis(300));
