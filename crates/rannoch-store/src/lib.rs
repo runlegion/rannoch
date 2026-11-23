@@ -10,8 +10,8 @@
 //! of its own, never inside an append.
 //!
 //! Rannoch keeps the [`Store`] in its `Config` for as long as it runs. A checkpoint query that
-//! fails is logged at `error`; when the checkpointer cannot open its connection, nothing is
-//! logged. Either way it tries again a second later.
+//! fails is logged at `error`, and so is each try at opening the checkpointer's connection that
+//! fails. Either way it tries again a second later.
 //!
 //! # Failures
 //!
@@ -99,7 +99,10 @@ impl Checkpointer {
             let mut conn = None;
             while wait.recv_timeout(CHECKPOINT_EVERY) == Err(RecvTimeoutError::Timeout) {
                 if conn.is_none() {
-                    conn = connection(&path).ok();
+                    match connection(&path) {
+                        Ok(opened) => conn = Some(opened),
+                        Err(e) => log::error!("checkpointer cannot open its connection: {e}"),
+                    }
                 }
                 if let Some(conn) = &conn
                     && conn
