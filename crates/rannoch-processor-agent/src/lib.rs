@@ -50,10 +50,10 @@ impl Action for AgentAction {
         &self.sig
     }
 
-    /// Checks `input` against sig.takes ("agent <name> input gave <field> as <type>, it declares
-    /// <type>", or "agent <name> input has no <field>") and returns that error without calling
-    /// the agent; else asks, and checks the answer against sig.gives ("agent <name> gave no
-    /// <field>", or "agent <name> gave <field> as <type>, it declares <type>").
+    /// Checks `input` against `sig.takes` (`agent <name> input gave <field> as <type>, it declares
+    /// <type>`, or `agent <name> input has no <field>`) and returns that error without calling
+    /// the agent; else asks, and checks the answer against `sig.gives` (`agent <name> gave no
+    /// <field>`, or `agent <name> gave <field> as <type>, it declares <type>`).
     fn run(&self, _: &Value, input: &Map<String, Value>) -> Result<Map<String, Value>, String> {
         let name = format!("agent {}", self.sig.action);
         fit(input, &self.sig.takes, &format!("{name} input"), "has no")?;

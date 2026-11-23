@@ -36,8 +36,8 @@ impl rannoch_processor::Action for Retrieve {
         &self.sig
     }
 
-    /// Gets, and checks the result against sig.gives: "<field> as <type>" for a field of the
-    /// wrong type, "no <field>" for a missing one.
+    /// Gets, and checks the result against `sig.gives`: `<field> as <type>` for a field of the
+    /// wrong type, `no <field>` for a missing one.
     fn run(
         &self,
         _options: &Value,

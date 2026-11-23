@@ -146,7 +146,7 @@ impl Action for Infer {
     }
 }
 
-/// takes text, gives vector (list<number>): the model2vec embedding, L2-normalized.
+/// takes text, gives vector (`list<number>`): the model2vec embedding, L2-normalized.
 #[derive(Debug)]
 pub struct Embed {
     sig: Sig,
