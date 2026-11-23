@@ -4,8 +4,8 @@
 //! each, and hands each to its processor: runs, whose flow has no job step, one after another;
 //! jobs, whose flow has a job step, each on a thread of its own. Processors send their own
 //! results; the queue sends only the 1s, a retry when a run fails while its chain has attempts
-//! left, the hunt's resend of a run a crash dropped, and a -1 saying "no processor" for an event
-//! whose `ty` has no flow.
+//! left, the hunt's resend of an event whose 1 has had nothing after it for `window`, and a -1
+//! saying "no processor" for an event whose `ty` has no flow.
 //!
 //! # Taking an event
 //!
@@ -32,10 +32,16 @@
 //!
 //! # The hunt
 //!
-//! Every [`Settings::hunt`], the queue looks for the 1s whose event has no 2 or -1, as a crash
-//! leaves them. For each 1 older than [`Settings::window`] with nothing after it anywhere in its
-//! event's tree, it sends the event again: a new event at 0 whose source is the hung event and
-//! whose data is `"hung"`. The hung event has no -1, so the resend is its own root.
+//! The hunt first runs one [`Settings::hunt`] after the queue starts, then every `hunt`. It looks
+//! for the 1s whose event has no 2 or -1. For each 1 older than [`Settings::window`] with nothing
+//! after it anywhere in its event's tree, it sends a resend: a new event at 0 whose source is the
+//! stalled event and whose data is `"hung"`. The hunt cannot tell a run a crash dropped from one
+//! still going, so a run or job still going, or still waiting its turn, `window` after its 1 is
+//! resent while it runs.
+//!
+//! The stalled event has a 1 and no -1, so the resend is its own root. rannoch-processor reads
+//! the root's data as the flow's data, which must be a JSON object, so it bins the resend with a
+//! "root data" error, and each retry fails the same way until the chain has had its `attempts`.
 //!
 //! # Stopping
 //!
@@ -220,8 +226,8 @@ pub struct Settings {
     pub attempts: u32,
     /// The backoff's first wait; each later wait doubles it.
     pub first_wait: Duration,
-    /// How old a 1 with nothing after it must be before the hunt sends its event again; 20
-    /// minutes by default.
+    /// How old a 1 with nothing after it must be before the hunt sends a resend for its event,
+    /// whether its run was dropped or is still going; 20 minutes by default.
     pub window: Duration,
     /// How often the hunt runs; one hour by default.
     pub hunt: Duration,
