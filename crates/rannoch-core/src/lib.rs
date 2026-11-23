@@ -131,8 +131,9 @@ pub struct Event<T, D> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i8)]
 pub enum Status {
-    /// -1: binned, and not run again. The queue sends it for an event whose `ty` has no flow,
-    /// and a processor sends it for a run that failed.
+    /// -1: binned, and not run again. The queue sends it for each failure it meets about an
+    /// event, as for one whose `ty` has no flow, and a processor sends it for a run that failed;
+    /// its data names the reason.
     Binned = -1,
     /// 0: added. An event at 0 is due to the queue once its `run_at` has passed, until an event
     /// with another status names it as its source.

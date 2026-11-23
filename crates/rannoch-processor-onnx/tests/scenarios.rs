@@ -98,9 +98,9 @@ impl App {
         Ok(App(ready(&path)?, signal, rannoch, queue, processor))
     }
 
-    /// The (ty, data) of every next sent about an event of `ty` with `data`, from the app's
-    /// forgr factory, once its flow has sent its 2.
-    fn hand(&self, ty: i64, data: &Value) -> Result<Vec<(i64, Value)>> {
+    /// The (ty, status, data) of every row about an event of `ty` with `data`, from the app's
+    /// forgr factory, once its flow has sent its 2 or its -1.
+    fn ran(&self, ty: i64, data: &Value) -> Result<Vec<(i64, i64, Value)>> {
         let id = Uuid::now_v7().to_string();
         let row = _events::factory().id(id.clone()).ty(ty);
         row.data(data.to_string()).status(0).insert(&self.0)?;
@@ -110,13 +110,36 @@ impl App {
         loop {
             let rows = select.query_map([&id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
             let rows: Vec<(i64, i64, String)> = rows.collect::<rusqlite::Result<_>>()?;
-            if rows.iter().any(|r| r.1 == 2) {
-                let next = |r: (i64, i64, String)| Ok((r.0, serde_json::from_str(&r.2)?));
-                return rows.into_iter().filter(|r| r.1 == 0).map(next).collect();
+            if rows.iter().any(|r| r.1 == 2 || r.1 == -1) {
+                let row = |r: (i64, i64, String)| Ok((r.0, r.1, serde_json::from_str(&r.2)?));
+                return rows.into_iter().map(row).collect();
             }
             assert!(start.elapsed() < Duration::from_secs(10), "{ty} {data} ran");
             thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// The (ty, data) of every next sent about an event of `ty` with `data` once its flow has
+    /// sent its 2.
+    fn hand(&self, ty: i64, data: &Value) -> Result<Vec<(i64, Value)>> {
+        let rows = self.ran(ty, data)?;
+        assert!(rows.iter().any(|r| r.1 == 2), "{ty} {data}: {rows:?}");
+        Ok(rows
+            .into_iter()
+            .filter(|r| r.1 == 0)
+            .map(|r| (r.0, r.2))
+            .collect())
+    }
+
+    /// The data of the -1 the flow for `ty` sends about `data`, which must send no next and no
+    /// 2; a row of `ty` at 0 is the queue's retry.
+    #[cfg(not(feature = "tract"))]
+    fn failed(&self, ty: i64, data: &Value) -> Result<Value> {
+        let rows = self.ran(ty, data)?;
+        let sent = |r: &(i64, i64, Value)| r.1 == 2 || (r.1 == 0 && r.0 != ty);
+        assert!(!rows.iter().any(sent), "{ty} {data}: {rows:?}");
+        let failed = rows.into_iter().find(|r| r.1 == -1);
+        Ok(failed.ok_or("no -1")?.2)
     }
 
     /// The `field` of the one next the flow for `ty` sends about `text`.
@@ -128,15 +151,33 @@ impl App {
     fn stop(self) {
         drop(self.1);
         self.2.shutdown();
-        self.3.join();
+        assert_eq!(self.3.join(), Ok(()));
     }
 }
 
-/// The app's embed and classify, each over the model file `model`.
-fn text_actions(model: &Path, tokenizer: &str) -> Result<Vec<Arc<dyn Action>>> {
+/// The app's embed and classify, each over the model file `model`, classify choosing among
+/// `labels`.
+fn text_actions(
+    model: &Path,
+    tokenizer: &str,
+    labels: &[(&str, &str)],
+) -> Result<Vec<Arc<dyn Action>>> {
     let embed = || -> Result<_> { Ok(Embed::new(sig("embed")?, Model::open(model)?, tokenizer)?) };
-    let classify = Classify::new(sig("classify")?, embed()?, &LABELS)?;
+    let classify = Classify::new(sig("classify")?, embed()?, labels)?;
     Ok(vec![Arc::new(embed()?), Arc::new(classify)])
+}
+
+/// The app over a fresh store `name`, its embed and classify over the fixture model2vec model,
+/// classify choosing among `labels`. Like c5, it runs without the `tract` feature, which cannot
+/// load the fixture's model.
+#[cfg(not(feature = "tract"))]
+fn fixture(name: &str, labels: &[(&str, &str)]) -> Result<App> {
+    let model = Path::new(MODEL);
+    let tokenizer = fs::read_to_string(model.join("tokenizer.json"))?;
+    App::start(
+        name,
+        text_actions(&model.join("onnx/model.onnx"), &tokenizer, labels)?,
+    )
 }
 
 /// Runs cargo with `args` on the test app of `tests/app`, the workspace's Cargo.lock copied in:
@@ -194,7 +235,7 @@ fn a_flow_embeds_and_classifies_text_with_a_local_model() -> Result<()> {
     // being bug, question and praise, each with a description
     let model = Path::new(MODEL);
     let tokenizer = fs::read_to_string(model.join("tokenizer.json"))?;
-    let actions = text_actions(&model.join("onnx/model.onnx"), &tokenizer)?;
+    let actions = text_actions(&model.join("onnx/model.onnx"), &tokenizer, &LABELS)?;
     let app = App::start("embeds_and_classifies", actions)?;
 
     // When the queue hands rannoch-processor an event to embed a text, twice
@@ -367,7 +408,7 @@ fn a_tract_build_runs_the_model_shipped_as_an_export_tract_can_load() -> Result<
     // And one app built with the onnx feature and one built with the tract feature, each with
     // flows that embed and classify text with that export
     let tokenizer = fs::read_to_string(model.join("tokenizer.json"))?;
-    let app = App::start("tract_build", text_actions(&export, &tokenizer)?)?;
+    let app = App::start("tract_build", text_actions(&export, &tokenizer, &LABELS)?)?;
     let vocab = serde_json::from_str::<Value>(&tokenizer)?["model"]["vocab"].take();
     let unit = |v: Vec<f32>| {
         let n = v.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
@@ -403,6 +444,57 @@ fn a_tract_build_runs_the_model_shipped_as_an_export_tract_can_load() -> Result<
         let best = about.iter().max_by(|a, b| cos(&a.1).total_cmp(&cos(&b.1)));
         assert_eq!(best.map(|b| b.0), Some(want), "the ort build on {text}");
     }
+    app.stop();
+    Ok(())
+}
+
+/// Not a scenario: #109. A text that is missing, or not a string, fails the step that embeds or
+/// classifies it.
+#[cfg(not(feature = "tract"))]
+#[test]
+fn a_text_that_is_missing_or_not_a_string_fails_its_step() -> Result<()> {
+    // Given an app whose flows embed and classify text with the fixture model2vec model
+    let app = fixture("a_text_that_is_missing", &LABELS)?;
+
+    // When an event to embed holds no text, and an event to classify holds a number as its text
+    // Then each one's -1 names text, and no next is sent
+    let embed = app.failed(20, &json!({}))?;
+    assert_eq!(embed, json!("embed takes text, a string"));
+    let classify = app.failed(30, &json!({ "text": 5 }))?;
+    assert_eq!(classify, json!("classify takes text, a string"));
+    app.stop();
+    Ok(())
+}
+
+/// Not a scenario: #109. A text none of whose words is in the vocabulary fails its step.
+#[cfg(not(feature = "tract"))]
+#[test]
+fn a_text_with_no_word_in_the_vocabulary_fails_its_step() -> Result<()> {
+    // Given an app whose flows embed and classify text with the fixture model2vec model
+    let app = fixture("a_text_with_no_word", &LABELS)?;
+
+    // When an event to embed holds a text none of whose words is in the fixture's vocabulary
+    // Then its -1 says so, and no next is sent
+    let embed = app.failed(20, &json!({ "text": "zzz qqq" }))?;
+    assert_eq!(
+        embed,
+        json!("embed: no word of the text is in the vocabulary")
+    );
+    app.stop();
+    Ok(())
+}
+
+/// Not a scenario: #109. Classify with no labels fails its step.
+#[cfg(not(feature = "tract"))]
+#[test]
+fn classify_with_no_labels_fails_its_step() -> Result<()> {
+    // Given an app whose classify, over the fixture model2vec model, has no labels
+    let app = fixture("classify_with_no_labels", &[])?;
+
+    // When an event to classify a text is handed over
+    // Then its -1 says classify has no labels, and no next is sent
+    let classify = app.failed(30, &json!({ "text": TEXTS[0] }))?;
+    assert_eq!(classify, json!("classify has no labels"));
     app.stop();
     Ok(())
 }

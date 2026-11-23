@@ -169,6 +169,6 @@ fn a_flow_step_calls_an_agent_the_app_reaches_through_the_agent_trait() -> Resul
 
     drop(signal);
     rannoch.shutdown();
-    queue.join();
+    queue.join().unwrap();
     Ok(())
 }

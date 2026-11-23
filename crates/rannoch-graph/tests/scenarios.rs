@@ -140,7 +140,7 @@ fn fr_rannoch_123_c10() {
     assert_eq!((next[0].0.as_str(), next[0].1.event), ("t0+", ids[0]));
     drop(signal);
     rannoch.shutdown();
-    queue.join();
+    queue.join().unwrap();
 }
 
 /// #92's flows, from the fixture `tests/payments.json`, of the built-in steps alone: a payment
@@ -238,5 +238,5 @@ fn with_graph_append_a_2_and_its_rows_commit_together_and_a_refused_row_gets_a_m
     assert!(!writes.lock().unwrap().contains_key(&none));
     drop(signal);
     rannoch.shutdown();
-    queue.join();
+    queue.join().unwrap();
 }

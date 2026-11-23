@@ -5,7 +5,8 @@
 //! jobs, whose flow has a job step, each on a thread of its own. Processors send their own
 //! results; the queue sends only the 1s, a retry when a run fails while its chain has attempts
 //! left, the hunt's resend of an event whose 1 has had nothing after it for `window`, and a -1
-//! saying "no processor" for an event whose `ty` has no flow.
+//! for each failure it meets about an event, whose data names the reason, such as "no processor"
+//! for an event whose `ty` has no flow.
 //!
 //! # Taking an event
 //!
@@ -13,9 +14,10 @@
 //! earliest `run_at` among the waiting events comes, and when the hunt is due. For each due event
 //! it sends a 1 with the data `"taken"`, then asks [`Flows::flow`] for the event's flow; an event
 //! whose `ty` has no flow gets a -1 with the data `"no processor"` and no retry. When rannoch
-//! refuses the 1, the event stays at 0 and is not run. An event whose `ty` does not convert to the
-//! app's `T` is logged and left at 0. Every status the queue sends goes through the app's
-//! [`rannoch_core::Sender`], so it is written at its inbox's next hand-over, like any other event.
+//! refuses the 1, the event stays at 0 and is not run. Every status the queue sends goes through
+//! the app's [`rannoch_core::Sender`], so it is written at its inbox's next hand-over, like any
+//! other event, save one: the -1 for an event whose `ty` is not the app's `T`, which
+//! `Sender::send` cannot take, the queue writes to `_events` itself.
 //!
 //! # Retries
 //!
@@ -42,6 +44,24 @@
 //! From a resend the queue walks back to the stalled event, without counting a failed attempt, so
 //! the processor is handed the stalled event's root and runs the flow on that root's data.
 //!
+//! # Failures
+//!
+//! A failure the queue meets about an event becomes a -1 about that event, whose data names the
+//! reason:
+//!
+//! - a due event, or a stalled one the hunt would resend, whose `ty` is not the app's `T`, as
+//!   when the app's enum changes: `ty <ty> is not the app's`;
+//! - a run that panics, with no retry: `the run panicked: <message>`;
+//! - a failed run whose retry's `run_at` is past what a time can hold, with no retry: `its retry's
+//!   wait overflows`;
+//! - a run the queue cannot hand over to its runs: `the queue's runs have stopped`.
+//!
+//! A row rannoch never writes is passed over with a log line at `error`, and no -1: one whose id,
+//! source or `run_at` does not parse, a 1 whose id is not a `UUIDv7`, and a retry whose source is
+//! not in `_events`. A read that fails in the store is logged at `error` and read again after
+//! [`Settings::first_wait`], never binned: the due events, the next `run_at` and a due event's
+//! chain; when the hunt cannot read the 1s or an event's tree, it runs again after `first_wait`.
+//!
 //! # Stopping
 //!
 //! The queue stops when every sender on its signal channel has dropped. The sender in the append
@@ -50,6 +70,8 @@
 //! [`rannoch_core::Rannoch::shutdown`], every send fails with `Closed`, the queue's and the
 //! processors' alike, and the queue logs each of its own; a result sent then is not written. So
 //! the app shuts rannoch down once the results it waits for are written, then joins the queue.
+//! [`Queue::join`] returns `Error::Queue` when the queue's thread panicked; the runs and jobs it
+//! started may then still be going.
 //!
 //! # Example
 //!
@@ -187,7 +209,7 @@
 //!
 //!     // Shutdown drops the append, and with it the signal sender, so the queue stops.
 //!     rannoch.shutdown();
-//!     queue.join();
+//!     queue.join()?;
 //!
 //!     drop(reads);
 //!     fs::remove_dir_all(&dir)?;
@@ -198,14 +220,15 @@
 mod queries;
 
 use std::collections::HashSet;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use rannoch_core::{Event, Sender, Status};
-use rusqlite::{Connection, Params};
+use rannoch_core::{Error, Event, Sender, Status};
+use rusqlite::{Connection, Params, params};
 use uuid::Uuid;
 
 /// An event as `_events` holds it: `ty` as its `u16`, data as its JSON text.
@@ -300,8 +323,14 @@ impl Queue {
     /// Waits until the queue has stopped and every run and job it started has finished. The
     /// queue stops only once every sender on its signal channel has dropped, so a sender still
     /// alive keeps this waiting.
-    pub fn join(self) {
-        let _ = self.thread.join();
+    ///
+    /// # Errors
+    ///
+    /// `Error::Queue` when the queue's thread panicked, as a panic in the app's [`Flows::flow`]
+    /// makes it. It then has not waited for the runs and jobs the queue started, which may still
+    /// be going.
+    pub fn join(self) -> Result<(), Error> {
+        self.thread.join().map_err(|_| Error::Queue)
     }
 }
 
@@ -323,11 +352,11 @@ fn run<T, D>(
 {
     // Every 1 accepted from this millisecond on is this queue's own, so the hunt leaves it.
     let started = Utc::now().timestamp_millis();
-    let (runs, bucket) = mpsc::channel::<(Arc<Flow<T, D>>, Row, Row, u32)>();
+    let (runs, bucket) = mpsc::channel::<(Arc<Flow<T, D>>, Row, Row, u32, T)>();
     let run_sender = sender.clone();
     let runs_thread = thread::spawn(move || {
-        for (flow, event, root, before) in bucket {
-            attempt(&flow, &event, &root, before, &run_sender, settings);
+        for (flow, event, root, before, ty) in bucket {
+            attempt(&flow, &event, &root, before, ty, &run_sender, settings);
         }
     });
     let mut jobs: Vec<JoinHandle<()>> = Vec::new();
@@ -341,32 +370,37 @@ fn run<T, D>(
         }
         jobs.retain(|job| !job.is_finished());
         if Instant::now() >= next_hunt {
-            hunt(conn, sender, settings.window, started);
+            // A hunt the store could not read for runs again after `first_wait`.
+            let read_all = hunt(conn, sender, settings.window, started);
             next_hunt = Instant::now() + settings.hunt;
+            if !read_all {
+                next_hunt = Instant::now() + settings.first_wait;
+            }
         }
         let Ok(due) = read(conn, queries::DUE, [now()]) else {
             log::error!("the queue could not read the due events");
+            wait = settings.first_wait;
             continue;
         };
         // An event whose 1 is kept has left the due events; until then the queue remembers it.
         taken.retain(|id| due.iter().any(|row| row.id == *id));
+        // An event whose chain the store could not read is read again after `first_wait`.
+        let mut unread = false;
         for row in due {
             if !taken.insert(row.id) {
                 continue;
             }
             let Ok(ty) = T::try_from(row.ty) else {
-                log::error!(
-                    "event {} has a ty the app does not know: {}",
-                    row.id,
-                    row.ty
-                );
+                not_the_apps(conn, row.id, row.ty);
                 continue;
             };
             let (root, before) = match root(conn, row.clone()) {
-                Ok(found) => found,
+                Ok(Some(found)) => found,
+                Ok(None) => continue,
                 Err(err) => {
-                    log::error!("the queue could not find the root of {}: {err}", row.id);
+                    log::error!("the queue could not read the chain of {}: {err}", row.id);
                     taken.remove(&row.id);
+                    unread = true;
                     continue;
                 }
             };
@@ -382,15 +416,21 @@ fn run<T, D>(
             if flow.job {
                 let job_sender = sender.clone();
                 jobs.push(thread::spawn(move || {
-                    attempt(&flow, &row, &root, before, &job_sender, settings);
+                    attempt(&flow, &row, &root, before, ty, &job_sender, settings);
                 }));
-            } else if runs.send((flow, row, root, before)).is_err() {
-                log::error!("the queue's runs have stopped");
+            } else if let Err(mpsc::SendError((_, row, ..))) =
+                runs.send((flow, row, root, before, ty))
+            {
+                let why = "the queue's runs have stopped";
+                send(sender, row.id, ty, why, Status::Binned);
             }
         }
-        wait = next_due(conn)
+        wait = next_due(conn, settings.first_wait)
             .unwrap_or(IDLE)
             .min(next_hunt.saturating_duration_since(Instant::now()));
+        if unread {
+            wait = wait.min(settings.first_wait);
+        }
     }
     drop(runs);
     let _ = runs_thread.join();
@@ -399,39 +439,51 @@ fn run<T, D>(
     }
 }
 
-/// Runs `event` through its processor. When the run fails and its chain, with `before` failed
-/// attempts behind it, has attempts left, sends a retry: status 0, the failed attempt as its
-/// source, the failure's result as its data, and a `run_at` after the backoff, which doubles the
-/// first wait for each attempt before.
+/// Runs `event`, whose `ty` is the app's `ty`, through its processor. When the run fails and its
+/// chain, with `before` failed attempts behind it, has attempts left, sends a retry: status 0, the
+/// failed attempt as its source, the failure's result as its data, and a `run_at` after the
+/// backoff, which doubles the first wait for each attempt before. A run that panics, and a retry
+/// whose `run_at` the backoff puts past what a time can hold, get a -1 saying so, and no retry.
 fn attempt<T, D>(
     flow: &Flow<T, D>,
     event: &Row,
     root: &Row,
     before: u32,
+    ty: T,
     sender: &Sender<T, D>,
     settings: Settings,
 ) where
-    T: TryFrom<u16> + PartialEq,
+    T: PartialEq,
     D: From<String>,
 {
-    let Err(failure) = (flow.run)(event, root, sender) else {
-        return;
+    let failure = match panic::catch_unwind(AssertUnwindSafe(|| (flow.run)(event, root, sender))) {
+        Ok(Ok(())) => return,
+        Ok(Err(failure)) => failure,
+        Err(panicked) => {
+            let what = panicked.downcast_ref::<String>().map(String::as_str);
+            let what = what.or_else(|| panicked.downcast_ref::<&str>().copied());
+            let why = format!("the run panicked: {}", what.unwrap_or_default());
+            send(sender, event.id, ty, &why, Status::Binned);
+            return;
+        }
     };
     let Some(wait) = backoff(settings, before) else {
-        return;
-    };
-    let Ok(ty) = T::try_from(event.ty) else {
         return;
     };
     let run_at = chrono::TimeDelta::from_std(wait)
         .ok()
         .and_then(|delay| Utc::now().checked_add_signed(delay));
+    let Some(run_at) = run_at else {
+        let why = "its retry's wait overflows";
+        send(sender, event.id, ty, why, Status::Binned);
+        return;
+    };
     let retry = Event {
         id: Uuid::nil(),
         source: Some(event.id),
         ty,
         data: D::from(failure),
-        run_at,
+        run_at: Some(run_at),
         status: Status::Added,
     };
     if sender.send(retry).is_err() {
@@ -458,8 +510,10 @@ fn backoff(settings: Settings, before: u32) -> Option<Duration> {
 
 /// The hunt: sends again, as a retry with that event as its source, each event whose 1 is
 /// older than `window` and from before `started`, the millisecond the queue started, with nothing
-/// after it in the event's tree, as a crash leaves it.
-fn hunt<T, D>(conn: &Connection, sender: &Sender<T, D>, window: Duration, started: i64)
+/// after it in the event's tree, as a crash leaves it; such an event whose `ty` is not the app's
+/// gets a -1 saying so. Whether it read all it needed: `false` when the store could not read the
+/// 1s or an event's tree.
+fn hunt<T, D>(conn: &Connection, sender: &Sender<T, D>, window: Duration, started: i64) -> bool
 where
     T: TryFrom<u16> + PartialEq,
     D: From<String>,
@@ -468,9 +522,10 @@ where
         Ok(ones) => ones,
         Err(err) => {
             log::error!("the hunt could not read the 1s: {err}");
-            return;
+            return false;
         }
     };
+    let mut read_all = true;
     for (one, event, ty) in ones {
         let ours = taken_at(one).is_none_or(|at| at.timestamp_millis() >= started);
         if ours || !older_than(one, window, Utc::now()) {
@@ -481,10 +536,12 @@ where
             Ok(true) => continue,
             Err(err) => {
                 log::error!("the hunt could not read the tree of {event}: {err}");
+                read_all = false;
                 continue;
             }
         }
         let Ok(ty) = T::try_from(ty) else {
+            not_the_apps(conn, event, ty);
             continue;
         };
         let retry = Event {
@@ -499,9 +556,12 @@ where
             log::error!("the hunt could not send {event} again: rannoch is closed");
         }
     }
+    read_all
 }
 
-/// The 1s whose event has no 2 or -1 yet: the 1's id, its event's id and the event's `ty`.
+/// The 1s whose event has no 2 or -1 yet: the 1's id, its event's id and the event's `ty`. A 1
+/// whose id is not a `UUIDv7`, or whose source is not a UUID, rannoch never writes: it is passed
+/// over with a log line.
 fn ones_without_result(conn: &Connection) -> rusqlite::Result<Vec<(Uuid, Uuid, u16)>> {
     let mut select = conn.prepare_cached(queries::ONES)?;
     let rows = select.query_map([], |r| {
@@ -514,8 +574,9 @@ fn ones_without_result(conn: &Connection) -> rusqlite::Result<Vec<(Uuid, Uuid, u
     let mut out = Vec::new();
     for row in rows {
         let (one, event, ty) = row?;
-        if let (Ok(one), Ok(event)) = (one.parse(), event.parse()) {
-            out.push((one, event, ty));
+        match (one.parse::<Uuid>(), event.parse()) {
+            (Ok(one), Ok(event)) if one.get_version_num() == 7 => out.push((one, event, ty)),
+            _ => log::error!("the hunt passed over the 1 {one} of {event}: not a UUIDv7 of a UUID"),
         }
     }
     Ok(out)
@@ -593,10 +654,23 @@ fn send<T: PartialEq, D: From<String>>(
     sent
 }
 
+/// Writes a -1 about the event `source`, whose `ty` is not the app's, saying so. `Sender::send`
+/// takes the app's `T`, so this one -1 cannot go through it: the queue writes it to `_events`
+/// itself, as the append writes one.
+fn not_the_apps(conn: &Connection, source: Uuid, ty: u16) {
+    let why = format!("ty {ty} is not the app's");
+    let row = params![Uuid::now_v7().to_string(), source.to_string(), ty, why];
+    if let Err(err) = conn.execute(queries::BIN, row) {
+        log::error!("the queue could not write a -1 for {source}: {err}");
+    }
+}
+
 /// The root whose data every flow uses, and how many failed attempts are behind `row` in its
 /// chain: back from `row` through each source that has a -1, one failed attempt each, and from
-/// each hunt's resend to the event it resends.
-fn root(conn: &Connection, row: Row) -> rusqlite::Result<(Row, u32)> {
+/// each hunt's resend to the event it resends. `None`, logged, when the walk reaches a source not
+/// in `_events`, which rannoch never writes.
+fn root(conn: &Connection, row: Row) -> rusqlite::Result<Option<(Row, u32)>> {
+    let id = row.id;
     let mut at = row;
     let mut before = 0_u32;
     while let Some(source) = at.source {
@@ -606,34 +680,39 @@ fn root(conn: &Connection, row: Row) -> rusqlite::Result<(Row, u32)> {
         if !failed && !resend {
             break;
         }
-        match read(conn, queries::EVENT, [source.to_string()])?.pop() {
-            Some(earlier) => {
-                at = earlier;
-                before = before.saturating_add(u32::from(failed));
-            }
-            None => break,
-        }
+        let Some(earlier) = read(conn, queries::EVENT, [source.to_string()])?.pop() else {
+            log::error!("the queue passed over {id}: {source} in its chain cannot be found");
+            return Ok(None);
+        };
+        at = earlier;
+        before = before.saturating_add(u32::from(failed));
     }
-    Ok((at, before))
+    Ok(Some((at, before)))
 }
 
-/// How long until the earliest `run_at` the queue knows of, or `None` when there is none.
-fn next_due(conn: &Connection) -> Option<Duration> {
-    let next: Option<String> = match conn.query_row(queries::NEXT_RUN_AT, [now()], |r| r.get(0)) {
-        Ok(next) => next,
+/// How long until the earliest `run_at` among the waiting events, or `None` when there is none.
+/// A `run_at` that is not a time, which rannoch never writes, is passed over with a log line.
+/// When the read fails, the queue reads again after `first_wait`.
+fn next_due(conn: &Connection, first_wait: Duration) -> Option<Duration> {
+    let next = || -> rusqlite::Result<Option<DateTime<Utc>>> {
+        let mut select = conn.prepare_cached(queries::NEXT_RUN_AT)?;
+        let mut rows = select.query([now()])?;
+        while let Some(row) = rows.next()? {
+            let (id, at): (String, String) = (row.get(0)?, row.get(1)?);
+            match at.parse() {
+                Ok(at) => return Ok(Some(at)),
+                Err(_) => log::error!("the queue passed over {id}: its run_at {at} is not a time"),
+            }
+        }
+        Ok(None)
+    };
+    match next() {
+        Ok(at) => at.map(|at| (at - Utc::now()).to_std().unwrap_or(Duration::ZERO)),
         Err(err) => {
             log::error!("the queue could not read the next run_at: {err}");
-            return None;
+            Some(first_wait)
         }
-    };
-    let at: DateTime<Utc> = match next?.parse() {
-        Ok(at) => at,
-        Err(err) => {
-            log::error!("the queue could not read a run_at: {err}");
-            return None;
-        }
-    };
-    Some((at - Utc::now()).to_std().unwrap_or(Duration::ZERO))
+    }
 }
 
 fn now() -> String {
@@ -797,6 +876,7 @@ mod tests {
         assert_eq!(
             root(&store, event(&store, &first))
                 .unwrap()
+                .unwrap()
                 .0
                 .id
                 .to_string(),
@@ -804,6 +884,7 @@ mod tests {
         );
         assert_eq!(
             root(&store, event(&store, &output))
+                .unwrap()
                 .unwrap()
                 .0
                 .id
@@ -822,7 +903,7 @@ mod tests {
         put(&store, Some(&first), "\"failed again\"", -1);
         let second = put(&store, Some(&first), "\"failed again\"", 0);
 
-        let (found, before) = root(&store, event(&store, &second)).unwrap();
+        let (found, before) = root(&store, event(&store, &second)).unwrap().unwrap();
 
         assert_eq!(found.id.to_string(), original);
         assert_eq!(found.data, "{\"in\":1}");
