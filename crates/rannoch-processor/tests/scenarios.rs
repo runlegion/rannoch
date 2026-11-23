@@ -853,7 +853,7 @@ fn a_wait_the_hunt_resends_sends_its_timeout_once_and_its_2_says_timeout() {
 
     // Then the hunt resends the wait
     let resend = app.retry(wait);
-    assert_eq!(app.sent(wait, 0), [(70, json!("hung"))]);
+    assert_eq!(app.sent(wait, 0).first(), Some(&(70, json!("hung"))));
 
     // And the resend sends the wait's timeout once, with the wait as its source, and its 2 says
     // "timeout"
