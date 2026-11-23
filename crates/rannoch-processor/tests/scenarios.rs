@@ -1867,3 +1867,147 @@ fn a_second_app_on_the_same_store_is_not_stopped() {
     second.stop();
     first.stop();
 }
+
+/// #109's flows on the built-in steps: a list whose emit step sends one next per item of
+/// `items`, a later one whose next is due more milliseconds on than a time can hold, and the
+/// flow their nexts reach.
+const FAILING: &str = r#"[
+  ["list.json", {"name": "list", "ty": 90, "takes": {"items": "list<string>"},
+    "steps": [{"do": "emit", "next": {"ty": 91, "each": "items", "shape": {"item": "$item"}}}]}],
+  ["later.json", {"name": "later", "ty": 92, "takes": {},
+    "steps": [{"do": "emit", "next": {"ty": 91, "delay_ms": 18446744073709551615,
+      "shape": {"item": "x"}}}]}],
+  ["item.json", {"name": "item", "ty": 91, "takes": {"item": "string"}, "steps": []}]
+]"#;
+
+/// `BUILT_IN`'s flows and `FAILING`'s, checked with no signature of the app's.
+fn failing() -> Result<String> {
+    let docs = |json| serde_json::from_str::<Vec<(String, FlowDoc)>>(json);
+    let docs = [docs(BUILT_IN)?, docs(FAILING)?].concat();
+    check(&docs, &[]).map_err(|e| e.join("\n").into())
+}
+
+/// The data of each -1 about `event` once its flow has run, which must have sent no next and
+/// no 2.
+fn failed(app: &App, event: Uuid) -> Vec<Value> {
+    let ran = until(WAIT, || app.statuses(event).contains(&-1));
+    assert!(ran, "{:?}", app.about(event));
+    assert_eq!(app.statuses(event), [1, -1]);
+    app.sent(event, -1).into_iter().map(|r| r.1).collect()
+}
+
+/// The app over a fresh store `name` running `failing`'s flows, the store holding one live wait
+/// of the ticket flow, whose data is `data` as written: status 0, due in an hour, nothing about
+/// it. Returns the app and the wait's id.
+fn live_wait(name: &str, data: &str) -> Result<(App, Uuid)> {
+    let path = database(name)?;
+    migrated(&path)?;
+    let (wait, due) = (Uuid::now_v7(), Utc::now() + TimeDelta::hours(1));
+    _events::factory()
+        .id(wait.to_string())
+        .ty(80)
+        .data(data)
+        .run_at(due.to_rfc3339_opts(SecondsFormat::Millis, true))
+        .status(0)
+        .insert(&ready(&path)?)?;
+    let app = App::built_in_at(path, &failing()?, Config::default())?;
+    Ok((app, wait))
+}
+
+/// Not a scenario: #109. A next due further on than a time can hold fails its step.
+#[test]
+fn a_next_delayed_past_the_last_time_fails_its_step() {
+    // Given a flow whose emit step sends a next with a delay_ms of u64::MAX
+    let app = App::built_in("a_next_delayed_past", &failing().unwrap()).unwrap();
+
+    // When an event is handed to it
+    let event = app.hand(92, &json!({})).unwrap();
+
+    // Then its -1 names the delay, and no next is sent
+    let delay = "a delay of 18446744073709551615 ms to ty 91 is out of range";
+    assert_eq!(failed(&app, event), [json!(delay)]);
+    app.stop();
+}
+
+/// Not a scenario: #109. A due wait whose `$wait` names no ty fails its step.
+#[test]
+fn a_due_wait_whose_for_is_not_a_ty_fails_its_step() {
+    // Given the ticket flow, which waits for its answer
+    let app = App::built_in("a_due_wait_whose_for", &failing().unwrap()).unwrap();
+
+    // When a due wait of it is handed over whose $wait is for 70000, which is no u16
+    let data = json!({ "$wait": { "step": 1, "for": 70000 }, "key": "t1",
+        "vals": { "ticket": "t1" } });
+    let wait = app.hand(80, &data).unwrap();
+
+    // Then its -1 names the for, and it sends no timeout
+    assert_eq!(failed(&app, wait), [json!("$wait for 70000 is not a ty")]);
+    app.stop();
+}
+
+/// Not a scenario: #109. A wait whose row cannot be read fails the step of the event it waits
+/// for.
+#[test]
+fn a_wait_that_cannot_be_read_fails_the_step_of_the_event_it_waits_for() {
+    // Given a live wait for t1's answer whose data SQLite reads but serde_json does not
+    let data = r#"{"$wait": {"step": 1, "for": 83,}, "key": "t1", "vals": {"ticket": "t1"}}"#;
+    let (app, wait) = live_wait("a_wait_that_cannot_be_read", data).unwrap();
+
+    // When t1's answer is handed over
+    let answer = app.hand(83, &json!({ "ticket": "t1" })).unwrap();
+
+    // Then its -1 names the wait and why it cannot be read
+    let why = serde_json::from_str::<Value>(data).unwrap_err();
+    let reason = format!("wait {wait} cannot be read: {why}");
+    assert_eq!(failed(&app, answer), [json!(reason)]);
+    app.stop();
+}
+
+/// Not a scenario: #109. A wait with no step, or no vals, fails the step of the event it waits
+/// for.
+#[test]
+fn a_wait_with_no_step_or_no_vals_fails_the_step_of_the_event_it_waits_for() {
+    let cases = [
+        (
+            "a_wait_with_no_step",
+            json!({ "$wait": { "for": 83 }, "key": "t1", "vals": { "ticket": "t1" } }),
+            "has no step",
+        ),
+        (
+            "a_wait_with_no_vals",
+            json!({ "$wait": { "step": 1, "for": 83 }, "key": "t1" }),
+            "has no vals",
+        ),
+    ];
+    for (name, data, lacks) in cases {
+        // Given a live wait for t1's answer whose data lacks its step, or its vals
+        let (app, wait) = live_wait(name, &data.to_string()).unwrap();
+
+        // When t1's answer is handed over
+        let answer = app.hand(83, &json!({ "ticket": "t1" })).unwrap();
+
+        // Then its -1 names the wait and what it lacks
+        assert_eq!(
+            failed(&app, answer),
+            [json!(format!("wait {wait} {lacks}"))]
+        );
+        app.stop();
+    }
+}
+
+/// Not a scenario: #109. An each over a field that is absent or not a list fails its step.
+#[test]
+fn each_over_a_field_that_is_not_a_list_fails_its_step() {
+    // Given a flow whose emit step sends one next per item of items
+    let app = App::built_in("each_over_a_field", &failing().unwrap()).unwrap();
+
+    // When events are handed to it whose items is absent, and a string
+    for data in [json!({}), json!({ "items": "a" })] {
+        let event = app.hand(90, &data).unwrap();
+
+        // Then each one's -1 names the field, and no next is sent
+        let reason = json!("each over items, which is not a list");
+        assert_eq!(failed(&app, event), [reason]);
+    }
+    app.stop();
+}

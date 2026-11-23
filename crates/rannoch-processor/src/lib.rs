@@ -152,8 +152,9 @@
 //!   takes, of its type; it does not check the other fields.
 //! - `delay_ms`, default `0`: the event comes due this many milliseconds after the run.
 //! - `each`, default none: the name of a list field. One event is sent per item, its shape
-//!   reading the item as `"$item"`; at run time, a field that is absent or not a list sends
-//!   none. `check` requires the field's type to be a list.
+//!   reading the item as `"$item"`; at run time, a field that is absent or not a list fails the
+//!   step with `each over <field>, which is not a list`. `check` requires the field's type to be
+//!   a list.
 //!
 //! ## A branch: [`Branch`] and [`Case`]
 //!
@@ -447,15 +448,21 @@ impl<T: TryFrom<u16> + PartialEq + 'static, D: From<Value> + 'static> Processor<
                         }
                         // A match answers its waits; the wait's own run, or a rerun's, does not.
                         let answers = |s: &Uuid| *s != id && *s != at.0;
-                        lock(&seen).extend(outs.iter().map(|o| o.0).filter(answers));
+                        let answered: Vec<Uuid> =
+                            outs.iter().map(|o| o.0).filter(answers).collect();
                         let done =
                             ty(event.ty).map(|t| (id, t, said.into(), None, Status::Processed));
                         let nexts = outs.into_iter().map(|(source, to, data, delay)| {
                             let at = TimeDelta::from_std(Duration::from_millis(delay)).ok();
                             let at = at.and_then(|d| Utc::now().checked_add_signed(d));
+                            let range = format!("a delay of {delay} ms to ty {to} is out of range");
+                            let at = Some(at.ok_or(range)?);
                             Ok((source, ty(to)?, Value::Object(data), at, Status::Added))
                         });
-                        nexts.chain([done]).collect::<Result<Vec<_>, String>>()
+                        let sends = nexts.chain([done]).collect::<Result<Vec<_>, String>>()?;
+                        // Only a run that sends its nexts answers the waits they match.
+                        lock(&seen).extend(answered);
+                        Ok(sends)
                     });
                 let (sends, result) = match sends {
                     Ok(sends) => {
@@ -513,20 +520,26 @@ fn lock<X>(mutex: &Mutex<X>) -> std::sync::MutexGuard<'_, X> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// The waits in `_events` waiting for `ty`: (id, data), and the rows about each.
+/// The waits in `_events` waiting for `ty`: (id, data), and the rows about each; a wait whose
+/// id or rows do not parse is `wait <id> cannot be read: <why>`.
 #[expect(clippy::type_complexity, reason = "the issue's signature")]
 fn waits_for(
     conn: &Connection,
     ty: u16,
-) -> rusqlite::Result<Vec<(Uuid, Value, Vec<(i8, String)>)>> {
+) -> rusqlite::Result<Vec<Result<(Uuid, Value, Vec<(i8, String)>), String>>> {
     let sql = "SELECT w.id, w.data, json_group_array(json_array(s.status, s.data))
         FILTER (WHERE s.id IS NOT NULL) FROM _events w LEFT JOIN _events s ON s.source = w.id
         WHERE json_extract(w.data, '$.\"$wait\".for') = ?1 GROUP BY w.id ORDER BY w.id";
     let row = |r: &rusqlite::Row<'_>| {
         let (id, data, about): (String, String, String) = (r.get(0)?, r.get(1)?, r.get(2)?);
-        let (data, about) = (serde_json::from_str(&data), serde_json::from_str(&about));
-        let id = id.parse().unwrap_or_default();
-        Ok((id, data.unwrap_or_default(), about.unwrap_or_default()))
+        let read = || -> Result<_, Box<dyn std::error::Error>> {
+            Ok((
+                id.parse()?,
+                serde_json::from_str(&data)?,
+                serde_json::from_str(&about)?,
+            ))
+        };
+        Ok(read().map_err(|e| format!("wait {id} cannot be read: {e}")))
     };
     conn.prepare_cached(sql)?.query_map([ty], row)?.collect()
 }
@@ -556,13 +569,26 @@ fn waits<'d>(
     data: &Map<String, Value>,
 ) -> Result<(Vec<(Uuid, u16, Map<String, Value>, u64)>, &'static str), String> {
     let due = data.get("$wait");
-    let ty = due.map_or(Some(ty), |at| at["for"].as_u64()?.try_into().ok());
+    let ty = match due {
+        None => ty,
+        Some(at) => at["for"]
+            .as_u64()
+            .and_then(|t| t.try_into().ok())
+            .ok_or_else(|| format!("$wait for {} is not a ty", at["for"]))?,
+    };
     let (mut outs, mut said) = (Vec::new(), if due.is_some() { "matched" } else { "done" });
-    for (wait_id, w, rows) in waits_for(conn, ty.unwrap_or(0)).map_err(|e| e.to_string())? {
-        let step: Option<usize> = w["$wait"]["step"].as_u64().and_then(|s| s.try_into().ok());
-        let at = |d: &'d FlowDoc| d.steps.get(step?)?.next.as_ref();
+    for read in waits_for(conn, ty).map_err(|e| e.to_string())? {
+        // A due wait's run reads its own row, which parsed as its root; no other is its wait.
+        let (wait_id, w, rows) = match read {
+            Ok(read) if due.is_none() || read.0 == id => read,
+            Err(e) if due.is_none() => return Err(e),
+            _ => continue,
+        };
+        let step = w["$wait"]["step"].as_u64().and_then(|s| s.try_into().ok());
+        let step: usize = step.ok_or_else(|| format!("wait {wait_id} has no step"))?;
+        let at = |d: &'d FlowDoc| d.steps.get(step)?.next.as_ref();
         let fits = |wait: &Wait| due.map_or(eval(&wait.key, data) == w["key"], |_| wait_id == id);
-        let is = |n: &&Next| matches!(n, Next::Wait { wait: x } if Some(x.for_ty) == ty && fits(x));
+        let is = |n: &&Next| matches!(n, Next::Wait { wait: x } if x.for_ty == ty && fits(x));
         if let Some(Next::Wait { wait }) = docs.iter().filter_map(at).find(is) {
             // The wait's nexts are objects; the queue's retry and the hunt's resend are strings.
             let zeros = rows
@@ -585,11 +611,16 @@ fn waits<'d>(
                 (false, false, 1, Some("\"timeout\"")) => wait.late.as_ref(),
                 _ => None,
             };
-            let mut vals = w["vals"].as_object().cloned().unwrap_or_default();
+            let vals = w["vals"].as_object();
+            let mut vals = vals
+                .ok_or_else(|| format!("wait {wait_id} has no vals"))?
+                .clone();
             let got = data.iter().filter(|_| due.is_none());
             vals.extend(got.map(|(k, v)| (format!("got.{k}"), v.clone())));
-            let nexts = to.into_iter().flat_map(|to| shaped(to, &vals));
-            outs.extend(nexts.map(|(to, d, delay)| (wait_id, to, d, delay)));
+            if let Some(to) = to {
+                let nexts = shaped(to, &vals)?.into_iter();
+                outs.extend(nexts.map(|(to, d, delay)| (wait_id, to, d, delay)));
+            }
         }
     }
     Ok((outs, said))
@@ -656,23 +687,32 @@ fn run(
                 continue;
             }
         };
-        nexts.extend(shaped(to, &vals));
+        nexts.extend(shaped(to, &vals)?);
     }
     Ok(nexts)
 }
 
 /// The nexts `to` sends from `vals`: one, or with `each` one per item of the list it names,
-/// each shaped with the item in scope as "$item".
-fn shaped(to: &To, vals: &Map<String, Value>) -> Vec<(u16, Map<String, Value>, u64)> {
-    let list = |l: &String| vals.get(l).and_then(Value::as_array).into_iter().flatten();
-    let items: Option<Vec<_>> = to.each.as_ref().map(|l| list(l).map(Some).collect());
+/// each shaped with the item in scope as "$item"; `each over <field>, which is not a list` when
+/// `vals` does not hold that field as a list.
+#[expect(clippy::type_complexity, reason = "a next as run gives it")]
+fn shaped(
+    to: &To,
+    vals: &Map<String, Value>,
+) -> Result<Vec<(u16, Map<String, Value>, u64)>, String> {
+    let list = |l: &String| vals.get(l).and_then(Value::as_array);
+    let list = |l| list(l).ok_or_else(|| format!("each over {l}, which is not a list"));
+    let items: Vec<Option<&Value>> = match &to.each {
+        None => vec![None],
+        Some(l) => list(l)?.iter().map(Some).collect(),
+    };
     let next = |item: Option<&Value>| {
         let mut vals = vals.clone();
         vals.extend(item.map(|item| ("item".to_owned(), item.clone())));
         let data = to.shape.iter().map(|(k, e)| (k.clone(), eval(e, &vals)));
         (to.ty, data.collect(), to.delay_ms)
     };
-    items.unwrap_or(vec![None]).into_iter().map(next).collect()
+    Ok(items.into_iter().map(next).collect())
 }
 
 #[cfg(test)]
@@ -968,7 +1008,7 @@ mod tests {
     fn shaped_with_each_gives_one_next_per_item_with_item() {
         let to = json!({ "ty": 41, "each": "list", "shape": { "word": "$item", "n": "$n" } });
         let to: super::To = serde_json::from_value(to).unwrap();
-        let nexts = super::shaped(&to, &obj(&json!({ "list": ["a", "b", "c"], "n": 7 })));
+        let nexts = super::shaped(&to, &obj(&json!({ "list": ["a", "b", "c"], "n": 7 }))).unwrap();
         let words = ["a", "b", "c"].map(|w| (41, obj(&json!({ "word": w, "n": 7 })), 0));
         assert_eq!(nexts, words);
     }
