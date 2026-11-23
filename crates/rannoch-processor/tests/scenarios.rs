@@ -1867,3 +1867,115 @@ fn a_second_app_on_the_same_store_is_not_stopped() {
     second.stop();
     first.stop();
 }
+
+/// #109's flows on the built-in steps: a list whose emit step sends one next per item of
+/// `items`, a later one whose next is due more milliseconds on than a time can hold, an asked one
+/// whose wait for its reply sends one next per item of the reply's `items`, the reply, and the
+/// flow their nexts reach.
+const FAILING: &str = r#"[
+  ["list.json", {"name": "list", "ty": 90, "takes": {"items": "list<string>"},
+    "steps": [{"do": "emit", "next": {"ty": 91, "each": "items", "shape": {"item": "$item"}}}]}],
+  ["later.json", {"name": "later", "ty": 92, "takes": {},
+    "steps": [{"do": "emit", "next": {"ty": 91, "delay_ms": 18446744073709551615,
+      "shape": {"item": "x"}}}]}],
+  ["asked.json", {"name": "asked", "ty": 93, "takes": {"ticket": "string"},
+    "steps": [{"do": "emit", "next": {"wait": {"for": 94, "key": "$ticket", "within_ms": 60000,
+      "next": {"ty": 91, "each": "got.items", "shape": {"item": "$item"}},
+      "timeout": {"ty": 91, "shape": {"item": "none"}}}}}]}],
+  ["reply.json", {"name": "reply", "ty": 94,
+    "takes": {"ticket": "string", "items": "list<string>"}, "steps": []}],
+  ["item.json", {"name": "item", "ty": 91, "takes": {"item": "string"}, "steps": []}]
+]"#;
+
+/// `BUILT_IN`'s flows and `FAILING`'s, checked with no signature of the app's.
+fn failing() -> Result<String> {
+    let docs = |json| serde_json::from_str::<Vec<(String, FlowDoc)>>(json);
+    let docs = [docs(BUILT_IN)?, docs(FAILING)?].concat();
+    check(&docs, &[]).map_err(|e| e.join("\n").into())
+}
+
+/// The data of each -1 about `event` once its flow has run, which must have sent no next and
+/// no 2.
+fn failed(app: &App, event: Uuid) -> Vec<Value> {
+    let ran = until(WAIT, || app.statuses(event).contains(&-1));
+    assert!(ran, "{:?}", app.about(event));
+    assert_eq!(app.statuses(event), [1, -1]);
+    app.sent(event, -1).into_iter().map(|r| r.1).collect()
+}
+
+/// Not a scenario: #109. A next due further on than a time can hold fails its step.
+#[test]
+fn a_next_delayed_past_the_last_time_fails_its_step() {
+    // Given a flow whose emit step sends a next with a delay_ms of u64::MAX
+    let app = App::built_in("a_next_delayed_past", &failing().unwrap()).unwrap();
+
+    // When an event is handed to it
+    let event = app.hand(92, &json!({})).unwrap();
+
+    // Then its -1 names the delay, and no next is sent
+    let delay = "a delay of 18446744073709551615 ms to ty 91 is out of range";
+    assert_eq!(failed(&app, event), [json!(delay)]);
+    app.stop();
+}
+
+/// Not a scenario: #109. A due wait whose `$wait` names no ty fails its step.
+#[test]
+fn a_due_wait_whose_for_is_not_a_ty_fails_its_step() {
+    // Given the ticket flow, which waits for its answer
+    let app = App::built_in("a_due_wait_whose_for", &failing().unwrap()).unwrap();
+
+    // When a due wait of it is handed over whose $wait is for 70000, which is no u16
+    let data = json!({ "$wait": { "step": 1, "for": 70000 }, "key": "t1",
+        "vals": { "ticket": "t1" } });
+    let wait = app.hand(80, &data).unwrap();
+
+    // Then its -1 names the for, and it sends no timeout
+    assert_eq!(failed(&app, wait), [json!("$wait for 70000 is not a ty")]);
+    app.stop();
+}
+
+/// Not a scenario: #109. An each over a field that is absent or not a list fails its step.
+#[test]
+fn each_over_a_field_that_is_not_a_list_fails_its_step() {
+    // Given a flow whose emit step sends one next per item of items
+    let app = App::built_in("each_over_a_field", &failing().unwrap()).unwrap();
+
+    // When events are handed to it whose items is absent, and a string
+    for data in [json!({}), json!({ "items": "a" })] {
+        let event = app.hand(90, &data).unwrap();
+
+        // Then each one's -1 names the field, and no next is sent
+        let reason = json!("each over items, which is not a list");
+        assert_eq!(failed(&app, event), [reason]);
+    }
+    app.stop();
+}
+
+/// Not a scenario: #109. A reply whose wait's next cannot be shaped from it fails, and answers
+/// the wait all the same, so a later reply with the same key runs.
+#[test]
+fn a_reply_a_waits_next_cannot_be_shaped_from_fails_once_and_a_later_reply_runs() {
+    // Given t1's asked event, whose wait for its reply sends one next per item of its items
+    let app = App::built_in("a_reply_a_waits_next", &failing().unwrap()).unwrap();
+    let asked = app.hand(93, &json!({ "ticket": "t1" })).unwrap();
+    assert!(until(WAIT, || app.statuses(asked).contains(&2)));
+    let wait = app.about(asked).into_iter().find(|r| r.1 == 93 && r.2 == 0);
+    let wait = wait.unwrap().0;
+
+    // When t1's reply is handed over with no items
+    let reply = json!({ "ticket": "t1" });
+    let first = app.hand(94, &reply).unwrap();
+
+    // Then its -1 names the wait and the field its next cannot be shaped from
+    let reason = format!("wait {wait}: each over got.items, which is not a list");
+    assert_eq!(failed(&app, first), [json!(reason)]);
+
+    // When a later reply for t1 is handed over, also with no items
+    let later = app.hand(94, &reply).unwrap();
+
+    // Then it runs as if the wait were not there, and the wait sends nothing
+    assert!(until(WAIT, || app.statuses(later).contains(&2)));
+    assert_eq!(app.statuses(later), [1, 2]);
+    assert_eq!(app.sent(wait, 0), Vec::<(i64, Value)>::new());
+    app.stop();
+}
