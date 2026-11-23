@@ -59,7 +59,7 @@ Producers send events with `Sender::send`. To stop, drop any signal sender the a
 
 ## How it fails
 
-- **A hand-over that fails** is logged at `error`, and the batch goes back on the heap ahead of what arrived since; the inbox tries again at its next interval, with no limit. A hand-over fails when the store cannot write the batch, as while another connection holds its write lock past the append's busy timeout. A batch that can never be written therefore stops its inbox: every later hand-over includes it, nothing more from that inbox reaches the disk, and its heap keeps growing. One way to get there is a step whose `$graph` holds an item that is not one of rannoch-graph's ops.
+- **A hand-over that fails** is logged at `error`, and the batch goes back on the heap ahead of what arrived since; the inbox tries again at its next interval, with no limit. A hand-over fails when the store cannot write the batch, as while another connection holds its write lock past the append's busy timeout, or when the append cannot write an item of it. A batch that can never be written therefore stops its inbox: every later hand-over includes it, nothing more from that inbox reaches the disk, and its heap keeps growing. One way to get there is a step whose `$graph` holds an item that is not one of rannoch-graph's ops.
 - **The last hand-over at shutdown** is not retried: if it fails, the failure is logged and its events are lost.
 - **A crash's resend runs the stalled event's flow on that event's data,** because the queue walks back from the resend to the event it resends.
 - **A step that fails** sends the event's -1, its data the step's message, and the queue retries it as above. An event whose `ty` has no flow gets a -1 saying "no processor".
