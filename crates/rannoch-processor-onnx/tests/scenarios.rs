@@ -151,7 +151,7 @@ impl App {
     fn stop(self) {
         drop(self.1);
         self.2.shutdown();
-        self.3.join();
+        assert_eq!(self.3.join(), Ok(()));
     }
 }
 

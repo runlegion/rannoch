@@ -6,7 +6,8 @@
 //! Each event becomes one `_events` row with its fields as given: `id` and `source` as text,
 //! `ty` as its `u16`, `data` as its JSON from serde, `run_at` as RFC 3339 in UTC to the
 //! millisecond, and `status` as its int. This crate only inserts rows; it updates and deletes
-//! none.
+//! none. The one row written to `_events` by anything else is rannoch-queue's -1 for an event
+//! whose `ty` is not the app's, which the app's `Sender` cannot take.
 //!
 //! The append signals once for each batch it commits, whether or not the queue still listens.
 //! The receiver is the queue's: rannoch-queue's `Queue` stops once every sender on that channel

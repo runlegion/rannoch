@@ -253,7 +253,7 @@ fn the_queue_runs_what_is_due() {
 
     drop(signal);
     rannoch.shutdown();
-    queue.join();
+    queue.join().unwrap();
 }
 
 /// Not a scenario: the queue's own memory of what it took. With an hour-long inbox interval each
@@ -306,7 +306,7 @@ fn an_event_taken_before_its_1_is_kept_is_not_taken_again() {
     assert_eq!(*runs.lock().unwrap(), 1, "event {event} ran more than once");
     drop(signal);
     rannoch.shutdown();
-    queue.join();
+    queue.join().unwrap();
 }
 
 /// One row about an event: id, status, data and `run_at`.
@@ -434,7 +434,7 @@ fn a_failing_flow_is_retried_then_binned() {
 
     drop(signal);
     rannoch.shutdown();
-    queue.join();
+    queue.join().unwrap();
 }
 
 /// A row from the app's forgr factory about `source`, with its status and, when given, `run_at`.
@@ -532,7 +532,7 @@ fn the_hunt_reruns_a_dropped_run() {
 
     drop(signal);
     rannoch.shutdown();
-    queue.join();
+    queue.join().unwrap();
 }
 
 #[test]

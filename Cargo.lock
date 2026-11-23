@@ -1337,8 +1337,10 @@ dependencies = [
  "log",
  "rannoch-core",
  "rannoch-events",
+ "rannoch-processor",
  "rannoch-store",
  "rusqlite",
+ "serde_json",
  "uuid",
 ]
 

@@ -6,10 +6,16 @@ FROM _events e WHERE e.status = 0 AND (e.run_at IS NULL OR e.run_at <= ?1)
 AND NOT EXISTS (SELECT 1 FROM _events s WHERE s.source = e.id AND s.status <> 0)
 ORDER BY e.id";
 
-/// The earliest `run_at` after `?1` among the events at status 0 that no status event has taken.
-pub(crate) const NEXT_RUN_AT: &str = "SELECT min(e.run_at) FROM _events e
+/// The id and `run_at` of each event at status 0 that no status event has taken, whose `run_at`
+/// is after `?1`, earliest first.
+pub(crate) const NEXT_RUN_AT: &str = "SELECT e.id, e.run_at FROM _events e
 WHERE e.status = 0 AND e.run_at > ?1
-AND NOT EXISTS (SELECT 1 FROM _events s WHERE s.source = e.id AND s.status <> 0)";
+AND NOT EXISTS (SELECT 1 FROM _events s WHERE s.source = e.id AND s.status <> 0)
+ORDER BY e.run_at";
+
+/// A -1 with the id `?1` about the event `?2`, of `ty` `?3`, whose data is `?4` as a JSON string.
+pub(crate) const BIN: &str = "INSERT INTO _events (id, source, ty, data, run_at, status)
+VALUES (?1, ?2, ?3, json_quote(?4), NULL, -1)";
 
 /// One event by its id.
 pub(crate) const EVENT: &str =
