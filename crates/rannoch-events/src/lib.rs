@@ -29,14 +29,20 @@
 //! items, and that 2 is not written: the append returns in its place a -1 for the 2's source, its
 //! data `store: ` and the store's message, as `store: NOT NULL constraint failed:
 //! payments.amount`, which the inbox sends; the rest of the batch commits, the 2's nexts
-//! included. A deferred foreign key is checked only at commit, after every savepoint, so a row
-//! that breaks one fails its whole batch.
+//! included. A row holding an integer above `i64::MAX`, or a number that is neither an integer
+//! nor a float, is refused the same way, since no INTEGER or REAL holds it exactly, as `store:
+//! 18446744073709551615 cannot be held exactly: payments.amount`. A deferred foreign key is
+//! checked only at commit, after every savepoint, so a row that breaks one fails its whole batch.
 //!
 //! # Failures
 //!
-//! Apart from a 2 whose store row is refused, a batch is written whole or not at all. When an
-//! event's `data` does not serialize, or a row cannot be inserted, as with an id already in
-//! `_events`, the append fails with `Error::Store`, writes nothing, and sends no signal.
+//! An event whose `data` does not serialize is not written, nor, for a 2, are its items: the
+//! append returns in its place a -1 for the event's source, or for the event itself when it has
+//! none, its data `data: ` and serde's message, as `data: key must be a string`, which the inbox
+//! sends; the rest of the batch commits. Apart from that and a 2 whose store row is refused, a
+//! batch is written whole or not at all: when a row cannot be inserted, as with an id already in
+//! `_events`, the append fails with `Error::Store`, writes nothing, and sends no signal. The free
+//! [`append`], which returns no -1, fails the same way on data that does not serialize.
 //!
 //! # Example
 //!
