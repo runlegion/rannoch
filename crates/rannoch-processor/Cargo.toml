@@ -8,6 +8,7 @@ rust-version.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["alloc", "clock"] }
 log = "0.4"
 rannoch-core = { path = "../rannoch-core" }
+rannoch-events = { path = "../rannoch-events" }
 rannoch-queue = { path = "../rannoch-queue" }
 rusqlite = { version = "0.41", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
@@ -16,7 +17,6 @@ uuid = "1"
 
 [dev-dependencies]
 rannoch-core = { path = "../rannoch-core", features = ["testing"] }
-rannoch-events = { path = "../rannoch-events" }
 rannoch-store = { path = "../rannoch-store" }
 uuid = { version = "1", features = ["v7"] }
 

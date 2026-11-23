@@ -59,6 +59,8 @@ pub fn compile(dir: &Path, signatures: &[&str]) {
 #[expect(clippy::too_many_lines, reason = "every check of a doc, in its order")]
 pub fn check(docs: &[(String, FlowDoc)], sigs: &[Sig]) -> Result<String, Vec<String>> {
     let (mut errors, mut flows, empty) = (Vec::new(), Vec::new(), Value::Object(Map::new()));
+    // The app's signatures, then the built-in steps', which one of the app's of the same name hides.
+    let sigs: Vec<&Sig> = sigs.iter().chain(crate::BUILTINS.iter()).collect();
     for (n, (file, flow)) in docs.iter().enumerate() {
         if let Some((first, _)) = docs[..n].iter().find(|(_, f)| f.ty == flow.ty) {
             errors.push(format!(
@@ -356,6 +358,33 @@ mod tests {
         let steps = json!([{ "do": "upper", "next": { "branch": branch } }]);
         let want = "E3 a.json step 0 next: branch on level, which nothing gives";
         assert_eq!(errors("string", &steps), [want]);
+    }
+
+    #[test]
+    fn emit_and_store_are_built_in_and_their_options_are_checked() {
+        let store = json!({ "store": { "table": "t", "row": { "k": "$text" } } });
+        let steps = json!([{ "do": "emit" }, { "do": "store", "with": store }]);
+        let flows = super::check(
+            &[(
+                "a.json".to_owned(),
+                serde_json::from_value(flow(&json!({}), &steps)).unwrap(),
+            )],
+            &[],
+        );
+        assert!(flows.is_ok(), "{flows:?}");
+        let steps = json!([{ "do": "store", "with": { "store": { "table": 1, "row": {} } } }]);
+        let want = "E2 a.json step 0 store: the options for store do not parse: table is number, \
+            not string";
+        assert_eq!(errors("string", &steps), [want]);
+
+        // An app action named emit replaces the built-in.
+        let emit: Vec<Sig> =
+            serde_json::from_value(json!([{ "action": "emit", "takes": { "text": "string" } }]))
+                .unwrap();
+        let a = flow(&json!({}), &json!([{ "do": "emit" }]));
+        let a = ("a.json".to_owned(), serde_json::from_value(a).unwrap());
+        let want = "E3 a.json step 0 emit: emit takes text, which nothing before it gives";
+        assert_eq!(super::check(&[a], &emit).unwrap_err(), [want]);
     }
 
     #[test]

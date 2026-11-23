@@ -15,6 +15,16 @@
 //! [`append_in`] writes a batch inside the caller's transaction, for an append that writes rows
 //! of its own in the same commit, as rannoch-graph's `GraphAppend` does.
 //!
+//! An `Events` made [`with_writes`](Events::with_writes) also writes the store rows that
+//! rannoch-processor's `store` step carries in its [`Writes`]: for each 2 in the batch,
+//! [`taking`] takes the items under the 2's source, as rannoch-graph's `GraphAppend` does, and
+//! [`store_in`] inserts each [`StoreRow`] in the batch's transaction, so every 2 has its rows. An
+//! item with a `store` key that is not a `StoreRow` fails the batch, and an item with none, as a
+//! graph `Op`, is not written. A batch that fails puts the items back for its retry. The row is
+//! inserted with `INSERT OR IGNORE`, so T's own keys decide whether a rerun adds a row: a string
+//! is bound as text, an integer or a float as an integer or a real, a bool as 0 or 1, null as
+//! NULL, and an array or an object as its JSON text.
+//!
 //! # Failures
 //!
 //! A batch is written whole or not at all. When an event's `data` does not serialize, or a row
@@ -101,22 +111,64 @@
 
 mod queries;
 
+use std::collections::HashMap;
 use std::sync::mpsc::Sender;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use chrono::SecondsFormat;
-use rannoch_core::{Append, Error, Event};
-use rusqlite::{Connection, params};
-use serde::Serialize;
+use rannoch_core::{Append, Error, Event, Status};
+use rusqlite::types::Value as Sql;
+use rusqlite::{CachedStatement, Connection, params, params_from_iter};
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+use uuid::Uuid;
 /// Where this crate's migratr migrations directory is, for the app's `build.rs`.
 pub const MIGRATIONS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/migrations");
 
+/// rannoch-processor's graph writes and store rows by the id of the event they are about, until
+/// the append that carries its 2 takes them.
+pub type Writes = Arc<Mutex<HashMap<Uuid, Vec<Value>>>>;
+
+/// The row rannoch-processor's `store` step carries to the append that writes its event's 2,
+/// `{"store": {"table": T, "row": {column: value}}}`; any other field is refused.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase", deny_unknown_fields)]
+pub enum StoreRow {
+    /// One row into `table`.
+    Store {
+        /// The table.
+        table: String,
+        /// The row's values, by column.
+        row: Map<String, Value>,
+    },
+}
+
+impl StoreRow {
+    /// The `INSERT OR IGNORE` of the row, a parameter for each column in order, prepared on
+    /// `conn` and not run; each name is quoted.
+    /// # Errors
+    /// The store's error, as `no such table: <table>` or `table <table> has no column named
+    /// <column>`.
+    pub fn insert<'c>(&self, conn: &'c Connection) -> rusqlite::Result<CachedStatement<'c>> {
+        let Self::Store { table, row } = self;
+        let quote = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
+        let columns: Vec<String> = row.keys().map(|c| quote(c)).collect();
+        let (columns, marks) = (columns.join(", "), vec!["?"; row.len()].join(", "));
+        let sql = format!(
+            "INSERT OR IGNORE INTO {} ({columns}) VALUES ({marks})",
+            quote(table)
+        );
+        conn.prepare_cached(&sql)
+    }
+}
+
 /// The events crate's append for the app's `Config`: the connection it
-/// writes `_events` through and the queue it signals.
+/// writes `_events` through, the queue it signals and the store rows it writes.
 #[derive(Debug)]
 pub struct Events {
     conn: Mutex<Connection>,
     queue: Sender<()>,
+    writes: Writes,
 }
 
 impl Events {
@@ -126,15 +178,49 @@ impl Events {
         Self {
             conn: Mutex::new(conn),
             queue,
+            writes: Writes::default(),
         }
+    }
+
+    /// The append, writing with each 2 the store rows rannoch-processor's `writes` holds under
+    /// the 2's source.
+    #[must_use]
+    pub fn with_writes(self, writes: Writes) -> Self {
+        Self { writes, ..self }
     }
 }
 
 impl<T: Copy + Into<u16>, D: Serialize> Append<T, D> for Events {
     fn append(&self, batch: &[Event<T, D>]) -> Result<(), Error> {
         let mut conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
-        append(&mut conn, batch, &self.queue)
+        taking(&self.writes, batch, |taken| {
+            commit(&mut conn, batch, taken.iter().flat_map(|(_, items)| items))
+        })?;
+        let _ = self.queue.send(());
+        Ok(())
     }
+}
+
+/// Takes the items `writes` holds under the source of each 2 in `batch` and hands them to
+/// `commit`. When it fails they go back for the batch's retry; a rerun's newer items stay.
+/// # Errors
+/// `commit`'s.
+pub fn taking<T, D, R>(
+    writes: &Writes,
+    batch: &[Event<T, D>],
+    commit: impl FnOnce(&[(Uuid, Vec<Value>)]) -> Result<R, Error>,
+) -> Result<R, Error> {
+    let held = || writes.lock().unwrap_or_else(PoisonError::into_inner);
+    let twos = batch.iter().filter(|e| e.status == Status::Processed);
+    // Held only to take them, so steps keep putting their writes while this batch commits.
+    let taken: Vec<_> = twos
+        .filter_map(|e| held().remove_entry(&e.source?))
+        .collect();
+    let done = commit(&taken);
+    for (source, items) in taken.into_iter().filter(|_| done.is_err()) {
+        held().entry(source).or_insert(items);
+    }
+    done
 }
 
 /// Appends `batch` to `_events` in one write, each event as one row with its
@@ -153,12 +239,51 @@ where
     T: Copy + Into<u16>,
     D: Serialize,
 {
-    let tx = conn.transaction().map_err(|_| Error::Store)?;
-    append_in(&tx, batch)?;
-    tx.commit().map_err(|_| Error::Store)?;
+    commit(conn, batch, [])?;
     // The events are kept whether or not the queue is still listening.
     let _ = queue.send(());
     Ok(())
+}
+
+/// `batch` and the store rows among `items` in one transaction; the other items are not written.
+fn commit<'i, T: Copy + Into<u16>, D: Serialize>(
+    conn: &mut Connection,
+    batch: &[Event<T, D>],
+    items: impl IntoIterator<Item = &'i Value>,
+) -> Result<(), Error> {
+    let tx = conn.transaction().map_err(|_| Error::Store)?;
+    append_in(&tx, batch)?;
+    for item in items {
+        store_in(&tx, item)?;
+    }
+    tx.commit().map_err(|_| Error::Store)
+}
+
+/// Inserts `item` on `conn` when it has a `store` key, as a [`StoreRow`], so T's own keys decide
+/// whether it adds a row: true; false for an item with no `store` key, left to the caller.
+/// # Errors
+/// `Error::Store` for an item with a `store` key that is not a `StoreRow`, or a table or a column
+/// the store does not have.
+pub fn store_in(conn: &Connection, item: &Value) -> Result<bool, Error> {
+    if item.get("store").is_none() {
+        return Ok(false);
+    }
+    let stored = StoreRow::deserialize(item).map_err(|_| Error::Store)?;
+    let StoreRow::Store { row, .. } = &stored;
+    let values = row.values().map(|value| match value {
+        Value::Null => Sql::Null,
+        Value::Bool(b) => Sql::Integer(i64::from(*b)),
+        Value::Number(n) => n
+            .as_i64()
+            .map_or(Sql::Real(n.as_f64().unwrap_or_default()), Sql::Integer),
+        Value::String(s) => Sql::Text(s.clone()),
+        value => Sql::Text(value.to_string()),
+    });
+    let mut insert = stored.insert(conn).map_err(|_| Error::Store)?;
+    insert
+        .execute(params_from_iter(values))
+        .map_err(|_| Error::Store)?;
+    Ok(true)
 }
 
 /// Appends `batch` to `_events` inside `tx`; the caller commits and signals the queue.
@@ -191,9 +316,11 @@ pub fn append_in<T: Copy + Into<u16>, D: Serialize>(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, mpsc};
 
-    use rannoch_core::{Error, Event, Status};
+    use rannoch_core::{Append, Error, Event, Status};
+    use serde_json::json;
     use uuid::Uuid;
 
     use super::{Events, append};
@@ -244,10 +371,69 @@ mod tests {
         let events = Events::new(rannoch_core::forgr::empty_store(), queue);
         let batch = [event(Uuid::now_v7()), event(Uuid::now_v7())];
 
-        rannoch_core::Append::append(&events, &batch).unwrap();
+        Append::append(&events, &batch).unwrap();
 
         assert_eq!(count(&events.conn.lock().unwrap()), 2);
         assert_eq!(signals.try_recv(), Ok(()));
+    }
+
+    #[test]
+    fn with_writes_inserts_each_2s_store_rows_and_a_failed_batch_puts_them_back() {
+        let store = rannoch_core::forgr::empty_store();
+        let sql = "CREATE TABLE t (k TEXT PRIMARY KEY, n INTEGER, b INTEGER, l TEXT, z TEXT)";
+        store.execute_batch(sql).unwrap();
+        let (queue, signals) = mpsc::channel();
+        let writes = Arc::new(Mutex::new(HashMap::new()));
+        let row = json!({ "k": "a", "n": 2, "b": true, "l": [1], "z": null });
+        let item = |table| json!({ "store": { "table": table, "row": row } });
+        let op = json!({ "set": { "node": "a", "key": "k", "value": 1 } });
+        let two = |source| Event {
+            source: Some(source),
+            status: Status::Processed,
+            ..event(Uuid::now_v7())
+        };
+        let events = Events::new(store, queue).with_writes(writes.clone());
+        let rows = |events: &Events| {
+            let conn = events.conn.lock().unwrap();
+            let sql = "SELECT k, n, b, l, z FROM t";
+            let mut rows = conn.prepare(sql).unwrap();
+            let rows = rows.query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            });
+            let rows: Vec<(String, i64, i64, String, Option<String>)> =
+                rows.unwrap().collect::<rusqlite::Result<_>>().unwrap();
+            rows
+        };
+
+        // Two 2s, each of a source holding a store row of key a and a graph Op: the first's row is
+        // written, the second's adds none, and neither's Op is written.
+        for _ in 0..2 {
+            let source = Uuid::now_v7();
+            writes
+                .lock()
+                .unwrap()
+                .insert(source, vec![item("t"), op.clone()]);
+            Append::append(&events, &[two(source)]).unwrap();
+            assert_eq!(signals.try_recv(), Ok(()));
+        }
+        let a = ("a".to_owned(), 2, 1, "[1]".to_owned(), None);
+        assert_eq!(rows(&events), [a]);
+        assert!(writes.lock().unwrap().is_empty());
+
+        // A store row into a table the store does not have fails the batch, which puts it back.
+        let source = Uuid::now_v7();
+        writes.lock().unwrap().insert(source, vec![item("nope")]);
+        let failed = Append::append(&events, &[event(Uuid::now_v7()), two(source)]);
+        assert_eq!(failed, Err(Error::Store));
+        assert!(signals.try_recv().is_err());
+        assert_eq!(count(&events.conn.lock().unwrap()), 2);
+        assert_eq!(writes.lock().unwrap()[&source], [item("nope")]);
+
+        // An item with a store key that is not a StoreRow fails the batch the same way.
+        let near = Uuid::now_v7();
+        let item = json!({ "store": { "table": "t" } });
+        writes.lock().unwrap().insert(near, vec![item]);
+        assert_eq!(Append::append(&events, &[two(near)]), Err(Error::Store));
     }
 
     #[test]
