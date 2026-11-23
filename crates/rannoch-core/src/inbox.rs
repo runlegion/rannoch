@@ -44,7 +44,7 @@ impl<T, D> Inbox<T, D> {
 
 /// Inbox `index`'s thread: on each interval it hands over its heap; when
 /// `stop` closes, it hands over what is left and returns.
-pub(crate) fn run<T, D>(
+pub(crate) fn run<T: PartialEq, D>(
     broker: &Shared<T, D>,
     index: usize,
     every: Duration,
@@ -60,15 +60,20 @@ pub(crate) fn run<T, D>(
     }
 }
 
-/// Hands inbox `index`'s heap to `append` as one batch; a batch that fails is
-/// logged and goes back on the heap, ahead of what arrived since.
-fn hand_over<T, D>(broker: &Shared<T, D>, index: usize, append: &dyn Append<T, D>) {
+/// Hands inbox `index`'s heap to `append` as one batch and sends the events it replies with; a
+/// batch that fails is logged and goes back on the heap, ahead of what arrived since.
+fn hand_over<T: PartialEq, D>(broker: &Shared<T, D>, index: usize, append: &dyn Append<T, D>) {
     let batch = mem::take(&mut lock(broker).inboxes[index].heap);
     if batch.is_empty() {
         return;
     }
-    if append.append(&batch).is_ok() {
+    if let Ok(replies) = append.append(&batch) {
         log::debug!("handed over {} events from inbox {index}", batch.len());
+        for reply in replies {
+            if let Err(e) = lock(broker).send(reply) {
+                log::error!("inbox {index} could not send a reply: {e}");
+            }
+        }
     } else {
         log::error!(
             "inbox {index} could not hand over {} events: {}",
@@ -122,13 +127,13 @@ mod tests {
     }
 
     impl Append<u8, ()> for Recorder {
-        fn append(&self, batch: &[Event<u8, ()>]) -> Result<(), Error> {
+        fn append(&self, batch: &[Event<u8, ()>]) -> Result<Vec<Event<u8, ()>>, Error> {
             if *self.failing.lock().unwrap() {
                 return Err(Error::Store);
             }
             let statuses = batch.iter().map(|e| e.status).collect();
             self.batches.lock().unwrap().push(statuses);
-            Ok(())
+            Ok(Vec::new())
         }
     }
 

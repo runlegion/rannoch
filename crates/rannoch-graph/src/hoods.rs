@@ -253,7 +253,7 @@ mod tests {
         let run = |conn: &mut Connection, hoods: &mut Hoods| {
             let mut recomputes = 0;
             for write in &burst {
-                let touched = commit(conn, none, std::slice::from_ref(write)).unwrap();
+                let (_, touched) = commit(conn, none, std::slice::from_ref(write)).unwrap();
                 recomputes += hoods.rewarm(conn, &touched);
             }
             recomputes

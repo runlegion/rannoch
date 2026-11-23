@@ -15,6 +15,10 @@
 //! as one batch once per interval, so a sent event reaches the append at its inbox's next
 //! hand-over. The default inbox's interval is 20 ms in [`Config::default`].
 //!
+//! The append returns the events it sends in reply, as a -1 for an event of the batch it did not
+//! write, and the inbox sends each as [`Sender::send`] does: to the inbox for its `ty`, and not
+//! once rannoch is shutting down, when the failure is logged at `error`.
+//!
 //! When the append fails, the inbox logs the failure at `error`, puts the batch back on its heap
 //! ahead of the events sent since, and hands all of them over again at its next interval. With
 //! rannoch-events' `Events`, which writes a batch in one transaction, a batch that always fails

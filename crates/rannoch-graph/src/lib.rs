@@ -138,12 +138,14 @@
 //! and they become current.
 //!
 //! A store row that rannoch-processor's `store` step carries, `{"store": {"table": T, "row":
-//! {..}}}`, is not an `Op`: rannoch-events' `store_in` inserts it in the same transaction. Any
-//! other item that does not parse as an `Op` fails the append with [`Error::Store`]: nothing in the
-//! batch is written, and `Writes` gets the batch's items back, unless that same event has items
-//! there again by then. Rannoch's inbox puts the failed batch back ahead of later events and
-//! tries it again each interval, so while the bad item is in it, nothing more from that inbox is
-//! written.
+//! {..}}}`, is not an `Op`: rannoch-events' `write_in` inserts it in the same transaction, each
+//! 2's items inside a savepoint. When T refuses it, that 2's rows are rolled back and the 2 is not
+//! written; the append returns a -1 for its source naming the reason, which the inbox sends, and
+//! the rest of the batch commits. Any other item that does not parse as an `Op` fails the append
+//! with [`Error::Store`]: nothing in the batch is written, and `Writes` gets the batch's items
+//! back, unless that same event has items there again by then. Rannoch's inbox puts the failed
+//! batch back ahead of later events and tries it again each interval, so while the bad item is in
+//! it, nothing more from that inbox is written.
 //!
 //! # What the reads return: now, as of T and why
 //!
@@ -419,50 +421,55 @@ impl GraphAppend {
     }
 }
 
-impl<T: Copy + Into<u16>, D: Serialize> Append<T, D> for GraphAppend {
-    fn append(&self, batch: &[Event<T, D>]) -> Result<(), Error> {
+impl<T: Copy + Into<u16>, D: Serialize + From<String>> Append<T, D> for GraphAppend {
+    fn append(&self, batch: &[Event<T, D>]) -> Result<Vec<Event<T, D>>, Error> {
         let mut conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
-        let touched = rannoch_events::taking(&self.writes, batch, |t| commit(&mut conn, batch, t))?;
+        let (replies, touched) =
+            rannoch_events::taking(&self.writes, batch, |t| commit(&mut conn, batch, t))?;
         if let Some(hoods) = &self.hoods {
             let mut hoods = hoods.lock().unwrap_or_else(PoisonError::into_inner);
             hoods.rewarm(&conn, &touched);
         }
         let _ = self.queue.send(());
-        Ok(())
+        Ok(replies)
     }
 }
 
-/// `batch` and the rows `taken` for its 2s, stamped with each 2's source, in one transaction;
-/// the nodes of the rows it added.
-fn commit<T: Copy + Into<u16>, D: Serialize>(
+/// The -1s an append returns, and the nodes of the rows it added.
+type Committed<T, D> = (Vec<Event<T, D>>, HashSet<String>);
+
+/// `batch` and the rows `taken` for its 2s, stamped with each 2's source, in one transaction,
+/// with rannoch-events' `write_in`: the -1s it returns, and the nodes of the rows it added.
+fn commit<T: Copy + Into<u16>, D: Serialize + From<String>>(
     conn: &mut Connection,
     batch: &[Event<T, D>],
     taken: &[(Uuid, Vec<Value>)],
-) -> Result<HashSet<String>, Error> {
+) -> Result<Committed<T, D>, Error> {
     let since = UNIX_EPOCH.elapsed().unwrap_or_default().as_millis();
     let written = i64::try_from(since).unwrap_or(i64::MAX);
-    let tx = conn.transaction().map_err(|_| Error::Store)?;
-    rannoch_events::append_in(&tx, batch)?;
-    let mut touched = HashSet::new();
-    for (source, items) in taken {
-        let event = source.to_string();
-        for item in items {
-            if rannoch_events::store_in(&tx, item)? {
-                continue;
-            }
-            let op = Op::deserialize(item).map_err(|_| Error::Store)?;
-            if write(&tx, &event, &op, written).map_err(|_| Error::Store)? == 1 {
-                match op {
-                    Op::Set { node, .. } | Op::Retract { node, .. } => touched.extend([node]),
-                    Op::Link { src, dst, .. } | Op::Unlink { src, dst, .. } => {
-                        touched.extend([src, dst]);
-                    }
+    let mut tx = conn.transaction().map_err(|_| Error::Store)?;
+    let mut touched = Vec::new();
+    let replies = rannoch_events::write_in(&mut tx, batch, taken, |tx, source, item| {
+        let op = Op::deserialize(item).map_err(|_| Error::Store)?;
+        if write(tx, &source.to_string(), &op, written).map_err(|_| Error::Store)? == 1 {
+            match op {
+                Op::Set { node, .. } | Op::Retract { node, .. } => touched.push((*source, node)),
+                Op::Link { src, dst, .. } | Op::Unlink { src, dst, .. } => {
+                    touched.extend([(*source, src), (*source, dst)]);
                 }
             }
         }
-    }
+        Ok(())
+    })?;
     tx.commit().map_err(|_| Error::Store)?;
-    Ok(touched)
+    // A source whose rows were rolled back touched nothing.
+    let added = touched.into_iter().filter(|(source, _)| {
+        !replies
+            .iter()
+            .any(|binned: &Event<T, D>| binned.source == Some(*source))
+    });
+    let added = added.map(|(_, node)| node).collect();
+    Ok((replies, added))
 }
 
 /// Adds `op`'s row, stamped with `event` and `written`; a row its key already holds stays.

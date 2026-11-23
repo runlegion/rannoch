@@ -30,13 +30,14 @@ pub trait Storage: fmt::Debug + Send + Sync {
 /// What core needs from the events crate: the append each inbox hands its
 /// batch to.
 pub trait Append<T, D>: fmt::Debug + Send + Sync {
-    /// Appends `batch` as one write.
+    /// Appends `batch` as one write, and returns the events it sends in reply, such as a -1 for
+    /// an event of the batch it did not write; the inbox sends each as [`Sender::send`] does.
     ///
     /// # Errors
     ///
     /// `Store` when the write fails. The inbox then logs the failure, puts the batch back on its
     /// heap ahead of the events sent since, and hands all of them over at its next interval.
-    fn append(&self, batch: &[Event<T, D>]) -> Result<(), Error>;
+    fn append(&self, batch: &[Event<T, D>]) -> Result<Vec<Event<T, D>>, Error>;
 }
 
 /// The app's configuration: its inboxes, the default inbox's batch interval,
@@ -84,6 +85,21 @@ pub(crate) struct Broker<T, D> {
     /// The default inbox first, then the configured inboxes.
     pub(crate) inboxes: Vec<Inbox<T, D>>,
     pub(crate) closed: bool,
+}
+
+impl<T: PartialEq, D> Broker<T, D> {
+    /// Passes `event` to the inbox for its `ty`, or to the default inbox when no inbox lists it.
+    pub(crate) fn send(&mut self, event: Event<T, D>) -> Result<Status, Error> {
+        if self.closed {
+            return Err(Error::Closed);
+        }
+        let index = self
+            .inboxes
+            .iter()
+            .position(|inbox| inbox.types.contains(&event.ty))
+            .unwrap_or(0);
+        Ok(self.inboxes[index].accept(event))
+    }
 }
 
 pub(crate) type Shared<T, D> = Arc<Mutex<Broker<T, D>>>;
@@ -212,16 +228,7 @@ impl<T: PartialEq, D> Sender<T, D> {
     ///
     /// `Closed` when rannoch is shutting down.
     pub fn send(&self, event: Event<T, D>) -> Result<Status, Error> {
-        let mut broker = lock(&self.broker);
-        if broker.closed {
-            return Err(Error::Closed);
-        }
-        let index = broker
-            .inboxes
-            .iter()
-            .position(|inbox| inbox.types.contains(&event.ty))
-            .unwrap_or(0);
-        Ok(broker.inboxes[index].accept(event))
+        lock(&self.broker).send(event)
     }
 }
 
@@ -384,13 +391,16 @@ mod tests {
     }
 
     impl Append<Ty, &'static str> for Recorder {
-        fn append(&self, batch: &[Event<Ty, &'static str>]) -> Result<(), Error> {
+        fn append(
+            &self,
+            batch: &[Event<Ty, &'static str>],
+        ) -> Result<Vec<Event<Ty, &'static str>>, Error> {
             if *self.failing.lock().unwrap() {
                 return Err(Error::Store);
             }
             let tys = batch.iter().map(|e| e.ty).collect();
             self.batches.lock().unwrap().push(tys);
-            Ok(())
+            Ok(Vec::new())
         }
     }
 

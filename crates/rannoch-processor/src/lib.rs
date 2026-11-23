@@ -255,9 +255,10 @@
 //!   it in the same transaction with `INSERT ... ON CONFLICT DO NOTHING`, so T's own keys decide
 //!   whether a rerun adds a row and a flow that fails writes none. A table or a column the store
 //!   does not have fails the step, as `store: no such table: <T>` or `store: table <T> has no
-//!   column named <column>`, and leaves the batch alone. A row that breaks any other constraint
-//!   of T, as NOT NULL or CHECK, passes the step and fails the append of the batch that holds the
-//!   2, which goes back for its retry as any batch that cannot be written.
+//!   column named <column>`, and leaves the batch alone. A row T refuses, by a NOT NULL, CHECK,
+//!   foreign key or type rule or a trigger, passes the step; the append rolls it back with the
+//!   event's 2, a -1 for the event is sent in their place, its data `store: ` and the store's
+//!   message, and the rest of the batch commits. The queue does not retry that event.
 //!
 //! # What `check` reports
 //!
@@ -1035,14 +1036,17 @@ mod tests {
     #[derive(Debug, Default)]
     struct Kept(Mutex<Sent>);
     impl Append<u16, Value> for Kept {
-        fn append(&self, batch: &[Event<u16, Value>]) -> Result<(), rannoch_core::Error> {
+        fn append(
+            &self,
+            batch: &[Event<u16, Value>],
+        ) -> Result<Vec<Event<u16, Value>>, rannoch_core::Error> {
             let mut kept = self.0.lock().unwrap();
             kept.extend(
                 batch
                     .iter()
                     .map(|e| (e.ty, e.source, e.status as i8, e.data.clone())),
             );
-            Ok(())
+            Ok(Vec::new())
         }
     }
 

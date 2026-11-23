@@ -138,12 +138,12 @@ fn fr_rannoch_010_c2() {
 }
 
 /// An event as the app sends it, with no source.
-fn event() -> Event<u8, ()> {
+fn event() -> Event<u8, String> {
     Event {
         id: Uuid::nil(),
         source: None,
         ty: 0,
-        data: (),
+        data: String::new(),
         run_at: None,
         status: Status::Added,
     }
@@ -164,9 +164,9 @@ fn events_in(path: &Path) -> Result<i64> {
 
 /// Rannoch with one default inbox at `interval`, handing over to `append`.
 fn open_with(
-    append: Arc<dyn Append<u8, ()>>,
+    append: Arc<dyn Append<u8, String>>,
     interval: TimeDelta,
-) -> std::result::Result<Rannoch<u8, ()>, Error> {
+) -> std::result::Result<Rannoch<u8, String>, Error> {
     Rannoch::open(Config {
         default_interval: interval,
         append: Some(append),
@@ -252,8 +252,11 @@ struct Flaky {
     events: Arc<Events>,
 }
 
-impl Append<u8, ()> for Flaky {
-    fn append(&self, batch: &[Event<u8, ()>]) -> std::result::Result<(), Error> {
+impl Append<u8, String> for Flaky {
+    fn append(
+        &self,
+        batch: &[Event<u8, String>],
+    ) -> std::result::Result<Vec<Event<u8, String>>, Error> {
         if self.failing.load(Ordering::SeqCst) {
             Err(Error::Store)
         } else {
@@ -450,7 +453,7 @@ fn an_app_opens_rannoch_over_its_database() {
     let newest = missing_newest(&path).unwrap();
 
     // When the app opens rannoch with its store
-    let opened = Rannoch::<u8, ()>::open(Config {
+    let opened = Rannoch::<u8, String>::open(Config {
         store: Some(Arc::new(Store::new(path.clone(), rannoch_core::migrator()))),
         ..Config::default()
     })
@@ -479,7 +482,7 @@ fn an_app_opens_rannoch_over_its_database() {
     held.query_row("SELECT count(*) FROM _events", [], |r| r.get::<_, i64>(0))
         .unwrap();
     let (queue, _signals) = mpsc::channel();
-    let rannoch = Rannoch::<u8, ()>::open(Config {
+    let rannoch = Rannoch::<u8, String>::open(Config {
         store: Some(Arc::new(Store::new(path.clone(), rannoch_core::migrator()))),
         append: Some(Arc::new(Events::new(conn, queue))),
         ..Config::default()
@@ -534,14 +537,18 @@ struct Timed {
     send_to_commit: Mutex<Vec<u64>>,
 }
 
-impl Append<u8, u64> for Timed {
-    fn append(&self, batch: &[Event<u8, u64>]) -> std::result::Result<(), Error> {
-        let appended = Append::<u8, u64>::append(&self.events, batch);
+impl Append<u8, String> for Timed {
+    fn append(
+        &self,
+        batch: &[Event<u8, String>],
+    ) -> std::result::Result<Vec<Event<u8, String>>, Error> {
+        let appended = Append::<u8, String>::append(&self.events, batch);
         let committed = nanos();
         if appended.is_ok()
             && let Ok(mut times) = self.send_to_commit.lock()
         {
-            times.extend(batch.iter().map(|e| committed.saturating_sub(e.data)));
+            let sent = |e: &Event<u8, String>| e.data.parse().unwrap_or(committed);
+            times.extend(batch.iter().map(|e| committed.saturating_sub(sent(e))));
         }
         appended
     }
@@ -552,7 +559,7 @@ impl Append<u8, u64> for Timed {
 /// the four values; rannoch open over it with
 /// the timed append.
 /// Rannoch over a kept history, the store it runs on, and its timed append.
-type Kept = (Rannoch<u8, u64>, Arc<Store>, Arc<Timed>);
+type Kept = (Rannoch<u8, String>, Arc<Store>, Arc<Timed>);
 
 fn history_kept(name: &str) -> Result<Kept> {
     let path = database(name)?;
@@ -586,18 +593,18 @@ fn history_kept(name: &str) -> Result<Kept> {
     });
     let rannoch = Rannoch::open(Config {
         store: Some(store.clone()),
-        append: Some(timed.clone() as Arc<dyn Append<u8, u64>>),
+        append: Some(timed.clone() as Arc<dyn Append<u8, String>>),
         ..Config::default()
     })?;
     Ok((rannoch, store, timed))
 }
 
-fn sent_now(n: u64) -> Event<u8, u64> {
+fn sent_now(n: u64) -> Event<u8, String> {
     Event {
         id: Uuid::nil(),
         source: None,
         ty: u8::try_from(n % 8).unwrap_or(0),
-        data: nanos(),
+        data: nanos().to_string(),
         run_at: None,
         status: Status::Added,
     }

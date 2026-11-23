@@ -12,25 +12,28 @@
 //! The receiver is the queue's: rannoch-queue's `Queue` stops once every sender on that channel
 //! has dropped, and the sender in an [`Events`] drops when that `Events` does.
 //!
-//! [`append_in`] writes a batch inside the caller's transaction, for an append that writes rows
-//! of its own in the same commit, as rannoch-graph's `GraphAppend` does.
+//! [`write_in`] writes a batch and its 2s' items inside the caller's transaction, for an append
+//! that writes rows of its own in the same commit, as rannoch-graph's `GraphAppend` does.
 //!
 //! An `Events` made [`with_writes`](Events::with_writes) also writes the store rows that
 //! rannoch-processor's `store` step carries in its [`Writes`]: for each 2 in the batch,
 //! [`taking`] takes the items under the 2's source, as rannoch-graph's `GraphAppend` does, and
-//! [`store_in`] inserts each [`StoreRow`] in the batch's transaction, so every 2 has its rows. An
+//! [`write_in`] inserts each [`StoreRow`] in the batch's transaction, so every 2 has its rows. An
 //! item with a `store` key that is not a `StoreRow` fails the batch, and an item with none, as a
 //! graph `Op`, is not written. A batch that fails puts the items back for its retry. The row is
 //! inserted with `INSERT ... ON CONFLICT DO NOTHING`, so T's own keys decide whether a rerun adds
 //! a row: a string is bound as text, an integer or a float as an integer or a real, a bool as 0
-//! or 1, null as NULL, and an array or an object as its JSON text. A row that breaks any other
-//! constraint of T, as NOT NULL or CHECK, fails the batch.
+//! or 1, null as NULL, and an array or an object as its JSON text. A row T refuses, by a NOT
+//! NULL, CHECK, foreign key or type rule or a trigger, is rolled back with the rest of its 2's
+//! items, and that 2 is not written: the append returns in its place a -1 for the 2's source, its
+//! data `store: ` and the store's message, as `store: NOT NULL constraint failed:
+//! payments.amount`, which the inbox sends; the rest of the batch commits.
 //!
 //! # Failures
 //!
-//! A batch is written whole or not at all. When an event's `data` does not serialize, or a row
-//! cannot be inserted, as with an id already in `_events`, the append fails with
-//! `Error::Store`, writes nothing, and sends no signal.
+//! Apart from a 2 whose store row is refused, a batch is written whole or not at all. When an
+//! event's `data` does not serialize, or a row cannot be inserted, as with an id already in
+//! `_events`, the append fails with `Error::Store`, writes nothing, and sends no signal.
 //!
 //! # Example
 //!
@@ -98,7 +101,7 @@
 //!
 //!     // A batch holding an id already written fails whole: nothing written, no signal.
 //!     let failed = events.append(&[page(Uuid::now_v7()), page(first)]);
-//!     assert_eq!(failed, Err(rannoch_core::Error::Store));
+//!     assert_eq!(failed.err(), Some(rannoch_core::Error::Store));
 //!     assert!(wake.try_recv().is_err());
 //!
 //!     let rows: i64 = ready(&path)?.query_row("SELECT count(*) FROM _events", [], |r| r.get(0))?;
@@ -119,7 +122,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use chrono::SecondsFormat;
 use rannoch_core::{Append, Error, Event, Status};
 use rusqlite::types::Value as Sql;
-use rusqlite::{CachedStatement, Connection, params, params_from_iter};
+use rusqlite::{CachedStatement, Connection, ErrorCode, Transaction, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use uuid::Uuid;
@@ -191,14 +194,17 @@ impl Events {
     }
 }
 
-impl<T: Copy + Into<u16>, D: Serialize> Append<T, D> for Events {
-    fn append(&self, batch: &[Event<T, D>]) -> Result<(), Error> {
+impl<T: Copy + Into<u16>, D: Serialize + From<String>> Append<T, D> for Events {
+    fn append(&self, batch: &[Event<T, D>]) -> Result<Vec<Event<T, D>>, Error> {
         let mut conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
-        taking(&self.writes, batch, |taken| {
-            commit(&mut conn, batch, taken.iter().flat_map(|(_, items)| items))
+        let replies = taking(&self.writes, batch, |taken| {
+            let mut tx = conn.transaction().map_err(|_| Error::Store)?;
+            let replies = write_in(&mut tx, batch, taken, |_, _, _| Ok(()))?;
+            tx.commit().map_err(|_| Error::Store)?;
+            Ok(replies)
         })?;
         let _ = self.queue.send(());
-        Ok(())
+        Ok(replies)
     }
 }
 
@@ -240,36 +246,89 @@ where
     T: Copy + Into<u16>,
     D: Serialize,
 {
-    commit(conn, batch, [])?;
+    let tx = conn.transaction().map_err(|_| Error::Store)?;
+    append_in(&tx, batch)?;
+    tx.commit().map_err(|_| Error::Store)?;
     // The events are kept whether or not the queue is still listening.
     let _ = queue.send(());
     Ok(())
 }
 
-/// `batch` and the store rows among `items` in one transaction; the other items are not written.
-fn commit<'i, T: Copy + Into<u16>, D: Serialize>(
-    conn: &mut Connection,
+/// Writes `batch` in `tx` with the items `taken` for its 2s, each 2's items inside a savepoint of
+/// their own: a `store` row with `ON CONFLICT DO NOTHING`, so T's own keys decide whether it adds
+/// a row, and any other item with `other`, which gets the 2's source. When T refuses a store row,
+/// by any of its constraints, the savepoint is rolled back and that 2 is not written: returned in
+/// its place is a -1 for its source, its data naming the reason, for the caller to send. The
+/// caller commits.
+/// # Errors
+/// `Error::Store` when an event cannot be inserted, `other` fails, or a store row fails for a
+/// reason other than a constraint, as an item with a `store` key that is not a [`StoreRow`], or a
+/// table or a column the store does not have.
+pub fn write_in<T, D>(
+    tx: &mut Transaction<'_>,
     batch: &[Event<T, D>],
-    items: impl IntoIterator<Item = &'i Value>,
-) -> Result<(), Error> {
-    let tx = conn.transaction().map_err(|_| Error::Store)?;
-    append_in(&tx, batch)?;
-    for item in items {
-        store_in(&tx, item)?;
+    taken: &[(Uuid, Vec<Value>)],
+    mut other: impl FnMut(&Connection, &Uuid, &Value) -> Result<(), Error>,
+) -> Result<Vec<Event<T, D>>, Error>
+where
+    T: Copy + Into<u16>,
+    D: Serialize + From<String>,
+{
+    let mut refused = Vec::new();
+    for (source, items) in taken {
+        let point = tx.savepoint().map_err(|_| Error::Store)?;
+        let written = items.iter().try_for_each(|item| {
+            if store_in(&point, item)? {
+                return Ok(());
+            }
+            other(&point, source, item).map_err(|_| Unwritten::Failed)
+        });
+        let ended = match written {
+            Ok(()) => point.commit(),
+            Err(Unwritten::Failed) => return Err(Error::Store),
+            Err(Unwritten::Refused(reason)) => {
+                refused.push((*source, reason));
+                // A savepoint finishes by rolling back to where it began.
+                point.finish()
+            }
+        };
+        ended.map_err(|_| Error::Store)?;
     }
-    tx.commit().map_err(|_| Error::Store)
+    let two_of =
+        |e: &Event<T, D>, source| e.status == Status::Processed && e.source == Some(source);
+    let kept = batch
+        .iter()
+        .filter(|e| !refused.iter().any(|(s, _)| two_of(e, *s)));
+    append_in(tx, kept)?;
+    let binned = refused.into_iter().filter_map(|(source, reason)| {
+        let two = batch.iter().find(|e| two_of(e, source))?;
+        Some(Event {
+            id: Uuid::nil(),
+            source: Some(source),
+            ty: two.ty,
+            data: D::from(reason),
+            run_at: None,
+            status: Status::Binned,
+        })
+    });
+    Ok(binned.collect())
 }
 
-/// Inserts `item` on `conn` when it has a `store` key, as a [`StoreRow`], so T's own keys decide
-/// whether it adds a row: true; false for an item with no `store` key, left to the caller.
-/// # Errors
-/// `Error::Store` for an item with a `store` key that is not a `StoreRow`, a table or a column the
-/// store does not have, or a row that breaks a constraint of T other than its keys.
-pub fn store_in(conn: &Connection, item: &Value) -> Result<bool, Error> {
+/// Why a 2's items were not written.
+enum Unwritten {
+    /// T refused a store row by one of its constraints: `store: ` and the store's message.
+    Refused(String),
+    /// Anything else, which fails the batch.
+    Failed,
+}
+
+/// Inserts `item` on `conn` when it has a `store` key, as a [`StoreRow`]: true; false for an item
+/// with no `store` key, left to the caller.
+fn store_in(conn: &Connection, item: &Value) -> Result<bool, Unwritten> {
     if item.get("store").is_none() {
         return Ok(false);
     }
-    let stored = StoreRow::deserialize(item).map_err(|_| Error::Store)?;
+    let stored = StoreRow::deserialize(item).map_err(|_| Unwritten::Failed)?;
     let StoreRow::Store { row, .. } = &stored;
     let values = row.values().map(|value| match value {
         Value::Null => Sql::Null,
@@ -280,21 +339,20 @@ pub fn store_in(conn: &Connection, item: &Value) -> Result<bool, Error> {
         Value::String(s) => Sql::Text(s.clone()),
         value => Sql::Text(value.to_string()),
     });
-    let mut insert = stored.insert(conn).map_err(|_| Error::Store)?;
-    insert
-        .execute(params_from_iter(values))
-        .map_err(|_| Error::Store)?;
-    Ok(true)
+    let mut insert = stored.insert(conn).map_err(|_| Unwritten::Failed)?;
+    match insert.execute(params_from_iter(values)) {
+        Ok(_) => Ok(true),
+        Err(e) if e.sqlite_error_code() == Some(ErrorCode::ConstraintViolation) => {
+            Err(Unwritten::Refused(format!("store: {e}")))
+        }
+        Err(_) => Err(Unwritten::Failed),
+    }
 }
 
 /// Appends `batch` to `_events` inside `tx`; the caller commits and signals the queue.
-///
-/// # Errors
-///
-/// `Error::Store` when an insert fails; the caller then commits nothing.
-pub fn append_in<T: Copy + Into<u16>, D: Serialize>(
-    tx: &rusqlite::Transaction<'_>,
-    batch: &[Event<T, D>],
+fn append_in<'e, T: Copy + Into<u16> + 'e, D: Serialize + 'e>(
+    tx: &Transaction<'_>,
+    batch: impl IntoIterator<Item = &'e Event<T, D>>,
 ) -> Result<(), Error> {
     let mut insert = tx.prepare(queries::APPEND).map_err(|_| Error::Store)?;
     for event in batch {
@@ -338,12 +396,12 @@ mod tests {
         }
     }
 
-    fn event(id: Uuid) -> Event<Ty, &'static str> {
+    fn event(id: Uuid) -> Event<Ty, String> {
         Event {
             id,
             source: None,
             ty: Ty::Page,
-            data: "data",
+            data: "data".to_owned(),
             run_at: None,
             status: Status::Added,
         }
@@ -425,7 +483,7 @@ mod tests {
         let source = Uuid::now_v7();
         writes.lock().unwrap().insert(source, vec![item("nope")]);
         let failed = Append::append(&events, &[event(Uuid::now_v7()), two(source)]);
-        assert_eq!(failed, Err(Error::Store));
+        assert_eq!(failed.err(), Some(Error::Store));
         assert!(signals.try_recv().is_err());
         assert_eq!(count(&events.conn.lock().unwrap()), 2);
         assert_eq!(writes.lock().unwrap()[&source], [item("nope")]);
@@ -434,11 +492,12 @@ mod tests {
         let near = Uuid::now_v7();
         let item = json!({ "store": { "table": "t" } });
         writes.lock().unwrap().insert(near, vec![item]);
-        assert_eq!(Append::append(&events, &[two(near)]), Err(Error::Store));
+        let failed = Append::append(&events, &[two(near)]);
+        assert_eq!(failed.err(), Some(Error::Store));
     }
 
     #[test]
-    fn a_store_row_that_breaks_not_null_fails_the_batch_and_is_put_back() {
+    fn a_store_row_t_refuses_is_rolled_back_with_its_2_and_a_minus_1_is_returned() {
         let store = rannoch_core::forgr::empty_store();
         let sql = "CREATE TABLE t (k TEXT PRIMARY KEY, n INTEGER NOT NULL)";
         store.execute_batch(sql).unwrap();
@@ -448,17 +507,36 @@ mod tests {
         // `n` is null, as `eval` gives for a field the input lacks.
         let item = json!({ "store": { "table": "t", "row": { "k": "a", "n": null } } });
         let source = Uuid::now_v7();
-        writes.lock().unwrap().insert(source, vec![item.clone()]);
+        writes.lock().unwrap().insert(source, vec![item]);
         let two = Event {
             source: Some(source),
             status: Status::Processed,
             ..event(Uuid::now_v7())
         };
+        let other = event(Uuid::now_v7());
 
-        assert_eq!(Append::append(&events, &[two]), Err(Error::Store));
-        assert!(signals.try_recv().is_err());
-        assert_eq!(count(&events.conn.lock().unwrap()), 0);
-        assert_eq!(writes.lock().unwrap()[&source], [item]);
+        let replies = Append::append(&events, &[other.clone(), two]).unwrap();
+
+        // The rest of the batch commits and signals; the 2 and its row are not written.
+        assert_eq!(signals.try_recv(), Ok(()));
+        let conn = events.conn.lock().unwrap();
+        let ids = "SELECT id FROM _events";
+        let ids: String = conn.query_row(ids, [], |r| r.get(0)).unwrap();
+        assert_eq!((count(&conn), ids), (1, other.id.to_string()));
+        let rows: i64 = conn
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
+        assert!(writes.lock().unwrap().is_empty());
+        // In its place, a -1 for its source naming the reason, for the inbox to send.
+        let [binned] = replies.as_slice() else {
+            panic!("{replies:?}")
+        };
+        assert_eq!(
+            (binned.source, binned.status),
+            (Some(source), Status::Binned)
+        );
+        assert_eq!(binned.data, "store: NOT NULL constraint failed: t.n");
     }
 
     #[test]
