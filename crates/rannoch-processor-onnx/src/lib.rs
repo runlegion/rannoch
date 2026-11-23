@@ -219,7 +219,9 @@ impl Action for Infer {
 /// is lowercased and split into words at whitespace, each ASCII punctuation mark a word of its
 /// own; each word is cut into the word pieces of the tokenizer's vocabulary, and a word the
 /// pieces do not cover whole is dropped. The ids go in as `input_ids`, with `offsets` `[0]` when
-/// the model takes it. A `text` that is missing or not a string is embedded as empty.
+/// the model takes it. A run fails with `<action> takes text, a string` when the input does not
+/// hold `text` as a string, and with `<action>: no word of the text is in the vocabulary` when no
+/// word of it gives an id.
 #[derive(Debug)]
 pub struct Embed {
     sig: Sig,
@@ -241,10 +243,16 @@ impl Embed {
         Ok(Self { sig, model, vocab })
     }
 
-    /// The embedding of `text`: `input_ids`, and `offsets` [0] when the model declares it.
-    fn embed(&self, text: &str) -> Result<Vec<f64>, String> {
-        let ids = Input::I64(tokenize(&self.vocab, text));
-        let mut inputs = vec![("input_ids".to_owned(), ids)];
+    /// The embedding of `text` for `action`: `input_ids`, and `offsets` [0] when the model
+    /// declares it; `<action>: no word of the text is in the vocabulary` when it gives no ids.
+    fn embed(&self, action: &str, text: &str) -> Result<Vec<f64>, String> {
+        let ids = tokenize(&self.vocab, text);
+        if ids.is_empty() {
+            return Err(format!(
+                "{action}: no word of the text is in the vocabulary"
+            ));
+        }
+        let mut inputs = vec![("input_ids".to_owned(), Input::I64(ids))];
         if self.model.inputs.iter().any(|i| i == "offsets") {
             inputs.push(("offsets".to_owned(), Input::I64(vec![0])));
         }
@@ -260,12 +268,15 @@ impl Action for Embed {
     }
 
     fn run(&self, _: &Value, input: &Map<String, Value>) -> Result<Map<String, Value>, String> {
-        let vector = self.embed(text(input))?;
+        let action = &self.sig.action;
+        let vector = self.embed(action, text(action, input)?)?;
         Ok(Map::from_iter([("vector".to_owned(), json!(vector))]))
     }
 }
 
 /// takes text, gives label (string): the label whose description's embedding is nearest by cosine.
+/// A run fails as `Embed`'s does, with `<action> has no labels` when it has none, and with
+/// `<action>: a zero vector has no nearest label` when the text's embedding or a label's is zero.
 #[derive(Debug)]
 pub struct Classify {
     sig: Sig,
@@ -279,7 +290,8 @@ impl Classify {
     /// # Errors
     /// The failure to embed a label's description.
     pub fn new(sig: Sig, embed: Embed, labels: &[(&str, &str)]) -> Result<Self, String> {
-        let label = |(label, about): &(&str, &str)| Ok(((*label).to_owned(), embed.embed(about)?));
+        let embedded = |about: &str| embed.embed(&sig.action, about);
+        let label = |(label, about): &(&str, &str)| Ok(((*label).to_owned(), embedded(about)?));
         let labels = labels.iter().map(label).collect::<Result<_, String>>()?;
         Ok(Self { sig, embed, labels })
     }
@@ -291,14 +303,17 @@ impl Action for Classify {
     }
 
     fn run(&self, _: &Value, input: &Map<String, Value>) -> Result<Map<String, Value>, String> {
-        let vector = self.embed.embed(text(input))?;
-        let label = nearest(&vector, &self.labels);
+        let action = &self.sig.action;
+        let vector = self.embed.embed(action, text(action, input)?)?;
+        let label = nearest(action, &vector, &self.labels)?;
         Ok(Map::from_iter([("label".to_owned(), json!(label))]))
     }
 }
 
-fn text(input: &Map<String, Value>) -> &str {
-    input.get("text").and_then(Value::as_str).unwrap_or("")
+/// The input's `text`; `<action> takes text, a string` when it holds none as a string.
+fn text<'a>(action: &str, input: &'a Map<String, Value>) -> Result<&'a str, String> {
+    let text = input.get("text").and_then(Value::as_str);
+    text.ok_or_else(|| format!("{action} takes text, a string"))
 }
 
 #[expect(clippy::needless_pass_by_value, reason = "the shape map_err passes")]
@@ -306,12 +321,21 @@ fn err(e: impl ToString) -> String {
     e.to_string()
 }
 
-/// The label whose vector is nearest `v` by cosine.
-fn nearest<'a>(v: &[f64], labels: &'a [(String, Vec<f64>)]) -> &'a str {
+/// The label whose vector is nearest `v` by cosine, for `action`; `<action>: a zero vector has
+/// no nearest label` when a cosine is NaN, and `<action> has no labels` when there are none.
+fn nearest<'a>(
+    action: &str,
+    v: &[f64],
+    labels: &'a [(String, Vec<f64>)],
+) -> Result<&'a str, String> {
     let norm = |x: &[f64]| x.iter().map(|a| a * a).sum::<f64>().sqrt();
     let cos = |l: &[f64]| v.iter().zip(l).map(|(a, b)| a * b).sum::<f64>() / (norm(v) * norm(l));
+    if labels.iter().any(|l| cos(&l.1).is_nan()) {
+        return Err(format!("{action}: a zero vector has no nearest label"));
+    }
     let best = labels.iter().max_by(|a, b| cos(&a.1).total_cmp(&cos(&b.1)));
-    best.map_or("", |(label, _)| label)
+    best.map(|(label, _)| label.as_str())
+        .ok_or_else(|| format!("{action} has no labels"))
 }
 
 fn normalize(v: &[f32]) -> Vec<f64> {
@@ -387,8 +411,15 @@ mod tests {
         let labels = [("bug", vec![3.0, 0.0]), ("question", vec![0.0, 1.0])];
         let labels: Vec<(String, Vec<f64>)> =
             labels.into_iter().map(|(l, v)| (l.into(), v)).collect();
-        assert_eq!(nearest(&[10.0, 1.0], &labels), "bug");
-        assert_eq!(nearest(&[1.0, 1.2], &labels), "question");
+        assert_eq!(nearest("classify", &[10.0, 1.0], &labels), Ok("bug"));
+        assert_eq!(nearest("classify", &[1.0, 1.2], &labels), Ok("question"));
+    }
+
+    #[test]
+    fn nearest_fails_on_a_zero_vector() {
+        let labels = [("bug".to_owned(), vec![3.0, 0.0])];
+        let zero = Err("classify: a zero vector has no nearest label".to_owned());
+        assert_eq!(nearest("classify", &[0.0, 0.0], &labels), zero);
     }
 
     #[test]
