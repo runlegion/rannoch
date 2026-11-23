@@ -1015,7 +1015,7 @@ const BUILT_IN: &str = r#"[
       {"do": "emit", "next": {"branch": {"on": "kind",
         "cases": [{"when": "rush", "next": {"ty": 81, "shape": {"ticket": "$ticket"}}}],
         "else": {"ty": 82, "shape": {"ticket": "$ticket"}}}}},
-      {"do": "emit", "next": {"wait": {"for": 83, "key": "$ticket", "within_ms": 1000,
+      {"do": "emit", "next": {"wait": {"for": 83, "key": "$ticket", "within_ms": 2500,
         "next": {"ty": 84, "shape": {"ticket": "$ticket"}},
         "timeout": {"ty": 85, "shape": {"ticket": "$ticket"}}}}}]}],
   ["rushed.json", {"name": "rushed", "ty": 81, "takes": {"ticket": "string"}, "steps": []}],
@@ -1057,7 +1057,17 @@ fn a_flow_of_built_in_steps_runs_with_no_action_of_the_apps() {
     let slow = app
         .hand(80, &json!({ "ticket": "t2", "kind": "slow" }))
         .unwrap();
+    let wait = |event| {
+        app.about(event)
+            .into_iter()
+            .find(|r| r.1 == 80 && r.2 == 0)
+            .unwrap()
+            .0
+    };
+    // t1's answer is handed as soon as its wait is kept, well before the wait is due.
     assert!(until(WAIT, || app.statuses(rush).contains(&2)));
+    let w1 = wait(rush);
+    let answer = app.hand(83, &json!({ "ticket": "t1" })).unwrap();
     assert!(until(WAIT, || app.statuses(slow).contains(&2)));
 
     // the branch's next is sent for the case the field matches
@@ -1073,15 +1083,7 @@ fn a_flow_of_built_in_steps_runs_with_no_action_of_the_apps() {
     assert_eq!(next(rush, 82).count() + next(slow, 81).count(), 0);
 
     // and the wait sends its next when the other event arrives
-    let wait = |event| {
-        app.about(event)
-            .into_iter()
-            .find(|r| r.1 == 80 && r.2 == 0)
-            .unwrap()
-            .0
-    };
-    let (w1, w2) = (wait(rush), wait(slow));
-    let answer = app.hand(83, &json!({ "ticket": "t1" })).unwrap();
+    let w2 = wait(slow);
     assert!(until(WAIT, || app.statuses(answer).contains(&2)));
     assert!(until(WAIT, || app.statuses(w1).contains(&2)));
     assert_eq!(app.sent(w1, 0), [(84, json!({ "ticket": "t1" }))]);
