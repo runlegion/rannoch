@@ -142,10 +142,10 @@
 //! 2's items inside a savepoint. When T refuses it, that 2's rows are rolled back and the 2 is not
 //! written; the append returns a -1 for its source naming the reason, which the inbox sends, and
 //! the rest of the batch commits, the 2's nexts included. Any other item that does not parse as
-//! an `Op` fails the append with [`Error::Store`]: nothing in the batch is written, and `Writes`
-//! gets the batch's items back, unless that same event has items there again by then. Rannoch's
-//! inbox puts the failed batch back ahead of later events and tries it again each interval, so
-//! while the bad item is in it, nothing more from that inbox is written.
+//! an `Op` is refused the same way, its -1's data `graph: ` and serde's message, as
+//! `` graph: missing field `props` `` for a `link` without `props`. An append the store cannot
+//! write fails with [`Error::Store`]: nothing in the batch is written, and `Writes` gets the
+//! batch's items back, unless that same event has items there again by then.
 //!
 //! # What the reads return: now, as of T and why
 //!
@@ -450,7 +450,11 @@ fn commit<T: Copy + Into<u16>, D: Serialize + From<String>>(
     let mut tx = conn.transaction().map_err(|_| Error::Store)?;
     let mut touched = Vec::new();
     let replies = rannoch_events::write_in(&mut tx, batch, taken, |tx, source, item| {
-        let op = Op::deserialize(item).map_err(|_| Error::Store)?;
+        let op = match Op::deserialize(item) {
+            Ok(op) => op,
+            // Refused like a store row: its 2's rows are rolled back and it gets a -1.
+            Err(e) => return Ok(Err(format!("graph: {e}"))),
+        };
         if write(tx, &source.to_string(), &op, written).map_err(|_| Error::Store)? == 1 {
             match op {
                 Op::Set { node, .. } | Op::Retract { node, .. } => touched.push((*source, node)),
@@ -459,7 +463,7 @@ fn commit<T: Copy + Into<u16>, D: Serialize + From<String>>(
                 }
             }
         }
-        Ok(())
+        Ok(Ok(()))
     })?;
     tx.commit().map_err(|_| Error::Store)?;
     // A source whose rows were rolled back touched nothing.
@@ -768,6 +772,62 @@ mod tests {
         let taken = [(second, vec![store("nope")])];
         assert!(super::commit(&mut conn, &[two(second)], &taken).is_err());
         assert_eq!(rows(&conn), [1, 1, 1]);
+    }
+
+    /// #107: an item that is not an `Op` is rolled back with its 2 and its event's other rows,
+    /// the append returns a -1 for the event naming the reason, and the rest of the batch commits.
+    #[test]
+    fn an_item_that_is_not_an_op_is_rolled_back_with_its_2_and_gets_a_minus_1() {
+        use rannoch_core::{Append, Event, Status};
+        let (signal, wake) = std::sync::mpsc::channel();
+        let writes = rannoch_processor::Writes::default();
+        let conn = rannoch_core::forgr::empty_store();
+        let append = super::GraphAppend::new(conn, signal, writes.clone());
+        let event = |source, status| Event {
+            id: Uuid::now_v7(),
+            source,
+            ty: 1_u16,
+            data: json!({}),
+            run_at: None,
+            status,
+        };
+        let set = |node| json!({ "set": { "node": node, "key": "k", "value": 1 } });
+        // A link without props, which every link needs.
+        let bare = json!({ "link": { "src": "b", "name": "next", "dst": "c" } });
+        let (good, bad) = (event(None, Status::Added), event(None, Status::Added));
+        writes.lock().unwrap().insert(good.id, vec![set("g")]);
+        writes.lock().unwrap().insert(bad.id, vec![set("b"), bare]);
+        let good_two = event(Some(good.id), Status::Processed);
+        let batch = [
+            good.clone(),
+            bad.clone(),
+            good_two.clone(),
+            event(Some(bad.id), Status::Processed),
+        ];
+
+        let replies = append.append(&batch).unwrap();
+
+        // The rest of the batch commits and signals: both events, the good 2 and its row.
+        assert_eq!(wake.try_recv(), Ok(()));
+        let conn = append.conn.lock().unwrap();
+        let read = |sql| {
+            let mut select = conn.prepare(sql).unwrap();
+            let rows = select.query_map([], |r| r.get(0)).unwrap();
+            rows.collect::<rusqlite::Result<Vec<String>>>().unwrap()
+        };
+        let ids = [&good, &bad, &good_two].map(|e| e.id.to_string());
+        assert_eq!(read("SELECT id FROM _events ORDER BY rowid"), ids);
+        assert_eq!(read("SELECT node FROM _nodes"), ["g"]);
+        assert!(writes.lock().unwrap().is_empty());
+        // In the bad 2's place, a -1 for its source naming the reason, for the inbox to send.
+        let [binned] = replies.as_slice() else {
+            panic!("{replies:?}")
+        };
+        assert_eq!(
+            (binned.source, binned.status),
+            (Some(bad.id), Status::Binned)
+        );
+        assert_eq!(binned.data, json!("graph: missing field `props`"));
     }
 
     /// A correction and a retraction, now, as of and why (the toy's P4).

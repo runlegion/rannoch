@@ -202,7 +202,7 @@ impl<T: Copy + Into<u16>, D: Serialize + From<String>> Append<T, D> for Events {
         let mut conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
         let replies = taking(&self.writes, batch, |taken| {
             let mut tx = conn.transaction().map_err(|_| Error::Store)?;
-            let replies = write_in(&mut tx, batch, taken, |_, _, _| Ok(()))?;
+            let replies = write_in(&mut tx, batch, taken, |_, _, _| Ok(Ok(())))?;
             tx.commit().map_err(|_| Error::Store)?;
             Ok(replies)
         })?;
@@ -260,18 +260,19 @@ where
 /// Writes `batch` in `tx` with the items `taken` for its 2s, each 2's items inside a savepoint of
 /// their own: a `store` row with `ON CONFLICT DO NOTHING`, so T's own keys decide whether it adds
 /// a row, and any other item with `other`, which gets the 2's source. When T refuses a store row,
-/// by any of its constraints or a value its INTEGER PRIMARY KEY cannot hold, the savepoint is
-/// rolled back and that 2 is not written: returned in its place is a -1 for its source, its data
-/// naming the reason, for the caller to send. The caller commits.
+/// by any of its constraints or a value its INTEGER PRIMARY KEY cannot hold, or `other` returns
+/// `Ok(Err(reason))` for an item it cannot write, the savepoint is rolled back and that 2 is not
+/// written: returned in its place is a -1 for its source, its data naming the reason, for the
+/// caller to send. The caller commits.
 /// # Errors
-/// `Error::Store` when an event cannot be inserted, `other` fails, or a store row fails for a
-/// reason other than a constraint, as an item with a `store` key that is not a [`StoreRow`], or a
-/// table or a column the store does not have.
+/// `Error::Store` when an event cannot be inserted, `other` returns `Err`, or a store row fails
+/// for a reason other than a constraint, as an item with a `store` key that is not a
+/// [`StoreRow`], or a table or a column the store does not have.
 pub fn write_in<T, D>(
     tx: &mut Transaction<'_>,
     batch: &[Event<T, D>],
     taken: &[(Uuid, Vec<Value>)],
-    mut other: impl FnMut(&Connection, &Uuid, &Value) -> Result<(), Error>,
+    mut other: impl FnMut(&Connection, &Uuid, &Value) -> Result<Result<(), String>, Error>,
 ) -> Result<Vec<Event<T, D>>, Error>
 where
     T: Copy + Into<u16>,
@@ -284,7 +285,8 @@ where
             if store_in(&point, item)? {
                 return Ok(());
             }
-            other(&point, source, item).map_err(|_| Unwritten::Failed)
+            let written = other(&point, source, item).map_err(|_| Unwritten::Failed)?;
+            written.map_err(Unwritten::Refused)
         });
         let ended = match written {
             Ok(()) => point.commit(),
@@ -320,7 +322,7 @@ where
 /// Why a 2's items were not written.
 enum Unwritten {
     /// T refused a store row, by one of its constraints or a value its INTEGER PRIMARY KEY cannot
-    /// hold: `store: ` and the store's message.
+    /// hold: `store: ` and the store's message; or the caller's reason for an item it cannot write.
     Refused(String),
     /// Anything else, which fails the batch.
     Failed,
