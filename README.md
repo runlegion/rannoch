@@ -91,4 +91,4 @@ All on one developer machine, as recorded on PRs #74, #76 and #114 and issues #6
 
 ## Docs
 
-Each crate's documentation is in its source: `cargo doc --workspace --no-deps --open`.
+Each crate's documentation is in its source: `cargo doc --workspace --no-deps --open`. [`docs/app-crates.md`](docs/app-crates.md) says how an app makes its own processor crates and its own ontology crate.
