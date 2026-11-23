@@ -143,7 +143,7 @@
 //! written; the append returns a -1 for its source naming the reason, which the inbox sends, and
 //! the rest of the batch commits, the 2's nexts included. Any other item that does not parse as
 //! an `Op` is refused the same way, its -1's data `graph: ` and serde's message, as
-//! ``graph: missing field `props` `` for a `link` without `props`. An append the store cannot
+//! `` graph: missing field `props` `` for a `link` without `props`. An append the store cannot
 //! write fails with [`Error::Store`]: nothing in the batch is written, and `Writes` gets the
 //! batch's items back, unless that same event has items there again by then.
 //!
