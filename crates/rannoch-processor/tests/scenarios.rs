@@ -1945,28 +1945,54 @@ fn a_due_wait_whose_for_is_not_a_ty_fails_its_step() {
     app.stop();
 }
 
-/// Not a scenario: #109. A wait whose row cannot be read fails the step of the event it waits
-/// for.
-#[test]
-fn a_wait_that_cannot_be_read_fails_the_step_of_the_event_it_waits_for() {
-    // Given a live wait for t1's answer whose data SQLite reads but serde_json does not
-    let data = r#"{"$wait": {"step": 1, "for": 83,}, "key": "t1", "vals": {"ticket": "t1"}}"#;
-    let (app, wait) = live_wait("a_wait_that_cannot_be_read", data).unwrap();
-
-    // When t1's answer is handed over
-    let answer = app.hand(83, &json!({ "ticket": "t1" })).unwrap();
-
-    // Then its -1 names the wait and why it cannot be read
-    let why = serde_json::from_str::<Value>(data).unwrap_err();
-    let reason = format!("wait {wait} cannot be read: {why}");
-    assert_eq!(failed(&app, answer), [json!(reason)]);
+/// Over a fresh store `name` holding the live wait `data`: hands t1's answer over twice, then
+/// once more after the app restarts, and asserts each answer runs as if the wait were not there,
+/// and the wait gets one -1, `wait <id> <why>`, and nothing else.
+fn passed_over(name: &str, data: &str, why: &str) -> Result<()> {
+    let (app, wait) = live_wait(name, data)?;
+    let t1 = json!({ "ticket": "t1" });
+    let ran = |app: &App, answer: Uuid| until(WAIT, || app.statuses(answer).contains(&2));
+    let first = [app.hand(83, &t1)?, app.hand(83, &t1)?];
+    assert!(first.iter().all(|answer| ran(&app, *answer)));
+    let path = app.path.clone();
     app.stop();
+    let app = App::built_in_at(path, &failing()?, Config::default())?;
+    let after = app.hand(83, &t1)?;
+    assert!(ran(&app, after));
+    thread::sleep(Duration::from_millis(200));
+    for answer in [first[0], first[1], after] {
+        assert_eq!(app.statuses(answer), [1, 2]);
+        assert_eq!(app.sent(answer, 2), [(83, json!("done"))]);
+    }
+    let about: Vec<(i64, i64, Value)> = app
+        .about(wait)
+        .into_iter()
+        .map(|r| (r.1, r.2, r.3))
+        .collect();
+    assert_eq!(about, [(80, -1, json!(format!("wait {wait} {why}")))]);
+    app.stop();
+    Ok(())
 }
 
-/// Not a scenario: #109. A wait with no step, or no vals, fails the step of the event it waits
-/// for.
+/// Not a scenario: #109. A wait whose row cannot be read gets its own -1, once, and the events
+/// it waits for run as if it were not there.
 #[test]
-fn a_wait_with_no_step_or_no_vals_fails_the_step_of_the_event_it_waits_for() {
+fn a_wait_that_cannot_be_read_is_binned_once_and_its_events_run_without_it() {
+    // Given a live wait for t1's answer whose data SQLite reads but serde_json does not
+    let data = r#"{"$wait": {"step": 1, "for": 83,}, "key": "t1", "vals": {"ticket": "t1"}}"#;
+    let why = serde_json::from_str::<Value>(data).unwrap_err();
+
+    // When t1's answer is handed over twice, and once more after the app restarts
+    // Then each answer runs as if the wait were not there
+    // And the wait gets one -1, which names why it cannot be read, and nothing else
+    let why = format!("cannot be read: {why}");
+    passed_over("a_wait_that_cannot_be_read", data, &why).unwrap();
+}
+
+/// Not a scenario: #109. A wait with no step, or no vals, gets its own -1, once, and the events
+/// it waits for run as if it were not there.
+#[test]
+fn a_wait_with_no_step_or_no_vals_is_binned_once_and_its_events_run_without_it() {
     let cases = [
         (
             "a_wait_with_no_step",
@@ -1981,17 +2007,10 @@ fn a_wait_with_no_step_or_no_vals_fails_the_step_of_the_event_it_waits_for() {
     ];
     for (name, data, lacks) in cases {
         // Given a live wait for t1's answer whose data lacks its step, or its vals
-        let (app, wait) = live_wait(name, &data.to_string()).unwrap();
-
-        // When t1's answer is handed over
-        let answer = app.hand(83, &json!({ "ticket": "t1" })).unwrap();
-
-        // Then its -1 names the wait and what it lacks
-        assert_eq!(
-            failed(&app, answer),
-            [json!(format!("wait {wait} {lacks}"))]
-        );
-        app.stop();
+        // When t1's answer is handed over twice, and once more after the app restarts
+        // Then each answer runs as if the wait were not there
+        // And the wait gets one -1, which names what it lacks, and nothing else
+        passed_over(name, &data.to_string(), lacks).unwrap();
     }
 }
 
