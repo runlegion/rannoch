@@ -163,6 +163,15 @@ impl App {
 
     /// The app over the store at `path`, as it is.
     fn open(path: PathBuf, attempts: u32) -> Result<Self> {
+        let settings = Settings {
+            attempts,
+            ..Settings::new(Duration::from_millis(100))
+        };
+        Self::open_with(path, settings)
+    }
+
+    /// The app over the store at `path`, as it is, its queue on `settings`.
+    fn open_with(path: PathBuf, settings: Settings) -> Result<Self> {
         let store = migrated(&path)?;
         let (calls, rating) = (Calls::default(), Arc::default());
         let (flows, actions) = (include_str!("flows.json"), actions(&calls, &rating));
@@ -175,10 +184,6 @@ impl App {
             append: Some(append),
             ..Config::default()
         })?;
-        let settings = Settings {
-            attempts,
-            ..Settings::new(Duration::from_millis(100))
-        };
         let queue = Queue::start(
             ready(&path)?,
             wake,
@@ -731,6 +736,68 @@ fn a_wait_kept_in_events_matches_times_out_and_sends_a_late_match_to_late_across
     assert_eq!(app.sent(w2, 0), [timeout, late]);
     let sent = app.count("SELECT count(*) FROM _events WHERE ty = 72 AND status = 0");
     assert_eq!(sent, 1, "o1's match only");
+
+    app.stop();
+}
+
+/// Not a scenario: #84. The hunt's resend of a run a crash dropped runs that run's flow on the
+/// dropped event's data.
+#[test]
+fn the_hunts_resend_runs_the_dropped_events_flow_on_its_data() {
+    // Given a store with an event of the flow that uses as, whose 1 is an hour old with nothing
+    // after it, as a crash leaves it
+    let path = database("the_hunts_resend").unwrap();
+    migrated(&path).unwrap();
+    let seed = ready(&path).unwrap();
+    let ago = |secs: i64| {
+        let at = u64::try_from(Utc::now().timestamp() - secs).unwrap();
+        Uuid::new_v7(uuid::Timestamp::from_unix(uuid::NoContext, at, 0))
+    };
+    let dropped = ago(7200);
+    _events::factory()
+        .id(dropped.to_string())
+        .ty(12)
+        .data(json!({ "text": "sam" }).to_string())
+        .status(0)
+        .insert(&seed)
+        .unwrap();
+    _events::factory()
+        .id(ago(3600).to_string())
+        .source(dropped.to_string())
+        .ty(12)
+        .data("\"taken\"")
+        .status(1)
+        .insert(&seed)
+        .unwrap();
+
+    // When the queue starts with a hunt that runs soon
+    let settings = Settings {
+        attempts: 1,
+        window: Duration::from_mins(1),
+        hunt: Duration::from_millis(300),
+        ..Settings::new(Duration::from_millis(100))
+    };
+    let app = App::open_with(path, settings).unwrap();
+
+    // Then the hunt resends the dropped event
+    let resend = app.retry(dropped);
+    assert_eq!(app.sent(dropped, 0), [(12, json!("hung"))]);
+
+    // And rannoch-processor runs the resend's flow on the dropped event's data
+    assert!(until(WAIT, || app
+        .statuses(resend)
+        .iter()
+        .any(|s| *s == 2 || *s == -1)));
+    assert_eq!(
+        app.sent(resend, -1),
+        Vec::<(i64, Value)>::new(),
+        "the resend failed"
+    );
+    assert_eq!(
+        app.sent(resend, 0),
+        [(22, json!({ "shout": { "text": "SAM" }, "text": "sam" }))]
+    );
+    assert_eq!(app.statuses(resend), [1, 0, 2]);
 
     app.stop();
 }

@@ -112,6 +112,9 @@ impl Queue {
 /// How long the queue waits for a signal when nothing it knows of comes due.
 const IDLE: Duration = Duration::from_secs(3600);
 
+/// The data of the hunt's resend, by which [`root`] knows it.
+const HUNG: &str = "hung";
+
 fn run<T, D>(
     conn: &Connection,
     signal: &Receiver<()>,
@@ -287,7 +290,7 @@ where
             id: Uuid::nil(),
             source: Some(event),
             ty,
-            data: D::from("hung".to_owned()),
+            data: D::from(HUNG.to_owned()),
             run_at: None,
             status: Status::Added,
         };
@@ -390,19 +393,22 @@ fn send<T: PartialEq, D: From<String>>(
 }
 
 /// The root whose data every flow uses, and how many failed attempts are behind `row` in its
-/// chain: back from `row` through each source that has a -1.
+/// chain: back from `row` through each source that has a -1, one failed attempt each, and from
+/// each hunt's resend to the event it resends.
 fn root(conn: &Connection, row: Row) -> rusqlite::Result<(Row, u32)> {
     let mut at = row;
     let mut before = 0_u32;
     while let Some(source) = at.source {
         let failed: bool = conn.query_row(queries::FAILED, [source.to_string()], |r| r.get(0))?;
-        if !failed {
+        // The append writes the resend's data as a JSON string.
+        let resend = at.data.strip_prefix('"').and_then(|d| d.strip_suffix('"')) == Some(HUNG);
+        if !failed && !resend {
             break;
         }
         match read(conn, queries::EVENT, [source.to_string()])?.pop() {
             Some(earlier) => {
                 at = earlier;
-                before = before.saturating_add(1);
+                before = before.saturating_add(u32::from(failed));
             }
             None => break,
         }
