@@ -61,7 +61,7 @@ Producers send events with `Sender::send`. To stop, drop any signal sender the a
 
 - **A hand-over that fails** is logged at `error`, and the batch goes back on the heap ahead of what arrived since; the inbox tries again at its next interval, with no limit. A batch that can never be written therefore stops its inbox: every later hand-over includes it, nothing more from that inbox reaches the disk, and its heap keeps growing. One way to get there is a step whose `$graph` holds an item that is not one of rannoch-graph's ops.
 - **The last hand-over at shutdown** is not retried: if it fails, the failure is logged and its events are lost.
-- **A crash's resend does not run the event again under rannoch-processor.** The resend is its own root, because the stalled event has a 1 and no -1, so the processor reads `"hung"` as the flow's data and bins it with a "root data" error, and every retry fails the same way (#84).
+- **A crash's resend runs the stalled event's flow on that event's data,** because the queue walks back from the resend to the event it resends.
 - **A step that fails** sends the event's -1, its data the step's message, and the queue retries it as above. An event whose `ty` has no flow gets a -1 saying "no processor".
 - **After `shutdown`**, `Sender::send` returns `Closed`. `queue.join()` returns only once every sender of the append's signal is dropped, so a signal sender the app keeps makes it wait for good; it also waits for every run and job the queue started.
 - **A second process** on the same store is not stopped by rannoch.
