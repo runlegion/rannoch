@@ -587,10 +587,11 @@ fn waits<'d>(
     let (mut outs, mut binned) = (Vec::new(), Vec::new());
     let mut said = if due.is_some() { "matched" } else { "done" };
     for (wait_id, wait_ty, w, rows) in waits_for(conn, ty).map_err(|e| e.to_string())? {
-        let wait_id: Uuid = match wait_id.parse() {
-            Ok(wait_id) => wait_id,
-            Err(e) if due.is_none() => return Err(format!("wait {wait_id} cannot be read: {e}")),
-            Err(_) => continue,
+        // An id that is not a UUID comes from a hand-written row, never from rannoch: as the
+        // queue's read does, the processor passes the row over with a log line.
+        let Ok(wait_id) = wait_id.parse::<Uuid>() else {
+            log::error!("the processor passed over wait {wait_id}, whose id is not a UUID");
+            continue;
         };
         // A due wait's run reads its own row, which parsed as its root; no other is its wait.
         if due.is_some() && wait_id != id {
