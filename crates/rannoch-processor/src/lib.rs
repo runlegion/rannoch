@@ -1,15 +1,268 @@
-//! The processor: it runs the app's flows. A flow is a JSON document ([`FlowDoc`]) of steps for
-//! one `ty`. A step's `do` names one or more of the app's [`Action`]s, joined by `.`, each
-//! declaring what it takes and gives in its [`Sig`]; a step's [`Next`] sends further events,
-//! branches on a value or waits for another event. The processor sends the event's 2 when its
-//! flow runs to the end, and its -1 when a step fails.
+#![warn(missing_docs)]
+//! The processor runs an app's flows. A flow is a JSON document for one event `ty`: a list of
+//! steps, each of which calls one or more of the app's [`Action`]s and can then send further
+//! events, branch on a value or wait for another event. This page is the reference for writing
+//! flow documents.
 //!
-//! - [`compile`] checks the app's flow documents from its `build.rs` and writes them as one JSON
-//!   array for the app to `include_str!`; [`check`] is the check it runs.
-//! - [`Processor::new`] takes that array, the app's actions and a connection; the processor is
-//!   the queue's `Flows`.
-//! - [`Processor::writes`] holds the graph rows a step gives as `$graph` until the append that
-//!   carries the event's 2 takes them.
+//! # Flow documents in an app
+//!
+//! 1. Each action declares a [`Sig`]: its name, its options, the fields it takes and gives, and
+//!    whether it is a job. A signatures export is a JSON array of `Sig`s.
+//! 2. The app's `build.rs` calls [`compile`] with the directory of its flow documents, one per
+//!    `.json` file, and its signatures exports. `compile` runs [`check`] and fails the build on
+//!    any error; otherwise it writes the flows as one JSON array to `$OUT_DIR/flows.json`.
+//! 3. The app compiles that file in with `include_str!(concat!(env!("OUT_DIR"), "/flows.json"))`
+//!    and hands it to [`Processor::new`] with its actions and a connection to the store. The
+//!    processor is the queue's `Flows`.
+//!
+//! # Example
+//!
+//! A support ticket is rated and logged by its severity, then paged to a team, which has an
+//! hour to answer. The ticket flow's first step branches and its second waits; the answer flow
+//! runs the event the wait waits for, and the log flow is where every next goes. `check`
+//! accepts the three documents, and names the error when a case's `when` is of a type other
+//! than the field's.
+//!
+//! ```
+//! use rannoch_processor::{FlowDoc, Sig, check};
+//! use serde_json::{Value, json};
+//!
+//! // What the app's actions declare, as its signatures export holds it.
+//! let sigs: Vec<Sig> = serde_json::from_value(json!([
+//!     { "action": "rate", "takes": { "text": "string" }, "gives": { "severity": "number" } },
+//!     { "action": "page", "options": { "team": "string" }, "takes": { "ticket": "string" },
+//!       "gives": { "at": "string" }, "job": true }
+//! ]))?;
+//!
+//! let ticket = json!({
+//!     "name": "ticket", "ty": 10, "takes": { "ticket": "string", "text": "string" },
+//!     "steps": [
+//!         { "do": "rate",
+//!           "next": { "branch": { "on": "severity",
+//!               "cases": [{ "when": 3, "next": { "ty": 30,
+//!                   "shape": { "ticket": "$ticket", "note": "urgent" } } }],
+//!               "else": { "ty": 30, "delay_ms": 60000,
+//!                   "shape": { "ticket": "$ticket",
+//!                       "note": { "$concat": ["severity ", "$severity"] } } } } } },
+//!         { "do": "page", "with": { "page": { "team": "support" } }, "as": "paged",
+//!           "next": { "wait": { "for": 21, "key": "$ticket", "within_ms": 3600000,
+//!               "next": { "ty": 30, "shape": { "ticket": "$ticket",
+//!                   "note": { "$concat": ["answered by ", { "$": "$got.by", "or": "someone" }] } } },
+//!               "timeout": { "ty": 30, "shape": { "ticket": "$ticket", "note": "no answer" } },
+//!               "late": { "ty": 30, "shape": { "ticket": "$ticket",
+//!                   "note": { "$concat": ["late answer by ", "$got.by"] } } } } } }
+//!     ]
+//! });
+//! let answer = json!({ "name": "answer", "ty": 21,
+//!     "takes": { "ticket": "string", "by": "string" }, "steps": [] });
+//! let log = json!({ "name": "log", "ty": 30,
+//!     "takes": { "ticket": "string", "note": "string" }, "steps": [] });
+//!
+//! // check takes each document with its file name, which its errors name.
+//! let docs = |ticket: &Value| -> serde_json::Result<Vec<(String, FlowDoc)>> {
+//!     [("ticket.json", ticket), ("answer.json", &answer), ("log.json", &log)]
+//!         .into_iter()
+//!         .map(|(file, doc)| Ok((file.to_owned(), serde_json::from_value(doc.clone())?)))
+//!         .collect()
+//! };
+//!
+//! let flows = check(&docs(&ticket)?, &sigs).map_err(|errors| errors.join("\n"))?;
+//! let flows: Vec<FlowDoc> = serde_json::from_str(&flows)?;
+//! // page is a job, so the ticket flow runs as one.
+//! assert!(flows[0].job);
+//!
+//! let mut wrong = ticket.clone();
+//! wrong["steps"][0]["next"]["branch"]["cases"][0]["when"] = json!("3");
+//! assert_eq!(
+//!     check(&docs(&wrong)?, &sigs),
+//!     Err(vec![r#"E4 ticket.json step 0 next: branch on severity as number, a case when "3""#
+//!         .to_owned()])
+//! );
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+//!
+//! # How a flow runs
+//!
+//! The queue hands the processor an event, and the processor runs the flow for its `ty` on the
+//! data of the event's root, a JSON object: the event's own data, or for a retry the data of the
+//! event that failed first. That object, and the fields the steps add to it, are the flow's
+//! values.
+//!
+//! The steps run in order, and so do the links of a step, the action names in its `do`. Each
+//! link is passed its options from the step's `with`, and as input the values with the outputs
+//! of the links before it in the step, a later field replacing an earlier one. The processor
+//! takes `$graph` out of each output, then fails the step when the output lacks a field the
+//! action's `Sig` gives, or holds it as another type: `<link> gave no <field>`, or `<link> gave
+//! <field> as <type>, not <type>`. When the step's links have run, their outputs join the values,
+//! or with `as` go under one field. The step's next is worked out from the values as they then
+//! stand, and the run goes on to the next step: a next, a branch or a wait does not end it.
+//!
+//! When the last step has run, the processor sends every step's nexts, each at status 0 with the
+//! event as its source, then the event's 2, whose data is `"done"`. When a step fails, it sends
+//! the event's -1, whose data is the failure, and no next. The queue retries the event while its
+//! chain has attempts left, and the retry runs the flow from its first step.
+//!
+//! # The flow document
+//!
+//! The flow, its steps, and each `To`, `Branch`, `Case` and `Wait` refuse fields they do not
+//! define. A document that does not parse fails `compile` with its path and the parse error,
+//! before `check` runs.
+//!
+//! ## The flow: [`FlowDoc`]
+//!
+//! - `name`, required: the flow's name, by which `check` names a next to it.
+//! - `ty`, required: the event `ty` the flow runs. Nexts and waits reach the flow by it.
+//! - `takes`, required: a [`Shape`] of the fields the flow's data holds. It is the first step's
+//!   scope, and every next to this `ty` must give each of its fields, of its type.
+//! - `steps`, required: the [`Step`]s, in order. The list may be empty, as the example's answer
+//!   and log flows show.
+//! - `job`, default `false`: whether the queue runs the flow as a job, on a thread of its own.
+//!   `check` sets it, true when any step's action has a job `Sig`, in place of what the document
+//!   says.
+//!
+//! ## A step: [`Step`]
+//!
+//! - `do`, required: the step's links, action names joined by `.`, as in `"trim.upper.greet"`.
+//! - `with`, default `{}`: each link's options, by its action name, as in `{"greet":
+//!   {"salutation": "hi"}}`. Options are literal JSON, not shape expressions; a link with no
+//!   entry is passed `{}`. `check` requires exactly the fields the action's `Sig` options name,
+//!   each of its type.
+//! - `as`, default none: a field name. The step's result, its links' outputs merged, goes under
+//!   that field as an object, and the rest of the values stay as they were; in `check`'s scope
+//!   the field's type is `any`. Without `as`, the outputs join the values, a later field
+//!   replacing an earlier one.
+//! - `next`, default none: what the step sends, in one of the three forms of [`Next`].
+//!
+//! ## What a step sends: [`Next`]
+//!
+//! A next has one of three forms, told apart by their fields:
+//!
+//! - A [`To`], such as `{"ty": 30, "shape": {"ticket": "$ticket"}}`: one event of that `ty`, or
+//!   with `each` one per item of a list.
+//! - `{"branch": {..}}`, a [`Branch`]: the `To` of the first case whose `when` equals a field's
+//!   value, else the branch's `else`.
+//! - `{"wait": {..}}`, a [`Wait`]: waits for an event of the `ty` it names with the same key,
+//!   then sends one `To` on a match, or another when none comes in time.
+//!
+//! ## A next to one `ty`: [`To`]
+//!
+//! - `ty`, required: the `ty` of the event sent. `check` requires a flow for it.
+//! - `shape`, default `{}`: the event's data, field by field, each value a shape expression
+//!   worked out from the values. `check` requires a field for each field the receiving flow
+//!   takes, of its type; it does not check the other fields.
+//! - `delay_ms`, default `0`: the event comes due this many milliseconds after the run.
+//! - `each`, default none: the name of a list field. One event is sent per item, its shape
+//!   reading the item as `"$item"`; at run time, a field that is absent or not a list sends
+//!   none. `check` requires the field's type to be a list.
+//!
+//! ## A branch: [`Branch`] and [`Case`]
+//!
+//! - `on`, required: the name of the field to branch on, a bare name and not a shape
+//!   expression. An absent field is null.
+//! - `cases`, required, and may be empty: the [`Case`]s, in order. A case has two fields:
+//!   - `when`, required: a JSON value.
+//!   - `next`, required: a [`To`].
+//! - `else`, required: the [`To`] sent when no case's `when` equals the field's value.
+//!
+//! The first case whose `when` equals the field's value sends its `next`. The comparison is of
+//! JSON values, so the number `1` does not equal the string `"1"`. `check` requires the field in
+//! scope and every `when` of its type.
+//!
+//! ## A wait: [`Wait`]
+//!
+//! - `for`, required: the `ty` of the event waited for. `check` requires a flow for it.
+//! - `key`, required: a shape expression, worked out from the values at the wait. An event of
+//!   the `for` ty matches when the same expression, worked out from that event's data, gives an
+//!   equal value. `check` requires the expression to give the same type both ways: in the
+//!   step's scope, and over the `takes` of the flow for `for`.
+//! - `within_ms`, required: how long the wait lasts, in milliseconds.
+//! - `next`, required: the [`To`] sent on the first match before the wait times out.
+//! - `timeout`, required: the [`To`] sent when the wait times out with no match.
+//! - `late`, default none: the [`To`] sent on the first match after the timeout. Without it, a
+//!   late match sends nothing.
+//!
+//! Each of the three is sent at most once, so a second match sends nothing. All three read the
+//! values as they stood at the wait; `next` and `late` also read each field of the matching
+//! event's data as `"$got.<field>"`. The matching event's own flow runs as it would without the
+//! wait.
+//!
+//! The wait is itself an event. The step sends an event of its own flow's `ty`, due `within_ms`
+//! after the run, whose data is `{"$wait": {"step": <step>, "for": <for>}, "key": <key>, "vals":
+//! <values>}`; a match sends `next` with that event as its source. When the event comes due, the
+//! processor runs none of the flow's steps. It sends `timeout` when nothing has matched, and the
+//! event's 2 says `"timeout"`, or `"matched"` when a match came first.
+//!
+//! # Shape expressions
+//!
+//! A `To`'s shape values and a wait's `key` are shape expressions, which [`eval`] works out from
+//! the values:
+//!
+//! - `"$field"`: the field's value, or null when the values do not hold it. A string that starts
+//!   with `$` reads the field named by the rest of it, whole: `"$a.b"` reads a field named `a.b`,
+//!   not `b` inside `a`.
+//! - `{"$concat": [..]}`: the parts, each a shape expression, joined as one string: a string
+//!   part as its text, any other value as its JSON text, so the number `2` adds `2` and null adds
+//!   `null`.
+//! - `{"$": <expression>, "or": <default>}`: the expression's value, or the default when that
+//!   value is null, as it is for an absent field. Without `or`, a null value stays null.
+//! - `"$item"`, in a `To` with `each`: the item.
+//! - `"$got.<field>"`, in a wait's `next` and `late`: that field of the matching event's data.
+//! - Anything else, an object without `$concat` or `$` included, is itself.
+//!
+//! `check` types the wait key, and each shape field the receiving flow takes, with
+//! [`type_expr`]: a `"$field"` has the field's type in scope, `$concat` gives `string`, and
+//! `{"$": .., "or": ..}` gives the inner expression's type, or `type_of` the default when the
+//! expression names something not in scope. `"$item"` has the type of the list's items, and
+//! `"$got.<field>"` the type the flow for `for` takes the field as.
+//!
+//! # Shape types
+//!
+//! A [`Shape`] maps field names to type names: `string`, `number`, `bool`, `list<string>`,
+//! `list<number>` and `any`. `check` compares the names as written. At run time a value's type is
+//! what [`type_of`] gives: a JSON string, number or bool is `string`, `number` or `bool`; an array
+//! of at least one item, every item a number, is `list<number>`, and any other array, an empty
+//! one included, is `list<string>`; an object or null is `any`. The processor checks an action's
+//! output against its `Sig`'s gives by these names, so a field it declares as `any` must hold an
+//! object or null.
+//!
+//! # `$graph`
+//!
+//! An action gives graph rows in a `$graph` field of its output: a list, each item a row for the
+//! app's append to write. The processor takes `$graph` out of the output before it checks the
+//! output or merges it, so the later links and the nexts never see it, and a `Sig` must not
+//! declare it in its gives. A `$graph` that is not a list fails the step with `<link> gave $graph
+//! as <type>, not list`. The rows of every link in the run are kept in order and, when the run
+//! succeeds, held in [`Processor::writes`] under the event's id; a failed run keeps none.
+//! rannoch-graph's `GraphAppend` takes them with the event's 2 and writes them in the same
+//! transaction; its `Op` is the form of an item, as in `{"set": {"node": "n1", "key": "name",
+//! "value": "Sam"}}`. With any other append, nothing takes them.
+//!
+//! # What `check` reports
+//!
+//! [`check`] returns every error in every document, in order, one line each: `E<n> <file> step
+//! <i> <where>: <what>`, where `<where>` is the link's action name, or `next` for an error in the
+//! step's next. For example: `E3 a.json step 0 upper: upper takes text, which nothing before it
+//! gives`.
+//!
+//! - `E1`, a link that names no action in the signatures: `no action named <link>`.
+//! - `E2`, a link's options that do not fit its `Sig`'s options: `the options for <link> do not
+//!   parse: <why>`, where `<why>` is `not an object`, ``unknown field `<field>` ``, ``missing
+//!   field `<field>` `` or `<field> is <type>, not <type>`.
+//! - `E3`, a field that nothing gives: `<link> takes <field>, which nothing before it gives`, or
+//!   `branch on <field>, which nothing gives`; or a wait key that does not give the same type both
+//!   ways: `wait key <key> does not render the same on both sides (<step> / <for>)`, each side
+//!   `Ok("<type>")` or `Err("<why>")`.
+//! - `E4`, a field of another type: `<link> takes <field> as <type>, it is <type>`, `branch on
+//!   <field> as <type>, a case when <value>`, or `each over <field>, which is not a list`.
+//! - `E5`, a field a next does not give: `the next to <flow> gives no <field>, which it takes`,
+//!   or `$<field> names nothing in scope` for a field an expression reads.
+//! - `E6`, a field a next gives as another type: `the next to <flow> gives <field> as <type>, it
+//!   takes <type>`.
+//! - `E7`, a `ty` that no flow runs: `the next goes to ty <ty>, which no flow takes`, or `wait for
+//!   ty <ty>, which no flow takes`.
+//!
+//! `compile` prints each line to stderr, then panics with `<n> errors in the flow docs in <dir>`,
+//! which fails the build.
 
 mod check;
 mod doc;
@@ -28,22 +281,42 @@ pub use check::{check, compile};
 pub use doc::{Branch, Case, Flow as FlowDoc, Next, Shape, Step, To, Wait};
 pub use doc::{eval, type_expr, type_of};
 
+/// What an action declares: its name, its options, the fields it takes and gives, and whether it
+/// is a job. A signatures export is a JSON array of these; a field a `Sig` does not define is
+/// refused.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Sig {
+    /// The name a step's `do` calls the action by.
     pub action: String,
+    /// The fields and types the action's options hold, which a step gives in its `with`; empty
+    /// by default.
     #[serde(default)]
     pub options: Shape,
+    /// The fields and types the action reads, each of which `check` requires something before it
+    /// to give, of that type; empty by default.
     #[serde(default)]
     pub takes: Shape,
+    /// The fields and types the action's output holds. `check` adds them to the step's scope;
+    /// after a step with `as`, only the `as` field, as `any`. The processor fails the step when
+    /// an output lacks one or holds it as another type; empty by default.
     #[serde(default)]
     pub gives: Shape,
+    /// Whether the action is long-running work; `false` by default. `check` reads it from the
+    /// signatures export and sets the flow's `job`: a flow with a job action runs as a job, on a
+    /// thread of its own.
     #[serde(default)]
     pub job: bool,
 }
 
+/// One of the app's actions, which a step calls by its `Sig`'s `action`.
 pub trait Action: Send + Sync {
+    /// The action's signature.
     fn sig(&self) -> &Sig;
+    /// Runs the action on `options`, the step's `with` for it or `{}` when it has none, and on
+    /// `input`, the values with the outputs of the links before it in the step. The output's
+    /// fields join the next link's input and the step's result, except `$graph`, which holds
+    /// the action's graph rows.
     /// # Errors
     /// The failure, which fails the step.
     fn run(
@@ -56,7 +329,8 @@ pub trait Action: Send + Sync {
 /// Graph writes by the id of the event they are about, until the append that carries its 2 takes them.
 pub type Writes = Arc<Mutex<HashMap<Uuid, Vec<Value>>>>;
 
-/// The app's flows by ty, each a `rannoch_queue::Flow` whose run closure calls `process`.
+/// The app's flows, one [`Flow`] for each flow's `ty`: the queue's [`Flows`]. `T` is the app's
+/// event type, made from each `ty` with `TryFrom<u16>`, and `D` its data, made from a JSON value.
 #[derive(Debug)]
 pub struct Processor<T, D> {
     flows: HashMap<u16, Arc<Flow<T, D>>>,
@@ -64,7 +338,10 @@ pub struct Processor<T, D> {
 }
 
 impl<T: TryFrom<u16> + PartialEq + 'static, D: From<Value> + 'static> Processor<T, D> {
-    /// `flows` is the JSON array of flow docs the app compiles in; `events` reads `_events`.
+    /// The processor over `flows`, the JSON array of flow docs that [`compile`] writes and the
+    /// app compiles in, and `actions`, found by their `Sig`'s `action`; `events` reads the waits
+    /// in `_events`. It does not check the docs: a link that names none of `actions` fails its
+    /// step with `no action named <link>`.
     /// # Errors
     /// The error of a flow doc that does not parse.
     pub fn new(

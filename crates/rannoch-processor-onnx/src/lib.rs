@@ -1,5 +1,68 @@
+#![warn(missing_docs)]
 //! Flow steps that run a local ONNX model: a numeric model, a text embedding and a text
 //! classifier. Every model runs through ort, or through tract when the `tract` feature is on.
+//!
+//! The app opens each model file with [`Model::open`] and makes its actions with the [`Sig`]s
+//! it declares for them in its signatures export: [`Infer`] for a numeric model, [`Embed`] for
+//! a model2vec embedding model, and [`Classify`] over an `Embed` and the app's labels. It hands
+//! them to `Processor::new` with its other actions, and a step calls each by its `Sig`'s
+//! `action`.
+//!
+//! # Example
+//!
+//! The model here is the crate's test model, `tests/models/add.onnx`, which adds its inputs `a`
+//! and `b` and gives the sum as `y`; an app opens its own file.
+//!
+//! ```
+//! use std::path::Path;
+//!
+//! use rannoch_processor::{Action, Sig};
+//! use rannoch_processor_onnx::{Infer, Model};
+//! use serde_json::{Map, json};
+//!
+//! let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/models/add.onnx");
+//! let sig: Sig = serde_json::from_value(json!({ "action": "add", "job": true,
+//!     "takes": { "a": "number", "b": "number" }, "gives": { "y": "number" } }))?;
+//! let add = Infer::new(sig, Model::open(Path::new(path))?);
+//!
+//! let input = Map::from_iter([("a".to_owned(), json!(2.5)), ("b".to_owned(), json!(4.0))]);
+//! assert_eq!(add.run(&json!({}), &input)?["y"], json!(6.5));
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+//!
+//! `Embed` and `Classify` need a model2vec model and its `tokenizer.json`, which the repo does
+//! not hold, so this example is not run. The crate's scenarios fetch minishlab/potion-base-8M
+//! from Hugging Face into the target directory; the example reads its `onnx/model.onnx` and
+//! `tokenizer.json`.
+//!
+//! ```no_run
+//! use std::path::Path;
+//! use std::sync::Arc;
+//!
+//! use rannoch_processor::{Action, Sig};
+//! use rannoch_processor_onnx::{Classify, Embed, Model};
+//! use serde_json::{Value, json};
+//!
+//! let dir = Path::new("potion-base-8M");
+//! let tokenizer = std::fs::read_to_string(dir.join("tokenizer.json"))?;
+//! let sig = |action: &str, gives: Value| {
+//!     let takes = json!({ "text": "string" });
+//!     serde_json::from_value::<Sig>(json!({ "action": action, "takes": takes, "gives": gives }))
+//! };
+//! let embed = || -> Result<Embed, Box<dyn std::error::Error>> {
+//!     let model = Model::open(&dir.join("onnx/model.onnx"))?;
+//!     Ok(Embed::new(sig("embed", json!({ "vector": "list<number>" }))?, model, &tokenizer)?)
+//! };
+//!
+//! let labels = [
+//!     ("bug", "the app crashed with an error and is broken"),
+//!     ("question", "how do I do this, can you explain"),
+//! ];
+//! let classify = Classify::new(sig("classify", json!({ "label": "string" }))?, embed()?, &labels)?;
+//! let actions: Vec<Arc<dyn Action>> = vec![Arc::new(embed()?), Arc::new(classify)];
+//! # drop(actions);
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -16,7 +79,7 @@ enum Input {
 /// The outputs of one run, by name, each flattened.
 type Outputs = Vec<(String, Vec<f32>)>;
 
-/// A loaded model file.
+/// A loaded ONNX model file, run through ort, or through tract with the `tract` feature.
 #[derive(Debug)]
 pub struct Model {
     #[cfg(not(feature = "tract"))]
@@ -27,6 +90,7 @@ pub struct Model {
 }
 
 impl Model {
+    /// Loads the model file at `path` into an ort session.
     /// # Errors
     /// The runtime's error, when the file does not load as a model.
     #[cfg(not(feature = "tract"))]
@@ -40,6 +104,7 @@ impl Model {
         Ok(Self { session, inputs })
     }
 
+    /// Loads the model file at `path` and optimizes it into a tract plan.
     /// # Errors
     /// The runtime's error, when the file does not load as a model.
     #[cfg(feature = "tract")]
@@ -108,6 +173,9 @@ impl Model {
 
 /// A numeric model as an action: each `takes` field (a number) goes in as a one-element f32
 /// tensor of the same name; each `gives` field is the first element of the output of that name.
+/// A run fails with `<action> takes <field>, a number` when the input does not hold the field as
+/// a number, and with `<action>'s model gives no output <field>` when the model gives no such
+/// output.
 #[derive(Debug)]
 pub struct Infer {
     sig: Sig,
@@ -115,6 +183,7 @@ pub struct Infer {
 }
 
 impl Infer {
+    /// The action `sig` declares, running `model`.
     #[must_use]
     pub fn new(sig: Sig, model: Model) -> Self {
         Self { sig, model }
@@ -146,7 +215,11 @@ impl Action for Infer {
     }
 }
 
-/// takes text, gives vector (`list<number>`): the model2vec embedding, L2-normalized.
+/// takes text, gives vector (`list<number>`): the model2vec embedding, L2-normalized. The text
+/// is lowercased and split into words at whitespace, each ASCII punctuation mark a word of its
+/// own; each word is cut into the word pieces of the tokenizer's vocabulary, and a word the
+/// pieces do not cover whole is dropped. The ids go in as `input_ids`, with `offsets` `[0]` when
+/// the model takes it. A `text` that is missing or not a string is embedded as empty.
 #[derive(Debug)]
 pub struct Embed {
     sig: Sig,
@@ -155,6 +228,8 @@ pub struct Embed {
 }
 
 impl Embed {
+    /// The action `sig` declares, running `model` with the vocabulary of `tokenizer_json`, the
+    /// model's `tokenizer.json`.
     /// # Errors
     /// When `tokenizer_json` does not parse or holds no `model.vocab`.
     pub fn new(sig: Sig, model: Model, tokenizer_json: &str) -> Result<Self, String> {
@@ -199,6 +274,8 @@ pub struct Classify {
 }
 
 impl Classify {
+    /// The action `sig` declares, choosing among `labels`, each a label and its description;
+    /// `embed` embeds each description once, here, and each text the action is given.
     /// # Errors
     /// The failure to embed a label's description.
     pub fn new(sig: Sig, embed: Embed, labels: &[(&str, &str)]) -> Result<Self, String> {
