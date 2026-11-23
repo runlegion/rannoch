@@ -241,8 +241,8 @@
 //!
 //! [`check`] returns every error in every document, in order, one line each: `E<n> <file> step
 //! <i> <where>: <what>`, where `<where>` is the link's action name, or `next` for an error in the
-//! step's next. For example: `E3 a.json step 0 upper: upper takes text, which nothing before it
-//! gives`.
+//! step's next; an error in no step is `E<n> <file>: <what>`. For example: `E3 a.json step 0
+//! upper: upper takes text, which nothing before it gives`.
 //!
 //! - `E1`, a link that names no action in the signatures: `no action named <link>`.
 //! - `E2`, a link's options that do not fit its `Sig`'s options: `the options for <link> do not
@@ -260,6 +260,8 @@
 //!   takes <type>`.
 //! - `E7`, a `ty` that no flow runs: `the next goes to ty <ty>, which no flow takes`, or `wait for
 //!   ty <ty>, which no flow takes`.
+//! - `E8`, a `ty` that an earlier document's flow also runs: `ty <ty>, which <file> also takes`,
+//!   where `<file>` is the first document of that `ty`.
 //!
 //! `compile` prints each line to stderr, then panics with `<n> errors in the flow docs in <dir>`,
 //! which fails the build.
