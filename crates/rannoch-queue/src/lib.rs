@@ -46,25 +46,21 @@
 //!
 //! # Failures
 //!
-//! Each failure the queue meets about an event becomes a -1 about that event, whose data names
-//! the reason:
+//! A failure the queue meets about an event becomes a -1 about that event, whose data names the
+//! reason:
 //!
-//! - a due event whose `ty` is not the app's `T`: `ty <ty> is not the app's`;
-//! - a due or waiting event that cannot be read: `its source <source> is not a UUID`, or `its
-//!   run_at <run_at> is not a time`;
-//! - a due event whose walk to its root cannot go on: `<id> in its chain is not in _events`, or
-//!   `<id> in its chain cannot be read: <why>`;
+//! - a due event, or a stalled one the hunt would resend, whose `ty` is not the app's `T`, as
+//!   when the app's enum changes: `ty <ty> is not the app's`;
 //! - a run that panics, with no retry: `the run panicked: <message>`;
 //! - a failed run whose retry's `run_at` is past what a time can hold, with no retry: `its retry's
 //!   wait overflows`;
-//! - a run the queue cannot hand over to its runs: `the queue's runs have stopped`;
-//! - in the hunt, a stalled event whose 1 is not a `UUIDv7`, whose tree cannot be read, or whose
-//!   `ty` is not the app's: `its 1 <id> is not a UUIDv7`, `the hunt could not read its tree:
-//!   <error>`, or `ty <ty> is not the app's`.
+//! - a run the queue cannot hand over to its runs: `the queue's runs have stopped`.
 //!
-//! A row whose id is not a UUID names no event, so it is logged at `error` and left. A read of the
-//! hunt's 1s that fails is logged at `error`; a read of the due events or of the next `run_at`
-//! that fails is logged, and read again after [`Settings::first_wait`].
+//! A row rannoch never writes is passed over with a log line at `error`, and no -1: one whose id,
+//! source or `run_at` does not parse, a 1 whose id is not a `UUIDv7`, and a retry whose source is
+//! not in `_events`. A read that fails in the store is logged at `error` and read again after
+//! [`Settings::first_wait`], never binned: the due events, the next `run_at` and a due event's
+//! chain; when the hunt cannot read the 1s or an event's tree, it runs again after `first_wait`.
 //!
 //! # Stopping
 //!
@@ -363,8 +359,6 @@ fn run<T, D>(
     });
     let mut jobs: Vec<JoinHandle<()>> = Vec::new();
     let mut taken = HashSet::new();
-    // The events not yet due that `next_due` has sent a -1 for.
-    let mut binned = HashSet::new();
     let mut next_hunt = Instant::now() + settings.hunt;
     // The first pass takes the events already due when the queue starts.
     let mut wait = Duration::ZERO;
@@ -374,39 +368,37 @@ fn run<T, D>(
         }
         jobs.retain(|job| !job.is_finished());
         if Instant::now() >= next_hunt {
-            hunt(conn, sender, settings.window, started);
+            // A hunt the store could not read for runs again after `first_wait`.
+            let read_all = hunt(conn, sender, settings.window, started);
             next_hunt = Instant::now() + settings.hunt;
+            if !read_all {
+                next_hunt = Instant::now() + settings.first_wait;
+            }
         }
         let Ok(due) = read(conn, queries::DUE, [now()]) else {
             log::error!("the queue could not read the due events");
             wait = settings.first_wait;
             continue;
         };
-        // An event whose 1 or -1 is kept has left the due events; until then the queue
-        // remembers it.
-        let id_of = |row: &Result<Row, Unread>| row.as_ref().map_or_else(|u| u.0, |r| r.id);
-        taken.retain(|id| due.iter().any(|row| id_of(row) == *id));
+        // An event whose 1 is kept has left the due events; until then the queue remembers it.
+        taken.retain(|id| due.iter().any(|row| row.id == *id));
+        // An event whose chain the store could not read is read again after `first_wait`.
+        let mut unread = false;
         for row in due {
-            let id = id_of(&row);
-            if binned.contains(&id) || !taken.insert(id) {
+            if !taken.insert(row.id) {
                 continue;
             }
-            let row = match row {
-                Ok(row) => row,
-                Err((id, ty, why)) => {
-                    bin(conn, sender, id, ty, &why);
-                    continue;
-                }
-            };
             let Ok(ty) = T::try_from(row.ty) else {
-                let why = format!("ty {} is not the app's", row.ty);
-                bin(conn, sender, row.id, row.ty, &why);
+                not_the_apps(conn, row.id, row.ty);
                 continue;
             };
             let (root, before) = match root(conn, row.clone()) {
-                Ok(found) => found,
-                Err(why) => {
-                    send(sender, row.id, ty, &why, Status::Binned);
+                Ok(Some(found)) => found,
+                Ok(None) => continue,
+                Err(err) => {
+                    log::error!("the queue could not read the chain of {}: {err}", row.id);
+                    taken.remove(&row.id);
+                    unread = true;
                     continue;
                 }
             };
@@ -431,9 +423,12 @@ fn run<T, D>(
                 send(sender, row.id, ty, why, Status::Binned);
             }
         }
-        wait = next_due(conn, sender, &mut binned, settings.first_wait)
+        wait = next_due(conn, settings.first_wait)
             .unwrap_or(IDLE)
             .min(next_hunt.saturating_duration_since(Instant::now()));
+        if unread {
+            wait = wait.min(settings.first_wait);
+        }
     }
     drop(runs);
     let _ = runs_thread.join();
@@ -513,9 +508,10 @@ fn backoff(settings: Settings, before: u32) -> Option<Duration> {
 
 /// The hunt: sends again, as a retry with that event as its source, each event whose 1 is
 /// older than `window` and from before `started`, the millisecond the queue started, with nothing
-/// after it in the event's tree, as a crash leaves it. An event whose 1 is not a `UUIDv7`, whose
-/// tree it cannot read, or whose `ty` is not the app's gets a -1 saying so.
-fn hunt<T, D>(conn: &Connection, sender: &Sender<T, D>, window: Duration, started: i64)
+/// after it in the event's tree, as a crash leaves it; such an event whose `ty` is not the app's
+/// gets a -1 saying so. Whether it read all it needed: `false` when the store could not read the
+/// 1s or an event's tree.
+fn hunt<T, D>(conn: &Connection, sender: &Sender<T, D>, window: Duration, started: i64) -> bool
 where
     T: TryFrom<u16> + PartialEq,
     D: From<String>,
@@ -524,20 +520,11 @@ where
         Ok(ones) => ones,
         Err(err) => {
             log::error!("the hunt could not read the 1s: {err}");
-            return;
+            return false;
         }
     };
+    let mut read_all = true;
     for (one, event, ty) in ones {
-        // The queue's 1s are UUIDv7s, whose time is when the 1 was accepted.
-        let Some(one) = one
-            .parse::<Uuid>()
-            .ok()
-            .filter(|id| id.get_version_num() == 7)
-        else {
-            let why = format!("its 1 {one} is not a UUIDv7");
-            bin(conn, sender, event, ty, &why);
-            continue;
-        };
         let ours = taken_at(one).is_none_or(|at| at.timestamp_millis() >= started);
         if ours || !older_than(one, window, Utc::now()) {
             continue;
@@ -546,14 +533,13 @@ where
             Ok(false) => {}
             Ok(true) => continue,
             Err(err) => {
-                let why = format!("the hunt could not read its tree: {err}");
-                bin(conn, sender, event, ty, &why);
+                log::error!("the hunt could not read the tree of {event}: {err}");
+                read_all = false;
                 continue;
             }
         }
         let Ok(ty) = T::try_from(ty) else {
-            let why = format!("ty {ty} is not the app's");
-            bin(conn, sender, event, ty, &why);
+            not_the_apps(conn, event, ty);
             continue;
         };
         let retry = Event {
@@ -568,11 +554,13 @@ where
             log::error!("the hunt could not send {event} again: rannoch is closed");
         }
     }
+    read_all
 }
 
-/// The 1s whose event has no 2 or -1 yet: the 1's id as stored, its event's id and the event's
-/// `ty`. A 1 whose event's id is not a UUID names no event, and is logged and left out.
-fn ones_without_result(conn: &Connection) -> rusqlite::Result<Vec<(String, Uuid, u16)>> {
+/// The 1s whose event has no 2 or -1 yet: the 1's id, its event's id and the event's `ty`. A 1
+/// whose id is not a `UUIDv7`, or whose source is not a UUID, rannoch never writes: it is passed
+/// over with a log line.
+fn ones_without_result(conn: &Connection) -> rusqlite::Result<Vec<(Uuid, Uuid, u16)>> {
     let mut select = conn.prepare_cached(queries::ONES)?;
     let rows = select.query_map([], |r| {
         Ok((
@@ -584,9 +572,9 @@ fn ones_without_result(conn: &Connection) -> rusqlite::Result<Vec<(String, Uuid,
     let mut out = Vec::new();
     for row in rows {
         let (one, event, ty) = row?;
-        match event.parse() {
-            Ok(event) => out.push((one, event, ty)),
-            Err(_) => log::error!("the hunt skipped the 1 {one}: its source {event} is not a UUID"),
+        match (one.parse::<Uuid>(), event.parse()) {
+            (Ok(one), Ok(event)) if one.get_version_num() == 7 => out.push((one, event, ty)),
+            _ => log::error!("the hunt passed over the 1 {one} of {event}: not a UUIDv7 of a UUID"),
         }
     }
     Ok(out)
@@ -664,19 +652,11 @@ fn send<T: PartialEq, D: From<String>>(
     sent
 }
 
-/// Sends a -1 about the event `source`, of `ty`, with `why` as its data. A `ty` that is the
-/// app's goes through `sender`, as every status the queue sends does. Any other cannot, since
-/// `Sender::send` takes the app's `T`, so the queue writes that -1 to `_events` itself, as the
-/// append writes one.
-fn bin<T, D>(conn: &Connection, sender: &Sender<T, D>, source: Uuid, ty: u16, why: &str)
-where
-    T: TryFrom<u16> + PartialEq,
-    D: From<String>,
-{
-    if let Ok(ty) = T::try_from(ty) {
-        send(sender, source, ty, why, Status::Binned);
-        return;
-    }
+/// Writes a -1 about the event `source`, whose `ty` is not the app's, saying so. `Sender::send`
+/// takes the app's `T`, so this one -1 cannot go through it: the queue writes it to `_events`
+/// itself, as the append writes one.
+fn not_the_apps(conn: &Connection, source: Uuid, ty: u16) {
+    let why = format!("ty {ty} is not the app's");
     let row = params![Uuid::now_v7().to_string(), source.to_string(), ty, why];
     if let Err(err) = conn.execute(queries::BIN, row) {
         log::error!("the queue could not write a -1 for {source}: {err}");
@@ -685,69 +665,46 @@ where
 
 /// The root whose data every flow uses, and how many failed attempts are behind `row` in its
 /// chain: back from `row` through each source that has a -1, one failed attempt each, and from
-/// each hunt's resend to the event it resends. When the walk cannot go on, why not.
-fn root(conn: &Connection, row: Row) -> Result<(Row, u32), String> {
+/// each hunt's resend to the event it resends. `None`, logged, when the walk reaches a source not
+/// in `_events`, which rannoch never writes.
+fn root(conn: &Connection, row: Row) -> rusqlite::Result<Option<(Row, u32)>> {
+    let id = row.id;
     let mut at = row;
     let mut before = 0_u32;
-    let unread = |err: rusqlite::Error| format!("its chain cannot be read: {err}");
     while let Some(source) = at.source {
-        let failed: bool = conn
-            .query_row(queries::FAILED, [source.to_string()], |r| r.get(0))
-            .map_err(unread)?;
+        let failed: bool = conn.query_row(queries::FAILED, [source.to_string()], |r| r.get(0))?;
         // The append writes the resend's data as a JSON string.
         let resend = at.data.strip_prefix('"').and_then(|d| d.strip_suffix('"')) == Some(HUNG);
         if !failed && !resend {
             break;
         }
-        match read(conn, queries::EVENT, [source.to_string()])
-            .map_err(unread)?
-            .pop()
-        {
-            Some(Ok(earlier)) => {
-                at = earlier;
-                before = before.saturating_add(u32::from(failed));
-            }
-            Some(Err((.., why))) => {
-                return Err(format!("{source} in its chain cannot be read: {why}"));
-            }
-            None => return Err(format!("{source} in its chain is not in _events")),
-        }
+        let Some(earlier) = read(conn, queries::EVENT, [source.to_string()])?.pop() else {
+            log::error!("the queue passed over {id}: {source} in its chain cannot be found");
+            return Ok(None);
+        };
+        at = earlier;
+        before = before.saturating_add(u32::from(failed));
     }
-    Ok((at, before))
+    Ok(Some((at, before)))
 }
 
 /// How long until the earliest `run_at` among the waiting events, or `None` when there is none.
-/// A waiting event before it that cannot be read, as one whose `run_at` is not a time, gets a -1
-/// once: `binned` holds each it has had. When the read fails, the queue reads again after
-/// `first_wait`.
-fn next_due<T, D>(
-    conn: &Connection,
-    sender: &Sender<T, D>,
-    binned: &mut HashSet<Uuid>,
-    first_wait: Duration,
-) -> Option<Duration>
-where
-    T: TryFrom<u16> + PartialEq,
-    D: From<String>,
-{
-    let mut unread = Vec::new();
-    let next = (|| -> rusqlite::Result<Option<DateTime<Utc>>> {
+/// A `run_at` that is not a time, which rannoch never writes, is passed over with a log line.
+/// When the read fails, the queue reads again after `first_wait`.
+fn next_due(conn: &Connection, first_wait: Duration) -> Option<Duration> {
+    let next = || -> rusqlite::Result<Option<DateTime<Utc>>> {
         let mut select = conn.prepare_cached(queries::NEXT_RUN_AT)?;
-        for row in select.query_map([now()], columns)? {
-            match parse(row?) {
-                Some(Ok(row)) => return Ok(row.run_at),
-                Some(Err(row)) => unread.push(row),
-                None => {}
+        let mut rows = select.query([now()])?;
+        while let Some(row) = rows.next()? {
+            let (id, at): (String, String) = (row.get(0)?, row.get(1)?);
+            match at.parse() {
+                Ok(at) => return Ok(Some(at)),
+                Err(_) => log::error!("the queue passed over {id}: its run_at {at} is not a time"),
             }
         }
         Ok(None)
-    })();
-    for (id, ty, why) in unread {
-        if binned.insert(id) {
-            bin(conn, sender, id, ty, &why);
-        }
-    }
-    match next {
+    };
+    match next() {
         Ok(at) => at.map(|at| (at - Utc::now()).to_std().unwrap_or(Duration::ZERO)),
         Err(err) => {
             log::error!("the queue could not read the next run_at: {err}");
@@ -760,63 +717,39 @@ fn now() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
-/// A row that cannot be read as a [`Row`]: its id, its `ty`, and why.
-type Unread = (Uuid, u16, String);
-
-/// An `_events` row's id, source, ty, data, `run_at` and status, as stored.
-type Columns = (String, Option<String>, u16, String, Option<String>, i64);
-
-fn columns(r: &rusqlite::Row<'_>) -> rusqlite::Result<Columns> {
-    Ok((
-        r.get(0)?,
-        r.get(1)?,
-        r.get(2)?,
-        r.get(3)?,
-        r.get(4)?,
-        r.get(5)?,
-    ))
-}
-
-/// The row, or why it cannot be read as one; `None`, logged, for a row whose id is not a UUID,
-/// which names no event.
-fn parse((id, source, ty, data, run_at, status): Columns) -> Option<Result<Row, Unread>> {
-    let Ok(id) = id.parse() else {
-        log::error!("the queue skipped a row whose id {id} is not a UUID");
-        return None;
-    };
-    let row = || -> Result<Row, String> {
-        let source = source.map(|s| {
-            s.parse()
-                .map_err(|_| format!("its source {s} is not a UUID"))
-        });
-        let run_at = run_at.map(|t| {
-            t.parse()
-                .map_err(|_| format!("its run_at {t} is not a time"))
-        });
-        Ok(Event {
+/// The rows `sql` selects, as id, source, ty, data, `run_at` and status.
+fn read(conn: &Connection, sql: &str, params: impl Params) -> rusqlite::Result<Vec<Row>> {
+    let mut select = conn.prepare_cached(sql)?;
+    let rows = select.query_map(params, |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, Option<String>>(1)?,
+            r.get::<_, u16>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, Option<String>>(4)?,
+            r.get::<_, i64>(5)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, source, ty, data, run_at, status) = row?;
+        let (Ok(id), Ok(source), Ok(run_at), Some(status)) = (
+            id.parse(),
+            source.map(|s| s.parse()).transpose(),
+            run_at.map(|t| t.parse()).transpose(),
+            status_of(status),
+        ) else {
+            log::error!("the queue skipped a row it could not read");
+            continue;
+        };
+        out.push(Event {
             id,
-            source: source.transpose()?,
+            source,
             ty,
             data,
-            run_at: run_at.transpose()?,
-            status: status_of(status)
-                .ok_or_else(|| format!("its status {status} is not a status"))?,
-        })
-    };
-    Some(row().map_err(|why| (id, ty, why)))
-}
-
-/// The rows `sql` selects, as id, source, ty, data, `run_at` and status, each a [`Row`] or why
-/// it cannot be read as one.
-fn read(
-    conn: &Connection,
-    sql: &str,
-    params: impl Params,
-) -> rusqlite::Result<Vec<Result<Row, Unread>>> {
-    let mut select = conn.prepare_cached(sql)?;
-    let mut out = Vec::new();
-    for row in select.query_map(params, columns)? {
-        out.extend(parse(row?));
+            run_at,
+            status,
+        });
     }
     Ok(out)
 }
@@ -854,11 +787,7 @@ mod tests {
     }
 
     fn event(conn: &rusqlite::Connection, id: &str) -> super::Row {
-        read(conn, queries::EVENT, [id])
-            .unwrap()
-            .pop()
-            .unwrap()
-            .unwrap()
+        read(conn, queries::EVENT, [id]).unwrap().pop().unwrap()
     }
 
     #[test]
@@ -945,6 +874,7 @@ mod tests {
         assert_eq!(
             root(&store, event(&store, &first))
                 .unwrap()
+                .unwrap()
                 .0
                 .id
                 .to_string(),
@@ -952,6 +882,7 @@ mod tests {
         );
         assert_eq!(
             root(&store, event(&store, &output))
+                .unwrap()
                 .unwrap()
                 .0
                 .id
@@ -970,7 +901,7 @@ mod tests {
         put(&store, Some(&first), "\"failed again\"", -1);
         let second = put(&store, Some(&first), "\"failed again\"", 0);
 
-        let (found, before) = root(&store, event(&store, &second)).unwrap();
+        let (found, before) = root(&store, event(&store, &second)).unwrap().unwrap();
 
         assert_eq!(found.id.to_string(), original);
         assert_eq!(found.data, "{\"in\":1}");

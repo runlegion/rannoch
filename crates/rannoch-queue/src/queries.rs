@@ -6,10 +6,10 @@ FROM _events e WHERE e.status = 0 AND (e.run_at IS NULL OR e.run_at <= ?1)
 AND NOT EXISTS (SELECT 1 FROM _events s WHERE s.source = e.id AND s.status <> 0)
 ORDER BY e.id";
 
-/// The events at status 0 that no status event has taken and whose `run_at` is after `?1`,
-/// earliest first.
-pub(crate) const NEXT_RUN_AT: &str = "SELECT e.id, e.source, e.ty, e.data, e.run_at, e.status
-FROM _events e WHERE e.status = 0 AND e.run_at > ?1
+/// The id and `run_at` of each event at status 0 that no status event has taken, whose `run_at`
+/// is after `?1`, earliest first.
+pub(crate) const NEXT_RUN_AT: &str = "SELECT e.id, e.run_at FROM _events e
+WHERE e.status = 0 AND e.run_at > ?1
 AND NOT EXISTS (SELECT 1 FROM _events s WHERE s.source = e.id AND s.status <> 0)
 ORDER BY e.run_at";
 

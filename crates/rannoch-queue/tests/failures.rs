@@ -1,16 +1,16 @@
 //! #108: each failure the queue meets about an event becomes one -1 for that event, whose data
 //! names the reason. Each test runs the real store, rannoch, `Events`, the queue and
 //! rannoch-processor on the built-in steps of rannoch-processor's fixture `tests/built_in.json`,
-//! over `_events` seeded from the app's forgr factory as a crash or a bad write leaves it. A run
-//! that panics, the runs channel closing and a panic on the queue's thread have no test here: no
-//! built-in step panics.
+//! over `_events` seeded from the app's forgr factory as a crash or a change to the app's `ty`
+//! leaves it. A run that panics, the runs channel closing and a panic on the queue's thread have
+//! no test here: no built-in step panics.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
-use chrono::{SecondsFormat, TimeDelta, Utc};
+use chrono::{TimeDelta, Utc};
 use rannoch_core::forgr::_events;
 use rannoch_core::{Append, Config, Rannoch};
 use rannoch_events::Events;
@@ -214,120 +214,13 @@ fn a_due_event_whose_ty_is_not_the_apps_gets_a_minus_1() -> Result<()> {
     Ok(())
 }
 
-/// 659-667: a due event whose source is not a UUID.
-#[test]
-fn a_due_event_that_cannot_be_read_gets_a_minus_1() -> Result<()> {
-    let path = store("cannot_be_read")?;
-    let event = id();
-    let data = r#"{"ticket":"t1"}"#;
-    seed(&path, &[(&event, Some("nobody"), 82, data, None, 0)])?;
-
-    let app = App::start(&path, HOUR, once())?;
-    app.signal_twice()?;
-    app.stop()?;
-
-    let binned = (-1, 82, said("its source nobody is not a UUID"));
-    assert_eq!(about(&path, &event)?, [binned]);
-    Ok(())
-}
-
-/// 365-372: the walk to a retry's root reads a source it cannot read.
-#[test]
-fn a_retry_whose_chain_cannot_be_read_gets_a_minus_1() -> Result<()> {
-    let path = store("chain_cannot_be_read")?;
-    let (first, retry) = (id(), id());
-    let data = r#"{"ticket":"t1"}"#;
-    seed(
-        &path,
-        &[
-            (&first, None, 82, data, Some("soon"), 0),
-            (&id(), Some(&first), 82, r#""failed""#, None, -1),
-            (&retry, Some(&first), 82, data, None, 0),
-        ],
-    )?;
-
-    let app = App::start(&path, HOUR, once())?;
-    app.signal_twice()?;
-    app.stop()?;
-
-    let why = format!("{first} in its chain cannot be read: its run_at soon is not a time");
-    assert_eq!(about(&path, &retry)?, [(-1, 82, said(&why))]);
-    Ok(())
-}
-
-/// 609-615: the walk to a retry's root reaches a source that is not in `_events`.
-#[test]
-fn a_retry_whose_source_is_not_in_events_gets_a_minus_1() -> Result<()> {
-    let path = store("source_not_in_events")?;
-    let (gone, retry) = (id(), id());
-    seed(
-        &path,
-        &[
-            (&id(), Some(&gone), 82, r#""failed""#, None, -1),
-            (&retry, Some(&gone), 82, r#"{"ticket":"t1"}"#, None, 0),
-        ],
-    )?;
-
-    let app = App::start(&path, HOUR, once())?;
-    app.signal_twice()?;
-    app.stop()?;
-
-    let why = format!("{gone} in its chain is not in _events");
-    assert_eq!(about(&path, &retry)?, [(-1, 82, said(&why))]);
-    Ok(())
-}
-
 /// Starts the app over the store at `path` with the hunt running every 300 ms, waits for a -1
-/// about `event` and for two more hunts, and stops it.
+/// about `event`, and stops it.
 fn hunt(path: &Path, event: &str) -> Result<()> {
     let app = App::start(path, FAST, hunting())?;
     let binned = || about(path, event).is_ok_and(|rows| rows.iter().any(|r| r.0 == -1));
     assert!(until(WAIT, binned), "no -1 about {event}");
-    thread::sleep(Duration::from_millis(700));
     app.stop()
-}
-
-/// 515-519: a 1 whose id does not parse, as a crash leaves it.
-#[test]
-fn the_hunt_bins_an_event_whose_1_has_an_id_that_does_not_parse() -> Result<()> {
-    let path = store("hunt_one_does_not_parse")?;
-    let event = ago(7200);
-    seed(
-        &path,
-        &[
-            (&event, None, 82, r#"{"ticket":"t1"}"#, None, 0),
-            ("not-an-id", Some(&event), 82, r#""taken""#, None, 1),
-        ],
-    )?;
-
-    hunt(&path, &event)?;
-
-    let binned = (-1, 82, said("its 1 not-an-id is not a UUIDv7"));
-    assert_eq!(about(&path, &event)?, [binned, (1, 82, said("taken"))]);
-    Ok(())
-}
-
-/// 475: a 1 whose id is not a `UUIDv7`, so it has no time to tell the hunt how old it is.
-#[test]
-fn the_hunt_bins_an_event_whose_1_is_not_a_uuidv7() -> Result<()> {
-    let path = store("hunt_one_not_v7")?;
-    let event = ago(7200);
-    let one = uuid::Builder::from_random_bytes([7; 16])
-        .into_uuid()
-        .to_string();
-    seed(
-        &path,
-        &[
-            (&event, None, 82, r#"{"ticket":"t1"}"#, None, 0),
-            (&one, Some(&event), 82, r#""taken""#, None, 1),
-        ],
-    )?;
-
-    hunt(&path, &event)?;
-
-    let binned = (-1, 82, said(&format!("its 1 {one} is not a UUIDv7")));
-    assert_eq!(about(&path, &event)?, [binned, (1, 82, said("taken"))]);
-    Ok(())
 }
 
 /// 487-489: a stalled event the hunt would resend, but whose ty is not the app's.
@@ -371,34 +264,5 @@ fn a_failed_run_whose_retry_wait_overflows_gets_a_minus_1_and_no_retry() -> Resu
         (-1, 87, said("its retry's wait overflows")),
     ];
     assert_eq!(about(&path, &event)?, rows);
-    Ok(())
-}
-
-/// 391 and 620-637: the earliest waiting event's `run_at` is not a time, and an event waits
-/// after it.
-#[test]
-fn a_waiting_event_whose_run_at_is_not_a_time_gets_a_minus_1_and_the_next_runs() -> Result<()> {
-    let path = store("run_at_not_a_time")?;
-    let at = |ms| {
-        (Utc::now() + TimeDelta::milliseconds(ms)).to_rfc3339_opts(SecondsFormat::Millis, true)
-    };
-    let (bad, next) = (id(), id());
-    let not_a_time = at(1_000).replace('Z', "Q");
-    seed(
-        &path,
-        &[
-            (&bad, None, 82, r#"{"ticket":"t1"}"#, Some(&not_a_time), 0),
-            (&next, None, 82, r#"{"ticket":"t2"}"#, Some(&at(2_000)), 0),
-        ],
-    )?;
-
-    let app = App::start(&path, FAST, once())?;
-    let ran = || about(&path, &next).is_ok_and(|rows| rows.iter().any(|r| r.0 == 2));
-    let on_time = until(WAIT, ran);
-    app.stop()?;
-
-    assert!(on_time, "the event after it did not run");
-    let why = format!("its run_at {not_a_time} is not a time");
-    assert_eq!(about(&path, &bad)?, [(-1, 82, said(&why))]);
     Ok(())
 }
