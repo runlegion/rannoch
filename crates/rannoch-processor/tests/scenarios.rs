@@ -1064,8 +1064,8 @@ fn a_queue_that_starts_takes_the_events_already_due_without_a_signal() {
 
 /// FR-RANNOCH-124's flows, from the fixture `tests/built_in.json`, each with the name of its
 /// file: a ticket's emit steps branch on its kind and wait for its answer, a payment stores its
-/// row, a lost order stores into a table the store does not have, and the flows their nexts
-/// reach. No action of the app's is in them.
+/// row, a lost order stores into a table the store does not have, an invoice stores its row and
+/// sends its receipt, and the flows their nexts reach. No action of the app's is in them.
 const BUILT_IN: &str = include_str!("built_in.json");
 
 /// `BUILT_IN` checked as the app's build checks it, with no signature of the app's: the flows to
@@ -1204,6 +1204,100 @@ fn store_refuses_a_table_it_does_not_have() {
     app.stop();
 }
 
+/// Not a scenario: #102. An invoice whose row `payments` refuses gets, in place of its 2 and its
+/// row, a -1 whose data is `reason`, and the receipt its step sent stands; a later invoice of the
+/// same inbox is written.
+fn a_refused_row_gets_a_minus_1(
+    name: &str,
+    payments: &str,
+    refused: &Value,
+    reason: &str,
+) -> Result<()> {
+    // Given a table that refuses the first invoice's row, and a flow whose step stores into it
+    // and sends a receipt
+    let app = built_in_with(name, Config::default())?;
+    app.read.execute_batch(payments)?;
+
+    // When that invoice is handed to the flow, then one the table takes
+    let first = app.hand(88, refused)?;
+    let later = app.hand(88, &json!({ "order": "o2", "amount": 5 }))?;
+
+    // Then the first gets a -1 naming the reason, and neither its 2 nor its row is written; the
+    // receipt its step sent stands
+    assert!(until(WAIT, || app.statuses(first).contains(&-1)));
+    assert_eq!(app.sent(first, -1), [(88, json!(reason))]);
+    assert_eq!(app.sent(first, 2), []);
+    assert_eq!(
+        app.count("SELECT count(*) FROM payments WHERE order_id = 'o1'"),
+        0
+    );
+    assert_eq!(app.sent(first, 0), [(89, json!({ "order": "o1" }))]);
+
+    // And the later invoice is written, with its 2, its row and its receipt
+    assert!(until(WAIT, || app.statuses(later).contains(&2)));
+    let row = "SELECT count(*) FROM payments WHERE order_id = 'o2' AND amount = 5";
+    assert_eq!(app.count(row), 1);
+    assert_eq!(app.sent(later, 0), [(89, json!({ "order": "o2" }))]);
+
+    app.stop();
+    Ok(())
+}
+
+#[test]
+fn a_row_that_breaks_not_null_gets_a_minus_1_and_no_2() {
+    let payments = "CREATE TABLE payments (order_id TEXT PRIMARY KEY, amount INTEGER NOT NULL)";
+    let absent = json!({ "order": "o1" });
+    let reason = "store: NOT NULL constraint failed: payments.amount";
+    a_refused_row_gets_a_minus_1("refused_not_null", payments, &absent, reason).unwrap();
+}
+
+#[test]
+fn a_row_that_breaks_a_foreign_key_gets_a_minus_1_and_no_2() {
+    let payments = format!("{ORDERS}; INSERT INTO orders (id) VALUES ('o2')");
+    let unknown = json!({ "order": "o1", "amount": 5 });
+    let reason = "store: FOREIGN KEY constraint failed";
+    a_refused_row_gets_a_minus_1("refused_foreign_key", &payments, &unknown, reason).unwrap();
+}
+
+/// How many payments #102's measurement runs to their 2.
+const RATE_EVENTS: u32 = 100_000;
+
+/// Not a scenario: #102's measurement of what the `store` step's savepoint costs. `RATE_EVENTS`
+/// payments are written at 0 in one transaction, the queue is signalled, and the flow rate is
+/// the payments over the time until every one has its 2; each has its row. Run it in release:
+/// `cargo test --release -p rannoch-processor --test scenarios -- --ignored --nocapture
+/// the_store_flow_rate`.
+#[test]
+#[ignore = "a measurement: run it in release"]
+fn the_store_flow_rate() {
+    // Given an app whose payment flow's step stores each payment's row
+    let app = App::built_in("store_flow_rate", &built_in().unwrap()).unwrap();
+    app.read.execute_batch(PAYMENTS).unwrap();
+
+    // When the payments are written at 0 and the queue is signalled
+    let mut conn = ready(&app.path).unwrap();
+    let tx = conn.transaction().unwrap();
+    for i in 0..RATE_EVENTS {
+        let data = json!({ "order": format!("o{i}"), "amount": i }).to_string();
+        let row = _events::factory().id(Uuid::now_v7().to_string()).ty(86);
+        row.data(data).status(0).insert(&tx).unwrap();
+    }
+    tx.commit().unwrap();
+    let start = Instant::now();
+    app.signal.send(()).unwrap();
+
+    // Then every payment reaches its 2 with its row, at the rate printed
+    let all = i64::from(RATE_EVENTS);
+    while app.count("SELECT count(*) FROM _events WHERE status = 2") < all {
+        thread::sleep(Duration::from_millis(50));
+    }
+    let elapsed = start.elapsed();
+    let rate = f64::from(RATE_EVENTS) / elapsed.as_secs_f64();
+    println!("{RATE_EVENTS} payments to their 2 in {elapsed:?}: {rate:.0} events/s");
+    assert_eq!(app.count("SELECT count(*) FROM payments"), all);
+    app.stop();
+}
+
 /// How many events wait their turn behind each other in #85's backlog.
 const BACKLOG: i64 = 5_000;
 
@@ -1288,10 +1382,11 @@ fn the_hunt_resends_an_event_a_crash_dropped() {
 
 // #92: the README's "What you can rely on" and "How it fails", each item through the real store,
 // rannoch, `Events`, the queue and rannoch-processor, on `BUILT_IN`'s flows of `emit` and `store`.
-// An item a scenario above already drives is not driven again; `GraphAppend` writing a batch
-// whole and a 2 with its `store` row are in rannoch-graph's scenarios. A payment whose row names
-// an order the store does not have stands in for the README's batch that can never be written,
-// a `$graph` item that is not an op, which no built-in step gives.
+// An item a scenario above already drives is not driven again; a 2 with its `store` row through
+// `GraphAppend`, and a row the table refuses there, are in rannoch-graph's scenarios. A batch
+// written whole or not at all is driven here with `Events`: a payment whose row breaks a deferred
+// foreign key, which SQLite checks only at commit, makes the README's batch that can never be
+// written.
 //
 // No built-in step gives a graph op, so rannoch-graph tests its own rows and reads:
 // - "Reads are decided by ids and stamps": in crates/rannoch-graph/src/lib.rs, `fr_rannoch_123_c2`
@@ -1417,6 +1512,12 @@ const ROOTS: &str = "SELECT count(*) FROM _events WHERE source IS NULL";
 const ORDERS: &str = "CREATE TABLE orders (id TEXT PRIMARY KEY);
     CREATE TABLE payments (order_id TEXT PRIMARY KEY REFERENCES orders(id), amount INTEGER)";
 
+/// Payments that must name an order the store has by the time their batch commits: a deferred
+/// foreign key, which SQLite checks only at commit.
+const DEFERRED: &str = "CREATE TABLE orders (id TEXT PRIMARY KEY);
+    CREATE TABLE payments (order_id TEXT PRIMARY KEY
+        REFERENCES orders(id) DEFERRABLE INITIALLY DEFERRED, amount INTEGER)";
+
 /// The `error` lines rannoch logs, for the scenarios that read them.
 struct Errors(Mutex<Vec<String>>);
 
@@ -1523,8 +1624,9 @@ fn an_accepted_event_is_in_memory_until_its_inbox_hands_it_over() {
 #[test]
 fn a_batch_the_store_never_takes_stops_its_inbox_and_is_lost_at_shutdown() {
     let _errors = logged();
-    // Given an app whose payments must name an order the store has, whose default inbox hands
-    // over every 300 ms, and whose queued tickets have an inbox of their own
+    // Given an app whose payments must name an order the store has by the time their batch
+    // commits, whose default inbox hands over every 300 ms, and whose queued tickets have an inbox
+    // of their own
     let queued = InboxConfig {
         name: "queued".to_owned(),
         types: vec![Ty(82)],
@@ -1535,14 +1637,15 @@ fn a_batch_the_store_never_takes_stops_its_inbox_and_is_lost_at_shutdown() {
         ..every(300)
     };
     let app = built_in_with("never_taken", config).unwrap();
-    app.read.execute_batch(ORDERS).unwrap();
+    app.read.execute_batch(DEFERRED).unwrap();
 
     // When a payment for an order the store does not have runs
     let paid = json!({ "order": "o1", "amount": 5 });
     app.send(86, &paid).unwrap();
     let payment = poll(WAIT, || app.root(&paid)).unwrap();
 
-    // Then the hand-over of the batch with its 2 and its row fails whole, and is logged at error
+    // Then the hand-over of the batch with its 2 and its row fails whole at commit, and is logged
+    // at error
     assert!(until(WAIT, || !failed_hand_overs().is_empty()));
     assert_eq!(app.sent(payment, 2), []);
     assert_eq!(app.count("SELECT count(*) FROM payments"), 0);
@@ -1577,7 +1680,7 @@ fn a_batch_the_store_never_takes_stops_its_inbox_and_is_lost_at_shutdown() {
     let tried = failed_hand_overs().len();
     thread::sleep(Duration::from_millis(400));
     assert_eq!(failed_hand_overs().len(), tried);
-    app.queue.join().unwrap();
+    assert_eq!(app.queue.join(), Ok(()));
 
     // And the batch and every event after it are lost
     let read = ready(&app.path).unwrap();

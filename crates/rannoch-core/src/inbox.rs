@@ -44,7 +44,7 @@ impl<T, D> Inbox<T, D> {
 
 /// Inbox `index`'s thread: on each interval it hands over its heap; when
 /// `stop` closes, it hands over what is left and returns.
-pub(crate) fn run<T, D>(
+pub(crate) fn run<T: PartialEq, D>(
     broker: &Shared<T, D>,
     index: usize,
     every: Duration,
@@ -60,22 +60,38 @@ pub(crate) fn run<T, D>(
     }
 }
 
-/// Hands inbox `index`'s heap to `append` as one batch; a batch that fails is
-/// logged and goes back on the heap, ahead of what arrived since.
-fn hand_over<T, D>(broker: &Shared<T, D>, index: usize, append: &dyn Append<T, D>) {
-    let batch = mem::take(&mut lock(broker).inboxes[index].heap);
-    if batch.is_empty() {
-        return;
-    }
-    if append.append(&batch).is_ok() {
+/// Hands inbox `index`'s heap to `append` as one batch and sends the events it replies with; a
+/// batch that fails is logged and goes back on the heap, ahead of what arrived since. Once
+/// rannoch is shutting down the broker takes no send, so the inbox accepts its replies onto its
+/// own heap and hands them over itself.
+fn hand_over<T: PartialEq, D>(broker: &Shared<T, D>, index: usize, append: &dyn Append<T, D>) {
+    loop {
+        let batch = mem::take(&mut lock(broker).inboxes[index].heap);
+        if batch.is_empty() {
+            return;
+        }
+        let Ok(replies) = append.append(&batch) else {
+            log::error!(
+                "inbox {index} could not hand over {} events: {}",
+                batch.len(),
+                Error::Store
+            );
+            lock(broker).inboxes[index].heap.splice(0..0, batch);
+            return;
+        };
         log::debug!("handed over {} events from inbox {index}", batch.len());
-    } else {
-        log::error!(
-            "inbox {index} could not hand over {} events: {}",
-            batch.len(),
-            Error::Store
-        );
-        lock(broker).inboxes[index].heap.splice(0..0, batch);
+        let mut held = lock(broker);
+        if !held.closed {
+            for reply in replies {
+                if let Err(e) = held.send(reply) {
+                    log::error!("inbox {index} could not send a reply: {e}");
+                }
+            }
+            return;
+        }
+        for reply in replies {
+            held.inboxes[index].accept(reply);
+        }
     }
 }
 
@@ -114,21 +130,22 @@ mod tests {
     }
 
     /// An append that fails while `failing` is set, keeping each batch's
-    /// statuses it received.
+    /// statuses it received, and replying to the next batch it writes with `replies`.
     #[derive(Debug, Default)]
     struct Recorder {
         failing: Mutex<bool>,
         batches: Mutex<Vec<Vec<Status>>>,
+        replies: Mutex<Vec<Event<u8, ()>>>,
     }
 
     impl Append<u8, ()> for Recorder {
-        fn append(&self, batch: &[Event<u8, ()>]) -> Result<(), Error> {
+        fn append(&self, batch: &[Event<u8, ()>]) -> Result<Vec<Event<u8, ()>>, Error> {
             if *self.failing.lock().unwrap() {
                 return Err(Error::Store);
             }
             let statuses = batch.iter().map(|e| e.status).collect();
             self.batches.lock().unwrap().push(statuses);
-            Ok(())
+            Ok(std::mem::take(&mut *self.replies.lock().unwrap()))
         }
     }
 
@@ -165,5 +182,53 @@ mod tests {
             [vec![Status::Added, Status::Processed]]
         );
         assert!(lock(&broker).inboxes[0].heap.is_empty());
+    }
+
+    #[test]
+    fn a_reply_goes_to_the_inbox_for_its_ty_and_at_shutdown_its_own_inbox_writes_it() {
+        let broker = Arc::new(Mutex::new(Broker {
+            inboxes: vec![
+                Inbox::new("default".to_owned(), Vec::new(), TimeDelta::zero()),
+                Inbox::new("ones".to_owned(), vec![1], TimeDelta::zero()),
+            ],
+            closed: false,
+        }));
+        let heap = |i: usize| -> Vec<(u8, Status, usize)> {
+            let held = lock(&broker);
+            let ids = held.inboxes[i].heap.iter();
+            ids.map(|e| (e.ty, e.status, e.id.get_version_num()))
+                .collect()
+        };
+        let recorder = Recorder::default();
+        let reply = || Event {
+            ty: 1,
+            status: Status::Binned,
+            ..event(Some(Uuid::now_v7()))
+        };
+
+        // A reply is sent as any event is: accepted, with its id, onto the heap of the inbox for
+        // its ty.
+        lock(&broker).inboxes[0].accept(event(None));
+        *recorder.replies.lock().unwrap() = vec![reply()];
+        hand_over(&broker, 0, &recorder);
+        assert_eq!(heap(0), []);
+        assert_eq!(heap(1), [(1, Status::Binned, 7)]);
+
+        // At shutdown the broker takes no send, so the inbox that handed the batch over writes
+        // its reply itself, in one more hand-over.
+        lock(&broker).closed = true;
+        lock(&broker).inboxes[0].accept(event(None));
+        *recorder.replies.lock().unwrap() = vec![reply()];
+        hand_over(&broker, 0, &recorder);
+        let batches = recorder.batches.lock().unwrap().clone();
+        assert_eq!(
+            batches,
+            [
+                vec![Status::Added],
+                vec![Status::Added],
+                vec![Status::Binned]
+            ]
+        );
+        assert_eq!((heap(0).len(), heap(1).len()), (0, 1));
     }
 }

@@ -18,5 +18,10 @@
       "row": {"order_id": "$order", "amount": "$amount"}}}}]}],
   ["lost.json", {"name": "lost", "ty": 87, "takes": {"order": "string"},
     "steps": [{"do": "store", "with": {"store": {"table": "nope",
-      "row": {"order_id": "$order"}}}}]}]
+      "row": {"order_id": "$order"}}}}]}],
+  ["invoice.json", {"name": "invoice", "ty": 88, "takes": {"order": "string", "amount": "number"},
+    "steps": [{"do": "store", "with": {"store": {"table": "payments",
+      "row": {"order_id": "$order", "amount": "$amount"}}},
+      "next": {"ty": 89, "shape": {"order": "$order"}}}]}],
+  ["receipt.json", {"name": "receipt", "ty": 89, "takes": {"order": "string"}, "steps": []}]
 ]

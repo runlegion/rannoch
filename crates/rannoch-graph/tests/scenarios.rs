@@ -151,11 +151,11 @@ const PAYMENTS: &str = include_str!("payments.json");
 const ORDERS: &str = "CREATE TABLE orders (id TEXT PRIMARY KEY);
     CREATE TABLE payments (order_id TEXT PRIMARY KEY REFERENCES orders(id), amount INTEGER)";
 
-/// #92: the README's "With `GraphAppend`, an event's 2 and its graph rows commit together" and
-/// "`GraphAppend` writes a batch whole or not at all", on the built-in `store`, whose row is the
-/// only kind a built-in step gives.
+/// #92: the README's "With `GraphAppend`, an event's 2 and its graph rows commit together", on
+/// the built-in `store`, whose row is the only kind a built-in step gives; and #102: a row the
+/// table refuses is written neither with its 2 nor in place of the rest of the batch.
 #[test]
-fn with_graph_append_a_2_and_its_rows_commit_together_and_a_batch_is_whole_or_not_at_all() {
+fn with_graph_append_a_2_and_its_rows_commit_together_and_a_refused_row_gets_a_minus_1() {
     // Given an app whose payment flow stores each payment's row, appended by GraphAppend, and
     // whose payments must name an order the store has
     let path = migrated("graph_built_in").unwrap();
@@ -217,27 +217,25 @@ fn with_graph_append_a_2_and_its_rows_commit_together_and_a_batch_is_whole_or_no
         thread::sleep(Duration::from_millis(1));
     }
 
-    // When a payment for an order the store does not have runs, its row held for its 2, and the
-    // inbox tries its batch for ten intervals
+    // When a payment for an order the store does not have runs
     let none = pay("none");
-    let held = || writes.lock().is_ok_and(|w| w.contains_key(&none));
-    assert!(until(held), "the payment ran");
-    thread::sleep(Duration::from_millis(200));
 
-    // Then nothing of its batch is written: not its receipt, its 2 or its row, which each
-    // failed hand-over puts back
-    let about = format!("SELECT count(*) FROM _events WHERE source = '{none}' AND status <> 1");
-    assert_eq!(count(&conn, &about), 0);
-    assert!(held(), "a hand-over wrote the row");
-
-    // When the store has its order
-    conn.execute("INSERT INTO orders (id) VALUES ('none')", [])
-        .unwrap();
-
-    // Then the batch is written whole: its receipt, its 2 and its row
-    assert!(until(|| count(&conn, &about) == 2));
+    // Then neither its row nor its 2 is written, and it gets a -1 naming the reason in their
+    // place; the rest of its batch, its receipt, is written
+    let about = |status| {
+        let sql = "SELECT json_group_array(data) FROM _events WHERE source = ?1 AND status = ?2";
+        let data = conn.query_row(sql, rusqlite::params![none.to_string(), status], |r| {
+            r.get(0)
+        });
+        data.unwrap_or_else(|e: rusqlite::Error| e.to_string())
+    };
+    assert!(until(|| about(-1) != "[]"));
+    assert_eq!(about(-1), r#"["\"store: FOREIGN KEY constraint failed\""]"#);
+    assert_eq!(about(2), "[]");
+    assert_eq!(about(0), r#"["{\"order\":\"none\"}"]"#);
     let row = "SELECT count(*) FROM payments WHERE order_id = 'none'";
-    assert_eq!(count(&conn, row), 1);
+    assert_eq!(count(&conn, row), 0);
+    assert!(!writes.lock().unwrap().contains_key(&none));
     drop(signal);
     rannoch.shutdown();
     queue.join().unwrap();
