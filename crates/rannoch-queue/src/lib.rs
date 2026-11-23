@@ -35,9 +35,10 @@
 //! The hunt first runs one [`Settings::hunt`] after the queue starts, then every `hunt`. It looks
 //! for the 1s whose event has no 2 or -1. For each 1 older than [`Settings::window`] with nothing
 //! after it anywhere in its event's tree, it sends a resend: a new event at 0 whose source is the
-//! stalled event and whose data is `"hung"`. The hunt cannot tell a run a crash dropped from one
-//! still going, so a run or job `window` after its 1 is resent, whether it is running or still
-//! waiting its turn.
+//! stalled event and whose data is `"hung"`. It leaves every 1 accepted since the queue started,
+//! however long its run or job has run or waited: only the queue sends 1s and one process runs
+//! over the store, so such a 1 is the running queue's own, its run or job going, waiting its
+//! turn, or with its result not yet handed over. The 1s a crash left are from before the start.
 //!
 //! From a resend the queue walks back to the stalled event, without counting a failed attempt, so
 //! the processor is handed the stalled event's root and runs the flow on that root's data.
@@ -226,7 +227,7 @@ pub struct Settings {
     /// The backoff's first wait; each later wait doubles it.
     pub first_wait: Duration,
     /// How old a 1 with nothing after it must be before the hunt sends a resend for its event,
-    /// whether its run was dropped or is still going; 20 minutes by default.
+    /// when the 1 is from before the queue started, as a crash leaves it; 20 minutes by default.
     pub window: Duration,
     /// How often the hunt runs; one hour by default.
     pub hunt: Duration,
@@ -321,6 +322,8 @@ fn run<T, D>(
     T: TryFrom<u16> + Copy + PartialEq + Send + 'static,
     D: From<String> + Send + 'static,
 {
+    // Every 1 accepted from this millisecond on is this queue's own, so the hunt leaves it.
+    let started = Utc::now().timestamp_millis();
     let (runs, bucket) = mpsc::channel::<(Arc<Flow<T, D>>, Row, Row, u32)>();
     let run_sender = sender.clone();
     let runs_thread = thread::spawn(move || {
@@ -338,7 +341,7 @@ fn run<T, D>(
         }
         jobs.retain(|job| !job.is_finished());
         if Instant::now() >= next_hunt {
-            hunt(conn, sender, settings.window);
+            hunt(conn, sender, settings.window, started);
             next_hunt = Instant::now() + settings.hunt;
         }
         let Ok(due) = read(conn, queries::DUE, [now()]) else {
@@ -454,8 +457,9 @@ fn backoff(settings: Settings, before: u32) -> Option<Duration> {
 }
 
 /// The hunt: sends again, as a retry with that event as its source, each event whose 1 is
-/// older than `window` with nothing after it in the event's tree, as a crash leaves it.
-fn hunt<T, D>(conn: &Connection, sender: &Sender<T, D>, window: Duration)
+/// older than `window` and from before `started`, the millisecond the queue started, with nothing
+/// after it in the event's tree, as a crash leaves it.
+fn hunt<T, D>(conn: &Connection, sender: &Sender<T, D>, window: Duration, started: i64)
 where
     T: TryFrom<u16> + PartialEq,
     D: From<String>,
@@ -468,7 +472,8 @@ where
         }
     };
     for (one, event, ty) in ones {
-        if !older_than(one, window, Utc::now()) {
+        let ours = taken_at(one).is_none_or(|at| at.timestamp_millis() >= started);
+        if ours || !older_than(one, window, Utc::now()) {
             continue;
         }
         match after(conn, event, one) {
