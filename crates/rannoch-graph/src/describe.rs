@@ -10,7 +10,10 @@ use crate::{Row, State, edges, history, prop, props};
 /// A describe's options: as of `at` when given, and every value over time when `history`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Opts {
+    /// As of this time, in milliseconds since the Unix epoch: only rows written at or before it
+    /// are read. `None` reads every row.
     pub at: Option<i64>,
+    /// Each key as every row it has had, each with its state, in place of its current row.
     pub history: bool,
 }
 
