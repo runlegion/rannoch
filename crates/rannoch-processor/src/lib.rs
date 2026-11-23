@@ -253,12 +253,17 @@
 //!   a row. It gives the row as `$graph`, `{"store": {"table": T, "row": {column: value}}}`, and
 //!   the append that writes the event's 2, `GraphAppend` or `Events` made `with_writes`, inserts
 //!   it in the same transaction with `INSERT ... ON CONFLICT DO NOTHING`, so T's own keys decide
-//!   whether a rerun adds a row and a flow that fails writes none. A table or a column the store
-//!   does not have fails the step, as `store: no such table: <T>` or `store: table <T> has no
-//!   column named <column>`, and leaves the batch alone. A row T refuses, by a NOT NULL, CHECK,
-//!   foreign key or type rule or a trigger, passes the step; the append rolls it back with the
+//!   whether a rerun adds a row and a flow that fails writes none. The step first tries the insert
+//!   on the processor's connection inside a savepoint and rolls back to it, so it writes nothing:
+//!   a table or a column the store does not have, or a row T refuses, by a NOT NULL, CHECK,
+//!   foreign key or type rule or a trigger, fails the step, as `store: no such table: <T>`,
+//!   `store: table <T> has no column named <column>` or `store: NOT NULL constraint failed:
+//!   <T>.<column>`. The event gets its -1 and no 2 or nexts, the queue retries it as any failed
+//!   step, and the batch is left alone. The one edge is a row T takes at the step and refuses at
+//!   the append, as when another write lands between them: the append rolls it back with the
 //!   event's 2, a -1 for the event is sent in their place, its data `store: ` and the store's
-//!   message, and the rest of the batch commits. The queue does not retry that event.
+//!   message, and the rest of the batch commits; the nexts the step sent stand, and the queue
+//!   does not retry the event.
 //!
 //! # What `check` reports
 //!
@@ -376,7 +381,7 @@ impl Action for Emit {
 }
 
 /// The built-in `store` on the processor's connection: it gives its [`StoreRow`] as `$graph`
-/// once the store has its table and each column.
+/// once the table would take it, its insert tried inside a savepoint and rolled back.
 struct Store(Arc<Mutex<Connection>>);
 
 impl Action for Store {
@@ -393,11 +398,9 @@ impl Action for Store {
         let row = options["row"].as_object().into_iter().flatten();
         let row = row.map(|(c, e)| (c.clone(), eval(e, input))).collect();
         let stored = StoreRow::Store { table, row };
-        let stored = stored.insert(&lock(&self.0)).map(|_| json!([stored]));
-        Ok(Map::from_iter([(
-            "$graph".to_owned(),
-            stored.map_err(|e| format!("store: {e}"))?,
-        )]))
+        let tried = stored.try_insert(&mut lock(&self.0));
+        tried.map_err(|e| format!("store: {e}"))?;
+        Ok(Map::from_iter([("$graph".to_owned(), json!([stored]))]))
     }
 }
 

@@ -1064,8 +1064,8 @@ fn a_queue_that_starts_takes_the_events_already_due_without_a_signal() {
 
 /// FR-RANNOCH-124's flows, from the fixture `tests/built_in.json`, each with the name of its
 /// file: a ticket's emit steps branch on its kind and wait for its answer, a payment stores its
-/// row, a lost order stores into a table the store does not have, and the flows their nexts
-/// reach. No action of the app's is in them.
+/// row, a lost order stores into a table the store does not have, an invoice stores its row and
+/// sends its receipt, and the flows their nexts reach. No action of the app's is in them.
 const BUILT_IN: &str = include_str!("built_in.json");
 
 /// `BUILT_IN` checked as the app's build checks it, with no signature of the app's: the flows to
@@ -1204,35 +1204,39 @@ fn store_refuses_a_table_it_does_not_have() {
     app.stop();
 }
 
-/// Not a scenario: #102. A payment whose row `payments` refuses gets, in place of its 2 and its
-/// row, a -1 whose data is `reason`; a later payment of the same inbox is written.
+/// Not a scenario: #102. An invoice whose row `payments` refuses fails its step: it gets a -1
+/// whose data is `reason`, and no 2, no row and no receipt; a later invoice is written, with its
+/// receipt.
 fn a_refused_row_gets_a_minus_1(
     name: &str,
     payments: &str,
     refused: &Value,
     reason: &str,
 ) -> Result<()> {
-    // Given a table that refuses the first payment's row, and a flow whose step stores into it
+    // Given a table that refuses the first invoice's row, and a flow whose step stores into it
+    // and sends a receipt
     let app = built_in_with(name, Config::default())?;
     app.read.execute_batch(payments)?;
 
-    // When that payment is handed to the flow, then one the table takes
-    let first = app.hand(86, refused)?;
-    let later = app.hand(86, &json!({ "order": "o2", "amount": 5 }))?;
+    // When that invoice is handed to the flow, then one the table takes
+    let first = app.hand(88, refused)?;
+    let later = app.hand(88, &json!({ "order": "o2", "amount": 5 }))?;
 
-    // Then the first gets a -1 naming the reason, and neither its 2 nor its row is written
+    // Then the first's step fails: it gets a -1 naming the reason, and no 2, no row and no
+    // receipt; with one attempt, no retry either
     assert!(until(WAIT, || app.statuses(first).contains(&-1)));
-    assert_eq!(app.sent(first, -1), [(86, json!(reason))]);
+    assert_eq!(app.sent(first, -1), [(88, json!(reason))]);
     assert_eq!(app.statuses(first), [1, -1]);
     assert_eq!(
         app.count("SELECT count(*) FROM payments WHERE order_id = 'o1'"),
         0
     );
 
-    // And the later payment is written, with its 2 and its row
+    // And the later invoice is written, with its 2, its row and its receipt
     assert!(until(WAIT, || app.statuses(later).contains(&2)));
     let row = "SELECT count(*) FROM payments WHERE order_id = 'o2' AND amount = 5";
     assert_eq!(app.count(row), 1);
+    assert_eq!(app.sent(later, 0), [(89, json!({ "order": "o2" }))]);
 
     app.stop();
     Ok(())
@@ -1252,6 +1256,45 @@ fn a_row_that_breaks_a_foreign_key_gets_a_minus_1_and_no_2() {
     let unknown = json!({ "order": "o1", "amount": 5 });
     let reason = "store: FOREIGN KEY constraint failed";
     a_refused_row_gets_a_minus_1("refused_foreign_key", &payments, &unknown, reason).unwrap();
+}
+
+/// How many payments #102's measurement runs to their 2.
+const RATE_EVENTS: u32 = 100_000;
+
+/// Not a scenario: #102's measurement of what the `store` step's savepoint costs. `RATE_EVENTS`
+/// payments are written at 0 in one transaction, the queue is signalled, and the flow rate is
+/// the payments over the time until every one has its 2; each has its row. Run it in release:
+/// `cargo test --release -p rannoch-processor --test scenarios -- --ignored --nocapture
+/// the_store_flow_rate`.
+#[test]
+#[ignore = "a measurement: run it in release"]
+fn the_store_flow_rate() {
+    // Given an app whose payment flow's step stores each payment's row
+    let app = App::built_in("store_flow_rate", &built_in().unwrap()).unwrap();
+    app.read.execute_batch(PAYMENTS).unwrap();
+
+    // When the payments are written at 0 and the queue is signalled
+    let mut conn = ready(&app.path).unwrap();
+    let tx = conn.transaction().unwrap();
+    for i in 0..RATE_EVENTS {
+        let data = json!({ "order": format!("o{i}"), "amount": i }).to_string();
+        let row = _events::factory().id(Uuid::now_v7().to_string()).ty(86);
+        row.data(data).status(0).insert(&tx).unwrap();
+    }
+    tx.commit().unwrap();
+    let start = Instant::now();
+    app.signal.send(()).unwrap();
+
+    // Then every payment reaches its 2 with its row, at the rate printed
+    let all = i64::from(RATE_EVENTS);
+    while app.count("SELECT count(*) FROM _events WHERE status = 2") < all {
+        thread::sleep(Duration::from_millis(50));
+    }
+    let elapsed = start.elapsed();
+    let rate = f64::from(RATE_EVENTS) / elapsed.as_secs_f64();
+    println!("{RATE_EVENTS} payments to their 2 in {elapsed:?}: {rate:.0} events/s");
+    assert_eq!(app.count("SELECT count(*) FROM payments"), all);
+    app.stop();
 }
 
 /// How many events wait their turn behind each other in #85's backlog.

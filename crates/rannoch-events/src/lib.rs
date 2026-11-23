@@ -23,11 +23,13 @@
 //! graph `Op`, is not written. A batch that fails puts the items back for its retry. The row is
 //! inserted with `INSERT ... ON CONFLICT DO NOTHING`, so T's own keys decide whether a rerun adds
 //! a row: a string is bound as text, an integer or a float as an integer or a real, a bool as 0
-//! or 1, null as NULL, and an array or an object as its JSON text. A row T refuses, by a NOT
-//! NULL, CHECK, foreign key or type rule or a trigger, is rolled back with the rest of its 2's
-//! items, and that 2 is not written: the append returns in its place a -1 for the 2's source, its
-//! data `store: ` and the store's message, as `store: NOT NULL constraint failed:
-//! payments.amount`, which the inbox sends; the rest of the batch commits.
+//! or 1, null as NULL, and an array or an object as its JSON text. rannoch-processor's `store`
+//! step has tried each row with [`StoreRow::try_insert`], so T refuses one here only when
+//! something written since makes it, as another write landing between the step and the append.
+//! A row T refuses, by a NOT NULL, CHECK, foreign key or type rule or a trigger, is rolled back
+//! with the rest of its 2's items, and that 2 is not written: the append returns in its place a
+//! -1 for the 2's source, its data `store: ` and the store's message, as `store: NOT NULL
+//! constraint failed: payments.amount`, which the inbox sends; the rest of the batch commits.
 //!
 //! # Failures
 //!
@@ -163,6 +165,38 @@ impl StoreRow {
             quote(table)
         );
         conn.prepare_cached(&sql)
+    }
+
+    /// Runs the row's insert on `conn` inside a savepoint and rolls back to it, so nothing is
+    /// written: whether T, its columns and its constraints take the row.
+    /// # Errors
+    /// The store's error, as `no such table: <table>` or `table <table> has no column named
+    /// <column>`, or the one T refuses the row with, as `NOT NULL constraint failed: <t>.<c>`.
+    pub fn try_insert(&self, conn: &mut Connection) -> rusqlite::Result<()> {
+        let point = conn.savepoint()?;
+        let tried = self
+            .insert(&point)
+            .and_then(|mut insert| insert.execute(params_from_iter(self.values())));
+        // A savepoint finishes by rolling back to where it began.
+        point.finish()?;
+        tried.map(drop)
+    }
+
+    /// The row's values in column order, as the insert binds them: a string as text, an integer
+    /// or a float as an integer or a real, a bool as 0 or 1, null as NULL, and an array or an
+    /// object as its JSON text.
+    fn values(&self) -> Vec<Sql> {
+        let Self::Store { row, .. } = self;
+        let value = |value: &Value| match value {
+            Value::Null => Sql::Null,
+            Value::Bool(b) => Sql::Integer(i64::from(*b)),
+            Value::Number(n) => n
+                .as_i64()
+                .map_or(Sql::Real(n.as_f64().unwrap_or_default()), Sql::Integer),
+            Value::String(s) => Sql::Text(s.clone()),
+            value => Sql::Text(value.to_string()),
+        };
+        row.values().map(value).collect()
     }
 }
 
@@ -329,18 +363,8 @@ fn store_in(conn: &Connection, item: &Value) -> Result<bool, Unwritten> {
         return Ok(false);
     }
     let stored = StoreRow::deserialize(item).map_err(|_| Unwritten::Failed)?;
-    let StoreRow::Store { row, .. } = &stored;
-    let values = row.values().map(|value| match value {
-        Value::Null => Sql::Null,
-        Value::Bool(b) => Sql::Integer(i64::from(*b)),
-        Value::Number(n) => n
-            .as_i64()
-            .map_or(Sql::Real(n.as_f64().unwrap_or_default()), Sql::Integer),
-        Value::String(s) => Sql::Text(s.clone()),
-        value => Sql::Text(value.to_string()),
-    });
     let mut insert = stored.insert(conn).map_err(|_| Unwritten::Failed)?;
-    match insert.execute(params_from_iter(values)) {
+    match insert.execute(params_from_iter(stored.values())) {
         Ok(_) => Ok(true),
         Err(e) if e.sqlite_error_code() == Some(ErrorCode::ConstraintViolation) => {
             Err(Unwritten::Refused(format!("store: {e}")))
