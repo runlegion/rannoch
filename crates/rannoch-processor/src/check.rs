@@ -54,11 +54,18 @@ pub fn compile(dir: &Path, signatures: &[&str]) {
 /// Checks `docs`, each a flow doc with the name of its file, against `sigs`: the flows as the
 /// JSON array to compile in, each with `job` set, or every error.
 /// # Errors
-/// Every error in every doc, one line each, `E<n> <file> step <i> <link name | next>: <what>`.
+/// Every error in every doc, one line each, `E<n> <file> step <i> <link name | next>: <what>`,
+/// or `E<n> <file>: <what>` for an error in no step.
 #[expect(clippy::too_many_lines, reason = "every check of a doc, in its order")]
 pub fn check(docs: &[(String, FlowDoc)], sigs: &[Sig]) -> Result<String, Vec<String>> {
     let (mut errors, mut flows, empty) = (Vec::new(), Vec::new(), Value::Object(Map::new()));
-    for (file, flow) in docs {
+    for (n, (file, flow)) in docs.iter().enumerate() {
+        if let Some((first, _)) = docs[..n].iter().find(|(_, f)| f.ty == flow.ty) {
+            errors.push(format!(
+                "E8 {file}: ty {}, which {first} also takes",
+                flow.ty
+            ));
+        }
         let mut flow = FlowDoc {
             job: false,
             ..flow.clone()
@@ -279,6 +286,31 @@ mod tests {
         let steps = json!([{ "do": "upper", "next": { "ty": 99 } }]);
         let want = "E7 a.json step 0 next: the next goes to ty 99, which no flow takes";
         assert_eq!(errors("string", &steps), [want]);
+    }
+
+    #[test]
+    fn e8_two_flows_with_the_same_ty() {
+        let a = flow(&json!({ "text": "string" }), &json!([]));
+        let b = json!({ "name": "b", "ty": 1, "takes": { "text": "string" }, "steps": [] });
+        let want = "E8 b.json: ty 1, which a.json also takes";
+        assert_eq!(check(&[("a.json", a), ("b.json", b)]).unwrap_err(), [want]);
+    }
+
+    #[test]
+    fn compile_fails_on_two_flows_with_the_same_ty() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::now_v7().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        for (file, name) in [("a.json", "a"), ("b.json", "b")] {
+            let doc = json!({ "name": name, "ty": 1, "takes": {}, "steps": [] });
+            std::fs::write(dir.join(file), doc.to_string()).unwrap();
+        }
+        let built = std::panic::catch_unwind(|| super::compile(&dir, &["[]"]));
+        std::fs::remove_dir_all(&dir).unwrap();
+        let why = built.unwrap_err().downcast::<String>().unwrap();
+        assert_eq!(
+            *why,
+            format!("1 errors in the flow docs in {}", dir.display())
+        );
     }
 
     #[test]
