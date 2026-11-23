@@ -1207,3 +1207,85 @@ fn store_refuses_a_table_it_does_not_have() {
 
     app.stop();
 }
+
+/// How many events wait their turn behind each other in #85's backlog.
+const BACKLOG: i64 = 5_000;
+
+/// The queue's settings for #85: one attempt, and the `window` and `hunt` given.
+fn hunting(window: Duration, hunt: Duration) -> Settings {
+    Settings {
+        attempts: 1,
+        window,
+        hunt,
+        ..Settings::new(Duration::from_millis(100))
+    }
+}
+
+/// Not a scenario: #85. The hunt does not resend an event whose run the running queue still
+/// holds: waiting its turn, going, or with its 2 not yet on disk.
+#[test]
+fn the_hunt_does_not_resend_a_run_the_queue_still_holds() {
+    // Given a store with a backlog of events of a flow of built-in steps, each at 0 with nothing
+    // after it
+    let path = database("the_hunt_leaves_held_runs").unwrap();
+    migrated(&path).unwrap();
+    let mut seed = ready(&path).unwrap();
+    let tx = seed.transaction().unwrap();
+    for i in 0..BACKLOG {
+        let data = json!({ "ticket": format!("t{i}") }).to_string();
+        let row = _events::factory().id(Uuid::now_v7().to_string()).ty(82);
+        row.data(data).status(0).insert(&tx).unwrap();
+    }
+    tx.commit().unwrap();
+
+    // When the queue runs them one after another, its window and hunt far shorter than the
+    // backlog
+    let settings = hunting(Duration::from_millis(20), Duration::from_millis(60));
+    let app = App::over(path, &built_in().unwrap(), |_, _| Vec::new(), settings).unwrap();
+    app.signal.send(()).unwrap();
+
+    // Then each event runs once, to its 2, and the hunt resends none of them
+    let twos = "SELECT count(*) FROM _events WHERE ty = 82 AND status = 2";
+    assert!(until(Duration::from_secs(60), || app.count(twos) >= BACKLOG));
+    thread::sleep(Duration::from_millis(300));
+    let hung = "SELECT count(*) FROM _events WHERE data = '\"hung\"'";
+    assert_eq!(app.count(hung), 0, "the hunt resent runs the queue held");
+    assert_eq!(app.count(twos), BACKLOG);
+
+    app.stop();
+}
+
+/// Not a scenario: #85. The hunt still resends an event whose 1 is on disk with nothing after it
+/// and no running queue holds, as a crash leaves it.
+#[test]
+fn the_hunt_resends_an_event_a_crash_dropped() {
+    // Given a store with an event of a flow of built-in steps whose 1 is an hour old with nothing
+    // after it
+    let path = database("the_hunt_resends_a_crash_dropped").unwrap();
+    migrated(&path).unwrap();
+    let seed = ready(&path).unwrap();
+    let dropped = ago(7200);
+    let data = json!({ "ticket": "t1" }).to_string();
+    let event = _events::factory().id(dropped.to_string()).ty(82).data(data);
+    event.status(0).insert(&seed).unwrap();
+    let one = _events::factory()
+        .id(ago(3600).to_string())
+        .source(dropped.to_string());
+    one.ty(82)
+        .data("\"taken\"")
+        .status(1)
+        .insert(&seed)
+        .unwrap();
+
+    // When the queue starts with a hunt that runs soon
+    let settings = hunting(Duration::from_mins(1), Duration::from_millis(300));
+    let app = App::over(path, &built_in().unwrap(), |_, _| Vec::new(), settings).unwrap();
+
+    // Then the hunt resends it once, and the resend runs to its 2
+    let resend = app.retry(dropped);
+    assert!(until(WAIT, || app.statuses(resend) == [1, 2]));
+    thread::sleep(Duration::from_millis(700));
+    assert_eq!(app.sent(dropped, 0), [(82, json!("hung"))]);
+
+    app.stop();
+}
