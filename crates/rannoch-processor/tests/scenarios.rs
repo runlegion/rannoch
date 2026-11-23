@@ -3,6 +3,9 @@
 //! events from the app's forgr factory, handed over by the real queue; the flow docs are
 //! `tests/flows.json` and the test processor crate's actions are `Fake`s. The build scenarios
 //! (`-c1`, `-c2`, `-c10`, `-c12`, `-c16`) build the test app of `tests/app` with cargo.
+//! FR-RANNOCH-124's scenarios, from `tests/features/fr_rannoch_124.feature`, run `BUILT_IN`'s
+//! flows on the built-in steps alone, `check`ed with no signature, the append an `Events` made
+//! `with_writes`.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -14,8 +17,8 @@ use chrono::{DateTime, TimeDelta, Utc};
 use rannoch_core::forgr::_events;
 use rannoch_core::{Append, Config, Rannoch};
 use rannoch_events::Events;
-use rannoch_processor::{Action, Processor, Sig};
-use rannoch_queue::{Queue, Settings};
+use rannoch_processor::{Action, FlowDoc, Processor, Sig, check};
+use rannoch_queue::{Flows, Queue, Settings};
 use rannoch_store::{Opened, Store};
 use rusqlite::Connection;
 use serde_json::{Map, Value, json};
@@ -144,14 +147,18 @@ fn until(limit: Duration, done: impl Fn() -> bool) -> bool {
 /// One row about an event: id, ty, status, data, `run_at`.
 type About = (Uuid, i64, i64, Value, Option<String>);
 
-/// The app: the store, rannoch, the queue handing events to rannoch-processor, and what the
-/// fake actions saw.
+/// The app's actions over what they record and the rating `rate` gives.
+type Made = fn(&Calls, &Arc<Mutex<Obj>>) -> Vec<Arc<dyn Action>>;
+
+/// The app: the store, rannoch, the queue handing events to rannoch-processor, the processor,
+/// and what the fake actions saw.
 struct App {
     path: PathBuf,
     read: Connection,
     signal: mpsc::Sender<()>,
     rannoch: Rannoch<Ty, Value>,
     queue: Queue,
+    processor: Arc<Processor<Ty, Value>>,
     calls: Calls,
     rating: Arc<Mutex<Obj>>,
 }
@@ -170,15 +177,47 @@ impl App {
         Self::open_with(path, settings)
     }
 
+    /// The app over a fresh store `name` running `flows` on the built-in steps, no action of its
+    /// own.
+    fn built_in(name: &str, flows: &str) -> Result<Self> {
+        let settings = Settings {
+            attempts: 1,
+            ..Settings::new(Duration::from_millis(100))
+        };
+        Self::over(database(name)?, flows, |_, _| Vec::new(), settings)
+    }
+
+    /// Runs the flow of the event `id`, of `ty` with `data`, again, its sends handed to rannoch.
+    fn rerun(&self, id: Uuid, ty: u16, data: &Value) -> std::result::Result<(), String> {
+        let (source, run_at, status, data) =
+            (None, None, rannoch_core::Status::Added, data.to_string());
+        let row = rannoch_core::Event {
+            id,
+            source,
+            ty,
+            data,
+            run_at,
+            status,
+        };
+        let flow = self.processor.flow(ty).ok_or("no flow")?;
+        (flow.run)(&row, &row, &self.rannoch.sender())
+    }
+
     /// The app over the store at `path`, as it is, its queue on `settings`.
     fn open_with(path: PathBuf, settings: Settings) -> Result<Self> {
+        Self::over(path, include_str!("flows.json"), actions, settings)
+    }
+
+    /// The app over the store at `path` running `flows` with the actions `made`, its queue on
+    /// `settings`; its `Events` writes the processor's store rows with each 2.
+    fn over(path: PathBuf, flows: &str, made: Made, settings: Settings) -> Result<Self> {
         let store = migrated(&path)?;
         let (calls, rating) = (Calls::default(), Arc::default());
-        let (flows, actions) = (include_str!("flows.json"), actions(&calls, &rating));
-        let processor: Processor<Ty, Value> = Processor::new(flows, actions, ready(&path)?)?;
+        let actions = made(&calls, &rating);
+        let processor = Arc::new(Processor::new(flows, actions, ready(&path)?)?);
         let (signal, wake) = mpsc::channel();
-        let append =
-            Arc::new(Events::new(ready(&path)?, signal.clone())) as Arc<dyn Append<Ty, Value>>;
+        let events = Events::new(ready(&path)?, signal.clone()).with_writes(processor.writes());
+        let append = Arc::new(events) as Arc<dyn Append<Ty, Value>>;
         let rannoch = Rannoch::open(Config {
             store: Some(store),
             append: Some(append),
@@ -188,7 +227,7 @@ impl App {
             ready(&path)?,
             wake,
             rannoch.sender(),
-            Arc::new(processor),
+            processor.clone(),
             settings,
         );
         Ok(Self {
@@ -197,6 +236,7 @@ impl App {
             signal,
             rannoch,
             queue,
+            processor,
             calls,
             rating,
         })
@@ -517,7 +557,7 @@ const BAD: [(&str, bool, &str); 10] = [
     ("e6", false, "E6 a.json step 0 next: the next to notice gives who as number, it takes string"),
     ("valid", true, "E5 10-greet.json step 0 next: $greeting names nothing in scope"),
     ("e7", false, "E7 a.json step 0 next: the next goes to ty 99, which no flow takes"),
-    ("emit", false, "E1 a.json step 0 emit: no action named emit"),
+    ("forget", false, "E1 a.json step 0 forget: no action named forget"),
     ("multi", false, "E1 a.json step 0 nope: no action named nope
 E7 a.json step 0 next: the next goes to ty 99, which no flow takes
 E4 b.json step 0 upper: upper takes text as string, it is number"),
@@ -635,7 +675,7 @@ fn the_apps_build_checks_its_flow_docs() -> Result<()> {
     // When the app is built with each bad flow doc in turn (a step naming nope; options for
     // greet with the unknown field salut; upper taking text nothing gives; upper taking text as
     // a number; a next to notice giving no who; one giving who as a number; a $concat naming
-    // greeting, which nothing in scope gives; a next to ty 99; a step naming emit; two docs
+    // greeting, which nothing in scope gives; a next to ty 99; a step naming forget; two docs
     // holding three errors)
     // Then each build fails listing exactly its errors
     app.assert_bad(true)
@@ -962,6 +1002,166 @@ fn a_wait_the_queue_retries_sends_late_on_the_first_match_after_its_timeout() {
     // When two payments for o9 arrive
     // Then the wait's late is sent once, for the first, with the wait as its source
     pays_late(&app, wait, (70, failed), 7).unwrap();
+
+    app.stop();
+}
+
+/// FR-RANNOCH-124's flows, each with the name of its file: a ticket's emit steps branch on its
+/// kind and wait for its answer, a payment stores its row, a lost order stores into a table the
+/// store does not have, and the flows their nexts reach. No action of the app's is in them.
+const BUILT_IN: &str = r#"[
+  ["ticket.json", {"name": "ticket", "ty": 80, "takes": {"ticket": "string", "kind": "string"},
+    "steps": [
+      {"do": "emit", "next": {"branch": {"on": "kind",
+        "cases": [{"when": "rush", "next": {"ty": 81, "shape": {"ticket": "$ticket"}}}],
+        "else": {"ty": 82, "shape": {"ticket": "$ticket"}}}}},
+      {"do": "emit", "next": {"wait": {"for": 83, "key": "$ticket", "within_ms": 1000,
+        "next": {"ty": 84, "shape": {"ticket": "$ticket"}},
+        "timeout": {"ty": 85, "shape": {"ticket": "$ticket"}}}}}]}],
+  ["rushed.json", {"name": "rushed", "ty": 81, "takes": {"ticket": "string"}, "steps": []}],
+  ["queued.json", {"name": "queued", "ty": 82, "takes": {"ticket": "string"}, "steps": []}],
+  ["answer.json", {"name": "answer", "ty": 83, "takes": {"ticket": "string"}, "steps": []}],
+  ["answered.json", {"name": "answered", "ty": 84, "takes": {"ticket": "string"}, "steps": []}],
+  ["unanswered.json", {"name": "unanswered", "ty": 85, "takes": {"ticket": "string"},
+    "steps": []}],
+  ["payment.json", {"name": "payment", "ty": 86, "takes": {"order": "string", "amount": "number"},
+    "steps": [{"do": "store", "with": {"store": {"table": "payments",
+      "row": {"order_id": "$order", "amount": "$amount"}}}}]}],
+  ["lost.json", {"name": "lost", "ty": 87, "takes": {"order": "string"},
+    "steps": [{"do": "store", "with": {"store": {"table": "nope",
+      "row": {"order_id": "$order"}}}}]}]
+]"#;
+
+/// `BUILT_IN` checked as the app's build checks it, with no signature of the app's: the flows to
+/// compile in, or every error.
+fn built_in() -> std::result::Result<String, Vec<String>> {
+    let docs: Vec<(String, FlowDoc)> =
+        serde_json::from_str(BUILT_IN).map_err(|e| vec![e.to_string()])?;
+    check(&docs, &[])
+}
+
+/// The table the payment flow stores into, keyed by its order.
+const PAYMENTS: &str = "CREATE TABLE payments (order_id TEXT PRIMARY KEY, amount INTEGER)";
+
+#[test]
+fn a_flow_of_built_in_steps_runs_with_no_action_of_the_apps() {
+    // Given an app whose flow has an emit step that branches on a field and an emit step that
+    // waits for another event, and no action of its own
+    // When the app's build checks the flow and an event of its ty is handed to it
+    // Then the build passes
+    let flows = built_in().unwrap();
+    let app = App::built_in("a_flow_of_built_in_steps", &flows).unwrap();
+    let rush = app
+        .hand(80, &json!({ "ticket": "t1", "kind": "rush" }))
+        .unwrap();
+    let slow = app
+        .hand(80, &json!({ "ticket": "t2", "kind": "slow" }))
+        .unwrap();
+    assert!(until(WAIT, || app.statuses(rush).contains(&2)));
+    assert!(until(WAIT, || app.statuses(slow).contains(&2)));
+
+    // the branch's next is sent for the case the field matches
+    let next = |event, ty| app.sent(event, 0).into_iter().filter(move |n| n.0 == ty);
+    assert_eq!(
+        next(rush, 81).collect::<Vec<_>>(),
+        [(81, json!({ "ticket": "t1" }))]
+    );
+    assert_eq!(
+        next(slow, 82).collect::<Vec<_>>(),
+        [(82, json!({ "ticket": "t2" }))]
+    );
+    assert_eq!(next(rush, 82).count() + next(slow, 81).count(), 0);
+
+    // and the wait sends its next when the other event arrives
+    let wait = |event| {
+        app.about(event)
+            .into_iter()
+            .find(|r| r.1 == 80 && r.2 == 0)
+            .unwrap()
+            .0
+    };
+    let (w1, w2) = (wait(rush), wait(slow));
+    let answer = app.hand(83, &json!({ "ticket": "t1" })).unwrap();
+    assert!(until(WAIT, || app.statuses(answer).contains(&2)));
+    assert!(until(WAIT, || app.statuses(w1).contains(&2)));
+    assert_eq!(app.sent(w1, 0), [(84, json!({ "ticket": "t1" }))]);
+    assert_eq!(app.sent(w1, 2), [(80, json!("matched"))]);
+
+    // and its timeout when none does
+    assert!(until(WAIT, || app.statuses(w2).contains(&2)));
+    assert_eq!(app.sent(w2, 0), [(85, json!({ "ticket": "t2" }))]);
+    assert_eq!(app.sent(w2, 2), [(80, json!("timeout"))]);
+
+    app.stop();
+}
+
+#[test]
+fn store_keeps_one_row_with_the_events_2() {
+    // Given a table with a key, and a flow whose step stores a row shaped from the event's fields
+    // into it
+    let app = App::built_in("store_keeps_one_row", &built_in().unwrap()).unwrap();
+    app.read.execute_batch(PAYMENTS).unwrap();
+
+    // When events are handed to the flow, and one of them is run again
+    let data = |i: i64| json!({ "order": format!("o{i}"), "amount": i * 10 });
+    let paid: Vec<Uuid> = (0..5).map(|i| app.hand(86, &data(i)).unwrap()).collect();
+    for event in &paid {
+        assert!(until(WAIT, || app.statuses(*event).contains(&2)));
+    }
+    app.rerun(paid[0], 86, &data(0)).unwrap();
+    assert!(until(WAIT, || app.statuses(paid[0]) == [1, 2, 2]));
+
+    // Then every event that has its 2 has exactly its one row in the table, with the values its
+    // fields gave
+    let mut select = app
+        .read
+        .prepare("SELECT order_id, amount FROM payments")
+        .unwrap();
+    let rows = select
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap();
+    let rows: Vec<(String, i64)> = rows.collect::<rusqlite::Result<_>>().unwrap();
+    drop(select);
+    assert_eq!(
+        rows,
+        (0..5)
+            .map(|i| (format!("o{i}"), i * 10))
+            .collect::<Vec<_>>()
+    );
+    let without = "SELECT count(*) FROM _events e WHERE e.ty = 86 AND e.status = 0
+        AND EXISTS (SELECT 1 FROM _events s WHERE s.source = e.id AND s.status = 2)
+        AND (SELECT count(*) FROM payments WHERE order_id = json_extract(e.data, '$.order')) != 1";
+    assert_eq!(app.count(without), 0);
+
+    // and the event run again added none
+    assert_eq!(app.count("SELECT count(*) FROM payments"), 5);
+
+    app.stop();
+}
+
+#[test]
+fn store_refuses_a_table_it_does_not_have() {
+    // Given a flow whose step stores a row into a table the store does not have
+    let app = App::built_in("store_refuses_a_table", &built_in().unwrap()).unwrap();
+    app.read.execute_batch(PAYMENTS).unwrap();
+
+    // When an event is handed to the flow
+    let lost = app.hand(87, &json!({ "order": "o1" })).unwrap();
+    let later = app
+        .hand(86, &json!({ "order": "o2", "amount": 5 }))
+        .unwrap();
+
+    // Then the event gets a -1 naming the table
+    assert!(until(WAIT, || app.statuses(lost).contains(&-1)));
+    assert_eq!(
+        app.sent(lost, -1),
+        [(87, json!("store: no such table: nope"))]
+    );
+
+    // and later events of the same inbox are written
+    assert!(until(WAIT, || app.statuses(later).contains(&2)));
+    let row = "SELECT count(*) FROM payments WHERE order_id = 'o2' AND amount = 5";
+    assert_eq!(app.count(row), 1);
 
     app.stop();
 }

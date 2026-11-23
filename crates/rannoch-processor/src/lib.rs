@@ -1,6 +1,6 @@
 #![warn(missing_docs)]
 //! The processor runs an app's flows. A flow is a JSON document for one event `ty`: a list of
-//! steps, each of which calls one or more of the app's [`Action`]s and can then send further
+//! steps, each of which calls one or more of the app's [`Action`]s or built-in steps and can send
 //! events, branch on a value or wait for another event. This page is the reference for writing
 //! flow documents.
 //!
@@ -235,7 +235,25 @@
 //! succeeds, held in [`Processor::writes`] under the event's id; a failed run keeps none.
 //! rannoch-graph's `GraphAppend` takes them with the event's 2 and writes them in the same
 //! transaction; its `Op` is the form of an item, as in `{"set": {"node": "n1", "key": "name",
-//! "value": "Sam"}}`. With any other append, nothing takes them.
+//! "value": "Sam"}}`. rannoch-events' `Events` made `with_writes` takes them and writes only the
+//! `store` rows among them. With any other append, nothing takes them.
+//!
+//! # Built-in steps
+//!
+//! A step can name `emit` or `store` with no action registered for it and no signature exported
+//! for it: `check` and the processor know both, and an app action of the same name replaces it.
+//! Neither reaches outside rannoch.
+//!
+//! - `emit` takes, gives and has no options: its step's `next`, a branch, an each, a delay or a
+//!   wait, is all it does.
+//! - `store`, with options `{"table": T, "row": {column: expression}}`, inserts one row into T,
+//!   each value worked out with [`eval`] from the step's input; it never updates, deletes or reads
+//!   a row. It gives the row as `$graph`, `{"store": {"table": T, "row": {column: value}}}`, and
+//!   the append that writes the event's 2, `GraphAppend` or `Events` made `with_writes`, inserts
+//!   it in the same transaction with `INSERT OR IGNORE`, so T's own keys decide whether a rerun
+//!   adds a row and a flow that fails writes none. A table or a column the store does not have
+//!   fails the step, as `store: no such table: <T>` or `store: table <T> has no column named
+//!   <column>`, and leaves the batch alone.
 //!
 //! # What `check` reports
 //!
@@ -244,7 +262,8 @@
 //! step's next; an error in no step is `E<n> <file>: <what>`. For example: `E3 a.json step 0
 //! upper: upper takes text, which nothing before it gives`.
 //!
-//! - `E1`, a link that names no action in the signatures: `no action named <link>`.
+//! - `E1`, a link that names neither an action in the signatures nor a built-in step:
+//!   `no action named <link>`.
 //! - `E2`, a link's options that do not fit its `Sig`'s options: `the options for <link> do not
 //!   parse: <why>`, where `<why>` is `not an object`, ``unknown field `<field>` ``, ``missing
 //!   field `<field>` `` or `<field> is <type>, not <type>`.
@@ -328,7 +347,54 @@ pub trait Action: Send + Sync {
     ) -> Result<Map<String, Value>, String>;
 }
 
-/// Graph writes by the id of the event they are about, until the append that carries its 2 takes them.
+/// The built-in steps' `Sig`s, which `check` and the processor know with no action of the app's:
+/// `emit`, and `store` with its options `table` and `row`.
+pub(crate) fn builtins() -> [Sig; 2] {
+    let store = [("table", "string"), ("row", "any")].map(|(f, t)| (f.to_owned(), t.to_owned()));
+    let sig = |action: &str| Sig {
+        action: action.to_owned(),
+        ..Sig::default()
+    };
+    let (emit, store) = (
+        sig("emit"),
+        Sig {
+            options: store.into(),
+            ..sig("store")
+        },
+    );
+    [emit, store]
+}
+
+/// A built-in step on the processor's connection: `emit` gives nothing, and `store` gives its row
+/// as `$graph`, `{"store": {"table": T, "row": {column: value}}}`, once the store has T and each
+/// column.
+struct Builtin(Sig, Arc<Mutex<Connection>>);
+
+impl Action for Builtin {
+    fn sig(&self) -> &Sig {
+        &self.0
+    }
+
+    fn run(
+        &self,
+        options: &Value,
+        input: &Map<String, Value>,
+    ) -> Result<Map<String, Value>, String> {
+        if self.0.action == "emit" {
+            return Ok(Map::new());
+        }
+        let table = options["table"].as_str().unwrap_or_default();
+        let row = options["row"].as_object().into_iter().flatten();
+        let row: Map<String, Value> = row.map(|(c, e)| (c.clone(), eval(e, input))).collect();
+        rannoch_events::insert(&lock(&self.1), table, row.keys())
+            .map_err(|e| format!("store: {e}"))?;
+        let item = json!({ "store": { "table": table, "row": row } });
+        Ok(Map::from_iter([("$graph".to_owned(), json!([item]))]))
+    }
+}
+
+/// Graph writes and store rows by the id of the event they are about, until the append that
+/// carries its 2 takes them.
 pub type Writes = Arc<Mutex<HashMap<Uuid, Vec<Value>>>>;
 
 /// The app's flows, one [`Flow`] for each flow's `ty`: the queue's [`Flows`]. `T` is the app's
@@ -341,9 +407,10 @@ pub struct Processor<T, D> {
 
 impl<T: TryFrom<u16> + PartialEq + 'static, D: From<Value> + 'static> Processor<T, D> {
     /// The processor over `flows`, the JSON array of flow docs that [`compile`] writes and the
-    /// app compiles in, and `actions`, found by their `Sig`'s `action`; `events` reads the waits
-    /// in `_events`. It does not check the docs: a link that names none of `actions` fails its
-    /// step with `no action named <link>`.
+    /// app compiles in, and `actions`, found by their `Sig`'s `action`, with the built-in steps
+    /// `emit` and `store`, which an action of the same name replaces; `events` reads the waits in
+    /// `_events` and prepares each `store`. It does not check the docs: a link that names none of
+    /// these fails its step with `no action named <link>`.
     /// # Errors
     /// The error of a flow doc that does not parse.
     pub fn new(
@@ -351,12 +418,16 @@ impl<T: TryFrom<u16> + PartialEq + 'static, D: From<Value> + 'static> Processor<
         actions: Vec<Arc<dyn Action>>,
         events: Connection,
     ) -> Result<Self, serde_json::Error> {
+        let (conn, seen) = (Arc::new(Mutex::new(events)), Arc::new(Mutex::default()));
         let mut by_name = HashMap::new();
+        for sig in builtins() {
+            let builtin: Arc<dyn Action> = Arc::new(Builtin(sig, conn.clone()));
+            by_name.insert(builtin.sig().action.clone(), builtin);
+        }
         for action in actions {
             by_name.insert(action.sig().action.clone(), action);
         }
         let docs: Arc<Vec<FlowDoc>> = Arc::new(serde_json::from_str(flows)?);
-        let (conn, seen) = (Arc::new(Mutex::new(events)), Arc::new(Mutex::default()));
         let mut by_ty: HashMap<u16, Arc<Flow<T, D>>> = HashMap::new();
         let writes = Writes::default();
         for doc in docs.iter().cloned() {
@@ -849,6 +920,28 @@ mod tests {
         assert_eq!(ran(json!(1)), [31]);
         assert_eq!(ran(json!("1")), [33]);
         assert_eq!(ran(json!(2)), [33]);
+    }
+
+    #[test]
+    fn store_gives_its_row_as_graph_and_fails_naming_a_table_or_column_the_store_does_not_have() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (k TEXT PRIMARY KEY, n INTEGER)")
+            .unwrap();
+        let [_, sig] = super::builtins();
+        let store = super::Builtin(sig, Arc::new(Mutex::new(conn)));
+        let input = obj(&json!({ "k": "a", "m": 2 }));
+        let ran =
+            |table: &str, row: Value| store.run(&json!({ "table": table, "row": row }), &input);
+
+        let item = json!({ "store": { "table": "t", "row": { "k": "a", "n": 2 } } });
+        let row = json!({ "k": "$k", "n": "$m" });
+        assert_eq!(ran("t", row.clone()), Ok(obj(&json!({ "$graph": [item] }))));
+        assert_eq!(
+            ran("nope", row),
+            Err("store: no such table: nope".to_owned())
+        );
+        let column = Err("store: table t has no column named x".to_owned());
+        assert_eq!(ran("t", json!({ "x": "$k" })), column);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-# Generated from FR-RANNOCH-119 (revision 8). Do not hand-edit.
+# Generated from FR-RANNOCH-119 (revision 9). Do not hand-edit.
 Feature: rannoch-processor runs a flow's steps and sends its nexts on success
 
   @module-rannoch-processor @criterion-FR-RANNOCH-119-c3 @criterion-FR-RANNOCH-119-c4 @criterion-FR-RANNOCH-119-c5
@@ -78,8 +78,8 @@ Feature: rannoch-processor runs a flow's steps and sends its nexts on success
     Then the build fails listing one error: greeting names nothing in scope
     When the app is built with a flow doc whose next goes to ty 99, which no flow takes
     Then the build fails listing one error saying so
-    When the app is built with a flow doc whose step names emit
-    Then the build fails listing one error: no action named emit
+    When the app is built with a flow doc whose step names forget
+    Then the build fails listing one error: no action named forget
     When the app is built with two flow docs holding three errors between them
     Then the build fails listing all three errors
 

@@ -137,7 +137,9 @@
 //! stamp. A retry or a hunt's resend is a new event: its items add rows stamped with its own id,
 //! and they become current.
 //!
-//! An item that does not parse as an `Op` fails the append with [`Error::Store`]: nothing in the
+//! A store row that rannoch-processor's `store` step carries, `{"store": {"table": T, "row":
+//! {..}}}`, is not an `Op`: rannoch-events' `store_in` inserts it in the same transaction. Any
+//! other item that does not parse as an `Op` fails the append with [`Error::Store`]: nothing in the
 //! batch is written, and `Writes` gets the batch's items back, unless that same event has items
 //! there again by then. Rannoch's inbox puts the failed batch back ahead of later events and
 //! tries it again each interval, so while the bad item is in it, nothing more from that inbox is
@@ -450,6 +452,9 @@ fn commit<T: Copy + Into<u16>, D: Serialize>(
     for (source, items) in taken {
         let event = source.to_string();
         for item in items {
+            if rannoch_events::store_in(&tx, item).map_err(|_| Error::Store)? {
+                continue;
+            }
             let op = Op::deserialize(item).map_err(|_| Error::Store)?;
             if write(&tx, &event, &op, written).map_err(|_| Error::Store)? == 1 {
                 match op {
@@ -728,6 +733,39 @@ mod tests {
         assert_eq!(value(&conn, "x", "L", Some(7_000)), None);
         assert_eq!(value(&conn, "x", "K", None), Some(json!("b")));
         assert_eq!(value(&conn, "x", "L", None), Some(json!("d")));
+    }
+
+    /// A 2's store row is inserted with its graph rows; one into a table the store does not have
+    /// fails the batch, writing none of it.
+    #[test]
+    fn a_store_row_is_written_with_its_2_and_one_the_store_does_not_have_fails_the_batch() {
+        use rannoch_core::{Event, Status};
+        let mut conn = rannoch_core::forgr::empty_store();
+        conn.execute_batch("CREATE TABLE t (k TEXT PRIMARY KEY)")
+            .unwrap();
+        let store = |table| json!({ "store": { "table": table, "row": { "k": "a" } } });
+        let set = json!({ "set": { "node": "a", "key": "k", "value": 1 } });
+        let two = |source| Event {
+            id: Uuid::now_v7(),
+            source: Some(source),
+            ty: 1_u16,
+            data: json!({}),
+            run_at: None,
+            status: Status::Processed,
+        };
+        let rows = |c: &Connection| {
+            let tables = ["t", "_nodes", "_events"];
+            tables.map(|t| count(c, &format!("SELECT count(*) FROM {t}")))
+        };
+
+        let (first, second) = (v7_at(1_000), v7_at(2_000));
+        let taken = [(first, vec![store("t"), set])];
+        super::commit(&mut conn, &[two(first)], &taken).unwrap();
+        assert_eq!(rows(&conn), [1, 1, 1]);
+
+        let taken = [(second, vec![store("nope")])];
+        assert!(super::commit(&mut conn, &[two(second)], &taken).is_err());
+        assert_eq!(rows(&conn), [1, 1, 1]);
     }
 
     /// A correction and a retraction, now, as of and why (the toy's P4).
