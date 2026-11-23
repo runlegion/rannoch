@@ -39,7 +39,7 @@ The store opens a connection only once no migration is pending, so the order mat
 2. Open each connection with `rannoch_store::open(path, &migrator)`, which returns `Opened::Ready` with the connection once nothing is pending.
 3. Make the processor with `Processor::new`, from the app's flows as JSON, its actions and a connection.
 4. Make a channel with `std::sync::mpsc::channel`. The append signals on its sender, and the queue waits on its receiver.
-5. Make the append: `Events::new(conn, signal)`, with `.with_writes(processor.writes())` when a flow uses the `store` step, or `GraphAppend::new(conn, signal, processor.writes())` when steps give graph rows, with `with_hoods` to keep describes warm. `Events` without the processor's writes writes no `store` row.
+5. Make the append: `Events::new(conn, signal)`, with `.with_writes(processor.writes())` when a flow uses the `store` step, or `GraphAppend::new(conn, signal, processor.writes())` when steps give graph rows, with `with_hoods` to keep describes warm. Without them, `Events` writes no `store` row.
 6. Open rannoch with `Rannoch::open`, its `Config` holding the store and the append.
 7. Start the queue with `Queue::start`, over a connection, the receiver, `rannoch.sender()`, the processor and its `Settings`.
 
