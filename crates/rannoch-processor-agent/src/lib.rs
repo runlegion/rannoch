@@ -1,6 +1,44 @@
+#![warn(missing_docs)]
 //! A flow step that calls an agent the app reaches through [`Agent`]: the step's input is
 //! checked against the agent's declared takes before the call, its answer against its gives
 //! after.
+//!
+//! The app implements [`Agent`] for each agent it reaches, and wraps it in an [`AgentAction`]
+//! with the [`Sig`] it declares for the agent in its signatures export. It hands the action to
+//! `Processor::new` with its other actions, and a step calls it by the `Sig`'s `action`, as in
+//! `{"do": "rate"}`.
+//!
+//! # Example
+//!
+//! ```
+//! use std::sync::Arc;
+//!
+//! use rannoch_processor::{Action, Sig};
+//! use rannoch_processor_agent::{Agent, AgentAction};
+//! use serde_json::{Map, Value, json};
+//!
+//! /// The app's agent; this one rates every text 2.
+//! struct Rater;
+//!
+//! impl Agent for Rater {
+//!     fn ask(&self, _input: &Map<String, Value>) -> Result<Map<String, Value>, String> {
+//!         Ok(Map::from_iter([("severity".to_owned(), json!(2))]))
+//!     }
+//! }
+//!
+//! let sig: Sig = serde_json::from_value(json!({ "action": "rate", "job": true,
+//!     "takes": { "text": "string" }, "gives": { "severity": "number" } }))?;
+//! let rate = AgentAction::new(sig, Arc::new(Rater));
+//!
+//! let input = Map::from_iter([("text".to_owned(), json!("it crashed"))]);
+//! assert_eq!(rate.run(&json!({}), &input)?["severity"], json!(2));
+//!
+//! // Input that does not fit the agent's takes fails the step without asking the agent.
+//! let input = Map::from_iter([("text".to_owned(), json!(5))]);
+//! let failure = "agent rate input gave text as number, it declares string";
+//! assert_eq!(rate.run(&json!({}), &input), Err(failure.to_owned()));
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
 
 use std::sync::Arc;
 
@@ -9,6 +47,8 @@ use serde_json::{Map, Value};
 
 /// What the app implements to reach its agents; rannoch reaches none on its own.
 pub trait Agent: Send + Sync {
+    /// Asks the agent with `input`, the step's input once it fits the agent's takes; the answer
+    /// is checked against its gives.
     /// # Errors
     /// The agent's failure, which fails the step.
     fn ask(&self, input: &Map<String, Value>) -> Result<Map<String, Value>, String>;
@@ -25,7 +65,9 @@ pub struct AgentAction {
 }
 
 impl AgentAction {
-    /// The agent's Sig is the one the app declares for it in its signatures.json, with job true.
+    /// The action calling `agent`, with `sig` the one the app declares for the agent in its
+    /// signatures export. `check` reads that export, so its `job` decides whether a flow that
+    /// calls the agent runs as a job.
     #[must_use]
     pub fn new(sig: Sig, agent: Arc<dyn Agent>) -> Self {
         Self { sig, agent }

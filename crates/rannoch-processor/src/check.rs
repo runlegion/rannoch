@@ -51,7 +51,8 @@ pub fn compile(dir: &Path, signatures: &[&str]) {
     }
 }
 
-/// The flows as the JSON array to compile in, or every error.
+/// Checks `docs`, each a flow doc with the name of its file, against `sigs`: the flows as the
+/// JSON array to compile in, each with `job` set, or every error.
 /// # Errors
 /// Every error in every doc, one line each, `E<n> <file> step <i> <link name | next>: <what>`.
 #[expect(clippy::too_many_lines, reason = "every check of a doc, in its order")]
