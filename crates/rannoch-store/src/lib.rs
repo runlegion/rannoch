@@ -10,8 +10,8 @@
 //! of its own, never inside an append.
 //!
 //! Rannoch keeps the [`Store`] in its `Config` for as long as it runs. A checkpoint query that
-//! fails is logged at `error`; when the checkpointer cannot open its connection, nothing is
-//! logged. Either way it tries again a second later.
+//! fails is logged at `error`, and so is each try at opening the checkpointer's connection that
+//! fails. Either way it tries again a second later.
 //!
 //! # Failures
 //!
@@ -99,7 +99,10 @@ impl Checkpointer {
             let mut conn = None;
             while wait.recv_timeout(CHECKPOINT_EVERY) == Err(RecvTimeoutError::Timeout) {
                 if conn.is_none() {
-                    conn = connection(&path).ok();
+                    match connection(&path) {
+                        Ok(opened) => conn = Some(opened),
+                        Err(e) => log::error!("checkpointer cannot open its connection: {e}"),
+                    }
                 }
                 if let Some(conn) = &conn
                     && conn
@@ -204,6 +207,9 @@ pub fn open(path: &Path, migrator: &migratr::Migrator) -> Result<Opened, Error> 
 mod tests {
     use std::fs;
     use std::path::Path;
+    use std::sync::{Mutex, PoisonError};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     use rannoch_core::Storage;
 
@@ -222,6 +228,50 @@ mod tests {
         assert_eq!(store.pending(), Ok(true));
         assert_eq!(store.apply(), Ok(()));
         assert_eq!(store.pending(), Ok(false));
+    }
+
+    /// The `error` lines logged in this test binary.
+    struct Errors(Mutex<Vec<String>>);
+
+    impl log::Log for Errors {
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            metadata.level() <= log::Level::Error
+        }
+        fn log(&self, record: &log::Record<'_>) {
+            if self.enabled(record.metadata()) {
+                let mut lines = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+                lines.push(record.args().to_string());
+            }
+        }
+        fn flush(&self) {}
+    }
+
+    static ERRORS: Errors = Errors(Mutex::new(Vec::new()));
+
+    #[test]
+    fn a_checkpointer_that_cannot_open_its_connection_logs_at_error_each_time() {
+        let _ = log::set_logger(&ERRORS);
+        log::set_max_level(log::LevelFilter::Error);
+        // A database in a directory that does not exist: no connection opens.
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp/rannoch-store-none");
+        if dir.exists() {
+            fs::remove_dir_all(&dir).unwrap();
+        }
+        let unopened = || {
+            let lines = ERRORS.0.lock().unwrap();
+            let line = format!("checkpointer cannot open its connection: {}", Error::Store);
+            lines.iter().filter(|l| **l == line).count()
+        };
+
+        let store = Store::new(dir.join("store.db"), rannoch_core::migrator());
+        // It tries once a second: the first two tries, each logged.
+        let start = Instant::now();
+        while unopened() < 2 && start.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(50));
+        }
+        drop(store);
+
+        assert!(unopened() >= 2, "{} lines", unopened());
     }
 
     #[test]
