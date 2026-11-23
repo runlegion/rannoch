@@ -1,6 +1,8 @@
 //! FR-RANNOCH-121's scenarios (`@criterion-FR-RANNOCH-121-c1` to `-c6`) over the test app of
 //! `tests/app`, its flows run by rannoch-processor over the real store and queue. c3 and c6 run
-//! with the `tract` feature, c5 without it; potion-base-8M is fetched into the target dir.
+//! with the `tract` feature, c5 without it. c5 and c6 embed with the fixture model2vec model of
+//! `tests/fixtures/model2vec`, which `tests/fixtures/generate.rs` writes; no scenario reaches the
+//! network.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc, mpsc::Sender};
@@ -21,6 +23,7 @@ use uuid::Uuid;
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 const ADD: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/models/add.onnx");
+const MODEL: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/model2vec");
 const TEXTS: [&str; 5] = [
     "the app crashes when I click save",
     "how do I export my notes?",
@@ -136,22 +139,6 @@ fn text_actions(model: &Path, tokenizer: &str) -> Result<Vec<Arc<dyn Action>>> {
     Ok(vec![Arc::new(embed()?), Arc::new(classify)])
 }
 
-/// The potion-base-8M files, fetched from Hugging Face into the target dir once.
-fn potion() -> Result<PathBuf> {
-    fs::create_dir_all(tmp("potion/onnx"))?;
-    for file in ["model.safetensors", "tokenizer.json", "onnx/model.onnx"] {
-        let (to, part) = (tmp("potion").join(file), tmp("potion.part"));
-        let url = format!("https://huggingface.co/minishlab/potion-base-8M/resolve/main/{file}");
-        let args = ["-sSfL", "-o", &part.display().to_string(), &url];
-        if !to.exists() && !Command::new("curl").args(args).status()?.success() {
-            return Err(format!("could not fetch {url}").into());
-        } else if !to.exists() {
-            fs::rename(&part, to)?;
-        }
-    }
-    Ok(tmp("potion"))
-}
-
 /// Runs cargo with `args` on the test app of `tests/app`, the workspace's Cargo.lock copied in:
 /// its stdout, or its stderr as the error.
 fn cargo(args: &[&str]) -> Result<String> {
@@ -203,18 +190,18 @@ fn a_flow_step_runs_a_local_model() -> Result<()> {
 #[test]
 fn a_flow_embeds_and_classifies_text_with_a_local_model() -> Result<()> {
     // Given an app that enables the onnx feature, built with flows whose steps embed and
-    // classify text with the potion-base-8M model, kept as a local file, classify's labels
+    // classify text with the fixture model2vec model, kept as a local file, classify's labels
     // being bug, question and praise, each with a description
-    let potion = potion()?;
-    let tokenizer = fs::read_to_string(potion.join("tokenizer.json"))?;
-    let actions = text_actions(&potion.join("onnx/model.onnx"), &tokenizer)?;
+    let model = Path::new(MODEL);
+    let tokenizer = fs::read_to_string(model.join("tokenizer.json"))?;
+    let actions = text_actions(&model.join("onnx/model.onnx"), &tokenizer)?;
     let app = App::start("embeds_and_classifies", actions)?;
 
     // When the queue hands rannoch-processor an event to embed a text, twice
-    // Then each next carries a vector of 256 numbers, identical both times
+    // Then each next carries a vector of 8 numbers, identical both times
     // (the processor checks each next's vector is a list<number>, as embed's sig gives)
     let once = app.ask(20, TEXTS[0], "vector")?;
-    assert_eq!(once.as_array().map(Vec::len), Some(256));
+    assert_eq!(once.as_array().map(Vec::len), Some(8));
     assert_eq!(app.ask(20, TEXTS[0], "vector")?, once);
 
     // When the queue hands rannoch-processor an event to embed a different text
@@ -266,15 +253,16 @@ fn ort<T: ort::tensor::PrimitiveTensorElementType + std::fmt::Debug + Clone + 's
     Ok(outputs[0].try_extract_tensor::<f32>()?.1.to_vec())
 }
 
-/// potion-base-8M as a Loop-free export, written from `model.safetensors` with tract-onnx's
-/// protobuf types: Gather of the [29528, 256] matrix by `input_ids`, `ReduceMean` over the
-/// tokens, then `ReduceL2` and Div, as its config's normalize asks; opset 13.
+/// The model2vec model in `model` as a Loop-free export, written from its `model.safetensors`
+/// with tract-onnx's protobuf types into the target dir: Gather of its embeddings matrix by
+/// `input_ids`, `ReduceMean` over the tokens, then `ReduceL2` and Div, as its config's normalize
+/// asks; opset 13.
 #[cfg(feature = "tract")]
 #[expect(clippy::field_reassign_with_default)]
-fn export(potion: &Path) -> Result<PathBuf> {
+fn export(model: &Path) -> Result<PathBuf> {
     use tract_onnx::pb::tensor_shape_proto::{Dimension, dimension::Value::DimParam};
     use tract_onnx::pb::{attribute_proto::AttributeType, tensor_proto::DataType, *};
-    let bytes = fs::read(potion.join("model.safetensors"))?;
+    let bytes = fs::read(model.join("model.safetensors"))?;
     let n = 8 + usize::try_from(u64::from_le_bytes(bytes[..8].try_into()?))?;
     let header: Value = serde_json::from_slice(&bytes[8..n])?;
     let ints = |k: &str| serde_json::from_value::<Vec<i64>>(header["embeddings"][k].clone());
@@ -334,7 +322,7 @@ fn export(potion: &Path) -> Result<PathBuf> {
         graph: Some(graph),
         ..ModelProto::default()
     };
-    let path = potion.join("export.onnx");
+    let path = tmp("export.onnx");
     fs::write(&path, prost::Message::encode_to_vec(&model))?;
     Ok(path)
 }
@@ -372,13 +360,13 @@ fn ids(vocab: &Value, text: &str) -> Vec<i64> {
 #[cfg(feature = "tract")]
 #[test]
 fn a_tract_build_runs_the_model_shipped_as_an_export_tract_can_load() -> Result<()> {
-    // Given the potion-base-8M model shipped as a Loop-free export, Gather and ReduceMean with
-    // the L2 step its config's normalize asks for, kept as a local file
-    let potion = potion()?;
-    let export = export(&potion)?;
+    // Given the fixture model2vec model shipped as a Loop-free export, Gather and ReduceMean
+    // with the L2 step its config's normalize asks for, kept as a local file
+    let model = Path::new(MODEL);
+    let export = export(model)?;
     // And one app built with the onnx feature and one built with the tract feature, each with
     // flows that embed and classify text with that export
-    let tokenizer = fs::read_to_string(potion.join("tokenizer.json"))?;
+    let tokenizer = fs::read_to_string(model.join("tokenizer.json"))?;
     let app = App::start("tract_build", text_actions(&export, &tokenizer)?)?;
     let vocab = serde_json::from_str::<Value>(&tokenizer)?["model"]["vocab"].take();
     let unit = |v: Vec<f32>| {
@@ -395,8 +383,8 @@ fn a_tract_build_runs_the_model_shipped_as_an_export_tract_can_load() -> Result<
     for text in TEXTS {
         let tract: Vec<f64> = serde_json::from_value(app.ask(20, text, "vector")?)?;
         let original = vec![("input_ids", ids(&vocab, text)), ("offsets", vec![0])];
-        let original = unit(ort(&potion.join("onnx/model.onnx"), original)?);
-        assert_eq!(tract.len(), 256);
+        let original = unit(ort(&model.join("onnx/model.onnx"), original)?);
+        assert_eq!(tract.len(), 8);
         assert!(close(&tract, &by_ort(text)?), "{text}: tract and ort");
         assert!(close(&tract, &original), "{text}: the original through ort");
     }

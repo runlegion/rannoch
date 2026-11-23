@@ -30,10 +30,10 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
-//! `Embed` and `Classify` need a model2vec model and its `tokenizer.json`, which the repo does
-//! not hold, so this example is not run. The crate's scenarios fetch minishlab/potion-base-8M
-//! from Hugging Face into the target directory; the example reads its `onnx/model.onnx` and
-//! `tokenizer.json`.
+//! `Embed` and `Classify` need a model2vec model and its `tokenizer.json`. This example reads the
+//! `onnx/model.onnx` and `tokenizer.json` of minishlab/potion-base-8M from a local directory the
+//! repo does not hold, so it is not run; the crate's scenarios use the small fixture model of
+//! `tests/fixtures/model2vec`, laid out the same way.
 //!
 //! ```no_run
 //! use std::path::Path;
