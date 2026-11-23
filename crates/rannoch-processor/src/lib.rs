@@ -260,7 +260,8 @@
 //!   foreign key or type rule or a trigger, passes the step; the append rolls it back with the
 //!   event's 2, a -1 for the event is sent in their place, its data `store: ` and the store's
 //!   message, and the rest of the batch commits. The nexts the step sent stand, and the queue does
-//!   not retry the event.
+//!   not retry the event. A deferred foreign key is checked only at commit, so a row that breaks
+//!   one fails its whole batch.
 //!
 //! # What `check` reports
 //!

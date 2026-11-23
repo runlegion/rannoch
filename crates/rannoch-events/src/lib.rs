@@ -29,7 +29,8 @@
 //! items, and that 2 is not written: the append returns in its place a -1 for the 2's source, its
 //! data `store: ` and the store's message, as `store: NOT NULL constraint failed:
 //! payments.amount`, which the inbox sends; the rest of the batch commits, the 2's nexts
-//! included.
+//! included. A deferred foreign key is checked only at commit, after every savepoint, so a row
+//! that breaks one fails its whole batch.
 //!
 //! # Failures
 //!
@@ -259,9 +260,9 @@ where
 /// Writes `batch` in `tx` with the items `taken` for its 2s, each 2's items inside a savepoint of
 /// their own: a `store` row with `ON CONFLICT DO NOTHING`, so T's own keys decide whether it adds
 /// a row, and any other item with `other`, which gets the 2's source. When T refuses a store row,
-/// by any of its constraints, the savepoint is rolled back and that 2 is not written: returned in
-/// its place is a -1 for its source, its data naming the reason, for the caller to send. The
-/// caller commits.
+/// by any of its constraints or a value its INTEGER PRIMARY KEY cannot hold, the savepoint is
+/// rolled back and that 2 is not written: returned in its place is a -1 for its source, its data
+/// naming the reason, for the caller to send. The caller commits.
 /// # Errors
 /// `Error::Store` when an event cannot be inserted, `other` fails, or a store row fails for a
 /// reason other than a constraint, as an item with a `store` key that is not a [`StoreRow`], or a
@@ -318,7 +319,8 @@ where
 
 /// Why a 2's items were not written.
 enum Unwritten {
-    /// T refused a store row by one of its constraints: `store: ` and the store's message.
+    /// T refused a store row, by one of its constraints or a value its INTEGER PRIMARY KEY cannot
+    /// hold: `store: ` and the store's message.
     Refused(String),
     /// Anything else, which fails the batch.
     Failed,
@@ -344,7 +346,13 @@ fn store_in(conn: &Connection, item: &Value) -> Result<bool, Unwritten> {
     let mut insert = stored.insert(conn).map_err(|_| Unwritten::Failed)?;
     match insert.execute(params_from_iter(values)) {
         Ok(_) => Ok(true),
-        Err(e) if e.sqlite_error_code() == Some(ErrorCode::ConstraintViolation) => {
+        // A value an INTEGER PRIMARY KEY cannot hold is a mismatch, not a constraint.
+        Err(e)
+            if matches!(
+                e.sqlite_error_code(),
+                Some(ErrorCode::ConstraintViolation | ErrorCode::TypeMismatch)
+            ) =>
+        {
             Err(Unwritten::Refused(format!("store: {e}")))
         }
         Err(_) => Err(Unwritten::Failed),
@@ -384,7 +392,7 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
-    use super::{Events, append};
+    use super::{Events, Writes, append};
 
     #[derive(Debug, Clone, Copy)]
     #[repr(u16)]
@@ -498,47 +506,84 @@ mod tests {
         assert_eq!(failed.err(), Some(Error::Store));
     }
 
-    #[test]
-    fn a_store_row_t_refuses_is_rolled_back_with_its_2_and_a_minus_1_is_returned() {
+    /// An `Events` with writes over an empty store that `sql` gives its tables: the append, its
+    /// writes and the receiver of its signal.
+    fn with_tables(sql: &str) -> (Events, Writes, mpsc::Receiver<()>) {
         let store = rannoch_core::forgr::empty_store();
-        let sql = "CREATE TABLE t (k TEXT PRIMARY KEY, n INTEGER NOT NULL)";
         store.execute_batch(sql).unwrap();
         let (queue, signals) = mpsc::channel();
         let writes = Arc::new(Mutex::new(HashMap::new()));
-        let events = Events::new(store, queue).with_writes(writes.clone());
-        // `n` is null, as `eval` gives for a field the input lacks.
-        let item = json!({ "store": { "table": "t", "row": { "k": "a", "n": null } } });
+        (
+            Events::new(store, queue).with_writes(writes.clone()),
+            writes,
+            signals,
+        )
+    }
+
+    /// A 2 whose source's store row `item` is in `writes`.
+    fn two_with(writes: &Writes, item: serde_json::Value) -> Event<Ty, String> {
         let source = Uuid::now_v7();
         writes.lock().unwrap().insert(source, vec![item]);
-        let two = Event {
+        Event {
             source: Some(source),
             status: Status::Processed,
             ..event(Uuid::now_v7())
-        };
+        }
+    }
+
+    #[test]
+    fn a_store_row_t_refuses_is_rolled_back_with_its_2_and_the_rest_of_the_batch_commits() {
+        let (events, writes, signals) =
+            with_tables("CREATE TABLE t (k TEXT PRIMARY KEY, n INTEGER NOT NULL)");
+        // `n` is null, as `eval` gives for a field the input lacks.
+        let row = |k, n| json!({ "store": { "table": "t", "row": { "k": k, "n": n } } });
+        let refused = two_with(&writes, row("a", json!(null)));
+        let taken = two_with(&writes, row("b", json!(1)));
         let other = event(Uuid::now_v7());
 
-        let replies = Append::append(&events, &[other.clone(), two]).unwrap();
+        let batch = [other.clone(), refused.clone(), taken.clone()];
+        let replies = Append::append(&events, &batch).unwrap();
 
-        // The rest of the batch commits and signals; the 2 and its row are not written.
+        // The rest of the batch commits and signals: the other event, and the second 2 with its
+        // row; the refused 2 and its row are not written.
         assert_eq!(signals.try_recv(), Ok(()));
         let conn = events.conn.lock().unwrap();
-        let ids = "SELECT id FROM _events";
-        let ids: String = conn.query_row(ids, [], |r| r.get(0)).unwrap();
-        assert_eq!((count(&conn), ids), (1, other.id.to_string()));
-        let rows: i64 = conn
-            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(rows, 0);
+        let read = |sql| {
+            let mut select = conn.prepare(sql).unwrap();
+            let rows = select.query_map([], |r| r.get(0)).unwrap();
+            rows.collect::<rusqlite::Result<Vec<String>>>().unwrap()
+        };
+        let ids = read("SELECT id FROM _events ORDER BY rowid");
+        assert_eq!(ids, [other.id.to_string(), taken.id.to_string()]);
+        assert_eq!(read("SELECT k || n FROM t"), ["b1"]);
         assert!(writes.lock().unwrap().is_empty());
-        // In its place, a -1 for its source naming the reason, for the inbox to send.
+        // In the refused 2's place, a -1 for its source naming the reason, for the inbox to send.
         let [binned] = replies.as_slice() else {
             panic!("{replies:?}")
         };
         assert_eq!(
             (binned.source, binned.status),
-            (Some(source), Status::Binned)
+            (refused.source, Status::Binned)
         );
         assert_eq!(binned.data, "store: NOT NULL constraint failed: t.n");
+    }
+
+    #[test]
+    fn a_value_an_integer_primary_key_cannot_hold_is_refused_too() {
+        let (events, writes, _signals) = with_tables("CREATE TABLE r (id INTEGER PRIMARY KEY)");
+        let two = two_with(
+            &writes,
+            json!({ "store": { "table": "r", "row": { "id": "x" } } }),
+        );
+
+        let replies = Append::append(&events, std::slice::from_ref(&two)).unwrap();
+
+        assert_eq!(count(&events.conn.lock().unwrap()), 0);
+        let [binned] = replies.as_slice() else {
+            panic!("{replies:?}")
+        };
+        assert_eq!(binned.source, two.source);
+        assert_eq!(binned.data, "store: datatype mismatch");
     }
 
     #[test]

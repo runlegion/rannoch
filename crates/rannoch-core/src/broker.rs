@@ -31,7 +31,8 @@ pub trait Storage: fmt::Debug + Send + Sync {
 /// batch to.
 pub trait Append<T, D>: fmt::Debug + Send + Sync {
     /// Appends `batch` as one write, and returns the events it sends in reply, such as a -1 for
-    /// an event of the batch it did not write; the inbox sends each as [`Sender::send`] does.
+    /// an event of the batch it did not write; the inbox sends each as [`Sender::send`] does, or
+    /// at shutdown hands them over itself.
     ///
     /// # Errors
     ///

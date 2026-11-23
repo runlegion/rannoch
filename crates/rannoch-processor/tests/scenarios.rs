@@ -15,7 +15,7 @@ use std::{fs, thread};
 
 use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
 use rannoch_core::forgr::_events;
-use rannoch_core::{Append, Config, Error, Event, Rannoch, Status};
+use rannoch_core::{Append, Config, Error, Event, InboxConfig, Rannoch, Status};
 use rannoch_events::Events;
 use rannoch_processor::{Action, FlowDoc, Processor, Sig, check};
 use rannoch_queue::{Flows, Queue, Settings};
@@ -1384,8 +1384,9 @@ fn the_hunt_resends_an_event_a_crash_dropped() {
 // rannoch, `Events`, the queue and rannoch-processor, on `BUILT_IN`'s flows of `emit` and `store`.
 // An item a scenario above already drives is not driven again; a 2 with its `store` row through
 // `GraphAppend`, and a row the table refuses there, are in rannoch-graph's scenarios. A batch
-// written whole or not at all is driven here with `Events`: another connection holding the
-// store's write lock makes the README's batch the store cannot write.
+// written whole or not at all is driven here with `Events`: a payment whose row breaks a deferred
+// foreign key, which SQLite checks only at commit, makes the README's batch that can never be
+// written.
 //
 // No built-in step gives a graph op, so rannoch-graph tests its own rows and reads:
 // - "Reads are decided by ids and stamps": in crates/rannoch-graph/src/lib.rs, `fr_rannoch_123_c2`
@@ -1511,6 +1512,12 @@ const ROOTS: &str = "SELECT count(*) FROM _events WHERE source IS NULL";
 const ORDERS: &str = "CREATE TABLE orders (id TEXT PRIMARY KEY);
     CREATE TABLE payments (order_id TEXT PRIMARY KEY REFERENCES orders(id), amount INTEGER)";
 
+/// Payments that must name an order the store has by the time their batch commits: a deferred
+/// foreign key, which SQLite checks only at commit.
+const DEFERRED: &str = "CREATE TABLE orders (id TEXT PRIMARY KEY);
+    CREATE TABLE payments (order_id TEXT PRIMARY KEY
+        REFERENCES orders(id) DEFERRABLE INITIALLY DEFERRED, amount INTEGER)";
+
 /// The `error` lines rannoch logs, for the scenarios that read them.
 struct Errors(Mutex<Vec<String>>);
 
@@ -1615,39 +1622,54 @@ fn an_accepted_event_is_in_memory_until_its_inbox_hands_it_over() {
 }
 
 #[test]
-fn a_batch_the_store_cannot_write_stops_its_inbox_and_is_lost_at_shutdown() {
+fn a_batch_the_store_never_takes_stops_its_inbox_and_is_lost_at_shutdown() {
     let _errors = logged();
-    // Given an app whose default inbox hands over every 300 ms, and another connection holding
-    // the store's write lock throughout, so each hand-over waits out the append's busy timeout of
-    // 5 s and fails
-    let app = built_in_with("cannot_write", every(300)).unwrap();
-    let writer = ready(&app.path).unwrap();
-    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    // Given an app whose payments must name an order the store has by the time their batch
+    // commits, whose default inbox hands over every 300 ms, and whose queued tickets have an inbox
+    // of their own
+    let queued = InboxConfig {
+        name: "queued".to_owned(),
+        types: vec![Ty(82)],
+        interval: TimeDelta::milliseconds(20),
+    };
+    let config = Config {
+        inboxes: vec![queued],
+        ..every(300)
+    };
+    let app = built_in_with("never_taken", config).unwrap();
+    app.read.execute_batch(DEFERRED).unwrap();
 
-    // When it sends an event
-    app.send(81, &json!({ "ticket": "r0" })).unwrap();
+    // When a payment for an order the store does not have runs
+    let paid = json!({ "order": "o1", "amount": 5 });
+    app.send(86, &paid).unwrap();
+    let payment = poll(WAIT, || app.root(&paid)).unwrap();
 
-    // Then the hand-over of its batch fails whole, and is logged at error
-    assert!(until(Duration::from_secs(10), || !failed_hand_overs().is_empty()));
-    let rushed = "SELECT count(*) FROM _events WHERE ty = 81";
-    assert_eq!(app.count(rushed), 0);
+    // Then the hand-over of the batch with its 2 and its row fails whole at commit, and is logged
+    // at error
+    assert!(until(WAIT, || !failed_hand_overs().is_empty()));
+    assert_eq!(app.sent(payment, 2), []);
+    assert_eq!(app.count("SELECT count(*) FROM payments"), 0);
 
-    // When it sends two more
+    // When it sends two more events to the default inbox, and a queued ticket to its own
     let held = *failed_hand_overs().last().unwrap();
     for ticket in ["r1", "r2"] {
         app.send(81, &json!({ "ticket": ticket })).unwrap();
     }
+    let queued = json!({ "ticket": "q1" });
+    app.send(82, &queued).unwrap();
 
-    // Then every later hand-over holds the failed batch and them, and fails: its heap grows, and
-    // nothing more from it reaches the disk
-    let grown = || failed_hand_overs().last() == Some(&(held + 2));
-    assert!(until(Duration::from_secs(15), grown));
+    // Then every later hand-over of the default inbox holds the failed batch and them, and
+    // fails: its heap grows, and nothing more from it reaches the disk
+    assert!(until(WAIT, || failed_hand_overs().last() == Some(&(held + 2))));
+    let rushed = "SELECT count(*) FROM _events WHERE ty = 81";
     assert_eq!(app.count(rushed), 0);
+
+    // And the other inbox still writes: the queued ticket is written and runs
+    app.ran(&queued);
 
     // When it sends one more just after a failed hand-over, then shuts down
     let tried = failed_hand_overs().len();
-    assert!(until(Duration::from_secs(10), || failed_hand_overs().len()
-        > tried));
+    assert!(until(WAIT, || failed_hand_overs().len() > tried));
     let held = *failed_hand_overs().last().unwrap();
     app.send(81, &json!({ "ticket": "r3" })).unwrap();
     drop(app.signal);
@@ -1658,13 +1680,14 @@ fn a_batch_the_store_cannot_write_stops_its_inbox_and_is_lost_at_shutdown() {
     let tried = failed_hand_overs().len();
     thread::sleep(Duration::from_millis(400));
     assert_eq!(failed_hand_overs().len(), tried);
-    app.queue.join().unwrap();
+    assert_eq!(app.queue.join(), Ok(()));
 
-    // And the batch and every event after it are lost, once the lock is released too
-    writer.execute_batch("ROLLBACK").unwrap();
+    // And the batch and every event after it are lost
     let read = ready(&app.path).unwrap();
     let count = |sql: &str| read.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap();
     assert_eq!(count(rushed), 0);
+    let two = format!("SELECT count(*) FROM _events WHERE source = '{payment}' AND status = 2");
+    assert_eq!(count(&two), 0);
 }
 
 #[test]

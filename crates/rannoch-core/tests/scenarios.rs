@@ -547,7 +547,10 @@ impl Append<u8, String> for Timed {
         if appended.is_ok()
             && let Ok(mut times) = self.send_to_commit.lock()
         {
-            let sent = |e: &Event<u8, String>| e.data.parse().unwrap_or(committed);
+            let sent = |e: &Event<u8, String>| -> u64 {
+                let parsed = e.data.parse();
+                parsed.unwrap_or_else(|err| panic!("send time {:?}: {err}", e.data))
+            };
             times.extend(batch.iter().map(|e| committed.saturating_sub(sent(e))));
         }
         appended

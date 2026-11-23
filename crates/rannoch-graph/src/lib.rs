@@ -141,11 +141,11 @@
 //! {..}}}`, is not an `Op`: rannoch-events' `write_in` inserts it in the same transaction, each
 //! 2's items inside a savepoint. When T refuses it, that 2's rows are rolled back and the 2 is not
 //! written; the append returns a -1 for its source naming the reason, which the inbox sends, and
-//! the rest of the batch commits, the 2's nexts included. Any other item that does not parse as an `Op` fails the append
-//! with [`Error::Store`]: nothing in the batch is written, and `Writes` gets the batch's items
-//! back, unless that same event has items there again by then. Rannoch's inbox puts the failed
-//! batch back ahead of later events and tries it again each interval, so while the bad item is in
-//! it, nothing more from that inbox is written.
+//! the rest of the batch commits, the 2's nexts included. Any other item that does not parse as
+//! an `Op` fails the append with [`Error::Store`]: nothing in the batch is written, and `Writes`
+//! gets the batch's items back, unless that same event has items there again by then. Rannoch's
+//! inbox puts the failed batch back ahead of later events and tries it again each interval, so
+//! while the bad item is in it, nothing more from that inbox is written.
 //!
 //! # What the reads return: now, as of T and why
 //!
