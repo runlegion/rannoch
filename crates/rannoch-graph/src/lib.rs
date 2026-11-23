@@ -142,10 +142,10 @@
 //! 2's items inside a savepoint. When T refuses it, that 2's rows are rolled back and the 2 is not
 //! written; the append returns a -1 for its source naming the reason, which the inbox sends, and
 //! the rest of the batch commits, the 2's nexts included. Any other item that does not parse as
-//! an `Op` fails the append with [`Error::Store`]: nothing in the batch is written, and `Writes`
-//! gets the batch's items back, unless that same event has items there again by then. Rannoch's
-//! inbox puts the failed batch back ahead of later events and tries it again each interval, so
-//! while the bad item is in it, nothing more from that inbox is written.
+//! an `Op` is refused the same way, its -1's data `graph: ` and serde's message, as
+//! ``graph: missing field `props` `` for a `link` without `props`. An append the store cannot
+//! write fails with [`Error::Store`]: nothing in the batch is written, and `Writes` gets the
+//! batch's items back, unless that same event has items there again by then.
 //!
 //! # What the reads return: now, as of T and why
 //!
@@ -450,7 +450,11 @@ fn commit<T: Copy + Into<u16>, D: Serialize + From<String>>(
     let mut tx = conn.transaction().map_err(|_| Error::Store)?;
     let mut touched = Vec::new();
     let replies = rannoch_events::write_in(&mut tx, batch, taken, |tx, source, item| {
-        let op = Op::deserialize(item).map_err(|_| Error::Store)?;
+        let op = match Op::deserialize(item) {
+            Ok(op) => op,
+            // Refused like a store row: its 2's rows are rolled back and it gets a -1.
+            Err(e) => return Ok(Err(format!("graph: {e}"))),
+        };
         if write(tx, &source.to_string(), &op, written).map_err(|_| Error::Store)? == 1 {
             match op {
                 Op::Set { node, .. } | Op::Retract { node, .. } => touched.push((*source, node)),
@@ -459,7 +463,7 @@ fn commit<T: Copy + Into<u16>, D: Serialize + From<String>>(
                 }
             }
         }
-        Ok(())
+        Ok(Ok(()))
     })?;
     tx.commit().map_err(|_| Error::Store)?;
     // A source whose rows were rolled back touched nothing.
