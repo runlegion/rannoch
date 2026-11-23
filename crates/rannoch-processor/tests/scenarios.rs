@@ -15,7 +15,7 @@ use std::{fs, thread};
 
 use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
 use rannoch_core::forgr::_events;
-use rannoch_core::{Append, Config, Rannoch};
+use rannoch_core::{Append, Config, Error, Event, InboxConfig, Rannoch, Status};
 use rannoch_events::Events;
 use rannoch_processor::{Action, FlowDoc, Processor, Sig, check};
 use rannoch_queue::{Flows, Queue, Settings};
@@ -211,6 +211,17 @@ impl App {
     /// The app over the store at `path` running `flows` with the actions `made`, its queue on
     /// `settings`; its `Events` writes the processor's store rows with each 2.
     fn over(path: PathBuf, flows: &str, made: Made, settings: Settings) -> Result<Self> {
+        Self::with(path, flows, made, Config::default(), settings)
+    }
+
+    /// As `over`, rannoch's inboxes as `config` has them.
+    fn with(
+        path: PathBuf,
+        flows: &str,
+        made: Made,
+        config: Config<Ty, Value>,
+        settings: Settings,
+    ) -> Result<Self> {
         let store = migrated(&path)?;
         let (calls, rating) = (Calls::default(), Arc::default());
         let actions = made(&calls, &rating);
@@ -221,7 +232,7 @@ impl App {
         let rannoch = Rannoch::open(Config {
             store: Some(store),
             append: Some(append),
-            ..Config::default()
+            ..config
         })?;
         let queue = Queue::start(
             ready(&path)?,
@@ -1288,4 +1299,565 @@ fn the_hunt_resends_an_event_a_crash_dropped() {
     assert_eq!(app.sent(dropped, 0), [(82, json!("hung"))]);
 
     app.stop();
+}
+
+// #92: the README's "What you can rely on" and "How it fails", each item through the real store,
+// rannoch, `Events`, the queue and rannoch-processor, on `BUILT_IN`'s flows of `emit` and `store`.
+// An item a scenario above already drives is not driven again; `GraphAppend`'s items are in
+// rannoch-graph's scenarios. Not driven, and why:
+// - A process that dies before its batch commits loses it, and a second process: a scenario
+//   cannot kill its own process or start another. The first scenario below shows the events are
+//   not on disk until then; a second app over the same file stands in for a second process, since
+//   rannoch takes no lock on the file and SQLite locks per connection.
+// - A heap with "no size limit", a hand-over tried again "with no limit", a kept signal sender
+//   making `join` wait "for good": a scenario sees them for as long as it watches.
+// - `join` waiting for a job: no built-in step is a job, so `check` makes no flow of them one.
+// - A graph row keyed by the event that wrote it, and every read of rannoch-graph: no built-in
+//   step gives a graph op; `store` gives a row of the app's table, keyed by that table's keys.
+
+impl App {
+    /// Sends an event of `ty` with `data` through rannoch, as a producer does.
+    fn send(&self, ty: u16, data: &Value) -> Result<()> {
+        self.rannoch.sender().send(event(ty, data))?;
+        Ok(())
+    }
+
+    /// The id of the event without a source whose data is `data`, once it is on disk.
+    fn root(&self, data: &Value) -> Option<Uuid> {
+        let sql = "SELECT id FROM _events WHERE source IS NULL AND data = ?1";
+        let id = self
+            .read
+            .query_row(sql, [data.to_string()], |r| r.get::<_, String>(0));
+        id.ok()?.parse().ok()
+    }
+
+    /// Waits for the event sent with `data` to have its 2, and returns its id.
+    fn ran(&self, data: &Value) -> Uuid {
+        let id = poll(WAIT, || self.root(data)).unwrap_or_default();
+        assert!(until(WAIT, || self.statuses(id).contains(&2)), "{data} ran");
+        id
+    }
+
+    /// Every `_events` row as JSON text, in the order the rows were inserted.
+    fn rows(&self) -> Vec<String> {
+        let sql = "SELECT json_array(rowid, id, source, ty, data, run_at, status) FROM _events
+            ORDER BY rowid";
+        let rows = self
+            .read
+            .prepare(sql)
+            .and_then(|mut select| select.query_map([], |r| r.get(0))?.collect());
+        rows.unwrap_or_default()
+    }
+}
+
+fn event(ty: u16, data: &Value) -> Event<Ty, Value> {
+    let (id, data) = (Uuid::nil(), data.clone());
+    let (source, run_at, status) = (None, None, Status::Added);
+    Event {
+        id,
+        source,
+        ty: Ty(ty),
+        data,
+        run_at,
+        status,
+    }
+}
+
+/// Polls `found` every 5 ms for up to `limit`: its first `Some`.
+fn poll<T>(limit: Duration, found: impl Fn() -> Option<T>) -> Option<T> {
+    let start = Instant::now();
+    loop {
+        if let Some(t) = found() {
+            return Some(t);
+        }
+        if start.elapsed() > limit {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn settings(attempts: u32) -> Settings {
+    Settings {
+        attempts,
+        ..Settings::new(Duration::from_millis(100))
+    }
+}
+
+/// The app over a fresh store `name` on `BUILT_IN`'s flows, rannoch's inboxes as `config` has
+/// them.
+fn built_in_with(name: &str, config: Config<Ty, Value>, settings: Settings) -> Result<App> {
+    let flows = built_in().map_err(|e| e.join("\n"))?;
+    App::with(database(name)?, &flows, |_, _| Vec::new(), config, settings)
+}
+
+/// A default inbox that hands over every `ms` milliseconds.
+fn every(ms: i64) -> Config<Ty, Value> {
+    Config {
+        default_interval: TimeDelta::milliseconds(ms),
+        ..Config::default()
+    }
+}
+
+/// When a row was accepted: its v7 id's time.
+fn accepted(id: Uuid) -> DateTime<Utc> {
+    let (secs, nanos) = id.get_timestamp().map_or((0, 0), |t| t.to_unix());
+    DateTime::from_timestamp(i64::try_from(secs).unwrap_or_default(), nanos).unwrap_or_default()
+}
+
+/// A payment two hours old whose 1 is an hour old with nothing after it, as a crash leaves a run.
+fn stall(conn: &Connection, data: &Value) -> Result<Uuid> {
+    let id = ago(7200);
+    let row = _events::factory().id(id.to_string()).ty(86);
+    row.data(data.to_string()).status(0).insert(conn)?;
+    let one = _events::factory().id(ago(3600).to_string()).ty(86);
+    one.source(id.to_string())
+        .data("\"taken\"")
+        .status(1)
+        .insert(conn)?;
+    Ok(id)
+}
+
+const ROOTS: &str = "SELECT count(*) FROM _events WHERE source IS NULL";
+
+/// Payments that must name an order the store has.
+const ORDERS: &str = "CREATE TABLE orders (id TEXT PRIMARY KEY);
+    CREATE TABLE payments (order_id TEXT PRIMARY KEY REFERENCES orders(id), amount INTEGER)";
+
+/// The `error` lines rannoch logs, for the scenarios that read them.
+struct Errors(Mutex<Vec<String>>);
+
+impl log::Log for Errors {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.level() <= log::Level::Error
+    }
+    fn log(&self, record: &log::Record<'_>) {
+        if self.enabled(record.metadata()) {
+            let mut lines = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            lines.push(record.args().to_string());
+        }
+    }
+    fn flush(&self) {}
+}
+
+static ERRORS: Errors = Errors(Mutex::new(Vec::new()));
+
+/// One scenario that reads the log at a time: every app in this binary logs to `ERRORS`.
+static LOGGED: Mutex<()> = Mutex::new(());
+
+/// Holds `LOGGED`, with `ERRORS` taking rannoch's `error` lines, emptied.
+fn logged() -> std::sync::MutexGuard<'static, ()> {
+    let one = LOGGED.lock().unwrap_or_else(PoisonError::into_inner);
+    let _ = log::set_logger(&ERRORS);
+    log::set_max_level(log::LevelFilter::Error);
+    ERRORS
+        .0
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
+    one
+}
+
+/// The failed hand-overs of the default inbox logged so far: how many events each held.
+fn failed_hand_overs() -> Vec<usize> {
+    let held = |line: &String| {
+        let rest = line.strip_prefix("inbox 0 could not hand over ")?;
+        rest.split(' ').next()?.parse().ok()
+    };
+    let lines = ERRORS.0.lock().unwrap_or_else(PoisonError::into_inner);
+    lines.iter().filter_map(held).collect()
+}
+
+#[test]
+fn an_accepted_event_is_in_memory_until_its_inbox_hands_it_over() {
+    // Given an app whose default inbox hands over every 400 ms; under Config::default, every 20
+    assert_eq!(
+        Config::<Ty, Value>::default().default_interval,
+        TimeDelta::milliseconds(20)
+    );
+    let app = built_in_with("in_memory", every(400), settings(1)).unwrap();
+    let landed = || app.count(ROOTS);
+
+    // When it sends three events
+    for ticket in ["m1", "m2", "m3"] {
+        app.send(82, &json!({ "ticket": ticket })).unwrap();
+    }
+
+    // Then none is in _events before the inbox's interval has passed
+    thread::sleep(Duration::from_millis(150));
+    assert_eq!(landed(), 0, "on the heap, not on disk");
+
+    // And the inbox hands its whole heap over as one batch: the first read to see one sees three,
+    // each at 0 with the v7 id it was given at accept
+    assert_eq!(poll(WAIT, || Some(landed()).filter(|n| *n > 0)), Some(3));
+    let v7 = "SELECT count(*) FROM _events WHERE source IS NULL AND status = 0
+        AND substr(id, 15, 1) = '7'";
+    assert_eq!(app.count(v7), 3);
+
+    // When it sends two more just after that hand-over
+    for ticket in ["m4", "m5"] {
+        app.send(82, &json!({ "ticket": ticket })).unwrap();
+    }
+
+    // Then they wait out the inbox's interval after it too, and are handed over together
+    thread::sleep(Duration::from_millis(150));
+    assert_eq!(landed(), 3);
+    assert_eq!(poll(WAIT, || Some(landed()).filter(|n| *n > 3)), Some(5));
+    app.stop();
+
+    // Given rannoch opened over a store with no append
+    let path = database("no_append").unwrap();
+    let store = migrated(&path).unwrap();
+    let rannoch = Rannoch::<Ty, Value>::open(Config {
+        store: Some(store),
+        ..Config::default()
+    })
+    .unwrap();
+
+    // When it is sent an event, then shut down
+    let kept = event(82, &json!({ "ticket": "kept" }));
+    rannoch.sender().send(kept).unwrap();
+    thread::sleep(Duration::from_millis(200));
+    rannoch.shutdown();
+
+    // Then nothing was handed over
+    let all = ready(&path)
+        .unwrap()
+        .query_row(ROOTS, [], |r| r.get::<_, i64>(0));
+    assert_eq!(all.unwrap(), 0);
+}
+
+#[test]
+fn a_batch_the_store_never_takes_stops_its_inbox_and_is_lost_at_shutdown() {
+    let _errors = logged();
+    // Given an app whose payments must name an order the store has, whose default inbox hands
+    // over every 300 ms, and whose queued tickets have an inbox of their own
+    let queued = InboxConfig {
+        name: "queued".to_owned(),
+        types: vec![Ty(82)],
+        interval: TimeDelta::milliseconds(20),
+    };
+    let config = Config {
+        inboxes: vec![queued],
+        ..every(300)
+    };
+    let app = built_in_with("never_taken", config, settings(1)).unwrap();
+    app.read.execute_batch(ORDERS).unwrap();
+
+    // When a payment for an order the store does not have runs
+    let paid = json!({ "order": "o1", "amount": 5 });
+    app.send(86, &paid).unwrap();
+    let payment = poll(WAIT, || app.root(&paid)).unwrap();
+
+    // Then the hand-over of the batch with its 2 and its row fails whole, and is logged at error
+    assert!(until(WAIT, || !failed_hand_overs().is_empty()));
+    assert_eq!(app.sent(payment, 2), []);
+    assert_eq!(app.count("SELECT count(*) FROM payments"), 0);
+
+    // When it sends two more events to the default inbox, and a queued ticket to its own
+    let held = *failed_hand_overs().last().unwrap();
+    for ticket in ["r1", "r2"] {
+        app.send(81, &json!({ "ticket": ticket })).unwrap();
+    }
+    let queued = json!({ "ticket": "q1" });
+    app.send(82, &queued).unwrap();
+
+    // Then every later hand-over of the default inbox holds the failed batch and them, and
+    // fails: its heap grows, and nothing more from it reaches the disk
+    assert!(until(WAIT, || failed_hand_overs().last() == Some(&(held + 2))));
+    let rushed = "SELECT count(*) FROM _events WHERE ty = 81";
+    assert_eq!(app.count(rushed), 0);
+
+    // And the other inbox still writes: the queued ticket is written and runs
+    app.ran(&queued);
+
+    // When it sends one more just after a failed hand-over, then shuts down
+    let tried = failed_hand_overs().len();
+    assert!(until(WAIT, || failed_hand_overs().len() > tried));
+    let held = *failed_hand_overs().last().unwrap();
+    app.send(81, &json!({ "ticket": "r3" })).unwrap();
+    drop(app.signal);
+    app.rannoch.shutdown();
+
+    // Then shutdown's hand-over, which holds it, fails and is logged, and is not tried again
+    assert_eq!(failed_hand_overs().last(), Some(&(held + 1)));
+    let tried = failed_hand_overs().len();
+    thread::sleep(Duration::from_millis(400));
+    assert_eq!(failed_hand_overs().len(), tried);
+    app.queue.join();
+
+    // And the batch and every event after it are lost
+    let read = ready(&app.path).unwrap();
+    let count = |sql: &str| read.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap();
+    assert_eq!(count(rushed), 0);
+    let two = format!("SELECT count(*) FROM _events WHERE source = '{payment}' AND status = 2");
+    assert_eq!(count(&two), 0);
+}
+
+#[test]
+fn a_failed_hand_over_is_tried_again_ahead_of_what_arrived_since() {
+    let _errors = logged();
+    // Given an app whose default inbox hands over every 300 ms, and another connection holding
+    // the store's write lock past the append's busy timeout of 5 s
+    let app = built_in_with("tried_again", every(300), settings(1)).unwrap();
+    let writer = ready(&app.path).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    // When it sends an event, and another while the first's hand-over waits on the lock
+    let (first, second) = (json!({ "ticket": "d" }), json!({ "ticket": "e" }));
+    app.send(82, &first).unwrap();
+    thread::sleep(Duration::from_millis(600));
+    app.send(82, &second).unwrap();
+
+    // Then that hand-over fails holding the first alone, and is logged at error
+    assert!(until(Duration::from_secs(10), || !failed_hand_overs().is_empty()));
+    assert_eq!(failed_hand_overs(), [1]);
+
+    // And once the lock is released, the inbox tries again at its next interval: both are
+    // written in one hand-over, the failed batch ahead of what arrived since
+    writer.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(
+        poll(WAIT, || Some(app.count(ROOTS)).filter(|n| *n > 0)),
+        Some(2)
+    );
+    let sql = "SELECT json_extract(data, '$.ticket') FROM _events WHERE source IS NULL
+        ORDER BY rowid";
+    let order: Vec<String> = app
+        .read
+        .prepare(sql)
+        .and_then(|mut s| s.query_map([], |r| r.get(0))?.collect())
+        .unwrap();
+    assert_eq!(order, ["d", "e"]);
+
+    // And as they run, the rows already in _events are only added to
+    let written = app.rows();
+    app.ran(&first);
+    app.ran(&second);
+    let rows = app.rows();
+    assert!(rows.len() > written.len() && rows.starts_with(&written));
+    app.stop();
+}
+
+#[test]
+fn the_queue_takes_each_due_event_once() {
+    // Given an app whose default inbox hands over every 300 ms, so each 1 is on the heap a while
+    let app = built_in_with("taken_once", every(300), settings(1)).unwrap();
+
+    // When it sends ten events, and the queue is woken every 10 ms until each has its 2
+    let events: Vec<Value> = (0..10)
+        .map(|i| json!({ "ticket": format!("once{i}") }))
+        .collect();
+    for data in &events {
+        app.send(82, data).unwrap();
+    }
+    let ids: Vec<Uuid> = events
+        .iter()
+        .filter_map(|d| poll(WAIT, || app.root(d)))
+        .collect();
+    assert_eq!(ids.len(), 10);
+    let start = Instant::now();
+    while !ids.iter().all(|id| app.statuses(*id).contains(&2)) {
+        app.signal.send(()).unwrap();
+        thread::sleep(Duration::from_millis(10));
+        assert!(start.elapsed() < WAIT, "each ran");
+    }
+
+    // Then each was taken once: one 1, then its 2
+    for id in &ids {
+        assert_eq!(app.statuses(*id), [1, 2]);
+    }
+    app.stop();
+}
+
+#[test]
+fn the_hunt_runs_a_hunt_after_the_queue_starts_then_every_hunt_on_the_stalled_events_data() {
+    // Given the queue's defaults: a 20-minute window and an hour between hunts
+    let defaults = Settings::new(Duration::from_millis(100));
+    assert_eq!(
+        (defaults.window, defaults.hunt),
+        (Duration::from_mins(20), Duration::from_hours(1))
+    );
+
+    // And a store as a crash leaves it: a payment whose 1 is an hour old with nothing after it
+    let path = database("hunt_every").unwrap();
+    migrated(&path).unwrap();
+    let seed = ready(&path).unwrap();
+    seed.execute_batch(PAYMENTS).unwrap();
+    let stalled = stall(&seed, &json!({ "order": "o1", "amount": 10 })).unwrap();
+
+    // When the queue starts with a window of a minute and a hunt every second, and is woken
+    // before the first hunt
+    let settings = hunting(Duration::from_mins(1), Duration::from_secs(1));
+    let started = Instant::now();
+    let app = App::over(path, &built_in().unwrap(), |_, _| Vec::new(), settings).unwrap();
+    thread::sleep(Duration::from_millis(100));
+    app.signal.send(()).unwrap();
+
+    // Then nothing is resent before the first hunt, a hunt after the start
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(app.sent(stalled, 0), []);
+    let resend = app.retry(stalled);
+    assert!(started.elapsed() >= Duration::from_secs(1));
+    assert_eq!(app.sent(stalled, 0), [(86, json!("hung"))]);
+
+    // And the resend runs the payment's flow on the stalled payment's data
+    assert!(until(WAIT, || app.statuses(resend) == [1, 2]));
+    let row = "SELECT count(*) FROM payments WHERE order_id = 'o1' AND amount = 10";
+    assert_eq!(app.count(row), 1);
+
+    // When another payment is left stalled after that hunt, and the queue is woken
+    let later = stall(&seed, &json!({ "order": "o2", "amount": 20 })).unwrap();
+    app.signal.send(()).unwrap();
+
+    // Then the wake does not hunt: the next hunt, a hunt after the first, resends it
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(app.sent(later, 0), []);
+    app.retry(later);
+    assert!(started.elapsed() >= Duration::from_secs(2));
+    assert_eq!(app.sent(later, 0), [(86, json!("hung"))]);
+    app.stop();
+}
+
+#[test]
+fn a_failed_run_is_retried_with_backoff_and_an_event_with_no_flow_gets_no_processor() {
+    // Given the queue's default of 10 attempts
+    assert_eq!(Settings::new(Duration::from_millis(100)).attempts, 10);
+
+    // And an app whose queue gives a chain 3 attempts, the first retry 200 ms after a failure
+    let settings = Settings {
+        attempts: 3,
+        ..Settings::new(Duration::from_millis(200))
+    };
+    let app = built_in_with("retried", Config::default(), settings).unwrap();
+
+    // When it sends an order lost to a table the store does not have, and an event of ty 99,
+    // which no flow runs
+    let (lost, orphan) = (json!({ "order": "o1" }), json!({ "ticket": "t99" }));
+    app.send(87, &lost).unwrap();
+    app.send(99, &orphan).unwrap();
+
+    // Then each failed run's step sends a -1 whose data is its message, and the queue sends a
+    // retry: a new event at 0 whose source is the failed run and whose data is the failure, due
+    // 200 ms after the first failure and twice that after the second
+    let failed = json!("store: no such table: nope");
+    let mut run = poll(WAIT, || app.root(&lost)).unwrap();
+    let mut written = Vec::new();
+    for wait in [200, 400] {
+        let retry = app.retry(run);
+        let rows = app.about(run);
+        let one = |status| rows.iter().find(|r| r.2 == status).cloned().unwrap();
+        let (binned, due) = (one(-1), one(0));
+        assert_eq!((binned.1, &binned.3), (87, &failed));
+        assert_eq!((due.0, due.1, &due.3), (retry, 87, &failed));
+        let at: DateTime<Utc> = due.4.unwrap().parse().unwrap();
+        let (wait, slack) = (TimeDelta::milliseconds(wait), TimeDelta::milliseconds(5));
+        assert!(at - accepted(binned.0) >= wait - slack, "{wait} after");
+        assert!(at - accepted(retry) <= wait + slack, "{wait} after");
+        written = app.rows();
+        run = retry;
+    }
+
+    // And the third failure sends its -1 and no retry: the chain has had its 3 attempts
+    assert!(until(WAIT, || app.statuses(run).contains(&-1)));
+    thread::sleep(Duration::from_secs(1));
+    assert_eq!(app.statuses(run), [1, -1]);
+    assert!(app.rows().starts_with(&written), "rows are only added");
+
+    // And the ty 99 event got a -1 saying "no processor", and no retry
+    let other = app.root(&orphan).unwrap();
+    let rows: Vec<(i64, Value)> = app.about(other).into_iter().map(|r| (r.2, r.3)).collect();
+    assert_eq!(rows, [(1, json!("taken")), (-1, json!("no processor"))]);
+    app.stop();
+}
+
+#[test]
+fn after_shutdown_a_send_is_closed_and_join_waits_for_signal_senders_and_runs() {
+    // Given a store with a backlog of payments, each at 0 with nothing after it
+    let path = database("after_shutdown").unwrap();
+    migrated(&path).unwrap();
+    let mut seed = ready(&path).unwrap();
+    seed.execute_batch(PAYMENTS).unwrap();
+    let tx = seed.transaction().unwrap();
+    for i in 0..BACKLOG {
+        let data = json!({ "order": format!("o{i}"), "amount": i }).to_string();
+        let row = _events::factory().id(Uuid::now_v7().to_string()).ty(86);
+        row.data(data).status(0).insert(&tx).unwrap();
+    }
+    tx.commit().unwrap();
+
+    // And an app whose queue takes them as it starts and runs them one after another
+    let app = App::over(path, &built_in().unwrap(), |_, _| Vec::new(), settings(1)).unwrap();
+    let twos = "SELECT count(*) FROM _events WHERE status = 2";
+    assert!(until(WAIT, || app.count(twos) > 0));
+
+    // When the app shuts rannoch down while they run, and drops its signal sender
+    let sender = app.rannoch.sender();
+    app.rannoch.shutdown();
+    let held = || app.processor.writes().lock().map_or(0, |w| w.len());
+    drop(app.signal);
+    let at_drop = held();
+
+    // Then a send returns Closed
+    let late = sender.send(event(82, &json!({ "ticket": "late" })));
+    assert_eq!(late, Err(Error::Closed));
+
+    // And join returns once the runs the queue started have finished: runs went on after the
+    // drop, and none after join, each keeping the row its 2 could not carry
+    app.queue.join();
+    let at_join = held();
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(held(), at_join, "a run went on after join returned");
+    assert!(at_join > at_drop, "the runs were done before the drop");
+
+    // Given another app, with nothing running, that shuts rannoch down and keeps its signal
+    // sender
+    let app = built_in_with("kept_signal", Config::default(), settings(1)).unwrap();
+    app.rannoch.shutdown();
+
+    // Then join does not return while the app keeps it, and returns once it is dropped
+    let (returned, done) = mpsc::channel();
+    let queue = app.queue;
+    let waiting = thread::spawn(move || {
+        queue.join();
+        let _ = returned.send(());
+    });
+    let kept = done.recv_timeout(Duration::from_millis(300));
+    assert!(kept.is_err(), "a kept signal sender keeps join waiting");
+    drop(app.signal);
+    assert!(done.recv_timeout(WAIT).is_ok());
+    waiting.join().unwrap();
+}
+
+#[test]
+fn a_second_app_on_the_same_store_is_not_stopped() {
+    // Given an app whose default inbox hands over every second
+    let path = database("second_app").unwrap();
+    let open = || {
+        let flows = built_in().unwrap();
+        App::with(
+            path.clone(),
+            &flows,
+            |_, _| Vec::new(),
+            every(1000),
+            settings(1),
+        )
+        .unwrap()
+    };
+    let first = open();
+
+    // When a second app opens rannoch and starts its queue over the same store
+    // Then nothing stops it
+    let second = open();
+
+    // When an event is written, and both queues are woken while the first's 1 is on its heap
+    let ticket = first.hand(82, &json!({ "ticket": "t6" })).unwrap();
+    second.signal.send(()).unwrap();
+
+    // Then both take it, and both run its flow
+    assert!(until(WAIT, || first.sent(ticket, 2).len() == 2));
+    let mut statuses = first.statuses(ticket);
+    statuses.sort_unstable();
+    assert_eq!(statuses, [1, 1, 2, 2]);
+    second.stop();
+    first.stop();
 }
