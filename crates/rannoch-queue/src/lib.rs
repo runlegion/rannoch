@@ -39,9 +39,8 @@
 //! still going, so a run or job `window` after its 1 is resent, whether it is running or still
 //! waiting its turn.
 //!
-//! The stalled event has a 1 and no -1, so the resend is its own root. rannoch-processor reads
-//! the root's data as the flow's data, which must be a JSON object, so it bins the resend with a
-//! "root data" error, and each retry fails the same way until the chain has had its `attempts`.
+//! From a resend the queue walks back to the stalled event, without counting a failed attempt, so
+//! the processor is handed the stalled event's root and runs the flow on that root's data.
 //!
 //! # Stopping
 //!
