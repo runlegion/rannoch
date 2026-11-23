@@ -143,14 +143,9 @@ fn fr_rannoch_123_c10() {
     queue.join();
 }
 
-/// #92's flows, of the built-in steps alone: a payment stores its row and sends its receipt.
-const PAYMENTS: &str = r#"[
-  ["payment.json", {"name": "payment", "ty": 86, "takes": {"order": "string", "amount": "number"},
-    "steps": [{"do": "store", "with": {"store": {"table": "payments",
-      "row": {"order_id": "$order", "amount": "$amount"}}},
-      "next": {"ty": 87, "shape": {"order": "$order"}}}]}],
-  ["receipt.json", {"name": "receipt", "ty": 87, "takes": {"order": "string"}, "steps": []}]
-]"#;
+/// #92's flows, from the fixture `tests/payments.json`, of the built-in steps alone: a payment
+/// stores its row and sends its receipt.
+const PAYMENTS: &str = include_str!("payments.json");
 
 /// Payments that must name an order the store has.
 const ORDERS: &str = "CREATE TABLE orders (id TEXT PRIMARY KEY);

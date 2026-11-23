@@ -1057,31 +1057,11 @@ fn a_queue_that_starts_takes_the_events_already_due_without_a_signal() {
     app.stop();
 }
 
-/// FR-RANNOCH-124's flows, each with the name of its file: a ticket's emit steps branch on its
-/// kind and wait for its answer, a payment stores its row, a lost order stores into a table the
-/// store does not have, and the flows their nexts reach. No action of the app's is in them.
-const BUILT_IN: &str = r#"[
-  ["ticket.json", {"name": "ticket", "ty": 80, "takes": {"ticket": "string", "kind": "string"},
-    "steps": [
-      {"do": "emit", "next": {"branch": {"on": "kind",
-        "cases": [{"when": "rush", "next": {"ty": 81, "shape": {"ticket": "$ticket"}}}],
-        "else": {"ty": 82, "shape": {"ticket": "$ticket"}}}}},
-      {"do": "emit", "next": {"wait": {"for": 83, "key": "$ticket", "within_ms": 2500,
-        "next": {"ty": 84, "shape": {"ticket": "$ticket"}},
-        "timeout": {"ty": 85, "shape": {"ticket": "$ticket"}}}}}]}],
-  ["rushed.json", {"name": "rushed", "ty": 81, "takes": {"ticket": "string"}, "steps": []}],
-  ["queued.json", {"name": "queued", "ty": 82, "takes": {"ticket": "string"}, "steps": []}],
-  ["answer.json", {"name": "answer", "ty": 83, "takes": {"ticket": "string"}, "steps": []}],
-  ["answered.json", {"name": "answered", "ty": 84, "takes": {"ticket": "string"}, "steps": []}],
-  ["unanswered.json", {"name": "unanswered", "ty": 85, "takes": {"ticket": "string"},
-    "steps": []}],
-  ["payment.json", {"name": "payment", "ty": 86, "takes": {"order": "string", "amount": "number"},
-    "steps": [{"do": "store", "with": {"store": {"table": "payments",
-      "row": {"order_id": "$order", "amount": "$amount"}}}}]}],
-  ["lost.json", {"name": "lost", "ty": 87, "takes": {"order": "string"},
-    "steps": [{"do": "store", "with": {"store": {"table": "nope",
-      "row": {"order_id": "$order"}}}}]}]
-]"#;
+/// FR-RANNOCH-124's flows, from the fixture `tests/built_in.json`, each with the name of its
+/// file: a ticket's emit steps branch on its kind and wait for its answer, a payment stores its
+/// row, a lost order stores into a table the store does not have, and the flows their nexts
+/// reach. No action of the app's is in them.
+const BUILT_IN: &str = include_str!("built_in.json");
 
 /// `BUILT_IN` checked as the app's build checks it, with no signature of the app's: the flows to
 /// compile in, or every error.
