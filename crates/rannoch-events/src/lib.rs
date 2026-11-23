@@ -396,7 +396,7 @@ mod tests {
 
     use super::{Events, Writes, append};
 
-    #[derive(Debug, Clone, Copy)]
+    #[derive(Debug, Clone, Copy, PartialEq)]
     #[repr(u16)]
     enum Ty {
         Page = 7,
@@ -586,6 +586,69 @@ mod tests {
         };
         assert_eq!(binned.source, two.source);
         assert_eq!(binned.data, "store: datatype mismatch");
+    }
+
+    /// An app's data: text, as rannoch's own reasons are, or counts keyed by a pair, which
+    /// `serde_json` cannot write.
+    #[derive(Debug, Clone, serde::Serialize)]
+    #[serde(untagged)]
+    enum Data {
+        Text(String),
+        ByPair(std::collections::BTreeMap<(u8, u8), u8>),
+    }
+
+    impl From<String> for Data {
+        fn from(text: String) -> Self {
+            Self::Text(text)
+        }
+    }
+
+    #[test]
+    fn an_event_whose_data_does_not_serialize_gets_a_minus_1_and_its_inbox_goes_on() {
+        let (queue, signals) = mpsc::channel();
+        let events = Arc::new(Events::new(rannoch_core::forgr::empty_store(), queue));
+        let rannoch = rannoch_core::Rannoch::<Ty, Data>::open(rannoch_core::Config {
+            append: Some(events.clone()),
+            ..rannoch_core::Config::default()
+        })
+        .unwrap();
+        let sent = |data| Event {
+            id: Uuid::nil(),
+            source: None,
+            ty: Ty::Page,
+            data,
+            run_at: None,
+            status: Status::Added,
+        };
+
+        // An event whose data does not serialize, sent ahead of one whose data does, in one batch
+        let (sender, text) = (rannoch.sender(), |t: &str| Data::Text(t.to_owned()));
+        let pairs = [((1, 2), 3)].into_iter().collect();
+        sender.send(sent(Data::ByPair(pairs))).unwrap();
+        sender.send(sent(text("first"))).unwrap();
+        let handed = signals.recv_timeout(std::time::Duration::from_secs(5));
+        assert_eq!(handed, Ok(()));
+        sender.send(sent(text("later"))).unwrap();
+        rannoch.shutdown();
+
+        // The other event is written, and so is a later one; in the first's place, a -1 for it
+        // naming the reason, its source the id the first was accepted with, which is not stored
+        let conn = events.conn.lock().unwrap();
+        let sql = "SELECT data, status, source IS NULL FROM _events ORDER BY status, data";
+        let mut select = conn.prepare(sql).unwrap();
+        let rows = select.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)));
+        let rows: Vec<(String, i64, bool)> =
+            rows.unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        let row = |data: &str, status, unsourced| (data.to_owned(), status, unsourced);
+        let reason = row("\"data: key must be a string\"", -1, false);
+        let others = [row("\"first\"", 0, true), row("\"later\"", 0, true)];
+        assert_eq!(rows, [reason, others[0].clone(), others[1].clone()]);
+        let sql = "SELECT source FROM _events WHERE status = -1";
+        let source: String = conn.query_row(sql, [], |r| r.get(0)).unwrap();
+        assert_eq!(source.parse::<Uuid>().unwrap().get_version_num(), 7);
+        let sql = "SELECT count(*) FROM _events WHERE id = ?1";
+        let stored: i64 = conn.query_row(sql, [&source], |r| r.get(0)).unwrap();
+        assert_eq!(stored, 0);
     }
 
     #[test]
