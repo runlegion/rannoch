@@ -374,7 +374,9 @@ impl<T: TryFrom<u16> + PartialEq + 'static, D: From<Value> + 'static> Processor<
                             let nexts = run(&doc, &actions, data, &mut graph)?.into_iter();
                             outs.extend(nexts.map(|(to, data, delay)| (id, to, data, delay)));
                         }
-                        lock(&seen).extend(outs.iter().map(|o| o.0).filter(|s| *s != id));
+                        // A match answers its waits; the wait's own run, or a rerun's, does not.
+                        let answers = |s: &Uuid| *s != id && *s != at.0;
+                        lock(&seen).extend(outs.iter().map(|o| o.0).filter(answers));
                         let done =
                             ty(event.ty).map(|t| (id, t, said.into(), None, Status::Processed));
                         let nexts = outs.into_iter().map(|(source, to, data, delay)| {
@@ -458,6 +460,20 @@ fn waits_for(
     conn.prepare_cached(sql)?.query_map([ty], row)?.collect()
 }
 
+/// The 2 of a retry or resend that ran the wait `id`, found down the chain of retries and
+/// resends below it, whose data are strings.
+fn rerun_two(conn: &Connection, id: Uuid) -> Result<Option<String>, String> {
+    let sql = "WITH RECURSIVE chain(id) AS (SELECT ?1
+        UNION SELECT e.id FROM _events e JOIN chain c ON e.source = c.id
+        WHERE e.status = 0 AND e.data NOT LIKE '{%')
+        SELECT s.data FROM chain c JOIN _events s ON s.source = c.id WHERE s.status = 2 LIMIT 1";
+    let mut select = conn.prepare_cached(sql).map_err(|e| e.to_string())?;
+    let mut twos = select
+        .query_map([id.to_string()], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    twos.next().transpose().map_err(|e| e.to_string())
+}
+
 /// What an event of `ty` whose root is `id` sends about waits as (source, ty, data, delay), and
 /// its 2's data.
 #[expect(clippy::type_complexity, reason = "a next with its source")]
@@ -482,8 +498,17 @@ fn waits<'d>(
                 .iter()
                 .filter(|r| r.0 == 0 && r.1.starts_with('{'))
                 .count();
-            let two = rows.iter().find(|r| r.0 == 2).map(|r| r.1.as_str());
-            let to = match (due.is_some(), answered.contains(&wait_id), zeros, two) {
+            let two = rows.iter().find(|r| r.0 == 2).map(|r| r.1.clone());
+            let two = match two {
+                None if due.is_none() && zeros == 1 => rerun_two(conn, wait_id)?,
+                two => two,
+            };
+            let to = match (
+                due.is_some(),
+                answered.contains(&wait_id),
+                zeros,
+                two.as_deref(),
+            ) {
                 (true, false, 0, _) => Some(&wait.timeout).inspect(|_| said = "timeout"),
                 (false, false, 0, None) => Some(&wait.next),
                 (false, false, 1, Some("\"timeout\"")) => wait.late.as_ref(),

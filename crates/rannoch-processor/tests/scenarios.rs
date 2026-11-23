@@ -898,3 +898,70 @@ fn a_wait_the_queue_retries_sends_its_timeout_once_and_its_2_says_timeout() {
 
     app.stop();
 }
+
+/// Two payments for o9, `paid` the first's amount, each waited for until its 2; then the wait's
+/// 0s, which must be `first`, the timeout and one late, for the first payment.
+fn pays_late(app: &App, wait: Uuid, first: (i64, Value), paid: u64) -> Result<()> {
+    for amount in [paid, paid + 1] {
+        let payment = app.hand(71, &json!({ "order": "o9", "amount": amount }))?;
+        assert!(until(WAIT, || app.statuses(payment).contains(&2)));
+    }
+    thread::sleep(Duration::from_millis(200));
+    let (timeout, late) = (
+        json!({ "order": "o9" }),
+        json!({ "order": "o9", "paid": paid }),
+    );
+    assert_eq!(app.sent(wait, 0), [first, (73, timeout), (74, late)]);
+    Ok(())
+}
+
+/// Not a scenario: #95. After the hunt's resend of a wait sends its timeout, the first match
+/// sends the wait's late, once.
+#[test]
+fn a_wait_the_hunt_resends_sends_late_on_the_first_match_after_its_timeout() {
+    // Given a store with o9's wait, whose 1 is on disk with nothing after it, as a crash leaves it
+    let path = database("a_wait_the_hunt_resends_late").unwrap();
+    let wait = waiting(&path, &[]).unwrap();
+
+    // And the hunt's resend of the wait has sent its timeout
+    let settings = Settings {
+        attempts: 1,
+        window: Duration::from_mins(1),
+        hunt: Duration::from_millis(300),
+        ..Settings::new(Duration::from_millis(100))
+    };
+    let app = App::open_with(path, settings).unwrap();
+    let resend = app.retry(wait);
+    assert!(until(WAIT, || app.statuses(resend).contains(&2)));
+    assert_eq!(app.sent(resend, 2), [(70, json!("timeout"))]);
+
+    // When two payments for o9 arrive
+    // Then the wait's late is sent once, for the first, with the wait as its source
+    pays_late(&app, wait, (70, json!("hung")), 7).unwrap();
+
+    app.stop();
+}
+
+/// Not a scenario: #95. After the queue's retry of a wait sends its timeout, the first match
+/// sends the wait's late, once.
+#[test]
+fn a_wait_the_queue_retries_sends_late_on_the_first_match_after_its_timeout() {
+    // Given a store with o9's wait, whose run failed, and the queue's retry of it
+    let path = database("a_wait_the_queue_retries_late").unwrap();
+    let failed = json!("database is locked");
+    let about = [(5000, -1, failed.clone()), (4800, 0, failed.clone())];
+    let wait = waiting(&path, &about).unwrap();
+
+    // And the retry has sent the wait's timeout
+    let app = App::open(path, 3).unwrap();
+    app.signal.send(()).unwrap();
+    let retry = app.retry(wait);
+    assert!(until(WAIT, || app.statuses(retry).contains(&2)));
+    assert_eq!(app.sent(retry, 2), [(70, json!("timeout"))]);
+
+    // When two payments for o9 arrive
+    // Then the wait's late is sent once, for the first, with the wait as its source
+    pays_late(&app, wait, (70, failed), 7).unwrap();
+
+    app.stop();
+}
