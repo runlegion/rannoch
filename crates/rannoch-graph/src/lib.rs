@@ -286,7 +286,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex, PoisonError, mpsc::Sender};
 use std::time::UNIX_EPOCH;
 
-use rannoch_core::{Append, Error, Event, Status};
+use rannoch_core::{Append, Error, Event};
 use rannoch_processor::Writes;
 use rusqlite::{CachedStatement, Connection, OptionalExtension, Params, Result, params};
 use serde::{Deserialize, Serialize};
@@ -412,22 +412,7 @@ impl GraphAppend {
 impl<T: Copy + Into<u16>, D: Serialize> Append<T, D> for GraphAppend {
     fn append(&self, batch: &[Event<T, D>]) -> Result<(), Error> {
         let mut conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
-        let twos = batch.iter().filter(|e| e.status == Status::Processed);
-        let mut writes = self.writes.lock().unwrap_or_else(PoisonError::into_inner);
-        let taken: Vec<(Uuid, Vec<Value>)> = twos
-            .filter_map(|e| writes.remove_entry(&e.source?))
-            .collect();
-        // Held only to take them, so steps keep putting their writes while this batch commits.
-        drop(writes);
-        let done = commit(&mut conn, batch, &taken);
-        if done.is_err() {
-            // A batch that fails puts its rows back for its retry; a rerun's newer writes stay.
-            let mut writes = self.writes.lock().unwrap_or_else(PoisonError::into_inner);
-            for (source, items) in taken {
-                writes.entry(source).or_insert(items);
-            }
-        }
-        let touched = done?;
+        let touched = rannoch_events::taking(&self.writes, batch, |t| commit(&mut conn, batch, t))?;
         if let Some(hoods) = &self.hoods {
             let mut hoods = hoods.lock().unwrap_or_else(PoisonError::into_inner);
             hoods.rewarm(&conn, &touched);
@@ -452,7 +437,7 @@ fn commit<T: Copy + Into<u16>, D: Serialize>(
     for (source, items) in taken {
         let event = source.to_string();
         for item in items {
-            if rannoch_events::store_in(&tx, item).map_err(|_| Error::Store)? {
+            if rannoch_events::store_in(&tx, item)? {
                 continue;
             }
             let op = Op::deserialize(item).map_err(|_| Error::Store)?;

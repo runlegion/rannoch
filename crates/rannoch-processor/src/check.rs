@@ -60,8 +60,7 @@ pub fn compile(dir: &Path, signatures: &[&str]) {
 pub fn check(docs: &[(String, FlowDoc)], sigs: &[Sig]) -> Result<String, Vec<String>> {
     let (mut errors, mut flows, empty) = (Vec::new(), Vec::new(), Value::Object(Map::new()));
     // The app's signatures, then the built-in steps', which one of the app's of the same name hides.
-    let builtins = crate::builtins();
-    let sigs: Vec<&Sig> = sigs.iter().chain(&builtins).collect();
+    let sigs: Vec<&Sig> = sigs.iter().chain(crate::BUILTINS.iter()).collect();
     for (n, (file, flow)) in docs.iter().enumerate() {
         if let Some((first, _)) = docs[..n].iter().find(|(_, f)| f.ty == flow.ty) {
             errors.push(format!(

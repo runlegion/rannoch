@@ -231,7 +231,9 @@
 //! app's append to write. The processor takes `$graph` out of the output before it checks the
 //! output or merges it, so the later links and the nexts never see it, and a `Sig` must not
 //! declare it in its gives. A `$graph` that is not a list fails the step with `<link> gave $graph
-//! as <type>, not list`. The rows of every link in the run are kept in order and, when the run
+//! as <type>, not list`, and so does an item with a `store` key from any link but the built-in
+//! `store`, an app action of that name included: `<link> gave a store row in $graph`. The rows of
+//! every link in the run are kept in order and, when the run
 //! succeeds, held in [`Processor::writes`] under the event's id; a failed run keeps none.
 //! rannoch-graph's `GraphAppend` takes them with the event's 2 and writes them in the same
 //! transaction; its `Op` is the form of an item, as in `{"set": {"node": "n1", "key": "name",
@@ -288,10 +290,12 @@
 mod check;
 mod doc;
 
-use std::{collections::HashMap, sync::Arc, sync::Mutex, sync::PoisonError, time::Duration};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+use std::{collections::HashMap, time::Duration};
 
 use chrono::{TimeDelta, Utc};
 use rannoch_core::{Event, Sender, Status};
+use rannoch_events::StoreRow;
 use rannoch_queue::{Flow, Flows, Row};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -348,31 +352,33 @@ pub trait Action: Send + Sync {
 }
 
 /// The built-in steps' `Sig`s, which `check` and the processor know with no action of the app's:
-/// `emit`, and `store` with its options `table` and `row`.
-pub(crate) fn builtins() -> [Sig; 2] {
-    let store = [("table", "string"), ("row", "any")].map(|(f, t)| (f.to_owned(), t.to_owned()));
-    let sig = |action: &str| Sig {
-        action: action.to_owned(),
-        ..Sig::default()
-    };
-    let (emit, store) = (
-        sig("emit"),
-        Sig {
-            options: store.into(),
-            ..sig("store")
-        },
-    );
-    [emit, store]
+/// `emit`, and `store` with its options `table` and `row`. Only the built-in `store` returns
+/// `&BUILTINS[1]` as its `sig`, which tells it from an app action of that name.
+pub(crate) static BUILTINS: LazyLock<[Sig; 2]> = LazyLock::new(|| {
+    let store = json!({ "action": "store", "options": { "table": "string", "row": "any" } });
+    serde_json::from_value(json!([{ "action": "emit" }, store])).unwrap_or_default()
+});
+
+/// The built-in `emit`: it gives nothing, so its step's next is all it does.
+struct Emit;
+
+impl Action for Emit {
+    fn sig(&self) -> &Sig {
+        &BUILTINS[0]
+    }
+
+    fn run(&self, _: &Value, _: &Map<String, Value>) -> Result<Map<String, Value>, String> {
+        Ok(Map::new())
+    }
 }
 
-/// A built-in step on the processor's connection: `emit` gives nothing, and `store` gives its row
-/// as `$graph`, `{"store": {"table": T, "row": {column: value}}}`, once the store has T and each
-/// column.
-struct Builtin(Sig, Arc<Mutex<Connection>>);
+/// The built-in `store` on the processor's connection: it gives its [`StoreRow`] as `$graph`
+/// once the store has its table and each column.
+struct Store(Arc<Mutex<Connection>>);
 
-impl Action for Builtin {
+impl Action for Store {
     fn sig(&self) -> &Sig {
-        &self.0
+        &BUILTINS[1]
     }
 
     fn run(
@@ -380,22 +386,19 @@ impl Action for Builtin {
         options: &Value,
         input: &Map<String, Value>,
     ) -> Result<Map<String, Value>, String> {
-        if self.0.action == "emit" {
-            return Ok(Map::new());
-        }
-        let table = options["table"].as_str().unwrap_or_default();
+        let table = options["table"].as_str().unwrap_or_default().to_owned();
         let row = options["row"].as_object().into_iter().flatten();
-        let row: Map<String, Value> = row.map(|(c, e)| (c.clone(), eval(e, input))).collect();
-        rannoch_events::insert(&lock(&self.1), table, row.keys())
-            .map_err(|e| format!("store: {e}"))?;
-        let item = json!({ "store": { "table": table, "row": row } });
-        Ok(Map::from_iter([("$graph".to_owned(), json!([item]))]))
+        let row = row.map(|(c, e)| (c.clone(), eval(e, input))).collect();
+        let stored = StoreRow::Store { table, row };
+        let stored = stored.insert(&lock(&self.0)).map(|_| json!([stored]));
+        Ok(Map::from_iter([(
+            "$graph".to_owned(),
+            stored.map_err(|e| format!("store: {e}"))?,
+        )]))
     }
 }
 
-/// Graph writes and store rows by the id of the event they are about, until the append that
-/// carries its 2 takes them.
-pub type Writes = Arc<Mutex<HashMap<Uuid, Vec<Value>>>>;
+pub use rannoch_events::Writes;
 
 /// The app's flows, one [`Flow`] for each flow's `ty`: the queue's [`Flows`]. `T` is the app's
 /// event type, made from each `ty` with `TryFrom<u16>`, and `D` its data, made from a JSON value.
@@ -419,12 +422,9 @@ impl<T: TryFrom<u16> + PartialEq + 'static, D: From<Value> + 'static> Processor<
         events: Connection,
     ) -> Result<Self, serde_json::Error> {
         let (conn, seen) = (Arc::new(Mutex::new(events)), Arc::new(Mutex::default()));
+        let builtins: [Arc<dyn Action>; 2] = [Arc::new(Emit), Arc::new(Store(conn.clone()))];
         let mut by_name = HashMap::new();
-        for sig in builtins() {
-            let builtin: Arc<dyn Action> = Arc::new(Builtin(sig, conn.clone()));
-            by_name.insert(builtin.sig().action.clone(), builtin);
-        }
-        for action in actions {
+        for action in builtins.into_iter().chain(actions) {
             by_name.insert(action.sig().action.clone(), action);
         }
         let docs: Arc<Vec<FlowDoc>> = Arc::new(serde_json::from_str(flows)?);
@@ -615,6 +615,13 @@ fn run(
             let options = step.with.get(link).cloned().unwrap_or(json!({}));
             let mut out = action.run(&options, &input)?;
             match out.remove("$graph") {
+                // Only the built-in store gives a store row; any other link's is refused.
+                Some(Value::Array(writes))
+                    if !std::ptr::eq(action.sig(), &raw const BUILTINS[1])
+                        && writes.iter().any(|w| w.get("store").is_some()) =>
+                {
+                    return Err(format!("{link} gave a store row in $graph"));
+                }
                 Some(Value::Array(mut writes)) => graph.append(&mut writes),
                 Some(g) => return Err(format!("{link} gave $graph as {}, not list", type_of(&g))),
                 None => {}
@@ -904,6 +911,20 @@ mod tests {
         let names: Vec<&str> = calls.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["a", "fail"]);
     }
+
+    #[test]
+    fn a_store_row_in_any_links_graph_but_the_built_in_stores_fails_the_step() {
+        let item = |_: &Map<String, Value>| Ok(obj(&json!({ "$graph": [{ "store": {} }] })));
+        for link in ["a", "store"] {
+            let flow = json!({ "name": "f", "ty": 1, "takes": {}, "steps": [{ "do": link }] });
+            let (ran, _) = run(&flow, &json!({}), &[(link, &[], item)]);
+            assert_eq!(
+                ran.unwrap_err(),
+                format!("{link} gave a store row in $graph")
+            );
+        }
+    }
+
     #[test]
     fn run_with_a_branch_picks_the_case_by_json_value_and_falls_to_else() {
         let flow = json!({ "name": "f", "ty": 1, "takes": {}, "steps": [{ "do": "a",
@@ -927,8 +948,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE t (k TEXT PRIMARY KEY, n INTEGER)")
             .unwrap();
-        let [_, sig] = super::builtins();
-        let store = super::Builtin(sig, Arc::new(Mutex::new(conn)));
+        let store = super::Store(Arc::new(Mutex::new(conn)));
         let input = obj(&json!({ "k": "a", "m": 2 }));
         let ran =
             |table: &str, row: Value| store.run(&json!({ "table": table, "row": row }), &input);
