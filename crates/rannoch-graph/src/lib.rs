@@ -7,9 +7,8 @@
 //! rannoch-processor holds the list in its [`Writes`] under the id of the event the flow ran on,
 //! and [`GraphAppend`], the app's [`Append`], writes the rows in the same transaction as that
 //! event's 2, each row stamped with the event. Reads take a connection to the same file:
-//! [`prop`], [`props`], [`history`], [`edges`] and [`why`] read rows, [`walk`] follows named edges
-//! out from a node, [`search`] finds nodes by their current text, [`describe`] shapes a node, and
-//! [`Hoods`] keeps a describe warm.
+//! [`prop`], [`props`], [`history`], [`edges`] and [`why`] read rows, [`describe`] shapes a node,
+//! and [`Hoods`] keeps a describe warm.
 //!
 //! # Example
 //!
@@ -168,20 +167,6 @@
 //!   through `_events`: its source, that event's source, and so on. It reads now only, and
 //!   returns an empty list when the key has no current row.
 //!
-//! # Walk and search
-//!
-//! [`walk`] follows named edges out from a node: each name in `via` follows its edges forwards,
-//! and `name<-` backwards. It reads the current edges as of `at`, goes at most `hops` steps, and
-//! returns each node it reaches, the root left out, once with its fewest hops: nearest first,
-//! then in node-id order, at most `cap` of them, and whether the cap cut the walk.
-//!
-//! [`search`] returns the nodes whose current text values match an FTS5 query, in node-id order;
-//! a key whose current value is not a JSON string has no text. The text is indexed in `_search`,
-//! an FTS5 table, and `_search_map`, which holds the node and key of each `_search` row. Every
-//! node row the append adds reindexes its key in the same transaction, so a correction's text
-//! replaces the old one and a retraction takes it out; these two tables' rows are replaced, not
-//! only added. Search reads now only.
-//!
 //! # Describe: a node by a shape
 //!
 //! [`describe`] returns a node shaped by a shape, a JSON list whose items say what to read:
@@ -296,10 +281,8 @@
 mod describe;
 mod hoods;
 mod queries;
-mod search;
 mod walk;
 
-pub use search::search;
 pub use walk::walk;
 
 use std::collections::HashSet;
@@ -475,8 +458,7 @@ fn commit<T: Copy + Into<u16>, D: Serialize>(
     Ok(touched)
 }
 
-/// Adds `op`'s row, stamped with `event` and `written`; a row its key already holds stays. A node
-/// row it adds reindexes its key's text.
+/// Adds `op`'s row, stamped with `event` and `written`; a row its key already holds stays.
 fn write(conn: &Connection, event: &str, op: &Op, written: i64) -> Result<usize> {
     let (value, retracted) = match op {
         Op::Set { value, .. } | Op::Link { props: value, .. } => (Some(value.to_string()), 0),
@@ -485,11 +467,7 @@ fn write(conn: &Connection, event: &str, op: &Op, written: i64) -> Result<usize>
     match op {
         Op::Set { node, key, .. } | Op::Retract { node, key } => {
             let row = params![node, key, value, event, written, retracted];
-            let added = conn.prepare_cached(queries::NODE)?.execute(row)?;
-            if added == 1 {
-                search::reindex(conn, node, key)?;
-            }
-            Ok(added)
+            conn.prepare_cached(queries::NODE)?.execute(row)
         }
         Op::Link { src, name, dst, .. } | Op::Unlink { src, name, dst } => {
             let row = params![src, name, dst, value, event, written, retracted];

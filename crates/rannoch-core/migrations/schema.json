@@ -1,5 +1,5 @@
 {
-  "version": 20261122000004,
+  "version": 20261122000003,
   "objects": [
     {
       "type": "index",
@@ -35,41 +35,6 @@
       "type": "table",
       "name": "_nodes",
       "sql": "CREATE TABLE \"_nodes\" (\"node\" TEXT NOT NULL, \"key\" TEXT NOT NULL, \"value\" TEXT, \"event\" TEXT NOT NULL, \"written\" INTEGER NOT NULL, \"retracted\" INTEGER NOT NULL DEFAULT (0), PRIMARY KEY (\"node\", \"key\", \"event\")) WITHOUT ROWID"
-    },
-    {
-      "type": "table",
-      "name": "_search",
-      "sql": "CREATE VIRTUAL TABLE _search USING fts5(text)"
-    },
-    {
-      "type": "table",
-      "name": "_search_config",
-      "sql": "CREATE TABLE '_search_config'(k PRIMARY KEY, v) WITHOUT ROWID"
-    },
-    {
-      "type": "table",
-      "name": "_search_content",
-      "sql": "CREATE TABLE '_search_content'(id INTEGER PRIMARY KEY, c0)"
-    },
-    {
-      "type": "table",
-      "name": "_search_data",
-      "sql": "CREATE TABLE '_search_data'(id INTEGER PRIMARY KEY, block BLOB)"
-    },
-    {
-      "type": "table",
-      "name": "_search_docsize",
-      "sql": "CREATE TABLE '_search_docsize'(id INTEGER PRIMARY KEY, sz BLOB)"
-    },
-    {
-      "type": "table",
-      "name": "_search_idx",
-      "sql": "CREATE TABLE '_search_idx'(segid, term, pgno, PRIMARY KEY(segid, term)) WITHOUT ROWID"
-    },
-    {
-      "type": "table",
-      "name": "_search_map",
-      "sql": "CREATE TABLE \"_search_map\" (\"node\" TEXT NOT NULL, \"key\" TEXT NOT NULL, \"row\" INTEGER NOT NULL, PRIMARY KEY (\"node\", \"key\")) WITHOUT ROWID"
     }
   ]
 }
