@@ -15,7 +15,7 @@ Version 0.1.0, built crate by crate on `main`.
 
 An app sends events to rannoch. Each event is a row in `_events`, the log in the app's SQLite file, and its progress is recorded as further events whose `source` is that event, each with a status: 0 when it is accepted, 1 when the queue takes it, 2 when its flow has run, and -1 when it is binned. Nothing in `_events` is updated or deleted.
 
-The queue hands each due event at status 0 to the flow for its `ty`. A flow is a JSON document of steps; each step calls one or more of the app's actions, and its result can send further events, branch on a value, or wait for another event. When the app's append is rannoch-graph's `GraphAppend`, the graph rows a step gives are written in the same transaction as the event's 2, so an event that has its 2 has its rows.
+The queue hands each due event at status 0 to the flow for its `ty`. A flow is a JSON document of steps; each step calls one or more of the app's actions, and its result can send further events, branch on a value, or wait for another event. The rows a step gives, a built-in `store` step's row or rannoch-graph's graph rows, are written in the same transaction as the event's 2 when the app's append holds the processor's writes (`Events::with_writes`, or `GraphAppend`), so an event that has its 2 has its rows.
 
 ## The crates
 
@@ -25,7 +25,7 @@ The queue hands each due event at status 0 to the flow for its `ty`. A flow is a
 | `rannoch-store` | Opens the app's SQLite file against that migrator, and reports pending migrations without applying them. `Store` is core's `Storage`: it applies them, and checkpoints the WAL once a second while it lives. |
 | `rannoch-events` | Owns `_events`; the one row written there by anything else is the queue's -1 for an event whose `ty` is not the app's, which `Sender::send` cannot take. `Events` is core's `Append`: it writes each batch in one transaction, then signals the queue. |
 | `rannoch-queue` | Takes the due events at status 0, sends a 1 for each, and hands each to its processor; retries a failed run while its chain has attempts left, resends a run a crash dropped, and sends a -1 naming the reason for each failure about an event, such as an event whose `ty` has no flow. |
-| `rannoch-processor` | Runs the app's flow documents: steps that call the app's `Action`s, and nexts, branches and waits. `compile` checks the documents when the app builds. |
+| `rannoch-processor` | Runs the app's flow documents: steps that call the app's `Action`s, and nexts, branches and waits. Two steps are built in: `emit`, which gives nothing so its step's nexts do the work, and `store`, which writes one row into the app's table its options name, with the event's 2. `compile` checks the documents when the app builds. |
 | `rannoch-processor-agent` | A step that calls an agent the app reaches through `Agent`, checked against what the agent takes and gives. |
 | `rannoch-processor-onnx` | Steps that run a local ONNX model: `Infer`, `Embed` and `Classify`, through ort, or through tract with the `tract` feature. |
 | `rannoch-processor-retrieve` | A step that queries one of the app's outside sources through `Source`. |
@@ -39,7 +39,7 @@ The store opens a connection only once no migration is pending, so the order mat
 2. Open each connection with `rannoch_store::open(path, &migrator)`, which returns `Opened::Ready` with the connection once nothing is pending.
 3. Make the processor with `Processor::new`, from the app's flows as JSON, its actions and a connection.
 4. Make a channel with `std::sync::mpsc::channel`. The append signals on its sender, and the queue waits on its receiver.
-5. Make the append: `Events::new(conn, signal)`, or `GraphAppend::new(conn, signal, processor.writes())` when steps give graph rows, with `with_hoods` to keep describes warm.
+5. Make the append: `Events::new(conn, signal)`, with `.with_writes(processor.writes())` when a flow uses the `store` step, or `GraphAppend::new(conn, signal, processor.writes())` when steps give graph rows, with `with_hoods` to keep describes warm. `Events` without the processor's writes writes no `store` row.
 6. Open rannoch with `Rannoch::open`, its `Config` holding the store and the append.
 7. Start the queue with `Queue::start`, over a connection, the receiver, `rannoch.sender()`, the processor and its `Settings`.
 
@@ -67,16 +67,19 @@ Producers send events with `Sender::send`. To stop, drop any signal sender the a
 - **A `$graph` item that is not one of rannoch-graph's ops** is refused by `GraphAppend` the same way: rolled back with its event's 2 and that event's other rows, and a -1 for the event sent in their place, its data `graph: ` and serde's message, as `` graph: missing field `props` `` for a `link` without `props`; the rest of the batch commits.
 - **An event whose data does not serialize** is not written, and when it is a 2, neither are its rows. In its place a -1 is sent: for a 2, for the event it records, as for a refused `store` row; for any other event, for that event itself, by the id it was accepted with, though that id is not in `_events`. Its data is `data: ` and serde's message, as `data: key must be a string`. The rest of the batch commits, so the inbox goes on.
 - **After `shutdown`**, `Sender::send` returns `Closed`. `queue.join()` returns only once every sender of the append's signal is dropped, so a signal sender the app keeps makes it wait for good; it also waits for every run and job the queue started. When the queue's thread panicked it returns `Error::Queue`, and runs and jobs already started may still be going.
+- **A read the queue cannot make,** of the due events, the next `run_at`, a chain or the hunt's 1s, is logged at `error` and made again after `first_wait`. A row in `_events` that rannoch never writes, such as an id that does not parse, is logged and passed over.
+- **The store's checkpointer,** when it cannot open its connection or checkpoint the WAL, logs at `error` and tries again a second later.
 - **A second process** on the same store is not stopped by rannoch.
 
 ## What was measured
 
-All on one developer machine, as recorded on PRs #74 and #76 and issues #65 and #66:
+All on one developer machine, as recorded on PRs #74, #76 and #114 and issues #65, #66 and #120:
 
 | What | Result | What ran it |
 |---|---|---|
 | A flow whose step writes nothing, 100,000 events to their 2 | 55,679 to 58,795 events/s | 55,679: `toys/graph/src/bin/flow.rs` in `noop` mode on the `toys/graph` branch, which is in the repo (PR #74); 57,011 to 58,795: the `noop` mode of the copy in the next row, which is not |
 | The same flow, each step giving three node rows and one edge through `GraphAppend` | 48,112 to 49,611 events/s over 6 runs, 15% to 18% below the step that writes nothing in the same runs; every 2 had its rows | a copy of that bench pointed at `GraphAppend`; the copy is not in the repo |
+| A flow whose built-in `store` step writes one row per event through `Events`, 100,000 events to their 2 | 46,442 to 47,450 events/s over 3 runs on `main` at d0c604a; 46,617 to 49,806 before #102 put each event's rows in a savepoint | `the_store_flow_rate` in `crates/rannoch-processor/tests/scenarios.rs`, which is ignored: `cargo test --release -p rannoch-processor --test scenarios -- --ignored --nocapture the_store_flow_rate` |
 | A `describe` of a two-level shape at 100,000 nodes and 499,876 edges, 32 nodes read, median, release build, file store | 0.30 to 0.32 ms cold, 13 to 15 µs warm | a timing run of the toy's P9a against the crate (PR #76), whose harness is not in the repo; the committed test `fr_rannoch_123_c9` asserts 5 ms or less cold, and measured 1.58 ms under `cargo test` |
 
 ## What the app owns
