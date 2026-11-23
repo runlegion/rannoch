@@ -166,7 +166,8 @@ fn with_graph_append_a_2_and_its_rows_commit_together_and_a_batch_is_whole_or_no
     let processor: Processor<u16, Value> =
         Processor::new(&flows, Vec::new(), ready(&path).unwrap()).unwrap();
     let (signal, wake) = mpsc::channel();
-    let append = GraphAppend::new(ready(&path).unwrap(), signal.clone(), processor.writes());
+    let writes = processor.writes();
+    let append = GraphAppend::new(ready(&path).unwrap(), signal.clone(), writes.clone());
     let rannoch = Rannoch::open(Config {
         store: Some(Arc::new(Store::new(path.clone(), rannoch_core::migrator()))),
         append: Some(Arc::new(append) as Arc<dyn Append<u16, Value>>),
@@ -216,13 +217,18 @@ fn with_graph_append_a_2_and_its_rows_commit_together_and_a_batch_is_whole_or_no
         thread::sleep(Duration::from_millis(1));
     }
 
-    // When a payment for an order the store does not have runs
+    // When a payment for an order the store does not have runs, its row held for its 2, and the
+    // inbox tries its batch for ten intervals
     let none = pay("none");
-    let about = format!("SELECT count(*) FROM _events WHERE source = '{none}' AND status <> 1");
-    thread::sleep(Duration::from_millis(500));
+    let held = || writes.lock().is_ok_and(|w| w.contains_key(&none));
+    assert!(until(held), "the payment ran");
+    thread::sleep(Duration::from_millis(200));
 
-    // Then nothing of its batch is written: not its receipt, its 2 or its row
+    // Then nothing of its batch is written: not its receipt, its 2 or its row, which each
+    // failed hand-over puts back
+    let about = format!("SELECT count(*) FROM _events WHERE source = '{none}' AND status <> 1");
     assert_eq!(count(&conn, &about), 0);
+    assert!(held(), "a hand-over wrote the row");
 
     // When the store has its order
     conn.execute("INSERT INTO orders (id) VALUES ('none')", [])

@@ -180,11 +180,16 @@ impl App {
     /// The app over a fresh store `name` running `flows` on the built-in steps, no action of its
     /// own.
     fn built_in(name: &str, flows: &str) -> Result<Self> {
+        Self::built_in_at(database(name)?, flows, Config::default())
+    }
+
+    /// As `built_in`, over the store at `path`, rannoch's inboxes as `config` has them.
+    fn built_in_at(path: PathBuf, flows: &str, config: Config<Ty, Value>) -> Result<Self> {
         let settings = Settings {
             attempts: 1,
             ..Settings::new(Duration::from_millis(100))
         };
-        Self::over(database(name)?, flows, |_, _| Vec::new(), settings)
+        Self::with(path, flows, |_, _| Vec::new(), config, settings)
     }
 
     /// Runs the flow of the event `id`, of `ty` with `data`, again, its sends handed to rannoch.
@@ -1300,13 +1305,15 @@ fn the_hunt_resends_an_event_a_crash_dropped() {
 //   a resend is, adds its row beside the earlier event's.
 //
 // Not driven, and why:
-// - A process that dies before its batch commits loses it, and a second process: a scenario
-//   cannot kill its own process or start another. The first scenario below shows the events are
-//   not on disk until then; a second app over the same file stands in for a second process, since
-//   rannoch takes no lock on the file and SQLite locks per connection.
+// - A process that dies before its batch commits loses it, and a second process on the store:
+//   each needs a second process (a death, or another process on the store); these scenarios run
+//   in one. The first scenario below shows the events are not on disk until the commit; a second
+//   app over the same file stands in for a second process, since rannoch takes no lock on the
+//   file and SQLite locks per connection.
 // - A heap with "no size limit", a hand-over tried again "with no limit", a kept signal sender
 //   making `join` wait "for good": a scenario sees them for as long as it watches.
-// - `join` waiting for a job: no built-in step is a job, so `check` makes no flow of them one.
+// - `join` waiting for a job, and the hunt leaving a job the running queue holds: an app gets a
+//   job only from a job signature, and no built-in step has one.
 
 impl App {
     /// Sends an event of `ty` with `data` through rannoch, as a producer does.
@@ -1370,18 +1377,11 @@ fn poll<T>(limit: Duration, found: impl Fn() -> Option<T>) -> Option<T> {
     }
 }
 
-fn settings(attempts: u32) -> Settings {
-    Settings {
-        attempts,
-        ..Settings::new(Duration::from_millis(100))
-    }
-}
-
 /// The app over a fresh store `name` on `BUILT_IN`'s flows, rannoch's inboxes as `config` has
 /// them.
-fn built_in_with(name: &str, config: Config<Ty, Value>, settings: Settings) -> Result<App> {
+fn built_in_with(name: &str, config: Config<Ty, Value>) -> Result<App> {
     let flows = built_in().map_err(|e| e.join("\n"))?;
-    App::with(database(name)?, &flows, |_, _| Vec::new(), config, settings)
+    App::built_in_at(database(name)?, &flows, config)
 }
 
 /// A default inbox that hands over every `ms` milliseconds.
@@ -1398,12 +1398,12 @@ fn accepted(id: Uuid) -> DateTime<Utc> {
     DateTime::from_timestamp(i64::try_from(secs).unwrap_or_default(), nanos).unwrap_or_default()
 }
 
-/// A payment two hours old whose 1 is an hour old with nothing after it, as a crash leaves a run.
-fn stall(conn: &Connection, data: &Value) -> Result<Uuid> {
+/// A payment two hours old whose 1 is `secs` old with nothing after it, as a crash leaves a run.
+fn stall(conn: &Connection, data: &Value, secs: i64) -> Result<Uuid> {
     let id = ago(7200);
     let row = _events::factory().id(id.to_string()).ty(86);
     row.data(data.to_string()).status(0).insert(conn)?;
-    let one = _events::factory().id(ago(3600).to_string()).ty(86);
+    let one = _events::factory().id(ago(secs).to_string()).ty(86);
     one.source(id.to_string())
         .data("\"taken\"")
         .status(1)
@@ -1468,7 +1468,7 @@ fn an_accepted_event_is_in_memory_until_its_inbox_hands_it_over() {
         Config::<Ty, Value>::default().default_interval,
         TimeDelta::milliseconds(20)
     );
-    let app = built_in_with("in_memory", every(400), settings(1)).unwrap();
+    let app = built_in_with("in_memory", every(400)).unwrap();
     let landed = || app.count(ROOTS);
 
     // When it sends three events
@@ -1481,7 +1481,7 @@ fn an_accepted_event_is_in_memory_until_its_inbox_hands_it_over() {
     assert_eq!(landed(), 0, "on the heap, not on disk");
 
     // And the inbox hands its whole heap over as one batch: the first read to see one sees three,
-    // each at 0 with the v7 id it was given at accept
+    // each at 0 with a v7 id
     assert_eq!(poll(WAIT, || Some(landed()).filter(|n| *n > 0)), Some(3));
     let v7 = "SELECT count(*) FROM _events WHERE source IS NULL AND status = 0
         AND substr(id, 15, 1) = '7'";
@@ -1534,7 +1534,7 @@ fn a_batch_the_store_never_takes_stops_its_inbox_and_is_lost_at_shutdown() {
         inboxes: vec![queued],
         ..every(300)
     };
-    let app = built_in_with("never_taken", config, settings(1)).unwrap();
+    let app = built_in_with("never_taken", config).unwrap();
     app.read.execute_batch(ORDERS).unwrap();
 
     // When a payment for an order the store does not have runs
@@ -1592,15 +1592,25 @@ fn a_failed_hand_over_is_tried_again_ahead_of_what_arrived_since() {
     let _errors = logged();
     // Given an app whose default inbox hands over every 300 ms, and another connection holding
     // the store's write lock past the append's busy timeout of 5 s
-    let app = built_in_with("tried_again", every(300), settings(1)).unwrap();
+    let app = built_in_with("tried_again", every(300)).unwrap();
     let writer = ready(&app.path).unwrap();
     writer.execute_batch("BEGIN IMMEDIATE").unwrap();
 
-    // When it sends an event, and another while the first's hand-over waits on the lock
+    // When it sends an event, and another while the first's hand-over waits on the lock. Rannoch
+    // shows no sign of a hand-over starting, so the second is sent 1 s after the first: the
+    // hand-over that takes the first starts within one 300 ms interval and waits 5 s. The checks
+    // confirm it: no hand-over has failed when the second is sent, and the one that fails holds
+    // the first alone.
     let (first, second) = (json!({ "ticket": "d" }), json!({ "ticket": "e" }));
     app.send(82, &first).unwrap();
-    thread::sleep(Duration::from_millis(600));
+    thread::sleep(Duration::from_secs(1));
     app.send(82, &second).unwrap();
+    let none = Vec::<usize>::new();
+    assert_eq!(
+        failed_hand_overs(),
+        none,
+        "the first's hand-over still waits"
+    );
 
     // Then that hand-over fails holding the first alone, and is logged at error
     assert!(until(Duration::from_secs(10), || !failed_hand_overs().is_empty()));
@@ -1624,6 +1634,7 @@ fn a_failed_hand_over_is_tried_again_ahead_of_what_arrived_since() {
 
     // And as they run, the rows already in _events are only added to
     let written = app.rows();
+    assert_ne!(written, Vec::<String>::new());
     app.ran(&first);
     app.ran(&second);
     let rows = app.rows();
@@ -1634,7 +1645,7 @@ fn a_failed_hand_over_is_tried_again_ahead_of_what_arrived_since() {
 #[test]
 fn the_queue_takes_each_due_event_once() {
     // Given an app whose default inbox hands over every 300 ms, so each 1 is on the heap a while
-    let app = built_in_with("taken_once", every(300), settings(1)).unwrap();
+    let app = built_in_with("taken_once", every(300)).unwrap();
 
     // When it sends ten events, and the queue is woken every 10 ms until each has its 2
     let events: Vec<Value> = (0..10)
@@ -1671,26 +1682,28 @@ fn the_hunt_runs_a_hunt_after_the_queue_starts_then_every_hunt_on_the_stalled_ev
         (Duration::from_mins(20), Duration::from_hours(1))
     );
 
-    // And a store as a crash leaves it: a payment whose 1 is an hour old with nothing after it
+    // And a store as a crash leaves it: a payment whose 1 is an hour old with nothing after it,
+    // and one whose 1 is 30 s old
     let path = database("hunt_every").unwrap();
     migrated(&path).unwrap();
     let seed = ready(&path).unwrap();
     seed.execute_batch(PAYMENTS).unwrap();
-    let stalled = stall(&seed, &json!({ "order": "o1", "amount": 10 })).unwrap();
+    let stalled = stall(&seed, &json!({ "order": "o1", "amount": 10 }), 3600).unwrap();
+    let young = stall(&seed, &json!({ "order": "o3", "amount": 30 }), 30).unwrap();
 
-    // When the queue starts with a window of a minute and a hunt every second, and is woken
-    // before the first hunt
-    let settings = hunting(Duration::from_mins(1), Duration::from_secs(1));
+    // When the queue starts with a window of a minute and a hunt every 2 s, and is woken before
+    // the first hunt
+    let settings = hunting(Duration::from_mins(1), Duration::from_secs(2));
     let started = Instant::now();
     let app = App::over(path, &built_in().unwrap(), |_, _| Vec::new(), settings).unwrap();
     thread::sleep(Duration::from_millis(100));
     app.signal.send(()).unwrap();
 
     // Then nothing is resent before the first hunt, a hunt after the start
-    thread::sleep(Duration::from_millis(300));
+    thread::sleep(Duration::from_millis(900));
     assert_eq!(app.sent(stalled, 0), []);
     let resend = app.retry(stalled);
-    assert!(started.elapsed() >= Duration::from_secs(1));
+    assert!(started.elapsed() >= Duration::from_secs(2));
     assert_eq!(app.sent(stalled, 0), [(86, json!("hung"))]);
 
     // And the resend runs the payment's flow on the stalled payment's data
@@ -1699,15 +1712,18 @@ fn the_hunt_runs_a_hunt_after_the_queue_starts_then_every_hunt_on_the_stalled_ev
     assert_eq!(app.count(row), 1);
 
     // When another payment is left stalled after that hunt, and the queue is woken
-    let later = stall(&seed, &json!({ "order": "o2", "amount": 20 })).unwrap();
+    let later = stall(&seed, &json!({ "order": "o2", "amount": 20 }), 3600).unwrap();
     app.signal.send(()).unwrap();
 
     // Then the wake does not hunt: the next hunt, a hunt after the first, resends it
-    thread::sleep(Duration::from_millis(300));
+    thread::sleep(Duration::from_millis(500));
     assert_eq!(app.sent(later, 0), []);
     app.retry(later);
-    assert!(started.elapsed() >= Duration::from_secs(2));
+    assert!(started.elapsed() >= Duration::from_secs(4));
     assert_eq!(app.sent(later, 0), [(86, json!("hung"))]);
+
+    // And neither hunt resent the payment whose 1 is younger than the window
+    assert_eq!(app.sent(young, 0), []);
     app.stop();
 }
 
@@ -1721,7 +1737,8 @@ fn a_failed_run_is_retried_with_backoff_and_an_event_with_no_flow_gets_no_proces
         attempts: 3,
         ..Settings::new(Duration::from_millis(200))
     };
-    let app = built_in_with("retried", Config::default(), settings).unwrap();
+    let (path, flows) = (database("retried").unwrap(), built_in().unwrap());
+    let app = App::over(path, &flows, |_, _| Vec::new(), settings).unwrap();
 
     // When it sends an order lost to a table the store does not have, and an event of ty 99,
     // which no flow runs
@@ -1754,6 +1771,7 @@ fn a_failed_run_is_retried_with_backoff_and_an_event_with_no_flow_gets_no_proces
     assert!(until(WAIT, || app.statuses(run).contains(&-1)));
     thread::sleep(Duration::from_secs(1));
     assert_eq!(app.statuses(run), [1, -1]);
+    assert_ne!(written, Vec::<String>::new());
     assert!(app.rows().starts_with(&written), "rows are only added");
 
     // And the ty 99 event got a -1 saying "no processor", and no retry
@@ -1779,7 +1797,7 @@ fn after_shutdown_a_send_is_closed_and_join_waits_for_signal_senders_and_runs() 
     tx.commit().unwrap();
 
     // And an app whose queue takes them as it starts and runs them one after another
-    let app = App::over(path, &built_in().unwrap(), |_, _| Vec::new(), settings(1)).unwrap();
+    let app = App::built_in_at(path, &built_in().unwrap(), Config::default()).unwrap();
     let twos = "SELECT count(*) FROM _events WHERE status = 2";
     assert!(until(WAIT, || app.count(twos) > 0));
 
@@ -1795,7 +1813,9 @@ fn after_shutdown_a_send_is_closed_and_join_waits_for_signal_senders_and_runs() 
     assert_eq!(late, Err(Error::Closed));
 
     // And join returns once the runs the queue started have finished: runs went on after the
-    // drop, and none after join, each keeping the row its 2 could not carry
+    // drop, and none after join, each keeping the row its 2 could not carry. This needs the
+    // backlog's runs still pending at shutdown, 20 ms in with 5,000 to run; `at_join > at_drop`
+    // checks that they were.
     app.queue.join();
     let at_join = held();
     thread::sleep(Duration::from_millis(300));
@@ -1804,7 +1824,7 @@ fn after_shutdown_a_send_is_closed_and_join_waits_for_signal_senders_and_runs() 
 
     // Given another app, with nothing running, that shuts rannoch down and keeps its signal
     // sender
-    let app = built_in_with("kept_signal", Config::default(), settings(1)).unwrap();
+    let app = App::built_in("kept_signal", &built_in().unwrap()).unwrap();
     app.rannoch.shutdown();
 
     // Then join does not return while the app keeps it, and returns once it is dropped
@@ -1827,14 +1847,7 @@ fn a_second_app_on_the_same_store_is_not_stopped() {
     let path = database("second_app").unwrap();
     let open = || {
         let flows = built_in().unwrap();
-        App::with(
-            path.clone(),
-            &flows,
-            |_, _| Vec::new(),
-            every(1000),
-            settings(1),
-        )
-        .unwrap()
+        App::built_in_at(path.clone(), &flows, every(1000)).unwrap()
     };
     let first = open();
 
