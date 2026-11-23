@@ -20,8 +20,8 @@
 //! rannoch-processor's `store` step carries in its [`Writes`]: for each 2 in the batch,
 //! [`taking`] takes the items under the 2's source, as rannoch-graph's `GraphAppend` does, and
 //! [`write_in`] inserts each [`StoreRow`] in the batch's transaction, so every 2 has its rows. An
-//! item with a `store` key that is not a `StoreRow` fails the batch, and an item with none, as a
-//! graph `Op`, is not written. A batch that fails puts the items back for its retry. The row is
+//! item with a `store` key that is not a `StoreRow` fails the batch. A batch that fails puts the
+//! items back for its retry. The row is
 //! inserted with `INSERT ... ON CONFLICT DO NOTHING`, so T's own keys decide whether a rerun adds
 //! a row: a string is bound as text, an integer or a float as an integer or a real, a bool as 0
 //! or 1, null as NULL, and an array or an object as its JSON text. A row T refuses, by a NOT
@@ -31,8 +31,10 @@
 //! payments.amount`, which the inbox sends; the rest of the batch commits, the 2's nexts
 //! included. A row holding an integer above `i64::MAX`, or a number that is neither an integer
 //! nor a float, is refused the same way, since no INTEGER or REAL holds it exactly, as `store:
-//! 18446744073709551615 cannot be held exactly: payments.amount`. A deferred foreign key is
-//! checked only at commit, after every savepoint, so a row that breaks one fails its whole batch.
+//! 18446744073709551615 cannot be held exactly: payments.amount`. An item with no `store` key, as
+//! a graph `Op`, is refused the same way, since `Events` writes no graph rows; its -1's data is
+//! `graph: Events writes no graph rows`. A deferred foreign key is checked only at commit,
+//! after every savepoint, so a row that breaks one fails its whole batch.
 //!
 //! # Failures
 //!
@@ -40,7 +42,7 @@
 //! append returns in its place a -1, for a 2 for its source, as for a refused store row, and for
 //! any other event for the event itself, by the id it was accepted with; its data is `data: ` and
 //! serde's message, as `data: key must be a string`, and the inbox sends it. The rest of the batch
-//! commits. Apart from that and a 2 whose store row is refused, a
+//! commits. Apart from that and a 2 whose store row or other item is refused, a
 //! batch is written whole or not at all: when a row cannot be inserted, as with an id already in
 //! `_events`, the append fails with `Error::Store`, writes nothing, and sends no signal. The free
 //! [`append`], which returns no -1, fails the same way on data that does not serialize.
@@ -209,7 +211,9 @@ impl<T: Copy + Into<u16>, D: Serialize + From<String>> Append<T, D> for Events {
         let mut conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
         let replies = taking(&self.writes, batch, |taken| {
             let mut tx = conn.transaction().map_err(|_| Error::Store)?;
-            let replies = write_in(&mut tx, batch, taken, |_, _, _| Ok(Ok(())))?;
+            // Refused like a store row: its 2's rows are rolled back and it gets a -1.
+            let graph = || Ok(Err("graph: Events writes no graph rows".to_owned()));
+            let replies = write_in(&mut tx, batch, taken, |_, _, _| graph())?;
             tx.commit().map_err(|_| Error::Store)?;
             Ok(replies)
         })?;
@@ -506,7 +510,6 @@ mod tests {
         let writes = Arc::new(Mutex::new(HashMap::new()));
         let row = json!({ "k": "a", "n": 2, "b": true, "l": [1], "z": null });
         let item = |table| json!({ "store": { "table": table, "row": row } });
-        let op = json!({ "set": { "node": "a", "key": "k", "value": 1 } });
         let two = |source| Event {
             source: Some(source),
             status: Status::Processed,
@@ -525,14 +528,11 @@ mod tests {
             rows
         };
 
-        // Two 2s, each of a source holding a store row of key a and a graph Op: the first's row is
-        // written, the second's adds none, and neither's Op is written.
+        // Two 2s, each of a source holding a store row of key a: the first's row is written, and
+        // the second's adds none.
         for _ in 0..2 {
             let source = Uuid::now_v7();
-            writes
-                .lock()
-                .unwrap()
-                .insert(source, vec![item("t"), op.clone()]);
+            writes.lock().unwrap().insert(source, vec![item("t")]);
             Append::append(&events, &[two(source)]).unwrap();
             assert_eq!(signals.try_recv(), Ok(()));
         }
