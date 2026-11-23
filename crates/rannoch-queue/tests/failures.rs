@@ -214,30 +214,6 @@ fn a_due_event_whose_ty_is_not_the_apps_gets_a_minus_1() -> Result<()> {
     Ok(())
 }
 
-/// 659-667, the ty: a ty that is not a `u16` fails its own row, not the whole due read.
-#[test]
-fn a_due_event_whose_ty_is_not_a_u16_gets_a_minus_1_and_the_rest_run() -> Result<()> {
-    let path = store("ty_not_a_u16")?;
-    let (big, next) = (id(), id());
-    seed(
-        &path,
-        &[
-            (&big, None, 70_000, r#"{"ticket":"t1"}"#, None, 0),
-            (&next, None, 82, r#"{"ticket":"t2"}"#, None, 0),
-        ],
-    )?;
-
-    let app = App::start(&path, HOUR, once())?;
-    app.signal_twice()?;
-    app.stop()?;
-
-    let binned = (-1, 70_000, said("ty 70000 is not the app's"));
-    assert_eq!(about(&path, &big)?, [binned]);
-    let ran = [(1, 82, said("taken")), (2, 82, said("done"))];
-    assert_eq!(about(&path, &next)?, ran);
-    Ok(())
-}
-
 /// 659-667: a due event whose source is not a UUID.
 #[test]
 fn a_due_event_that_cannot_be_read_gets_a_minus_1() -> Result<()> {

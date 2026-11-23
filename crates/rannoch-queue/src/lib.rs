@@ -49,7 +49,7 @@
 //! Each failure the queue meets about an event becomes a -1 about that event, whose data names
 //! the reason:
 //!
-//! - a due event whose `ty` is not the app's `T`, or not a `u16`: `ty <ty> is not the app's`;
+//! - a due event whose `ty` is not the app's `T`: `ty <ty> is not the app's`;
 //! - a due or waiting event that cannot be read: `its source <source> is not a UUID`, or `its
 //!   run_at <run_at> is not a time`;
 //! - a due event whose walk to its root cannot go on: `<id> in its chain is not in _events`, or
@@ -62,9 +62,9 @@
 //!   `ty` is not the app's: `its 1 <id> is not a UUIDv7`, `the hunt could not read its tree:
 //!   <error>`, or `ty <ty> is not the app's`.
 //!
-//! A row whose id is not a UUID names no event, so it is logged at `error` and left. So is a read
-//! of the due events or of the hunt's 1s that fails; one of the next `run_at` that fails is
-//! logged, and read again after [`Settings::first_wait`].
+//! A row whose id is not a UUID names no event, so it is logged at `error` and left. A read of the
+//! hunt's 1s that fails is logged at `error`; a read of the due events or of the next `run_at`
+//! that fails is logged, and read again after [`Settings::first_wait`].
 //!
 //! # Stopping
 //!
@@ -379,6 +379,7 @@ fn run<T, D>(
         }
         let Ok(due) = read(conn, queries::DUE, [now()]) else {
             log::error!("the queue could not read the due events");
+            wait = settings.first_wait;
             continue;
         };
         // An event whose 1 or -1 is kept has left the due events; until then the queue
@@ -399,7 +400,7 @@ fn run<T, D>(
             };
             let Ok(ty) = T::try_from(row.ty) else {
                 let why = format!("ty {} is not the app's", row.ty);
-                bin(conn, sender, row.id, row.ty.into(), &why);
+                bin(conn, sender, row.id, row.ty, &why);
                 continue;
             };
             let (root, before) = match root(conn, row.clone()) {
@@ -534,7 +535,7 @@ where
             .filter(|id| id.get_version_num() == 7)
         else {
             let why = format!("its 1 {one} is not a UUIDv7");
-            bin(conn, sender, event, ty.into(), &why);
+            bin(conn, sender, event, ty, &why);
             continue;
         };
         let ours = taken_at(one).is_none_or(|at| at.timestamp_millis() >= started);
@@ -546,13 +547,13 @@ where
             Ok(true) => continue,
             Err(err) => {
                 let why = format!("the hunt could not read its tree: {err}");
-                bin(conn, sender, event, ty.into(), &why);
+                bin(conn, sender, event, ty, &why);
                 continue;
             }
         }
         let Ok(ty) = T::try_from(ty) else {
             let why = format!("ty {ty} is not the app's");
-            bin(conn, sender, event, ty.into(), &why);
+            bin(conn, sender, event, ty, &why);
             continue;
         };
         let retry = Event {
@@ -663,16 +664,16 @@ fn send<T: PartialEq, D: From<String>>(
     sent
 }
 
-/// Sends a -1 about the event `source`, whose `ty` is `ty` as stored, with `why` as its data. A
-/// `ty` that is the app's goes through `sender`, as every status the queue sends does. Any other
-/// cannot, since `Sender::send` takes the app's `T`, so the queue writes that -1 to `_events`
-/// itself, as the append writes one.
-fn bin<T, D>(conn: &Connection, sender: &Sender<T, D>, source: Uuid, ty: i64, why: &str)
+/// Sends a -1 about the event `source`, of `ty`, with `why` as its data. A `ty` that is the
+/// app's goes through `sender`, as every status the queue sends does. Any other cannot, since
+/// `Sender::send` takes the app's `T`, so the queue writes that -1 to `_events` itself, as the
+/// append writes one.
+fn bin<T, D>(conn: &Connection, sender: &Sender<T, D>, source: Uuid, ty: u16, why: &str)
 where
     T: TryFrom<u16> + PartialEq,
     D: From<String>,
 {
-    if let Some(ty) = u16::try_from(ty).ok().and_then(|ty| T::try_from(ty).ok()) {
+    if let Ok(ty) = T::try_from(ty) {
         send(sender, source, ty, why, Status::Binned);
         return;
     }
@@ -759,11 +760,11 @@ fn now() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
-/// A row that cannot be read as a [`Row`]: its id, its `ty` as stored, and why.
-type Unread = (Uuid, i64, String);
+/// A row that cannot be read as a [`Row`]: its id, its `ty`, and why.
+type Unread = (Uuid, u16, String);
 
 /// An `_events` row's id, source, ty, data, `run_at` and status, as stored.
-type Columns = (String, Option<String>, i64, String, Option<String>, i64);
+type Columns = (String, Option<String>, u16, String, Option<String>, i64);
 
 fn columns(r: &rusqlite::Row<'_>) -> rusqlite::Result<Columns> {
     Ok((
@@ -795,7 +796,7 @@ fn parse((id, source, ty, data, run_at, status): Columns) -> Option<Result<Row, 
         Ok(Event {
             id,
             source: source.transpose()?,
-            ty: u16::try_from(ty).map_err(|_| format!("ty {ty} is not the app's"))?,
+            ty,
             data,
             run_at: run_at.transpose()?,
             status: status_of(status)
