@@ -249,8 +249,14 @@ where
     T: Copy + Into<u16>,
     D: Serialize,
 {
+    let rows = batch
+        .iter()
+        .map(|e| Ok((e, serde_json::to_string(&e.data)?)));
+    let rows = rows
+        .collect::<serde_json::Result<Vec<_>>>()
+        .map_err(|_| Error::Store)?;
     let tx = conn.transaction().map_err(|_| Error::Store)?;
-    append_in(&tx, batch)?;
+    append_in(&tx, &rows)?;
     tx.commit().map_err(|_| Error::Store)?;
     // The events are kept whether or not the queue is still listening.
     let _ = queue.send(());
@@ -260,10 +266,13 @@ where
 /// Writes `batch` in `tx` with the items `taken` for its 2s, each 2's items inside a savepoint of
 /// their own: a `store` row with `ON CONFLICT DO NOTHING`, so T's own keys decide whether it adds
 /// a row, and any other item with `other`, which gets the 2's source. When T refuses a store row,
-/// by any of its constraints or a value its INTEGER PRIMARY KEY cannot hold, or `other` returns
-/// `Ok(Err(reason))` for an item it cannot write, the savepoint is rolled back and that 2 is not
-/// written: returned in its place is a -1 for its source, its data naming the reason, for the
-/// caller to send. The caller commits.
+/// by any of its constraints or a value its INTEGER PRIMARY KEY cannot hold, or the row holds a
+/// number no INTEGER or REAL holds exactly, or `other` returns `Ok(Err(reason))` for an item it
+/// cannot write, the savepoint is rolled back and that 2 is not written: returned in its place is
+/// a -1 for its source, its data naming the reason, for the caller to send. An event whose data
+/// does not serialize is not written either, nor are a 2's items with it: returned in its place is
+/// a -1 for its source, or for the event itself when it has none, its data `data: ` and serde's
+/// message. The caller commits.
 /// # Errors
 /// `Error::Store` when an event cannot be inserted, `other` returns `Err`, or a store row fails
 /// for a reason other than a constraint, as an item with a `store` key that is not a
@@ -278,8 +287,27 @@ where
     T: Copy + Into<u16>,
     D: Serialize + From<String>,
 {
+    let two_of =
+        |e: &Event<T, D>, source| e.status == Status::Processed && e.source == Some(source);
+    // Each -1 to return: its source, its ty and its reason.
+    let mut binned = Vec::new();
+    let mut rows = Vec::with_capacity(batch.len());
+    for event in batch {
+        match serde_json::to_string(&event.data) {
+            Ok(data) => rows.push((event, data)),
+            // The event cannot be stored: its -1 is for its source, or for itself without one.
+            Err(e) => {
+                let source = event.source.unwrap_or(event.id);
+                binned.push((source, event.ty, format!("data: {e}")));
+            }
+        }
+    }
     let mut refused = Vec::new();
     for (source, items) in taken {
+        // A 2 that cannot be stored has its -1 already, and its items are not written.
+        let Some(&(two, _)) = rows.iter().find(|&&(e, _)| two_of(e, *source)) else {
+            continue;
+        };
         let point = tx.savepoint().map_err(|_| Error::Store)?;
         let written = items.iter().try_for_each(|item| {
             if store_in(&point, item)? {
@@ -292,29 +320,25 @@ where
             Ok(()) => point.commit(),
             Err(Unwritten::Failed) => return Err(Error::Store),
             Err(Unwritten::Refused(reason)) => {
-                refused.push((*source, reason));
+                refused.push(*source);
+                binned.push((*source, two.ty, reason));
                 // A savepoint finishes by rolling back to where it began.
                 point.finish()
             }
         };
         ended.map_err(|_| Error::Store)?;
     }
-    let two_of =
-        |e: &Event<T, D>, source| e.status == Status::Processed && e.source == Some(source);
-    let kept = batch
+    let kept = rows
         .iter()
-        .filter(|e| !refused.iter().any(|(s, _)| two_of(e, *s)));
+        .filter(|(e, _)| !refused.iter().any(|s| two_of(e, *s)));
     append_in(tx, kept)?;
-    let binned = refused.into_iter().filter_map(|(source, reason)| {
-        let two = batch.iter().find(|e| two_of(e, source))?;
-        Some(Event {
-            id: Uuid::nil(),
-            source: Some(source),
-            ty: two.ty,
-            data: D::from(reason),
-            run_at: None,
-            status: Status::Binned,
-        })
+    let binned = binned.into_iter().map(|(source, ty, reason)| Event {
+        id: Uuid::nil(),
+        source: Some(source),
+        ty,
+        data: D::from(reason),
+        run_at: None,
+        status: Status::Binned,
     });
     Ok(binned.collect())
 }
@@ -322,7 +346,8 @@ where
 /// Why a 2's items were not written.
 enum Unwritten {
     /// T refused a store row, by one of its constraints or a value its INTEGER PRIMARY KEY cannot
-    /// hold: `store: ` and the store's message; or the caller's reason for an item it cannot write.
+    /// hold: `store: ` and the store's message; a store row holds a number no INTEGER or REAL
+    /// holds exactly; or the caller's reason for an item it cannot write.
     Refused(String),
     /// Anything else, which fails the batch.
     Failed,
@@ -335,17 +360,27 @@ fn store_in(conn: &Connection, item: &Value) -> Result<bool, Unwritten> {
         return Ok(false);
     }
     let stored = StoreRow::deserialize(item).map_err(|_| Unwritten::Failed)?;
-    let StoreRow::Store { row, .. } = &stored;
-    let values = row.values().map(|value| match value {
-        Value::Null => Sql::Null,
-        Value::Bool(b) => Sql::Integer(i64::from(*b)),
-        Value::Number(n) => n
-            .as_i64()
-            .map_or(Sql::Real(n.as_f64().unwrap_or_default()), Sql::Integer),
-        Value::String(s) => Sql::Text(s.clone()),
-        value => Sql::Text(value.to_string()),
-    });
+    let StoreRow::Store { table, row } = &stored;
     let mut insert = stored.insert(conn).map_err(|_| Unwritten::Failed)?;
+    let values = row.iter().map(|(column, value)| {
+        Ok(match value {
+            Value::Null => Sql::Null,
+            Value::Bool(b) => Sql::Integer(i64::from(*b)),
+            // An integer above i64::MAX, or a number that is neither an integer nor a float, has
+            // no INTEGER or REAL that holds it exactly.
+            Value::Number(n) => n
+                .as_i64()
+                .map(Sql::Integer)
+                .or_else(|| n.as_f64().filter(|_| n.is_f64()).map(Sql::Real))
+                .ok_or_else(|| {
+                    let at = format!("{table}.{column}");
+                    Unwritten::Refused(format!("store: {n} cannot be held exactly: {at}"))
+                })?,
+            Value::String(s) => Sql::Text(s.clone()),
+            value => Sql::Text(value.to_string()),
+        })
+    });
+    let values = values.collect::<Result<Vec<_>, Unwritten>>()?;
     match insert.execute(params_from_iter(values)) {
         Ok(_) => Ok(true),
         // A value an INTEGER PRIMARY KEY cannot hold is a mismatch, not a constraint.
@@ -361,14 +396,14 @@ fn store_in(conn: &Connection, item: &Value) -> Result<bool, Unwritten> {
     }
 }
 
-/// Appends `batch` to `_events` inside `tx`; the caller commits and signals the queue.
-fn append_in<'e, T: Copy + Into<u16> + 'e, D: Serialize + 'e>(
+/// Appends each event, with its data as JSON, to `_events` inside `tx`; the caller commits and
+/// signals the queue.
+fn append_in<'e, T: Copy + Into<u16> + 'e, D: 'e>(
     tx: &Transaction<'_>,
-    batch: impl IntoIterator<Item = &'e Event<T, D>>,
+    rows: impl IntoIterator<Item = &'e (&'e Event<T, D>, String)>,
 ) -> Result<(), Error> {
     let mut insert = tx.prepare(queries::APPEND).map_err(|_| Error::Store)?;
-    for event in batch {
-        let data = serde_json::to_string(&event.data).map_err(|_| Error::Store)?;
+    for (event, data) in rows {
         insert
             .execute(params![
                 event.id.to_string(),
@@ -656,7 +691,8 @@ mod tests {
         let mut store = rannoch_core::forgr::empty_store();
         let tx = store.transaction().unwrap();
 
-        super::append_in(&tx, &[event(Uuid::now_v7()), event(Uuid::now_v7())]).unwrap();
+        let (a, b) = (event(Uuid::now_v7()), event(Uuid::now_v7()));
+        super::append_in(&tx, &[(&a, "{}".to_owned()), (&b, "{}".to_owned())]).unwrap();
         assert_eq!(count(&tx), 2);
         tx.rollback().unwrap();
 
