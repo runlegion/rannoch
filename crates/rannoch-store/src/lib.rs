@@ -1,12 +1,62 @@
-//! The store: opens the app's `SQLite` database against the app's one
+#![warn(missing_docs)]
+//! The store: [`open`] opens the app's `SQLite` database against the app's one
 //! migrator, reports pending migrations and never applies them, and hands
-//! back the connection when none are pending. Core applies them at start
-//! through [`Store`], its implementation of core's `Storage`.
+//! back the connection when none are pending. [`Store`], the store's
+//! implementation of core's `Storage`, applies them; core calls it at start.
 //!
 //! Every connection the store opens has foreign keys on, the WAL journal, a
 //! 64 MiB page cache, automatic checkpoints off and fullfsync on; while a
 //! [`Store`] is alive it checkpoints the WAL once a second from a connection
 //! of its own, never inside an append.
+//!
+//! Rannoch keeps the [`Store`] in its `Config` for as long as it runs. A checkpoint that fails
+//! is logged at `error`, and the store tries again a second later.
+//!
+//! # Failures
+//!
+//! [`open`] fails with `Error::Store` when the database cannot be opened, or when the migrator
+//! cannot plan against it, as with a file that is not a database. Pending migrations are not a
+//! failure: [`open`] returns [`Opened::Pending`] with their versions and no connection.
+//!
+//! # Example
+//!
+//! The first two steps of starting rannoch: make the store and apply its pending migrations,
+//! then open a connection. [`rannoch_core::Rannoch::open`] makes the same `pending` and `apply`
+//! calls before anything else. The database here is in a new directory under the system's
+//! temporary directory; an app gives its own path.
+//!
+//! ```
+//! use std::error::Error;
+//! use std::fs;
+//!
+//! use rannoch_core::Storage;
+//! use rannoch_store::{Opened, Store};
+//! use uuid::Uuid;
+//!
+//! fn main() -> Result<(), Box<dyn Error>> {
+//!     let dir = std::env::temp_dir().join(Uuid::now_v7().to_string());
+//!     fs::create_dir_all(&dir)?;
+//!     let path = dir.join("app.db");
+//!     let migrator = rannoch_core::migrator();
+//!
+//!     // A new database has every migration pending, so open gives no connection yet.
+//!     let store = Store::new(path.clone(), rannoch_core::migrator());
+//!     assert!(matches!(rannoch_store::open(&path, &migrator)?, Opened::Pending(_)));
+//!     if store.pending()? {
+//!         store.apply()?;
+//!     }
+//!
+//!     let Opened::Ready(conn) = rannoch_store::open(&path, &migrator)? else {
+//!         return Err("a migration is still pending".into());
+//!     };
+//!     let rows: i64 = conn.query_row("SELECT count(*) FROM _events", [], |r| r.get(0))?;
+//!     assert_eq!(rows, 0);
+//!
+//!     drop((conn, store));
+//!     fs::remove_dir_all(&dir)?;
+//!     Ok(())
+//! }
+//! ```
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError};
