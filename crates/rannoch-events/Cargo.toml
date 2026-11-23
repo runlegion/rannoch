@@ -14,6 +14,7 @@ uuid = "1"
 
 [dev-dependencies]
 rannoch-core = { path = "../rannoch-core", features = ["testing"] }
+rannoch-store = { path = "../rannoch-store" }
 uuid = { version = "1", features = ["v7"] }
 
 [lints]

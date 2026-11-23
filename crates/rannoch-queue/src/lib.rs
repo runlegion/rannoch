@@ -1,10 +1,200 @@
+#![warn(missing_docs)]
 //! The queue: when the events crate signals, or when an event comes due, it takes the events at
 //! status 0 that are due and have no status event whose source is them, sends a status 1 for
 //! each, and hands each to its processor: runs, whose flow has no job step, one after another;
 //! jobs, whose flow has a job step, each on a thread of its own. Processors send their own
 //! results; the queue sends only the 1s, a retry when a run fails while its chain has attempts
-//! left, the hunt's resend of a run a crash dropped, and a -1 saying "no processor" for an event
-//! whose `ty` has no flow.
+//! left, the hunt's resend of an event whose 1 has had nothing after it for `window`, and a -1
+//! saying "no processor" for an event whose `ty` has no flow.
+//!
+//! # Taking an event
+//!
+//! The queue runs on a thread of its own. It wakes on each signal, when the earliest `run_at`
+//! among the waiting events comes, and when the hunt is due. For each due event it sends a 1
+//! with the data `"taken"`, then asks [`Flows::flow`] for the event's flow; an event whose `ty`
+//! has no flow gets a -1 with the data `"no processor"` and no retry. When rannoch refuses the
+//! 1, the event stays at 0 and is not run. An event whose `ty` does not convert to the app's `T`
+//! is logged and left at 0. Every status the queue sends goes through the app's
+//! [`rannoch_core::Sender`], so it is written at its inbox's next hand-over, like any other
+//! event.
+//!
+//! # Retries
+//!
+//! A [`Processor`] is handed the event it runs and that event's root, the chain's first event:
+//! the queue walks back from the event through each source that has a -1, counting the failed
+//! attempts as it goes. So a processor whose run fails sends a -1 about the event it ran, then
+//! returns `Err` with the failure's result; rannoch-processor's does. While the chain has
+//! attempts left, the queue then sends a retry: a new event at 0 whose source is the failed one,
+//! whose data is the failure's result, and whose `run_at` is the backoff from now. The backoff
+//! is [`Settings::first_wait`] for the first retry and doubles for each one after it. A chain
+//! gets [`Settings::attempts`] runs in all, the first included; when the last one fails, the
+//! queue sends nothing more.
+//!
+//! # The hunt
+//!
+//! The hunt first runs one [`Settings::hunt`] after the queue starts, then every `hunt`. It looks
+//! for the 1s whose event has no 2 or -1. For each 1 older than [`Settings::window`] with nothing
+//! after it anywhere in its event's tree, it sends a resend: a new event at 0 whose source is the
+//! stalled event and whose data is `"hung"`. The hunt cannot tell a run a crash dropped from one
+//! still going, so a run or job `window` after its 1 is resent, whether it is running or still
+//! waiting its turn.
+//!
+//! The stalled event has a 1 and no -1, so the resend is its own root. rannoch-processor reads
+//! the root's data as the flow's data, which must be a JSON object, so it bins the resend with a
+//! "root data" error, and each retry fails the same way until the chain has had its `attempts`.
+//!
+//! # Stopping
+//!
+//! The queue stops when every sender on its signal channel has dropped. The sender in the append
+//! drops when rannoch shuts down, so a signal sender the app keeps, or an `Arc` of the append it
+//! holds, keeps the queue running and [`Queue::join`] waiting. After
+//! [`rannoch_core::Rannoch::shutdown`], every send fails with `Closed`, the queue's and the
+//! processors' alike, and the queue logs each of its own; a result sent then is not written. So
+//! the app shuts rannoch down once the results it waits for are written, then joins the queue.
+//!
+//! # Example
+//!
+//! Starting rannoch in the order the README gives, against a store in a new directory under the
+//! system's temporary directory, then one page sent, run and shut down. In place of
+//! rannoch-processor's `Processor`, the `Flows` an app with flow documents passes, this app has
+//! a `Flows` of its own: one flow, which sends a 2 for each page it runs.
+//!
+//! ```
+//! use std::error::Error;
+//! use std::fs;
+//! use std::path::Path;
+//! use std::sync::{Arc, mpsc};
+//! use std::thread;
+//! use std::time::{Duration, Instant};
+//!
+//! use rannoch_core::{Config, Event, Rannoch, Sender, Status, Storage};
+//! use rannoch_events::Events;
+//! use rannoch_queue::{Flow, Flows, Queue, Row, Settings};
+//! use rannoch_store::{Opened, Store};
+//! use rusqlite::Connection;
+//! use uuid::Uuid;
+//!
+//! /// The app's event types, written to `_events` as their `u16`.
+//! #[derive(Debug, Clone, Copy, PartialEq)]
+//! enum Ty {
+//!     Page = 1,
+//! }
+//!
+//! impl From<Ty> for u16 {
+//!     fn from(ty: Ty) -> u16 {
+//!         ty as u16
+//!     }
+//! }
+//!
+//! impl TryFrom<u16> for Ty {
+//!     type Error = u16;
+//!     fn try_from(n: u16) -> Result<Self, u16> {
+//!         match n {
+//!             1 => Ok(Ty::Page),
+//!             other => Err(other),
+//!         }
+//!     }
+//! }
+//!
+//! /// The app's flows: one, for pages.
+//! struct Pages(Arc<Flow<Ty, String>>);
+//!
+//! impl Flows<Ty, String> for Pages {
+//!     fn flow(&self, ty: u16) -> Option<Arc<Flow<Ty, String>>> {
+//!         (ty == u16::from(Ty::Page)).then(|| Arc::clone(&self.0))
+//!     }
+//! }
+//!
+//! /// The page flow: a run that sends a 2 about the page it runs.
+//! fn pages() -> Pages {
+//!     Pages(Arc::new(Flow {
+//!         job: false,
+//!         run: Box::new(|event: &Row, _root: &Row, sender: &Sender<Ty, String>| {
+//!             let done = Event {
+//!                 id: Uuid::nil(),
+//!                 source: Some(event.id),
+//!                 ty: Ty::Page,
+//!                 data: "done".to_owned(),
+//!                 run_at: None,
+//!                 status: Status::Processed,
+//!             };
+//!             sender.send(done).map(|_| ()).map_err(|e| e.to_string())
+//!         }),
+//!     }))
+//! }
+//!
+//! /// A connection to the migrated database at `path`.
+//! fn ready(path: &Path) -> Result<Connection, Box<dyn Error>> {
+//!     match rannoch_store::open(path, &rannoch_core::migrator())? {
+//!         Opened::Ready(conn) => Ok(conn),
+//!         Opened::Pending(versions) => Err(format!("migrations pending: {versions:?}").into()),
+//!     }
+//! }
+//!
+//! fn main() -> Result<(), Box<dyn Error>> {
+//!     let dir = std::env::temp_dir().join(Uuid::now_v7().to_string());
+//!     fs::create_dir_all(&dir)?;
+//!     let path = dir.join("app.db");
+//!
+//!     // 1. The store, with its pending migrations applied.
+//!     let store = Arc::new(Store::new(path.clone(), rannoch_core::migrator()));
+//!     if store.pending()? {
+//!         store.apply()?;
+//!     }
+//!
+//!     // 2. A connection for the append, one for the queue, and one for the app's reads.
+//!     let (for_append, for_queue, reads) = (ready(&path)?, ready(&path)?, ready(&path)?);
+//!
+//!     // 3. The app's flows.
+//!     let flows = Arc::new(pages());
+//!
+//!     // 4. The channel the append signals the queue on.
+//!     let (signal, wake) = mpsc::channel();
+//!
+//!     // 5. The append, holding the only signal sender, so the queue stops once it drops.
+//!     let append = Events::new(for_append, signal);
+//!
+//!     // 6. Rannoch, holding the store and the append.
+//!     let rannoch = Rannoch::<Ty, String>::open(Config {
+//!         store: Some(store),
+//!         append: Some(Arc::new(append)),
+//!         ..Config::default()
+//!     })?;
+//!
+//!     // 7. The queue.
+//!     let settings = Settings::new(Duration::from_millis(100));
+//!     let queue = Queue::start(for_queue, wake, rannoch.sender(), flows, settings);
+//!
+//!     // A producer sends a page.
+//!     let page = Event {
+//!         id: Uuid::nil(),
+//!         source: None,
+//!         ty: Ty::Page,
+//!         data: "/about".to_owned(),
+//!         run_at: None,
+//!         status: Status::Added,
+//!     };
+//!     rannoch.sender().send(page)?;
+//!
+//!     // The page, the queue's 1 and the flow's 2 are each written at a hand-over.
+//!     let written = [(Status::Added, 1), (Status::InProgress, 1), (Status::Processed, 1)];
+//!     let start = Instant::now();
+//!     while rannoch_queue::report(&reads)? != written {
+//!         if start.elapsed() > Duration::from_secs(10) {
+//!             return Err("the page was not processed".into());
+//!         }
+//!         thread::sleep(Duration::from_millis(20));
+//!     }
+//!
+//!     // Shutdown drops the append, and with it the signal sender, so the queue stops.
+//!     rannoch.shutdown();
+//!     queue.join();
+//!
+//!     drop(reads);
+//!     fs::remove_dir_all(&dir)?;
+//!     Ok(())
+//! }
+//! ```
 
 mod queries;
 
@@ -24,7 +214,8 @@ pub type Row = Event<u16, String>;
 
 /// A processor: handed the event it runs, that event's root and a sender, it sends its own
 /// result about the event it runs, and tells the queue whether the run failed, with the
-/// failure's result, so the queue can retry it.
+/// failure's result, so the queue can retry it. A run that fails sends its -1 before it returns
+/// `Err`: the queue counts a chain's attempts by its -1s.
 pub type Processor<T, D> =
     Box<dyn Fn(&Row, &Row, &Sender<T, D>) -> Result<(), String> + Send + Sync>;
 
@@ -35,15 +226,16 @@ pub struct Settings {
     pub attempts: u32,
     /// The backoff's first wait; each later wait doubles it.
     pub first_wait: Duration,
-    /// How old a 1 with nothing after it must be before the hunt sends its event again; 20
-    /// minutes by default.
+    /// How old a 1 with nothing after it must be before the hunt sends a resend for its event,
+    /// whether its run was dropped or is still going; 20 minutes by default.
     pub window: Duration,
     /// How often the hunt runs; one hour by default.
     pub hunt: Duration,
 }
 
 impl Settings {
-    /// The settings with `first_wait` and the default attempts.
+    /// The settings with `first_wait`, and the defaults for the rest: 10 attempts, a 20-minute
+    /// window and a hunt every hour.
     #[must_use]
     pub fn new(first_wait: Duration) -> Self {
         Self {
@@ -85,7 +277,10 @@ pub struct Queue {
 }
 
 impl Queue {
-    /// Starts the queue over `conn`, woken by `signal`, sending through `sender`.
+    /// Starts the queue over `conn`, woken by `signal`, sending through `sender`, on a thread of
+    /// its own. `T` is the app's `ty`, read back from its `u16` in `_events`; `D` is the app's
+    /// data, made from text: the queue's own, such as `"taken"`, and a failed run's result for a
+    /// retry.
     #[must_use]
     pub fn start<T, D>(
         conn: Connection,
@@ -103,7 +298,9 @@ impl Queue {
         }
     }
 
-    /// Waits until the queue has stopped and every run and job it started has finished.
+    /// Waits until the queue has stopped and every run and job it started has finished. The
+    /// queue stops only once every sender on its signal channel has dropped, so a sender still
+    /// alive keeps this waiting.
     pub fn join(self) {
         let _ = self.thread.join();
     }
@@ -344,7 +541,7 @@ fn after(conn: &Connection, event: Uuid, one: Uuid) -> rusqlite::Result<bool> {
 }
 
 /// The queue's report: the number of `_events` rows at each status, in status order, over the
-/// app's store connection `conn`.
+/// app's store connection `conn`. Only the statuses that have rows appear.
 ///
 /// # Errors
 ///
