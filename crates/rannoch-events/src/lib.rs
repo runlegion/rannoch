@@ -1,5 +1,103 @@
+#![warn(missing_docs)]
 //! The events crate: it owns `_events`, appends each batch to it in one
 //! write, and signals the queue once that write has committed.
+//!
+//! [`Events`] is the append an app puts in core's `Config`: each inbox hands it its batches.
+//! Each event becomes one `_events` row with its fields as given: `id` and `source` as text,
+//! `ty` as its `u16`, `data` as its JSON from serde, `run_at` as RFC 3339 in UTC to the
+//! millisecond, and `status` as its int. This crate only inserts rows; it updates and deletes
+//! none.
+//!
+//! The append signals once for each batch it commits, whether or not the queue still listens.
+//! The receiver is the queue's: rannoch-queue's `Queue` stops once every sender on that channel
+//! has dropped, and the sender in an [`Events`] drops when that `Events` does.
+//!
+//! [`append_in`] writes a batch inside the caller's transaction, for an append that writes rows
+//! of its own in the same commit, as rannoch-graph's `GraphAppend` does.
+//!
+//! # Failures
+//!
+//! A batch is written whole or not at all. When an event's `data` does not serialize, or a row
+//! cannot be inserted, as with an id already in `_events`, the append fails with
+//! `Error::Store`, writes nothing, and sends no signal.
+//!
+//! # Example
+//!
+//! The append on its own, over a store migrated as in rannoch-store's example: a batch written
+//! and signalled, then a batch that fails whole. Through rannoch, an inbox makes these calls and
+//! sets each id at accept; called directly, the append writes the ids it is given.
+//!
+//! ```
+//! use std::error::Error;
+//! use std::fs;
+//! use std::path::Path;
+//! use std::sync::mpsc;
+//!
+//! use rannoch_core::{Append, Event, Status, Storage};
+//! use rannoch_events::Events;
+//! use rannoch_store::{Opened, Store};
+//! use rusqlite::Connection;
+//! use serde_json::json;
+//! use uuid::Uuid;
+//!
+//! /// The app's event types, written to `_events` as their `u16`.
+//! #[derive(Debug, Clone, Copy)]
+//! enum Ty {
+//!     Page = 1,
+//! }
+//!
+//! impl From<Ty> for u16 {
+//!     fn from(ty: Ty) -> u16 {
+//!         ty as u16
+//!     }
+//! }
+//!
+//! /// A connection to the migrated database at `path`.
+//! fn ready(path: &Path) -> Result<Connection, Box<dyn Error>> {
+//!     match rannoch_store::open(path, &rannoch_core::migrator())? {
+//!         Opened::Ready(conn) => Ok(conn),
+//!         Opened::Pending(versions) => Err(format!("migrations pending: {versions:?}").into()),
+//!     }
+//! }
+//!
+//! fn main() -> Result<(), Box<dyn Error>> {
+//!     let dir = std::env::temp_dir().join(Uuid::now_v7().to_string());
+//!     fs::create_dir_all(&dir)?;
+//!     let path = dir.join("app.db");
+//!     let store = Store::new(path.clone(), rannoch_core::migrator());
+//!     if store.pending()? {
+//!         store.apply()?;
+//!     }
+//!
+//!     let (signal, wake) = mpsc::channel();
+//!     let events = Events::new(ready(&path)?, signal);
+//!     let page = |id| Event {
+//!         id,
+//!         source: None,
+//!         ty: Ty::Page,
+//!         data: json!({ "url": "/about" }),
+//!         run_at: None,
+//!         status: Status::Added,
+//!     };
+//!
+//!     // One batch, one write, one signal.
+//!     let first = Uuid::now_v7();
+//!     events.append(&[page(first)])?;
+//!     wake.try_recv()?;
+//!
+//!     // A batch holding an id already written fails whole: nothing written, no signal.
+//!     let failed = events.append(&[page(Uuid::now_v7()), page(first)]);
+//!     assert_eq!(failed, Err(rannoch_core::Error::Store));
+//!     assert!(wake.try_recv().is_err());
+//!
+//!     let rows: i64 = ready(&path)?.query_row("SELECT count(*) FROM _events", [], |r| r.get(0))?;
+//!     assert_eq!(rows, 1);
+//!
+//!     drop((events, store));
+//!     fs::remove_dir_all(&dir)?;
+//!     Ok(())
+//! }
+//! ```
 
 mod queries;
 
