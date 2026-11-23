@@ -1886,44 +1886,54 @@ fn a_failed_run_is_retried_with_backoff_and_an_event_with_no_flow_gets_no_proces
 
 #[test]
 fn after_shutdown_a_send_is_closed_and_join_waits_for_signal_senders_and_runs() {
-    // Given a store with a backlog of payments, each at 0 with nothing after it
-    let path = database("after_shutdown").unwrap();
-    migrated(&path).unwrap();
-    let mut seed = ready(&path).unwrap();
-    seed.execute_batch(PAYMENTS).unwrap();
-    let tx = seed.transaction().unwrap();
-    for i in 0..BACKLOG {
-        let data = json!({ "order": format!("o{i}"), "amount": i }).to_string();
-        let row = _events::factory().id(Uuid::now_v7().to_string()).ty(86);
-        row.data(data).status(0).insert(&tx).unwrap();
-    }
-    tx.commit().unwrap();
+    // Given an app whose payment flow's step stores each payment's row, and the processor's writes
+    // held, so a payment's run cannot put its row there and finish until they are let go
+    let app = App::built_in("after_shutdown", &built_in().unwrap()).unwrap();
+    app.read.execute_batch(PAYMENTS).unwrap();
+    let writes = app.processor.writes();
+    let holding = writes.lock().unwrap();
 
-    // And an app whose queue takes them as it starts and runs them one after another
-    let app = App::built_in_at(path, &built_in().unwrap(), Config::default()).unwrap();
-    let twos = "SELECT count(*) FROM _events WHERE status = 2";
-    assert!(until(WAIT, || app.count(twos) > 0));
+    // And payments the queue has taken: each 1 is on disk, so each run is the queue's, held
+    let data = |i: i64| json!({ "order": format!("o{i}"), "amount": i * 10 });
+    let paid: Vec<Uuid> = (0..3).map(|i| app.hand(86, &data(i)).unwrap()).collect();
+    for event in &paid {
+        assert!(until(WAIT, || app.statuses(*event) == [1]));
+    }
 
     // When the app shuts rannoch down while they run, and drops its signal sender
     let sender = app.rannoch.sender();
     app.rannoch.shutdown();
-    let held = || app.processor.writes().lock().map_or(0, |w| w.len());
     drop(app.signal);
-    let at_drop = held();
+    let at_drop = holding.len();
 
     // Then a send returns Closed
     let late = sender.send(event(82, &json!({ "ticket": "late" })));
     assert_eq!(late, Err(Error::Closed));
 
-    // And join returns once the runs the queue started have finished: runs went on after the
-    // drop, and none after join, each keeping the row its 2 could not carry. This needs the
-    // backlog's runs still pending at shutdown, 20 ms in with 5,000 to run; `at_join > at_drop`
-    // checks that they were.
-    app.queue.join().unwrap();
+    // And join does not return while the runs the queue started are going
+    let (returned, done) = mpsc::channel();
+    let queue = app.queue;
+    let waiting = thread::spawn(move || {
+        queue.join().unwrap();
+        let _ = returned.send(());
+    });
+    let kept = done.recv_timeout(Duration::from_millis(300));
+    assert!(kept.is_err(), "a run still going keeps join waiting");
+
+    // And returns once they have finished: each ran after the drop and none after join, each
+    // keeping the row its 2 could not carry
+    drop(holding);
+    assert!(done.recv_timeout(WAIT).is_ok());
+    waiting.join().unwrap();
+    let held = || writes.lock().map_or(0, |w| w.len());
     let at_join = held();
     thread::sleep(Duration::from_millis(300));
     assert_eq!(held(), at_join, "a run went on after join returned");
-    assert!(at_join > at_drop, "the runs were done before the drop");
+    assert_eq!(
+        (at_drop, at_join),
+        (0, paid.len()),
+        "the runs ran after the drop"
+    );
 
     // Given another app, with nothing running, that shuts rannoch down and keeps its signal
     // sender
