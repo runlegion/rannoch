@@ -364,7 +364,7 @@ impl<T: TryFrom<u16> + PartialEq + 'static, D: From<Value> + 'static> Processor<
             let (docs, conn, seen, writes) =
                 (docs.clone(), conn.clone(), seen.clone(), writes.clone());
             let process = move |event: &Row, root: &Row, sender: &Sender<T, D>| {
-                let (id, at, mut graph) = (event.id, (event.id, event.ty), Vec::new());
+                let (id, at, mut graph) = (event.id, (root.id, event.ty), Vec::new());
                 let ty = |ty| T::try_from(ty).map_err(|_| format!("ty {ty} is not the app's"));
                 let sends = serde_json::from_str(&root.data)
                     .map_err(|e| format!("root data: {e}"))
@@ -458,7 +458,8 @@ fn waits_for(
     conn.prepare_cached(sql)?.query_map([ty], row)?.collect()
 }
 
-/// What `id` of `ty` sends about waits as (source, ty, data, delay), and its 2's data.
+/// What an event of `ty` whose root is `id` sends about waits as (source, ty, data, delay), and
+/// its 2's data.
 #[expect(clippy::type_complexity, reason = "a next with its source")]
 fn waits<'d>(
     conn: &Connection,
@@ -476,7 +477,11 @@ fn waits<'d>(
         let fits = |wait: &Wait| due.map_or(eval(&wait.key, data) == w["key"], |_| wait_id == id);
         let is = |n: &&Next| matches!(n, Next::Wait { wait: x } if Some(x.for_ty) == ty && fits(x));
         if let Some(Next::Wait { wait }) = docs.iter().filter_map(at).find(is) {
-            let zeros = rows.iter().filter(|r| r.0 == 0).count();
+            // The wait's nexts are objects; the queue's retry and the hunt's resend are strings.
+            let zeros = rows
+                .iter()
+                .filter(|r| r.0 == 0 && r.1.starts_with('{'))
+                .count();
             let two = rows.iter().find(|r| r.0 == 2).map(|r| r.1.as_str());
             let to = match (due.is_some(), answered.contains(&wait_id), zeros, two) {
                 (true, false, 0, _) => Some(&wait.timeout).inspect(|_| said = "timeout"),

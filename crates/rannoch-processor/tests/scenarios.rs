@@ -801,3 +801,100 @@ fn the_hunts_resend_runs_the_dropped_events_flow_on_its_data() {
 
     app.stop();
 }
+
+/// An id `secs` seconds ago.
+fn ago(secs: i64) -> Uuid {
+    let at = u64::try_from(Utc::now().timestamp() - secs).unwrap_or_default();
+    Uuid::new_v7(uuid::Timestamp::from_unix(uuid::NoContext, at, 0))
+}
+
+/// A store at `path` holding o9's wait, as the order flow keeps it, two hours old with a 1 after
+/// it, then each of `about` as (seconds ago, status, data) with the wait as its source; the
+/// wait's id.
+fn waiting(path: &Path, about: &[(i64, i64, Value)]) -> Result<Uuid> {
+    migrated(path)?;
+    let seed = ready(path)?;
+    let wait = ago(7200);
+    let data = json!({ "$wait": { "step": 0, "for": 71 }, "key": "o9", "vals": { "order": "o9" } });
+    _events::factory()
+        .id(wait.to_string())
+        .ty(70)
+        .data(data.to_string())
+        .status(0)
+        .insert(&seed)?;
+    let taken = (5400, 1, json!("taken"));
+    for (secs, status, data) in std::iter::once(&taken).chain(about) {
+        _events::factory()
+            .id(ago(*secs).to_string())
+            .source(wait.to_string())
+            .ty(70)
+            .data(data.to_string())
+            .status(*status)
+            .insert(&seed)?;
+    }
+    Ok(wait)
+}
+
+/// Not a scenario: #91. The hunt's resend of a wait a crash dropped sends the wait's timeout.
+#[test]
+fn a_wait_the_hunt_resends_sends_its_timeout_once_and_its_2_says_timeout() {
+    // Given a store with o9's wait, whose 1 is on disk with nothing after it, as a crash leaves it
+    let path = database("a_wait_the_hunt_resends").unwrap();
+    let wait = waiting(&path, &[]).unwrap();
+
+    // When the queue starts with a hunt that runs soon
+    let settings = Settings {
+        attempts: 1,
+        window: Duration::from_mins(1),
+        hunt: Duration::from_millis(300),
+        ..Settings::new(Duration::from_millis(100))
+    };
+    let app = App::open_with(path, settings).unwrap();
+
+    // Then the hunt resends the wait
+    let resend = app.retry(wait);
+    assert_eq!(app.sent(wait, 0).first(), Some(&(70, json!("hung"))));
+
+    // And the resend sends the wait's timeout once, with the wait as its source, and its 2 says
+    // "timeout"
+    assert!(until(WAIT, || app
+        .statuses(resend)
+        .iter()
+        .any(|s| *s == 2 || *s == -1)));
+    thread::sleep(Duration::from_millis(200));
+    let timeout = (73, json!({ "order": "o9" }));
+    assert_eq!(app.sent(wait, 0), [(70, json!("hung")), timeout]);
+    assert_eq!(app.sent(resend, 2), [(70, json!("timeout"))]);
+    assert_eq!(app.statuses(resend), [1, 2]);
+
+    app.stop();
+}
+
+/// Not a scenario: #91. The queue's retry of a wait whose run failed sends the wait's timeout.
+#[test]
+fn a_wait_the_queue_retries_sends_its_timeout_once_and_its_2_says_timeout() {
+    // Given a store with o9's wait, whose run failed, and the queue's retry of it
+    let path = database("a_wait_the_queue_retries").unwrap();
+    let failed = json!("database is locked");
+    let about = [(5000, -1, failed.clone()), (4800, 0, failed.clone())];
+    let wait = waiting(&path, &about).unwrap();
+
+    // When the queue starts and takes the retry
+    let app = App::open(path, 3).unwrap();
+    app.signal.send(()).unwrap();
+    let retry = app.retry(wait);
+
+    // Then the retry sends the wait's timeout once, with the wait as its source, and its 2 says
+    // "timeout"
+    assert!(until(WAIT, || app
+        .statuses(retry)
+        .iter()
+        .any(|s| *s == 2 || *s == -1)));
+    thread::sleep(Duration::from_millis(200));
+    let timeout = (73, json!({ "order": "o9" }));
+    assert_eq!(app.sent(wait, 0), [(70, failed), timeout]);
+    assert_eq!(app.sent(retry, 2), [(70, json!("timeout"))]);
+    assert_eq!(app.statuses(retry), [1, 2]);
+
+    app.stop();
+}
