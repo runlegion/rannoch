@@ -1303,8 +1303,23 @@ fn the_hunt_resends_an_event_a_crash_dropped() {
 
 // #92: the README's "What you can rely on" and "How it fails", each item through the real store,
 // rannoch, `Events`, the queue and rannoch-processor, on `BUILT_IN`'s flows of `emit` and `store`.
-// An item a scenario above already drives is not driven again; `GraphAppend`'s items are in
-// rannoch-graph's scenarios. Not driven, and why:
+// An item a scenario above already drives is not driven again; `GraphAppend` writing a batch
+// whole and a 2 with its `store` row are in rannoch-graph's scenarios. A payment whose row names
+// an order the store does not have stands in for the README's batch that can never be written,
+// a `$graph` item that is not an op, which no built-in step gives.
+//
+// No built-in step gives a graph op, so rannoch-graph tests its own rows and reads:
+// - "Reads are decided by ids and stamps": in crates/rannoch-graph/src/lib.rs, `fr_rannoch_123_c2`
+//   shows the greater event id wins whichever event is applied first; `fr_rannoch_123_c3` that as
+//   of T leaves out a row written after T by an event accepted before it; `fr_rannoch_123_c4` a
+//   correction and a retraction now, as of T, and `why` returning the event and its sources.
+// - "An event's 2 and its graph rows commit together": `fr_rannoch_123_c10` in rannoch-graph's
+//   scenarios shows every event with its 2 through the real queue has its rows, stamped with the
+//   event; `fr_rannoch_123_c1` that applying the same events again adds no row and moves no
+//   stamp; and `fr_rannoch_123_c4` that a new event whose source is an earlier one, as a retry or
+//   a resend is, adds its row beside the earlier event's.
+//
+// Not driven, and why:
 // - A process that dies before its batch commits loses it, and a second process: a scenario
 //   cannot kill its own process or start another. The first scenario below shows the events are
 //   not on disk until then; a second app over the same file stands in for a second process, since
@@ -1312,8 +1327,6 @@ fn the_hunt_resends_an_event_a_crash_dropped() {
 // - A heap with "no size limit", a hand-over tried again "with no limit", a kept signal sender
 //   making `join` wait "for good": a scenario sees them for as long as it watches.
 // - `join` waiting for a job: no built-in step is a job, so `check` makes no flow of them one.
-// - A graph row keyed by the event that wrote it, and every read of rannoch-graph: no built-in
-//   step gives a graph op; `store` gives a row of the app's table, keyed by that table's keys.
 
 impl App {
     /// Sends an event of `ty` with `data` through rannoch, as a producer does.
