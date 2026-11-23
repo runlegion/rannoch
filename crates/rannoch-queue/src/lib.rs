@@ -70,7 +70,8 @@
 //! [`rannoch_core::Rannoch::shutdown`], every send fails with `Closed`, the queue's and the
 //! processors' alike, and the queue logs each of its own; a result sent then is not written. So
 //! the app shuts rannoch down once the results it waits for are written, then joins the queue.
-//! [`Queue::join`] returns `Error::Queue` when the queue's thread panicked.
+//! [`Queue::join`] returns `Error::Queue` when the queue's thread panicked; the runs and jobs it
+//! started may then still be going.
 //!
 //! # Example
 //!
@@ -326,7 +327,8 @@ impl Queue {
     /// # Errors
     ///
     /// `Error::Queue` when the queue's thread panicked, as a panic in the app's [`Flows::flow`]
-    /// makes it.
+    /// makes it. It then has not waited for the runs and jobs the queue started, which may still
+    /// be going.
     pub fn join(self) -> Result<(), Error> {
         self.thread.join().map_err(|_| Error::Queue)
     }
