@@ -1,3 +1,3 @@
 [workspace]
 resolver = "3"
-members = ["app", "proc-text"]
+members = ["app", "proc-text", "onto-pay", "pay-app"]

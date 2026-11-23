@@ -1,0 +1,1 @@
+{"up": [{"op": "create_table", "table": "payments", "columns": [{"name": "order_id", "type": "TEXT", "primary_key": 1}, {"name": "amount", "type": "INTEGER"}]}]}

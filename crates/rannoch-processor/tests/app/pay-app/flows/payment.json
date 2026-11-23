@@ -1,0 +1,3 @@
+{"name": "payment", "ty": 1, "takes": {"order": "string", "amount": "number"},
+  "steps": [{"do": "store", "with": {"store": {"table": "payments",
+    "row": {"order_id": "$order", "amount": "$amount"}}}}]}

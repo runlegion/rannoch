@@ -304,6 +304,8 @@ use rusqlite::{CachedStatement, Connection, OptionalExtension, Params, Result, p
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
+/// Where this crate's migratr migrations directory is, for the app's `build.rs`.
+pub const MIGRATIONS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/migrations");
 
 pub use describe::{Opts, describe};
 pub use hoods::Hoods;
