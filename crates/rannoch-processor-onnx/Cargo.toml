@@ -24,5 +24,10 @@ rannoch-store = { path = "../rannoch-store" }
 rusqlite = { version = "0.41", features = ["bundled"] }
 uuid = { version = "1", features = ["v7"] }
 
+[[example]]
+name = "fixture"
+path = "tests/fixtures/generate.rs"
+required-features = ["tract"]
+
 [lints]
 workspace = true
