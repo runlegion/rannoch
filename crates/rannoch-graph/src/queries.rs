@@ -31,6 +31,20 @@ pub(crate) const IN: &str =
     "SELECT src, props, event, written, retracted FROM _edges WHERE dst = ?1 AND name = ?2
     AND (?3 IS NULL OR written <= ?3) ORDER BY src, event DESC";
 
+/// The nodes reached from ?1 in at most ?2 hops as of ?3, over the current edges named in the
+/// JSON arrays ?4 (forwards) and ?5 (backwards), each at its fewest hops, nearest first, at
+/// most ?6.
+pub(crate) const WALK: &str = "WITH RECURSIVE w(node, depth) AS (SELECT ?1, 0
+    UNION SELECT e.dst, w.depth + 1 FROM w JOIN _edges e ON e.src = w.node
+    WHERE w.depth < ?2 AND e.name IN (SELECT value FROM json_each(?4)) AND e.retracted = 0
+    AND (?3 IS NULL OR e.written <= ?3) AND e.event = (SELECT max(f.event) FROM _edges f
+    WHERE f.src = e.src AND f.name = e.name AND f.dst = e.dst AND (?3 IS NULL OR f.written <= ?3))
+    UNION SELECT e.src, w.depth + 1 FROM w JOIN _edges e ON e.dst = w.node
+    WHERE w.depth < ?2 AND e.name IN (SELECT value FROM json_each(?5)) AND e.retracted = 0
+    AND (?3 IS NULL OR e.written <= ?3) AND e.event = (SELECT max(f.event) FROM _edges f
+    WHERE f.src = e.src AND f.name = e.name AND f.dst = e.dst AND (?3 IS NULL OR f.written <= ?3)))
+    SELECT node, min(depth) AS d FROM w WHERE node <> ?1 GROUP BY node ORDER BY d, node LIMIT ?6";
+
 /// An event, then its source chain through `_events`.
 pub(crate) const WHY: &str = "WITH RECURSIVE c(id, source, depth) AS (
     SELECT id, source, 0 FROM _events WHERE id = ?1

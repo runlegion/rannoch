@@ -7,8 +7,8 @@
 //! rannoch-processor holds the list in its [`Writes`] under the id of the event the flow ran on,
 //! and [`GraphAppend`], the app's [`Append`], writes the rows in the same transaction as that
 //! event's 2, each row stamped with the event. Reads take a connection to the same file:
-//! [`prop`], [`props`], [`history`], [`edges`] and [`why`] read rows, [`describe`] shapes a node,
-//! and [`Hoods`] keeps a describe warm.
+//! [`prop`], [`props`], [`history`], [`edges`] and [`why`] read rows, [`walk`] follows named edges
+//! out from a node, [`describe`] shapes a node, and [`Hoods`] keeps a describe warm.
 //!
 //! # Example
 //!
@@ -167,6 +167,13 @@
 //!   through `_events`: its source, that event's source, and so on. It reads now only, and
 //!   returns an empty list when the key has no current row.
 //!
+//! # Walk: the nodes a node reaches
+//!
+//! [`walk`] follows named edges out from a node: each name in `via` follows its edges forwards,
+//! and `name<-` backwards. It reads the current edges as of `at`, goes at most `hops` steps, and
+//! returns each node it reaches, the root left out, once with its fewest hops: nearest first,
+//! then in node-id order, at most `cap` of them, and whether the cap cut the walk.
+//!
 //! # Describe: a node by a shape
 //!
 //! [`describe`] returns a node shaped by a shape, a JSON list whose items say what to read:
@@ -281,6 +288,9 @@
 mod describe;
 mod hoods;
 mod queries;
+mod walk;
+
+pub use walk::walk;
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, PoisonError, mpsc::Sender};
