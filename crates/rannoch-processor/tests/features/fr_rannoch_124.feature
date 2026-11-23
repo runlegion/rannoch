@@ -1,4 +1,4 @@
-# Generated from FR-RANNOCH-124 (revision 2). Do not hand-edit.
+# Generated from FR-RANNOCH-124 (revision 4). Do not hand-edit.
 Feature: rannoch-processor has two built-in steps, emit and store, that never reach outside rannoch
 
   @module-rannoch-processor @criterion-FR-RANNOCH-124-c1 @criterion-FR-RANNOCH-124-c2
