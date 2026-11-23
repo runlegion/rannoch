@@ -12,31 +12,36 @@
 //!
 //! ```
 //! use std::sync::Arc;
+//! use std::sync::atomic::{AtomicUsize, Ordering};
 //!
 //! use rannoch_processor::{Action, Sig};
 //! use rannoch_processor_agent::{Agent, AgentAction};
 //! use serde_json::{Map, Value, json};
 //!
-//! /// The app's agent; this one rates every text 2.
-//! struct Rater;
+//! /// The app's agent; this one rates every text 2, and counts its calls.
+//! struct Rater(AtomicUsize);
 //!
 //! impl Agent for Rater {
 //!     fn ask(&self, _input: &Map<String, Value>) -> Result<Map<String, Value>, String> {
+//!         self.0.fetch_add(1, Ordering::SeqCst);
 //!         Ok(Map::from_iter([("severity".to_owned(), json!(2))]))
 //!     }
 //! }
 //!
 //! let sig: Sig = serde_json::from_value(json!({ "action": "rate", "job": true,
 //!     "takes": { "text": "string" }, "gives": { "severity": "number" } }))?;
-//! let rate = AgentAction::new(sig, Arc::new(Rater));
-//!
-//! let input = Map::from_iter([("text".to_owned(), json!("it crashed"))]);
-//! assert_eq!(rate.run(&json!({}), &input)?["severity"], json!(2));
+//! let rater = Arc::new(Rater(AtomicUsize::new(0)));
+//! let rate = AgentAction::new(sig, rater.clone());
 //!
 //! // Input that does not fit the agent's takes fails the step without asking the agent.
 //! let input = Map::from_iter([("text".to_owned(), json!(5))]);
 //! let failure = "agent rate input gave text as number, it declares string";
 //! assert_eq!(rate.run(&json!({}), &input), Err(failure.to_owned()));
+//! assert_eq!(rater.0.load(Ordering::SeqCst), 0);
+//!
+//! let input = Map::from_iter([("text".to_owned(), json!("it crashed"))]);
+//! assert_eq!(rate.run(&json!({}), &input)?["severity"], json!(2));
+//! assert_eq!(rater.0.load(Ordering::SeqCst), 1);
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 

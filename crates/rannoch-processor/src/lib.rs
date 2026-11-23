@@ -159,8 +159,9 @@
 //!
 //! - `on`, required: the name of the field to branch on, a bare name and not a shape
 //!   expression. An absent field is null.
-//! - `cases`, required, and may be empty: the [`Case`]s, in order. A case's `when` is a JSON
-//!   value, and its `next` a [`To`].
+//! - `cases`, required, and may be empty: the [`Case`]s, in order. A case has two fields:
+//!   - `when`, required: a JSON value.
+//!   - `next`, required: a [`To`].
 //! - `else`, required: the [`To`] sent when no case's `when` equals the field's value.
 //!
 //! The first case whose `when` equals the field's value sends its `next`. The comparison is of
@@ -203,14 +204,15 @@
 //!   part as its text, any other value as its JSON text, so the number `2` adds `2` and null adds
 //!   `null`.
 //! - `{"$": <expression>, "or": <default>}`: the expression's value, or the default when that
-//!   value is null, as it is for an absent field. Without `or`, null.
+//!   value is null, as it is for an absent field. Without `or`, a null value stays null.
 //! - `"$item"`, in a `To` with `each`: the item.
 //! - `"$got.<field>"`, in a wait's `next` and `late`: that field of the matching event's data.
 //! - Anything else, an object without `$concat` or `$` included, is itself.
 //!
-//! `check` types each expression with [`type_expr`]: a `"$field"` has the field's type in scope,
-//! `$concat` gives `string`, and `{"$": .., "or": ..}` gives the field's type, or the default's
-//! when the field is not in scope. `"$item"` has the type of the list's items, and
+//! `check` types the wait key, and each shape field the receiving flow takes, with
+//! [`type_expr`]: a `"$field"` has the field's type in scope, `$concat` gives `string`, and
+//! `{"$": .., "or": ..}` gives the inner expression's type, or `type_of` the default when the
+//! expression names something not in scope. `"$item"` has the type of the list's items, and
 //! `"$got.<field>"` the type the flow for `for` takes the field as.
 //!
 //! # Shape types
@@ -295,9 +297,9 @@ pub struct Sig {
     /// to give, of that type; empty by default.
     #[serde(default)]
     pub takes: Shape,
-    /// The fields and types the action's output holds. `check` adds them to the scope, and the
-    /// processor fails the step when an output lacks one or holds it as another type; empty by
-    /// default.
+    /// The fields and types the action's output holds. `check` adds them to the step's scope;
+    /// after a step with `as`, only the `as` field, as `any`. The processor fails the step when
+    /// an output lacks one or holds it as another type; empty by default.
     #[serde(default)]
     pub gives: Shape,
     /// Whether the action is long-running work; `false` by default. `check` reads it from the
