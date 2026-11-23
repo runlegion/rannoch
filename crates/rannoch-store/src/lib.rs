@@ -9,14 +9,16 @@
 //! [`Store`] is alive it checkpoints the WAL once a second from a connection
 //! of its own, never inside an append.
 //!
-//! Rannoch keeps the [`Store`] in its `Config` for as long as it runs. A checkpoint that fails
-//! is logged at `error`, and the store tries again a second later.
+//! Rannoch keeps the [`Store`] in its `Config` for as long as it runs. A checkpoint query that
+//! fails is logged at `error`; when the checkpointer cannot open its connection, nothing is
+//! logged. Either way it tries again a second later.
 //!
 //! # Failures
 //!
-//! [`open`] fails with `Error::Store` when the database cannot be opened, or when the migrator
-//! cannot plan against it, as with a file that is not a database. Pending migrations are not a
-//! failure: [`open`] returns [`Opened::Pending`] with their versions and no connection.
+//! [`open`] fails with `Error::Store` when the database cannot be opened with the store's
+//! pragmas, as with a file that is not a database, or when the migrator cannot plan against it.
+//! Pending migrations are not a failure: [`open`] returns [`Opened::Pending`] with their versions
+//! and no connection.
 //!
 //! # Example
 //!

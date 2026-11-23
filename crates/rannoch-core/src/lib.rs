@@ -53,8 +53,8 @@
 //! }
 //!
 //! fn main() -> Result<(), Error> {
-//!     // Assets go to an inbox that hands over every half second; every other ty goes to the
-//!     // default inbox.
+//!     // Assets go to an inbox with a half-second interval; every other ty goes to the default
+//!     // inbox.
 //!     let assets = InboxConfig {
 //!         name: "assets".to_owned(),
 //!         types: vec![Ty::Asset],

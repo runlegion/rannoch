@@ -36,8 +36,8 @@
 //! for the 1s whose event has no 2 or -1. For each 1 older than [`Settings::window`] with nothing
 //! after it anywhere in its event's tree, it sends a resend: a new event at 0 whose source is the
 //! stalled event and whose data is `"hung"`. The hunt cannot tell a run a crash dropped from one
-//! still going, so a run or job still going, or still waiting its turn, `window` after its 1 is
-//! resent while it runs.
+//! still going, so a run or job `window` after its 1 is resent, whether it is running or still
+//! waiting its turn.
 //!
 //! The stalled event has a 1 and no -1, so the resend is its own root. rannoch-processor reads
 //! the root's data as the flow's data, which must be a JSON object, so it bins the resend with a
@@ -279,7 +279,8 @@ pub struct Queue {
 impl Queue {
     /// Starts the queue over `conn`, woken by `signal`, sending through `sender`, on a thread of
     /// its own. `T` is the app's `ty`, read back from its `u16` in `_events`; `D` is the app's
-    /// data, made from the queue's own text, such as `"taken"`, for the statuses it sends.
+    /// data, made from text: the queue's own, such as `"taken"`, and a failed run's result for a
+    /// retry.
     #[must_use]
     pub fn start<T, D>(
         conn: Connection,
