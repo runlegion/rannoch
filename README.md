@@ -47,6 +47,33 @@ Producers send events with `Sender::send`. To stop, drop any signal sender the a
 
 [`crates/rannoch-graph/tests/scenarios.rs`](crates/rannoch-graph/tests/scenarios.rs) wires steps 2 to 7 against a file store and runs 500 events through a flow whose step gives graph rows. It applies the migrations by opening rannoch once with only its store, and writes its events straight into `_events` with forgr's factory instead of sending them.
 
+## What you can rely on
+
+- **An accepted event is in memory until its inbox hands it over.** `Sender::send` gives the event a UUIDv7 id and puts it on its inbox's heap, which has no size limit. Every `interval` (20 ms for the default inbox under `Config::default`) the inbox hands its whole heap to the append as one batch, and the events are on disk once that batch commits. A process that dies before then loses them.
+- **`Events` and `GraphAppend` write a batch whole or not at all,** in one transaction. Rows in `_events` are only added.
+- **Each due event is handed to its flow once while the process runs.** The queue sends a 1 for it first, and keeps the events it has taken in memory until their 1 is on disk. If the process dies after the 1 and before the result, the hunt sends the event again once its 1 has had nothing after it for `window` (20 minutes by default); the hunt runs every `hunt` (an hour by default).
+- **A failed run is retried, with backoff.** The queue sends a retry: a new event with the failed one as its `source`, due after `first_wait`, doubled for each failed attempt before it, until the chain has had `attempts` (10 by default).
+- **With `GraphAppend`, an event's 2 and its graph rows commit together,** so a reader never sees a 2 without its rows. Running the same event again adds no rows.
+- **Reads are decided by ids and stamps.** The current value of a key is the row with the greatest event id, whatever order the events ran in; as of T reads only rows whose `written` stamp is at or before T; `why` returns the event that wrote the current value and its chain of sources.
+
+## How it fails
+
+- **A hand-over that fails** is logged at `error`, and the batch goes back on the heap ahead of what arrived since; the inbox tries again at its next interval, with no limit. A batch that can never be written therefore stops its inbox: every later hand-over includes it, nothing more from that inbox reaches the disk, and its heap keeps growing. One way to get there is a step whose `$graph` holds an item that is not one of rannoch-graph's ops.
+- **The last hand-over at shutdown** is not retried: if it fails, the failure is logged and its events are lost.
+- **A step that fails** sends the event's -1, its data the step's message, and the queue retries it as above. An event whose `ty` has no flow gets a -1 saying "no processor".
+- **After `shutdown`**, `Sender::send` returns `Closed`. `queue.join()` returns only once every sender of the append's signal is dropped, so a signal sender the app keeps makes it wait for good.
+- **A second process** on the same store is not stopped by rannoch.
+
+## What was measured
+
+All on one developer machine, as recorded on PR #74 and issues #65 and #66:
+
+| What | Result | What ran it |
+|---|---|---|
+| A flow whose step writes nothing, 100,000 events to their 2 | 55,679 to 58,795 events/s | `toys/graph/src/bin/flow.rs` on the `toys/graph` branch, `noop` mode, built against the crates of the branch measured; that branch is in the repo |
+| The same flow, each step giving three node rows and one edge through `GraphAppend` | 48,112 to 49,611 events/s over 6 runs, 15% to 18% below the step that writes nothing in the same runs; every 2 had its rows | a copy of that bench pointed at `GraphAppend`; the copy is not in the repo |
+| A `describe` of a two-level shape at 100,000 nodes and 499,876 edges, 32 nodes read, median, release build, file store | 0.30 to 0.32 ms cold, 13 to 15 µs warm | a test written for the run and deleted after it; the committed test `fr_rannoch_123_c9` asserts 5 ms or less cold in a debug build |
+
 ## What the app owns
 
 - One process opens the store and runs rannoch over it. Keeping a second process from doing the same is the app's job.
