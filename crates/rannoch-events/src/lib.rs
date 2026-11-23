@@ -645,6 +645,43 @@ mod tests {
     }
 
     #[test]
+    fn a_2_whose_data_does_not_serialize_is_binned_for_its_source_and_any_other_event_for_itself() {
+        let (events, writes, _signals) = with_tables("CREATE TABLE t (k TEXT PRIMARY KEY)");
+        let unwritable = || Data::ByPair([((1, 2), 3)].into_iter().collect());
+        let at = |source, status, data| Event {
+            id: Uuid::now_v7(),
+            source,
+            ty: Ty::Page,
+            data,
+            run_at: None,
+            status,
+        };
+        let (x, y) = (Uuid::now_v7(), Uuid::now_v7());
+        let row = json!({ "store": { "table": "t", "row": { "k": "a" } } });
+        writes.lock().unwrap().insert(x, vec![row]);
+        // A 2 of x, with a store row; a 0 the app sent with y as its source; and one that serializes
+        let two = at(Some(x), Status::Processed, unwritable());
+        let sourced = at(Some(y), Status::Added, unwritable());
+        let other = at(None, Status::Added, Data::Text("other".to_owned()));
+
+        let batch = [two, sourced.clone(), other.clone()];
+        let replies = Append::append(&events, &batch).unwrap();
+
+        // Only the other event is written, and the 2's store row is not
+        let conn = events.conn.lock().unwrap();
+        let ids: rusqlite::Result<String> =
+            conn.query_row("SELECT group_concat(id) FROM _events", [], |r| r.get(0));
+        assert_eq!(ids.unwrap(), other.id.to_string());
+        let rows: rusqlite::Result<i64> =
+            conn.query_row("SELECT count(*) FROM t", [], |r| r.get(0));
+        assert_eq!(rows.unwrap(), 0);
+        // The 2's -1 is for its source, as for a refused store row; the other event's is for itself
+        let binned: Vec<_> = replies.iter().map(|e| (e.source, e.status)).collect();
+        let minus_1 = |source| (Some(source), Status::Binned);
+        assert_eq!(binned, [minus_1(x), minus_1(sourced.id)]);
+    }
+
+    #[test]
     fn an_event_whose_data_does_not_serialize_gets_a_minus_1_and_its_inbox_goes_on() {
         let (queue, signals) = mpsc::channel();
         let events = Arc::new(Events::new(rannoch_core::forgr::empty_store(), queue));
