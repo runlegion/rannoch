@@ -1869,7 +1869,8 @@ fn a_second_app_on_the_same_store_is_not_stopped() {
 }
 
 /// #109's flows on the built-in steps: a list whose emit step sends one next per item of
-/// `items`, a later one whose next is due more milliseconds on than a time can hold, and the
+/// `items`, a later one whose next is due more milliseconds on than a time can hold, an asked one
+/// whose wait for its reply sends one next per item of the reply's `items`, the reply, and the
 /// flow their nexts reach.
 const FAILING: &str = r#"[
   ["list.json", {"name": "list", "ty": 90, "takes": {"items": "list<string>"},
@@ -1877,6 +1878,12 @@ const FAILING: &str = r#"[
   ["later.json", {"name": "later", "ty": 92, "takes": {},
     "steps": [{"do": "emit", "next": {"ty": 91, "delay_ms": 18446744073709551615,
       "shape": {"item": "x"}}}]}],
+  ["asked.json", {"name": "asked", "ty": 93, "takes": {"ticket": "string"},
+    "steps": [{"do": "emit", "next": {"wait": {"for": 94, "key": "$ticket", "within_ms": 60000,
+      "next": {"ty": 91, "each": "got.items", "shape": {"item": "$item"}},
+      "timeout": {"ty": 91, "shape": {"item": "none"}}}}}]}],
+  ["reply.json", {"name": "reply", "ty": 94,
+    "takes": {"ticket": "string", "items": "list<string>"}, "steps": []}],
   ["item.json", {"name": "item", "ty": 91, "takes": {"item": "string"}, "steps": []}]
 ]"#;
 
@@ -1894,24 +1901,6 @@ fn failed(app: &App, event: Uuid) -> Vec<Value> {
     assert!(ran, "{:?}", app.about(event));
     assert_eq!(app.statuses(event), [1, -1]);
     app.sent(event, -1).into_iter().map(|r| r.1).collect()
-}
-
-/// The app over a fresh store `name` running `failing`'s flows, the store holding one live wait
-/// of the ticket flow, whose data is `data` as written: status 0, due in an hour, nothing about
-/// it. Returns the app and the wait's id.
-fn live_wait(name: &str, data: &str) -> Result<(App, Uuid)> {
-    let path = database(name)?;
-    migrated(&path)?;
-    let (wait, due) = (Uuid::now_v7(), Utc::now() + TimeDelta::hours(1));
-    _events::factory()
-        .id(wait.to_string())
-        .ty(80)
-        .data(data)
-        .run_at(due.to_rfc3339_opts(SecondsFormat::Millis, true))
-        .status(0)
-        .insert(&ready(&path)?)?;
-    let app = App::built_in_at(path, &failing()?, Config::default())?;
-    Ok((app, wait))
 }
 
 /// Not a scenario: #109. A next due further on than a time can hold fails its step.
@@ -1945,75 +1934,6 @@ fn a_due_wait_whose_for_is_not_a_ty_fails_its_step() {
     app.stop();
 }
 
-/// Over a fresh store `name` holding the live wait `data`: hands t1's answer over twice, then
-/// once more after the app restarts, and asserts each answer runs as if the wait were not there,
-/// and the wait gets one -1, `wait <id> <why>`, and nothing else.
-fn passed_over(name: &str, data: &str, why: &str) -> Result<()> {
-    let (app, wait) = live_wait(name, data)?;
-    let t1 = json!({ "ticket": "t1" });
-    let ran = |app: &App, answer: Uuid| until(WAIT, || app.statuses(answer).contains(&2));
-    let first = [app.hand(83, &t1)?, app.hand(83, &t1)?];
-    assert!(first.iter().all(|answer| ran(&app, *answer)));
-    let path = app.path.clone();
-    app.stop();
-    let app = App::built_in_at(path, &failing()?, Config::default())?;
-    let after = app.hand(83, &t1)?;
-    assert!(ran(&app, after));
-    thread::sleep(Duration::from_millis(200));
-    for answer in [first[0], first[1], after] {
-        assert_eq!(app.statuses(answer), [1, 2]);
-        assert_eq!(app.sent(answer, 2), [(83, json!("done"))]);
-    }
-    let about: Vec<(i64, i64, Value)> = app
-        .about(wait)
-        .into_iter()
-        .map(|r| (r.1, r.2, r.3))
-        .collect();
-    assert_eq!(about, [(80, -1, json!(format!("wait {wait} {why}")))]);
-    app.stop();
-    Ok(())
-}
-
-/// Not a scenario: #109. A wait whose row cannot be read gets its own -1, once, and the events
-/// it waits for run as if it were not there.
-#[test]
-fn a_wait_that_cannot_be_read_is_binned_once_and_its_events_run_without_it() {
-    // Given a live wait for t1's answer whose data SQLite reads but serde_json does not
-    let data = r#"{"$wait": {"step": 1, "for": 83,}, "key": "t1", "vals": {"ticket": "t1"}}"#;
-    let why = serde_json::from_str::<Value>(data).unwrap_err();
-
-    // When t1's answer is handed over twice, and once more after the app restarts
-    // Then each answer runs as if the wait were not there
-    // And the wait gets one -1, which names why it cannot be read, and nothing else
-    let why = format!("cannot be read: {why}");
-    passed_over("a_wait_that_cannot_be_read", data, &why).unwrap();
-}
-
-/// Not a scenario: #109. A wait with no step, or no vals, gets its own -1, once, and the events
-/// it waits for run as if it were not there.
-#[test]
-fn a_wait_with_no_step_or_no_vals_is_binned_once_and_its_events_run_without_it() {
-    let cases = [
-        (
-            "a_wait_with_no_step",
-            json!({ "$wait": { "for": 83 }, "key": "t1", "vals": { "ticket": "t1" } }),
-            "has no step",
-        ),
-        (
-            "a_wait_with_no_vals",
-            json!({ "$wait": { "step": 1, "for": 83 }, "key": "t1" }),
-            "has no vals",
-        ),
-    ];
-    for (name, data, lacks) in cases {
-        // Given a live wait for t1's answer whose data lacks its step, or its vals
-        // When t1's answer is handed over twice, and once more after the app restarts
-        // Then each answer runs as if the wait were not there
-        // And the wait gets one -1, which names what it lacks, and nothing else
-        passed_over(name, &data.to_string(), lacks).unwrap();
-    }
-}
-
 /// Not a scenario: #109. An each over a field that is absent or not a list fails its step.
 #[test]
 fn each_over_a_field_that_is_not_a_list_fails_its_step() {
@@ -2028,5 +1948,34 @@ fn each_over_a_field_that_is_not_a_list_fails_its_step() {
         let reason = json!("each over items, which is not a list");
         assert_eq!(failed(&app, event), [reason]);
     }
+    app.stop();
+}
+
+/// Not a scenario: #109. A reply whose wait's next cannot be shaped from it fails, and answers
+/// the wait all the same, so a later reply with the same key runs.
+#[test]
+fn a_reply_a_waits_next_cannot_be_shaped_from_fails_once_and_a_later_reply_runs() {
+    // Given t1's asked event, whose wait for its reply sends one next per item of its items
+    let app = App::built_in("a_reply_a_waits_next", &failing().unwrap()).unwrap();
+    let asked = app.hand(93, &json!({ "ticket": "t1" })).unwrap();
+    assert!(until(WAIT, || app.statuses(asked).contains(&2)));
+    let wait = app.about(asked).into_iter().find(|r| r.1 == 93 && r.2 == 0);
+    let wait = wait.unwrap().0;
+
+    // When t1's reply is handed over with no items
+    let reply = json!({ "ticket": "t1" });
+    let first = app.hand(94, &reply).unwrap();
+
+    // Then its -1 names the wait and the field its next cannot be shaped from
+    let reason = format!("wait {wait}: each over got.items, which is not a list");
+    assert_eq!(failed(&app, first), [json!(reason)]);
+
+    // When a later reply for t1 is handed over, also with no items
+    let later = app.hand(94, &reply).unwrap();
+
+    // Then it runs as if the wait were not there, and the wait sends nothing
+    assert!(until(WAIT, || app.statuses(later).contains(&2)));
+    assert_eq!(app.statuses(later), [1, 2]);
+    assert_eq!(app.sent(wait, 0), Vec::<(i64, Value)>::new());
     app.stop();
 }

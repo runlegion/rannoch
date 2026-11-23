@@ -330,11 +330,12 @@ fn nearest<'a>(
 ) -> Result<&'a str, String> {
     let norm = |x: &[f64]| x.iter().map(|a| a * a).sum::<f64>().sqrt();
     let cos = |l: &[f64]| v.iter().zip(l).map(|(a, b)| a * b).sum::<f64>() / (norm(v) * norm(l));
-    if labels.iter().any(|l| cos(&l.1).is_nan()) {
+    let cosines: Vec<(&str, f64)> = labels.iter().map(|(l, x)| (l.as_str(), cos(x))).collect();
+    if cosines.iter().any(|c| c.1.is_nan()) {
         return Err(format!("{action}: a zero vector has no nearest label"));
     }
-    let best = labels.iter().max_by(|a, b| cos(&a.1).total_cmp(&cos(&b.1)));
-    best.map(|(label, _)| label.as_str())
+    let best = cosines.into_iter().max_by(|a, b| a.1.total_cmp(&b.1));
+    best.map(|(label, _)| label)
         .ok_or_else(|| format!("{action} has no labels"))
 }
 
