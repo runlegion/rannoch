@@ -298,6 +298,8 @@ where
         |e: &Event<T, D>, source| e.status == Status::Processed && e.source == Some(source);
     // Each -1 to return: its source, its ty and its reason.
     let mut binned = Vec::new();
+    // The sources of the 2s that cannot be stored, whose items are not written either.
+    let mut unstored = Vec::new();
     let mut rows = Vec::with_capacity(batch.len());
     for event in batch {
         match serde_json::to_string(&event.data) {
@@ -306,7 +308,10 @@ where
             // source, as for a refused store row; any other event's -1 is for the event itself.
             Err(e) => {
                 let source = match event.source {
-                    Some(source) if event.status == Status::Processed => source,
+                    Some(source) if event.status == Status::Processed => {
+                        unstored.push(source);
+                        source
+                    }
                     _ => event.id,
                 };
                 binned.push((source, event.ty, format!("data: {e}")));
@@ -314,11 +319,7 @@ where
         }
     }
     let mut refused = Vec::new();
-    for (source, items) in taken {
-        // A 2 that cannot be stored has its -1 already, and its items are not written.
-        let Some(&(two, _)) = rows.iter().find(|&&(e, _)| two_of(e, *source)) else {
-            continue;
-        };
+    for (source, items) in taken.iter().filter(|(s, _)| !unstored.contains(s)) {
         let point = tx.savepoint().map_err(|_| Error::Store)?;
         let written = items.iter().try_for_each(|item| {
             if store_in(&point, item)? {
@@ -332,7 +333,9 @@ where
             Err(Unwritten::Failed) => return Err(Error::Store),
             Err(Unwritten::Refused(reason)) => {
                 refused.push(*source);
-                binned.push((*source, two.ty, reason));
+                if let Some(two) = batch.iter().find(|e| two_of(e, *source)) {
+                    binned.push((*source, two.ty, reason));
+                }
                 // A savepoint finishes by rolling back to where it began.
                 point.finish()
             }
