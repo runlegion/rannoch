@@ -1,5 +1,40 @@
+#![warn(missing_docs)]
 //! A flow action that queries one of the app's outside sources, through a trait the app
 //! implements; the source's result is checked against the source's declared gives.
+//!
+//! The app implements [`Source`] for each source it reaches, and wraps it in a [`Retrieve`]
+//! with the [`Sig`] it declares for the source in its signatures export. It hands the action to
+//! `Processor::new` with its other actions, and a step calls it by the `Sig`'s `action`, as in
+//! `{"do": "lookup"}`. `Retrieve` does not check the input against the `Sig`'s takes; `check`
+//! does that when the app builds.
+//!
+//! # Example
+//!
+//! ```
+//! use std::sync::Arc;
+//!
+//! use rannoch_processor::{Action, Sig};
+//! use rannoch_processor_retrieve::{Retrieve, Source};
+//! use serde_json::{Map, Value, json};
+//!
+//! /// The app's source; this one makes each user's email from their name.
+//! struct Directory;
+//!
+//! impl Source for Directory {
+//!     fn get(&self, input: &Map<String, Value>) -> Result<Map<String, Value>, String> {
+//!         let user = input.get("user").and_then(Value::as_str).ok_or("no user")?;
+//!         Ok(Map::from_iter([("email".to_owned(), json!(format!("{user}@example.com")))]))
+//!     }
+//! }
+//!
+//! let sig: Sig = serde_json::from_value(json!({ "action": "lookup", "job": true,
+//!     "takes": { "user": "string" }, "gives": { "email": "string" } }))?;
+//! let lookup = Retrieve::new(sig, Arc::new(Directory));
+//!
+//! let input = Map::from_iter([("user".to_owned(), json!("sam"))]);
+//! assert_eq!(lookup.run(&json!({}), &input)?["email"], json!("sam@example.com"));
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
 
 use std::sync::Arc;
 
@@ -8,6 +43,8 @@ use serde_json::{Map, Value};
 
 /// What the app implements to reach its outside sources; rannoch reaches none on its own.
 pub trait Source: Send + Sync {
+    /// Gets from the source for `input`, the step's input; the result is checked against the
+    /// source's gives.
     /// # Errors
     /// The failure to get, which fails the step.
     fn get(&self, input: &Map<String, Value>) -> Result<Map<String, Value>, String>;
@@ -24,7 +61,9 @@ pub struct Retrieve {
 }
 
 impl Retrieve {
-    /// The source's Sig is the one the app declares for it in its signatures.json, with job true.
+    /// The action querying `source`, with `sig` the one the app declares for the source in its
+    /// signatures export. `check` reads that export, so its `job` decides whether a flow that
+    /// queries the source runs as a job.
     #[must_use]
     pub fn new(sig: Sig, source: Arc<dyn Source>) -> Self {
         Self { sig, source }
@@ -36,8 +75,8 @@ impl rannoch_processor::Action for Retrieve {
         &self.sig
     }
 
-    /// Gets, and checks the result against sig.gives: "<field> as <type>" for a field of the
-    /// wrong type, "no <field>" for a missing one.
+    /// Gets, and checks the result against `sig.gives`: `<field> as <type>` for a field of the
+    /// wrong type, `no <field>` for a missing one.
     fn run(
         &self,
         _options: &Value,

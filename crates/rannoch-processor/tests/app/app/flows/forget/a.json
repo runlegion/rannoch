@@ -1,0 +1,1 @@
+{"name": "a", "ty": 1, "takes": {"text": "string"}, "steps": [{"do": "forget"}]}

@@ -34,7 +34,8 @@ pub trait Append<T, D>: fmt::Debug + Send + Sync {
     ///
     /// # Errors
     ///
-    /// `Store` when the write fails.
+    /// `Store` when the write fails. The inbox then logs the failure, puts the batch back on its
+    /// heap ahead of the events sent since, and hands all of them over at its next interval.
     fn append(&self, batch: &[Event<T, D>]) -> Result<(), Error>;
 }
 
@@ -42,8 +43,11 @@ pub trait Append<T, D>: fmt::Debug + Send + Sync {
 /// the app's store and the events crate's append.
 #[derive(Debug, Clone)]
 pub struct Config<T, D> {
-    /// The default inbox's batch interval; every type not listed goes there.
+    /// The default inbox's batch interval; every type not listed goes there. 20 ms in
+    /// `Config::default()`.
     pub default_interval: TimeDelta,
+    /// The app's own inboxes, each with the `ty` values sent to it; none by default. A `ty`
+    /// listed in two inboxes fails open with `Config`.
     pub inboxes: Vec<InboxConfig<T>>,
     /// The app's store; with none, open runs no migration check. Rannoch
     /// keeps it for as long as it runs.
@@ -66,8 +70,12 @@ impl<T, D> Default for Config<T, D> {
 /// One inbox: its name, the `ty` values that go to it, and its batch interval.
 #[derive(Debug, Clone)]
 pub struct InboxConfig<T> {
+    /// The inbox's name, shown in the `debug` log line for each event it accepts.
     pub name: String,
+    /// The `ty` values whose events go to this inbox.
     pub types: Vec<T>,
+    /// How often the inbox hands its heap to the append. A negative interval fails open with
+    /// `Config`.
     pub interval: TimeDelta,
 }
 
@@ -97,7 +105,8 @@ pub struct Rannoch<T, D> {
 
 impl<T: PartialEq + Send + 'static, D: Send + 'static> Rannoch<T, D> {
     /// Opens rannoch with a configuration. Before anything else, applies the
-    /// store's pending migrations.
+    /// store's pending migrations. With an append, it starts one thread for each inbox, the
+    /// default inbox included.
     ///
     /// # Errors
     ///
@@ -169,7 +178,8 @@ impl<T: PartialEq + Send + 'static, D: Send + 'static> Rannoch<T, D> {
     }
 
     /// Shuts rannoch down: every send after this fails with `Closed`, each
-    /// inbox hands over what is left on its heap, and its thread is joined.
+    /// inbox hands over what is left on its heap, and its thread is joined. When that last
+    /// hand-over fails, the failure is logged and those events are not written.
     pub fn shutdown(self) {
         lock(&self.broker).closed = true;
         drop(self.stops);
@@ -194,7 +204,9 @@ impl<T, D> Clone for Sender<T, D> {
 }
 
 impl<T: PartialEq, D> Sender<T, D> {
-    /// Sends an event to the broker, which passes it to the inbox for its `ty`.
+    /// Sends an event to the broker, which passes it to the inbox for its `ty`, or to the
+    /// default inbox when no inbox lists it. Returns `Status::Added` once the event is on that
+    /// inbox's heap; the inbox hands it to the append at its next hand-over.
     ///
     /// # Errors
     ///
