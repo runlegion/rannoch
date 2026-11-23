@@ -637,6 +637,52 @@ mod tests {
         assert_eq!(binned.data, "store: datatype mismatch");
     }
 
+    /// #123: an item that is not a `store` row, as a graph `Op`, is rolled back with its 2 and its
+    /// event's store row, the append returns a -1 for the event naming the reason, and the rest
+    /// of the batch commits.
+    #[test]
+    fn an_item_that_is_not_a_store_row_is_rolled_back_with_its_2_and_gets_a_minus_1() {
+        let (events, writes, signals) = with_tables("CREATE TABLE t (k TEXT PRIMARY KEY)");
+        let row = |k| json!({ "store": { "table": "t", "row": { "k": k } } });
+        let good = two_with(&writes, row("g"));
+        // A store row, then a graph Op.
+        let source = Uuid::now_v7();
+        let op = json!({ "set": { "node": "n", "key": "k", "value": 1 } });
+        writes.lock().unwrap().insert(source, vec![row("b"), op]);
+        let bad = Event {
+            source: Some(source),
+            status: Status::Processed,
+            ..event(Uuid::now_v7())
+        };
+        let other = event(Uuid::now_v7());
+
+        let batch = [other.clone(), bad, good.clone()];
+        let replies = Append::append(&events, &batch).unwrap();
+
+        // The rest of the batch commits and signals: the other event, and the good 2 with its
+        // row; the bad 2 and its store row are not written.
+        assert_eq!(signals.try_recv(), Ok(()));
+        let conn = events.conn.lock().unwrap();
+        let read = |sql| {
+            let mut select = conn.prepare(sql).unwrap();
+            let rows = select.query_map([], |r| r.get(0)).unwrap();
+            rows.collect::<rusqlite::Result<Vec<String>>>().unwrap()
+        };
+        let ids = read("SELECT id FROM _events ORDER BY rowid");
+        assert_eq!(ids, [other.id.to_string(), good.id.to_string()]);
+        assert_eq!(read("SELECT k FROM t"), ["g"]);
+        assert!(writes.lock().unwrap().is_empty());
+        // In the bad 2's place, a -1 for its source naming the reason, for the inbox to send.
+        let [binned] = replies.as_slice() else {
+            panic!("{replies:?}")
+        };
+        assert_eq!(
+            (binned.source, binned.status),
+            (Some(source), Status::Binned)
+        );
+        assert_eq!(binned.data, "graph: Events writes no graph rows");
+    }
+
     /// An app's data: text, as rannoch's own reasons are, or counts keyed by a pair, which
     /// `serde_json` cannot write.
     #[derive(Debug, Clone, serde::Serialize)]
