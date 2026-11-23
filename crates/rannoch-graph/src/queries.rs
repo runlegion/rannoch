@@ -45,6 +45,23 @@ pub(crate) const WALK: &str = "WITH RECURSIVE w(node, depth) AS (SELECT ?1, 0
     WHERE f.src = e.src AND f.name = e.name AND f.dst = e.dst AND (?3 IS NULL OR f.written <= ?3)))
     SELECT node, min(depth) AS d FROM w WHERE node <> ?1 GROUP BY node ORDER BY d, node LIMIT ?6";
 
+/// A key's text out of `_search`.
+pub(crate) const UNINDEX: &str =
+    "DELETE FROM _search WHERE rowid = (SELECT row FROM _search_map WHERE node = ?1 AND key = ?2)";
+
+/// A key's entry out of `_search_map`.
+pub(crate) const UNMAP: &str = "DELETE FROM _search_map WHERE node = ?1 AND key = ?2";
+
+/// A text into `_search`.
+pub(crate) const INDEX: &str = "INSERT INTO _search (text) VALUES (?1)";
+
+/// A key's `_search` row, into `_search_map`.
+pub(crate) const MAP: &str = "INSERT INTO _search_map (node, key, row) VALUES (?1, ?2, ?3)";
+
+/// The nodes whose indexed text matches ?1, by node.
+pub(crate) const SEARCH: &str = "SELECT DISTINCT m.node FROM _search s
+    JOIN _search_map m ON m.row = s.rowid WHERE _search MATCH ?1 ORDER BY m.node";
+
 /// An event, then its source chain through `_events`.
 pub(crate) const WHY: &str = "WITH RECURSIVE c(id, source, depth) AS (
     SELECT id, source, 0 FROM _events WHERE id = ?1

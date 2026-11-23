@@ -29,7 +29,7 @@ The queue hands each due event at status 0 to the flow for its `ty`. A flow is a
 | `rannoch-processor-agent` | A step that calls an agent the app reaches through `Agent`, checked against what the agent takes and gives. |
 | `rannoch-processor-onnx` | Steps that run a local ONNX model: `Infer`, `Embed` and `Classify`, through ort, or through tract with the `tract` feature. |
 | `rannoch-processor-retrieve` | A step that queries one of the app's outside sources through `Source`. |
-| `rannoch-graph` | The tables an app builds its ontology on, `_nodes` and `_edges`, rows only added. `GraphAppend` writes a step's graph rows with its 2. Reads: `prop`, `props`, `history`, `edges`, `why`, `describe`, and `Hoods`, which keeps a describe warm. |
+| `rannoch-graph` | The tables an app builds its ontology on, `_nodes` and `_edges`, rows only added. `GraphAppend` writes a step's graph rows with its 2. Reads: `prop`, `props`, `history`, `edges`, `why`, `walk`, which follows named edges out from a node, `search`, which finds nodes by their current text through SQLite's full-text index (FTS5), `describe`, and `Hoods`, which keeps a describe warm. |
 
 ## Starting rannoch in an app
 
