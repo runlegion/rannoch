@@ -6,18 +6,15 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["alloc"] }
 log = "0.4"
 rannoch-core = { path = "../rannoch-core" }
-rannoch-store = { path = "../rannoch-store" }
+serde = "1"
 serde_json = "1"
 
 [dev-dependencies]
-rannoch-core = { path = "../rannoch-core", features = ["testing"] }
 rannoch-events = { path = "../rannoch-events" }
-rannoch-events-trim = { path = "../rannoch-events-trim" }
-rannoch-processor = { path = "../rannoch-processor" }
-rannoch-queue = { path = "../rannoch-queue" }
-rusqlite = { version = "0.41", features = ["bundled"] }
+rannoch-store = { path = "../rannoch-store" }
 uuid = { version = "1", features = ["v7"] }
 
 [lints]
