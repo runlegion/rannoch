@@ -1254,6 +1254,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "rannoch-events-log"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "rannoch-core",
+ "rannoch-events",
+ "rannoch-processor",
+ "rannoch-queue",
+ "rannoch-store",
+ "rusqlite",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "rannoch-events-trim"
 version = "0.1.0"
 dependencies = [
