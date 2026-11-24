@@ -62,6 +62,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -77,6 +78,9 @@ PRAGMA fullfsync = ON;";
 
 /// How often the store checkpoints the WAL.
 const CHECKPOINT_EVERY: Duration = Duration::from_secs(1);
+
+/// The database path of the one store, which [`Store::new`] sets.
+static PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 /// A connection to the database at `path` with the store's pragmas.
 fn connection(path: &Path) -> Result<Connection, Error> {
@@ -140,15 +144,28 @@ pub struct Store {
 
 impl Store {
     /// The store for the database at `path`, against the app's one `migrator`.
-    /// It checkpoints the WAL once a second until it is dropped.
+    /// It checkpoints the WAL once a second until it is dropped. It is the one store: each
+    /// `new` replaces the path [`Store::connection`] opens.
     #[must_use]
     pub fn new(path: PathBuf, migrator: migratr::Migrator) -> Self {
+        *PATH.lock().unwrap_or_else(PoisonError::into_inner) = Some(path.clone());
         let checkpointer = Checkpointer::start(path.clone());
         Self {
             path,
             migrator,
             _checkpointer: checkpointer,
         }
+    }
+
+    /// A connection to the one store, the database of the last [`Store::new`], with the store's
+    /// pragmas.
+    ///
+    /// # Errors
+    ///
+    /// `Error::Store` when no store has been made, or its database cannot be opened.
+    pub fn connection() -> Result<Connection, Error> {
+        let path = PATH.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        connection(&path.ok_or(Error::Store)?)
     }
 }
 
