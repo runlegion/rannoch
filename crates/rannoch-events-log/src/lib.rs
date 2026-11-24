@@ -8,7 +8,8 @@
 //! `_events` through [`Store::connection`], the one store, and appends one line for each row it
 //! finds, in the order written: `{"id": .., "source": .., "ty": .., "data": .., "run_at": ..,
 //! "status": ..}`, each value as the column holds it. An event the append did not write, as a 2
-//! whose `store` row was refused, has no row and no line.
+//! whose `store` row was refused, has no row and no line. The queue's -1 for an event whose `ty`
+//! is not the app's is written outside the append, and has no line either.
 //!
 //! # Failures
 //!
