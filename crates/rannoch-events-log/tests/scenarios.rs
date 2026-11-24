@@ -187,10 +187,30 @@ fn every_event_written_to_events_is_one_json_line_in_the_log_as_events_holds_it(
     // does, in the order written, the rows after the trim included
     let after = rows(&path).unwrap();
     assert_eq!(after.len(), 6);
-    let text = fs::read_to_string(&log).unwrap();
-    let lines: Vec<Value> = text
-        .lines()
-        .map(|l| serde_json::from_str(l).unwrap())
-        .collect();
-    assert_eq!(lines, [written, after].concat());
+    let lines = || {
+        let text = fs::read_to_string(&log).unwrap();
+        let lines = text.lines().map(|l| serde_json::from_str(l).unwrap());
+        lines.collect::<Vec<Value>>()
+    };
+    assert_eq!(lines(), [written.clone(), after].concat());
+
+    // When a row reaches _events after the log's last read, and the app starts again and
+    // appends a page
+    let late = _events::factory().id(Uuid::now_v7().to_string()).ty(12);
+    late.data("{}")
+        .status(0)
+        .insert(&ready(&path).unwrap())
+        .unwrap();
+    let events = Events::new(ready(&path).unwrap(), mpsc::channel().0);
+    let restarted = Log::new(events, log.clone()).unwrap();
+    let again = Event {
+        id: Uuid::now_v7(),
+        ..page(5)
+    };
+    restarted.append(&[again]).unwrap();
+
+    // Then the log holds that row and the page after the lines before the restart
+    let all = rows(&path).unwrap();
+    assert_eq!(all.len(), 8);
+    assert_eq!(lines(), [written, all].concat());
 }

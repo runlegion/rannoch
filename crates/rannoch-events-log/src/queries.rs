@@ -1,7 +1,9 @@
 //! This crate's SQL, checked by forgr against the app's schema.json.
 
-/// The largest rowid in `_events`, or 0 when it is empty.
-pub(crate) const LAST: &str = "SELECT coalesce(max(rowid), 0) FROM _events";
+/// The rowid of the `_events` row whose id is `?1`; when there is none, the largest rowid in
+/// `_events`, or 0 when it is empty.
+pub(crate) const START: &str = "SELECT coalesce((SELECT rowid FROM _events WHERE id = ?1),
+    (SELECT max(rowid) FROM _events), 0)";
 
 /// Each `_events` row whose id is in the JSON array `?1` or whose rowid is above `?2`, once, in
 /// the order written: its rowid, and the row as one JSON object of its columns.

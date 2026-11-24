@@ -9,9 +9,13 @@
 //! `_events` since its last read, each once, in the order the rows were written, and appends one
 //! line for each: `{"id": .., "source": .., "ty": .., "data": .., "run_at": .., "status": ..}`,
 //! each value as the column holds it. A row written outside the append, as the queue's -1 for an
-//! event whose `ty` is not the app's, has its line with the next batch. The `Log`'s first read is
-//! at `Log::new`, so the rows already in `_events` then have no line. An event the append did not
-//! write, as a 2 whose `store` row was refused, has no row and no line.
+//! event whose `ty` is not the app's, has its line with the next batch. An event the append did
+//! not write, as a 2 whose `store` row was refused, has no row and no line.
+//!
+//! `Log::new` starts after the row the file's last line names, so a restart loses no line. When
+//! the file has no line, or its last line names no row in `_events`, as after trim deleted that
+//! row, or does not parse, as after a crash mid-write, it starts at the table's largest rowid, and
+//! the rows already in `_events` then have no line.
 //!
 //! SQLite gives a new row the largest rowid in `_events` plus one. When the newest rows are
 //! deleted, as by rannoch-events-trim with an `older_than_ms` near 0, the rows written next take
@@ -20,15 +24,15 @@
 //!
 //! # Failures
 //!
-//! When the append it wraps fails, the `Log` returns that failure and logs nothing. When reading
-//! back or writing the file fails, the batch stays written, the failure is logged at `error`, and
-//! the rows are read again after the next batch.
+//! When the append it wraps fails, the `Log` returns that failure and logs nothing. When opening
+//! the file, reading back or writing the file fails, the batch stays written, the failure is
+//! logged at `error`, and the rows are read again after the next batch.
 
 mod queries;
 
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::path::PathBuf;
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader, ErrorKind, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
 use rannoch_core::{Append, Error, Event};
@@ -46,15 +50,20 @@ pub struct Log<A> {
 }
 
 impl<A> Log<A> {
-    /// `append`, with each row that reaches `_events` from now on logged to the file at `path`,
-    /// which is created when it is not there.
+    /// `append`, with each row that reaches `_events` after the row the last line of the file at
+    /// `path` names, or from now on, logged to that file, which is created when it is not there.
     ///
     /// # Errors
     ///
-    /// `Error::Store` when the store cannot be read.
+    /// `Error::Config` when the file is there but cannot be read; `Error::Store` when the store
+    /// cannot be read.
     pub fn new(append: A, path: PathBuf) -> Result<Self, Error> {
+        let id = last_line(&path)?.and_then(|line| {
+            let line: Value = serde_json::from_slice(&line).ok()?;
+            line["id"].as_str().map(str::to_owned)
+        });
         let conn = Store::connection()?;
-        let last = conn.query_row(queries::LAST, [], |r| r.get(0));
+        let last = conn.query_row(queries::START, [id], |r| r.get(0));
         let last = Mutex::new(last.map_err(|_| Error::Store)?);
         Ok(Self { append, path, last })
     }
@@ -66,6 +75,10 @@ impl<A> Log<A> {
         batch: &[Event<T, D>],
         last: &mut i64,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
         let ids: Vec<Value> = batch.iter().map(|e| e.id.to_string().into()).collect();
         let conn = Store::connection()?;
         let mut select = conn.prepare(queries::ROWS)?;
@@ -78,14 +91,20 @@ impl<A> Log<A> {
             lines.push('\n');
             read = rowid;
         }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
         file.write_all(lines.as_bytes())?;
         *last = read;
         Ok(())
     }
+}
+
+/// The last line of the file at `path`, or none when the file has no line or is not there.
+fn last_line(path: &Path) -> Result<Option<Vec<u8>>, Error> {
+    match File::open(path) {
+        Ok(file) => BufReader::new(file).split(b'\n').last().transpose(),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+    .map_err(|_| Error::Config)
 }
 
 impl<T, D, A: Append<T, D>> Append<T, D> for Log<A> {
