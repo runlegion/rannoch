@@ -1260,6 +1260,7 @@ dependencies = [
  "log",
  "rannoch-core",
  "rannoch-events",
+ "rannoch-events-trim",
  "rannoch-processor",
  "rannoch-queue",
  "rannoch-store",

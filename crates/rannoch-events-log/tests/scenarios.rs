@@ -1,8 +1,9 @@
 //! #129's scenario. The store is the app's database through the real store; events are sent
 //! through rannoch, run by the real queue and rannoch-processor on the built-in `emit`, and
 //! written by rannoch-events' append, which the app wraps in the log; a row of a `ty` the app
-//! no longer has comes from the app's forgr factory, and the queue writes its -1. This binary
-//! holds one test, so the one store is this test's.
+//! no longer has comes from the app's forgr factory, and the queue writes its -1; then
+//! rannoch-events-trim deletes every row. This binary holds one test, so the one store is this
+//! test's.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
@@ -17,7 +18,7 @@ use rannoch_processor::{FlowDoc, Processor, check};
 use rannoch_queue::{Queue, Settings};
 use rannoch_store::{Opened, Store};
 use rusqlite::Connection;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -167,18 +168,29 @@ fn every_event_written_to_events_is_one_json_line_in_the_log_as_events_holds_it(
     // And the app sends a fourth page
     rannoch.sender().send(page(3)).unwrap();
     assert!(until(|| count(2) == 8));
+    let written = rows(&path).unwrap();
+    assert_eq!(written.len(), 26);
+
+    // And trim deletes every row, the newest included, and the app sends a fifth page
+    thread::sleep(Duration::from_millis(5));
+    let trim = &rannoch_events_trim::actions()[0];
+    trim.run(&json!({ "older_than_ms": 0 }), &Map::new())
+        .unwrap();
+    assert_eq!(rows(&path).unwrap(), Vec::<Value>::new());
+    rannoch.sender().send(page(4)).unwrap();
+    assert!(until(|| count(2) == 2));
     drop(signal);
     rannoch.shutdown();
     assert_eq!(queue.join(), Ok(()));
 
-    // Then every row in _events is one JSON line in the log, holding the row as _events does,
-    // in the order written
-    let written = rows(&path).unwrap();
-    assert_eq!(written.len(), 26);
+    // Then every row written to _events is one JSON line in the log, holding the row as _events
+    // does, in the order written, the rows after the trim included
+    let after = rows(&path).unwrap();
+    assert_eq!(after.len(), 6);
     let text = fs::read_to_string(&log).unwrap();
     let lines: Vec<Value> = text
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
-    assert_eq!(lines, written);
+    assert_eq!(lines, [written, after].concat());
 }
