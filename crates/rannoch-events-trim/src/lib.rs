@@ -14,6 +14,8 @@
 //! The step fails, with `trim: ` and the reason, when `older_than_ms` is not a whole number of
 //! milliseconds, or when the store cannot be reached or the delete fails.
 
+mod queries;
+
 use std::sync::{Arc, LazyLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -53,8 +55,7 @@ impl Action for Trim {
         // The least v7 id of that millisecond: every id below it was made before it.
         let cutoff = Builder::from_unix_timestamp_millis(at, &[0; 10]).into_uuid();
         let conn = Store::connection().map_err(|e| fail(&e))?;
-        let sql = "DELETE FROM _events WHERE id < ?1";
-        conn.execute(sql, [cutoff.to_string()])
+        conn.execute(queries::TRIM, [cutoff.to_string()])
             .map_err(|e| fail(&e))?;
         Ok(Map::new())
     }
