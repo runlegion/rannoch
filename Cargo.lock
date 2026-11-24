@@ -1257,14 +1257,12 @@ dependencies = [
 name = "rannoch-events-log"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "log",
  "rannoch-core",
  "rannoch-events",
- "rannoch-events-trim",
- "rannoch-processor",
- "rannoch-queue",
  "rannoch-store",
- "rusqlite",
+ "serde",
  "serde_json",
  "uuid",
 ]
