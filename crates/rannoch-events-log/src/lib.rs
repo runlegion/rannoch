@@ -12,10 +12,12 @@
 //! event whose `ty` is not the app's, has its line with the next batch. An event the append did
 //! not write, as a 2 whose `store` row was refused, has no row and no line.
 //!
-//! `Log::new` starts after the row the file's last line names, so a restart loses no line. When
-//! the file has no line, or its last line names no row in `_events`, as after trim deleted that
-//! row, or does not parse, as after a crash mid-write, it starts at the table's largest rowid, and
-//! the rows already in `_events` then have no line.
+//! `Log::new` starts after the row the file's last line names, so a restart loses no line; it reads
+//! that line back from the end of the file, so its start does not grow with the log. When the file
+//! is not there or has no line, or its last line names no row in `_events`, as after trim deleted
+//! that row, or does not parse, as after a crash mid-write, it starts at the table's largest rowid,
+//! and the rows already in `_events` then have no line. When the file is there but cannot be read,
+//! `Log::new` fails with `Error::Config`.
 //!
 //! SQLite gives a new row the largest rowid in `_events` plus one. When the newest rows are
 //! deleted, as by rannoch-events-trim with an `older_than_ms` near 0, the rows written next take
@@ -31,7 +33,7 @@
 mod queries;
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, ErrorKind, Write};
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
@@ -97,10 +99,33 @@ impl<A> Log<A> {
     }
 }
 
-/// The last line of the file at `path`, or none when the file has no line or is not there.
+/// How many bytes [`last_line`] reads back from the file's end at a time.
+const CHUNK: u64 = 4096;
+
+/// The last line of the file at `path`, read back from its end, or none when the file has no
+/// line or is not there.
 fn last_line(path: &Path) -> Result<Option<Vec<u8>>, Error> {
+    let back = |mut file: File| -> std::io::Result<Option<Vec<u8>>> {
+        let (mut end, mut tail) = (file.seek(SeekFrom::End(0))?, Vec::new());
+        loop {
+            // The last line ends at the file's final newline, or at its end without one.
+            let line = tail.strip_suffix(b"\n").unwrap_or(&tail);
+            if let Some(at) = line.iter().rposition(|b| *b == b'\n') {
+                return Ok(Some(line[at + 1..].to_vec()));
+            }
+            if end == 0 {
+                return Ok((!line.is_empty()).then(|| line.to_vec()));
+            }
+            let start = end.saturating_sub(CHUNK);
+            let mut chunk = vec![0; usize::try_from(end - start).map_err(std::io::Error::other)?];
+            file.seek(SeekFrom::Start(start))?;
+            file.read_exact(&mut chunk)?;
+            chunk.append(&mut tail);
+            (end, tail) = (start, chunk);
+        }
+    };
     match File::open(path) {
-        Ok(file) => BufReader::new(file).split(b'\n').last().transpose(),
+        Ok(file) => back(file),
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
     }
@@ -116,5 +141,31 @@ impl<T, D, A: Append<T, D>> Append<T, D> for Log<A> {
             log::error!("the events log could not log a batch to {path}: {e}");
         }
         Ok(replies)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::Path;
+
+    #[test]
+    fn last_line_reads_a_line_longer_than_a_chunk_back_from_the_end() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp/events-log-last");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("events.log");
+        let long = "x".repeat(10_000);
+        for (body, last) in [
+            (format!("a\n{long}\n"), Some(long.as_str())),
+            (format!("a\n{long}"), Some(long.as_str())),
+            (format!("{long}\n"), Some(long.as_str())),
+            ("a\n".to_owned(), Some("a")),
+            (String::new(), None),
+        ] {
+            fs::write(&path, &body).unwrap();
+            let want = last.map(|l| l.as_bytes().to_vec());
+            assert_eq!(super::last_line(&path).unwrap(), want, "{}", body.len());
+        }
+        assert_eq!(super::last_line(&dir.join("none.log")).unwrap(), None);
     }
 }
