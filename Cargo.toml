@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/rannoch-core", "crates/rannoch-store", "crates/rannoch-events", "crates/rannoch-queue", "crates/rannoch-processor", "crates/rannoch-processor-agent", "crates/rannoch-processor-onnx", "crates/rannoch-processor-retrieve", "crates/rannoch-graph"]
+members = ["crates/rannoch-core", "crates/rannoch-store", "crates/rannoch-events", "crates/rannoch-queue", "crates/rannoch-processor", "crates/rannoch-processor-agent", "crates/rannoch-processor-onnx", "crates/rannoch-processor-retrieve", "crates/rannoch-graph", "crates/rannoch-events-trim"]
 
 [workspace.package]
 version = "0.1.0"
