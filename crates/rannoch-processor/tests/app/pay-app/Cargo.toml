@@ -19,6 +19,5 @@ uuid = "1"
 migratr = "0.3"
 onto-pay = { path = "../onto-pay" }
 rannoch-events = { path = "../../../../rannoch-events" }
-rannoch-graph = { path = "../../../../rannoch-graph" }
 rannoch-processor = { path = "../../.." }
 rusqlite = { version = "0.41", features = ["bundled"] }

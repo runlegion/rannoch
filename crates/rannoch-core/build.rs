@@ -10,10 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// The migrations directory of every crate with tables, from core's own.
-const CRATES: &[&str] = &[
-    "../rannoch-events/migrations",
-    "../rannoch-graph/migrations",
-];
+const CRATES: &[&str] = &["../rannoch-events/migrations"];
 
 fn main() -> Result<(), Box<dyn Error>> {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);

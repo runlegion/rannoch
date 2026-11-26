@@ -1,50 +1,61 @@
-//! FR-RANNOCH-123-c10 through the real store, queue and rannoch-processor, as in
-//! rannoch-processor-retrieve's scenarios: events from the app's forgr factory, handed over by
-//! the queue to a flow whose one step gives the event's graph rows as `$graph`, and
-//! `GraphAppend` writing them with the 2.
+//! #134's scenarios through the real store, queue and rannoch-processor: an app whose ontology
+//! is its own tables, whose flows write them with the built-in `store` step through a `Warm`
+//! append, and whose reads are events whose flows call rannoch-graph's steps. Each event is
+//! written into `_events` from the app's forgr factory. rannoch-store has one store per
+//! process, so the scenarios take turns.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
 use rannoch_core::forgr::_events;
 use rannoch_core::{Append, Config, Rannoch};
-use rannoch_graph::{GraphAppend, edges, prop};
-use rannoch_processor::{Action, FlowDoc, Processor, Sig, check};
+use rannoch_events::Events;
+use rannoch_graph::{Hoods, SIGNATURES, Warm};
+use rannoch_processor::{FlowDoc, Processor, Sig, check};
 use rannoch_queue::{Queue, Settings};
 use rannoch_store::{Opened, Store};
-use rusqlite::Connection;
-use serde_json::{Map, Value, json};
+use rusqlite::{Connection, params};
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-/// How many events the queue hands to the flow.
-const N: i64 = 500;
+/// One scenario at a time: the store is the process's one.
+static ONE: Mutex<()> = Mutex::new(());
 
-const FLOWS: &str = r#"[{"name": "write", "ty": 40, "takes": {"n": "string"},
-  "steps": [{"do": "write"}]}]"#;
+/// The app's ontology, as its ontology crate's migrations make it: names rannoch-graph never
+/// names.
+const ONTOLOGY: &str = "CREATE TABLE doc_titles (doc TEXT, title TEXT, event TEXT,
+    written INTEGER, PRIMARY KEY (doc, event));
+    CREATE TABLE cites (doc TEXT, cited TEXT, PRIMARY KEY (doc, cited))";
 
-/// The step's action: the event's node gets a name and a next edge, given as `$graph`.
-struct Write(Sig);
-impl Action for Write {
-    fn sig(&self) -> &Sig {
-        &self.0
-    }
-    fn run(
-        &self,
-        _: &Value,
-        input: &Map<String, Value>,
-    ) -> std::result::Result<Map<String, Value>, String> {
-        let n = input.get("n").and_then(Value::as_str).unwrap_or_default();
-        let graph = json!([
-            { "set": { "node": n, "key": "name", "value": format!("thing {n}") } },
-            { "link": { "src": n, "name": "next", "dst": format!("{n}+"), "props": {} } }
-        ]);
-        Ok([("$graph".to_owned(), graph)].into_iter().collect())
-    }
-}
+/// The app's flows: a cite written with `store`; three reads, each returning its result as an
+/// event of the app's; and the flows those events go to.
+const FLOWS: &str = r#"[
+  ["cite.json", {"name": "cite", "ty": 40, "takes": {"doc": "string", "cited": "string"},
+    "steps": [{"do": "store", "with": {"store": {"table": "cites",
+      "row": {"doc": "$doc", "cited": "$cited"}}}}]}],
+  ["reach.json", {"name": "reach", "ty": 50, "takes": {"node": "string"},
+    "steps": [{"do": "walk", "with": {"walk": {
+      "via": {"cites": {"from": "doc", "to": "cited"}}, "hops": 3, "cap": 10}},
+      "next": {"ty": 60, "shape": {"walk": "$walk"}}}]}],
+  ["nowhere.json", {"name": "nowhere", "ty": 53, "takes": {"node": "string"},
+    "steps": [{"do": "walk", "with": {"walk": {
+      "via": {"nope": {"from": "doc", "to": "cited"}}, "hops": 3, "cap": 10}},
+      "next": {"ty": 60, "shape": {"walk": "$walk"}}}]}],
+  ["explain.json", {"name": "explain", "ty": 51, "takes": {"node": "string"},
+    "steps": [{"do": "why", "with": {"why": {"table": "doc_titles", "key": "doc",
+      "event": "event"}}, "next": {"ty": 61, "shape": {"why": "$why"}}}]}],
+  ["then.json", {"name": "then", "ty": 52, "takes": {"node": "string", "at": "number"},
+    "steps": [{"do": "as_of", "with": {"as_of": {"table": "doc_titles", "key": "doc",
+      "time": "written"}}, "next": {"ty": 62, "shape": {"row": "$row"}}}]}],
+  ["walked.json", {"name": "walked", "ty": 60, "takes": {"walk": "any"}, "steps": []}],
+  ["explained.json", {"name": "explained", "ty": 61, "takes": {"why": "list<string>"},
+    "steps": []}],
+  ["read.json", {"name": "read", "ty": 62, "takes": {"row": "any"}, "steps": []}]
+]"#;
 
 fn ready(path: &Path) -> Result<Connection> {
     match rannoch_store::open(path, &rannoch_core::migrator())? {
@@ -53,7 +64,7 @@ fn ready(path: &Path) -> Result<Connection> {
     }
 }
 
-/// A fresh store `name` for the app, with every migration applied by opening rannoch once.
+/// A fresh store `name`, with every migration of rannoch's applied by opening rannoch once.
 fn migrated(name: &str) -> Result<PathBuf> {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
     drop(fs::remove_dir_all(&dir));
@@ -80,163 +91,234 @@ fn until(done: impl Fn() -> bool) -> bool {
     done()
 }
 
-fn count(conn: &Connection, sql: &str) -> i64 {
-    conn.query_row(sql, [], |r| r.get(0)).unwrap_or(-1)
+/// The app running: rannoch, the queue, a connection and the signal it hands events with.
+struct App {
+    conn: Connection,
+    signal: mpsc::Sender<()>,
+    rannoch: Rannoch<u16, Value>,
+    queue: Queue,
 }
 
-/// Every event that has its 2 has its graph rows: they commit in the same transaction.
-#[test]
-fn fr_rannoch_123_c10() {
-    // Given an app whose flow's step gives each event's graph rows, appended by GraphAppend
-    let path = migrated("graph").unwrap();
-    let sig = Sig {
-        action: "write".to_owned(),
-        ..Sig::default()
-    };
-    let actions: Vec<Arc<dyn Action>> = vec![Arc::new(Write(sig))];
-    let processor: Processor<u16, Value> =
-        Processor::new(FLOWS, actions, ready(&path).unwrap()).unwrap();
-    let (signal, wake) = mpsc::channel();
-    let append = GraphAppend::new(ready(&path).unwrap(), signal.clone(), processor.writes());
-    let rannoch = Rannoch::open(Config {
-        store: Some(Arc::new(Store::new(path.clone(), rannoch_core::migrator()))),
-        append: Some(Arc::new(append) as Arc<dyn Append<u16, Value>>),
-        ..Config::default()
-    })
-    .unwrap();
-    let settings = Settings::new(Duration::from_millis(100));
-    let (conn, sender) = (ready(&path).unwrap(), rannoch.sender());
-    let queue = Queue::start(conn, wake, sender, Arc::new(processor), settings);
-
-    // When the queue hands the flow N events from the app's forgr factory
-    let conn = ready(&path).unwrap();
-    let ids: Vec<Uuid> = (0..N)
-        .map(|i| {
-            let id = Uuid::now_v7();
-            let data = json!({ "n": format!("t{i}") }).to_string();
-            let row = _events::factory().id(id.to_string()).ty(40).data(data);
-            row.status(0).insert(&conn).unwrap();
-            id
+impl App {
+    /// The app over a fresh store `name` holding its ontology, its flows checked against
+    /// rannoch-graph's signatures, and its append `Events` with its writes, in a `Warm`.
+    fn start(name: &str) -> Result<Self> {
+        let path = migrated(name)?;
+        let conn = ready(&path)?;
+        conn.execute_batch(ONTOLOGY)?;
+        let docs: Vec<(String, FlowDoc)> = serde_json::from_str(FLOWS)?;
+        let sigs: Vec<Sig> = serde_json::from_str(SIGNATURES)?;
+        let flows = check(&docs, &sigs).map_err(|e| e.join("\n"))?;
+        let hoods = Hoods::default();
+        let actions = rannoch_graph::actions(&hoods);
+        let processor: Processor<u16, Value> = Processor::new(&flows, actions, ready(&path)?)?;
+        let (signal, wake) = mpsc::channel();
+        let writes = processor.writes();
+        let events = Events::new(ready(&path)?, signal.clone()).with_writes(writes.clone());
+        let append = Warm::new(events, writes, hoods);
+        let rannoch = Rannoch::open(Config {
+            store: Some(Arc::new(Store::new(path.clone(), rannoch_core::migrator()))),
+            append: Some(Arc::new(append) as Arc<dyn Append<u16, Value>>),
+            ..Config::default()
+        })?;
+        let settings = Settings::new(Duration::from_millis(100));
+        let processor = Arc::new(processor);
+        let queue = Queue::start(ready(&path)?, wake, rannoch.sender(), processor, settings);
+        Ok(Self {
+            conn,
+            signal,
+            rannoch,
+            queue,
         })
-        .collect();
-    signal.send(()).unwrap();
-    let twos = "SELECT count(*) FROM _events WHERE status = 2";
-    assert!(
-        until(|| count(&conn, twos) == N),
-        "{} of {N} 2s",
-        count(&conn, twos)
-    );
-
-    // Then every event that has its 2 has its graph rows, stamped with the event
-    let missing = "SELECT count(*) FROM _events e WHERE e.status = 0 AND e.ty = 40
-        AND EXISTS (SELECT 1 FROM _events s WHERE s.source = e.id AND s.status = 2)
-        AND (e.id NOT IN (SELECT event FROM _nodes) OR e.id NOT IN (SELECT event FROM _edges))";
-    assert_eq!(count(&conn, missing), 0);
-    assert_eq!(count(&conn, "SELECT count(*) FROM _nodes"), N);
-    assert_eq!(count(&conn, "SELECT count(*) FROM _edges"), N);
-    let name = prop(&conn, "t0", "name", None).unwrap().unwrap();
-    assert_eq!((name.value, name.event), (json!("thing t0"), ids[0]));
-    let next = edges(&conn, "t0", "next", false, None).unwrap();
-    assert_eq!((next[0].0.as_str(), next[0].1.event), ("t0+", ids[0]));
-    drop(signal);
-    rannoch.shutdown();
-    queue.join().unwrap();
-}
-
-/// #92's flows, from the fixture `tests/payments.json`, of the built-in steps alone: a payment
-/// stores its row and sends its receipt.
-const PAYMENTS: &str = include_str!("payments.json");
-
-/// Payments that must name an order the store has.
-const ORDERS: &str = "CREATE TABLE orders (id TEXT PRIMARY KEY);
-    CREATE TABLE payments (order_id TEXT PRIMARY KEY REFERENCES orders(id), amount INTEGER)";
-
-/// #92: the README's "With `GraphAppend`, an event's 2 and its graph rows commit together", on
-/// the built-in `store`, whose row is the only kind a built-in step gives; and #102: a row the
-/// table refuses is written neither with its 2 nor in place of the rest of the batch.
-#[test]
-fn with_graph_append_a_2_and_its_rows_commit_together_and_a_refused_row_gets_a_minus_1() {
-    // Given an app whose payment flow stores each payment's row, appended by GraphAppend, and
-    // whose payments must name an order the store has
-    let path = migrated("graph_built_in").unwrap();
-    let conn = ready(&path).unwrap();
-    conn.execute_batch(ORDERS).unwrap();
-    let docs: Vec<(String, FlowDoc)> = serde_json::from_str(PAYMENTS).unwrap();
-    let flows = check(&docs, &[]).unwrap();
-    let processor: Processor<u16, Value> =
-        Processor::new(&flows, Vec::new(), ready(&path).unwrap()).unwrap();
-    let (signal, wake) = mpsc::channel();
-    let writes = processor.writes();
-    let append = GraphAppend::new(ready(&path).unwrap(), signal.clone(), writes.clone());
-    let rannoch = Rannoch::open(Config {
-        store: Some(Arc::new(Store::new(path.clone(), rannoch_core::migrator()))),
-        append: Some(Arc::new(append) as Arc<dyn Append<u16, Value>>),
-        ..Config::default()
-    })
-    .unwrap();
-    let settings = Settings::new(Duration::from_millis(100));
-    let queue = Queue::start(
-        ready(&path).unwrap(),
-        wake,
-        rannoch.sender(),
-        Arc::new(processor),
-        settings,
-    );
-    let pay = |order: &str| {
-        let data = json!({ "order": order, "amount": 5 }).to_string();
-        let id = Uuid::now_v7();
-        let row = _events::factory().id(id.to_string()).ty(86).data(data);
-        row.status(0).insert(&conn).unwrap();
-        signal.send(()).unwrap();
-        id
-    };
-
-    // When 200 payments for orders the store has are handed to the flow, one a millisecond
-    // Then no read, while they run, sees a payment with its 2 and without its row
-    let twos = "SELECT count(*) FROM _events e WHERE e.ty = 86 AND e.source IS NULL
-        AND EXISTS (SELECT 1 FROM _events s WHERE s.source = e.id AND s.status = 2)";
-    let bare = format!(
-        "{twos} AND NOT EXISTS (SELECT 1 FROM payments p
-        WHERE p.order_id = json_extract(e.data, '$.order'))"
-    );
-    let (start, mut sent) = (Instant::now(), 0);
-    while count(&conn, twos) < 200 {
-        if sent < 200 {
-            let order = format!("o{sent}");
-            conn.execute("INSERT INTO orders (id) VALUES (?1)", [&order])
-                .unwrap();
-            pay(&order);
-            sent += 1;
-        }
-        assert_eq!(count(&conn, &bare), 0);
-        assert!(
-            start.elapsed() < Duration::from_secs(30),
-            "{} of 200",
-            count(&conn, twos)
-        );
-        thread::sleep(Duration::from_millis(1));
     }
 
-    // When a payment for an order the store does not have runs
-    let none = pay("none");
+    /// Hands the queue an event of `ty` with `data`; returns its id.
+    fn hand(&self, ty: i64, data: &Value) -> Result<Uuid> {
+        let id = Uuid::now_v7();
+        let row = _events::factory()
+            .id(id.to_string())
+            .ty(ty)
+            .data(data.to_string());
+        row.status(0).insert(&self.conn)?;
+        self.signal.send(())?;
+        Ok(id)
+    }
 
-    // Then neither its row nor its 2 is written, and it gets a -1 naming the reason in their
-    // place; the rest of its batch, its receipt, is written
-    let about = |status| {
-        let sql = "SELECT json_group_array(data) FROM _events WHERE source = ?1 AND status = ?2";
-        let data = conn.query_row(sql, rusqlite::params![none.to_string(), status], |r| {
-            r.get(0)
-        });
-        data.unwrap_or_else(|e: rusqlite::Error| e.to_string())
+    /// The data of the row about `id` at `status`, when there is one.
+    fn now(&self, id: Uuid, status: i64) -> Option<Value> {
+        let sql = "SELECT data FROM _events WHERE source = ?1 AND status = ?2";
+        let data = self
+            .conn
+            .query_row(sql, params![id.to_string(), status], |r| {
+                r.get::<_, String>(0)
+            });
+        data.ok().and_then(|d| serde_json::from_str(&d).ok())
+    }
+
+    /// The data of the row about `id` at `status`, once there is one.
+    fn about(&self, id: Uuid, status: i64) -> Option<Value> {
+        until(|| self.now(id, status).is_some());
+        self.now(id, status)
+    }
+
+    /// Hands a read of `ty` with `data`, and returns its result: the data of the event it
+    /// returns, whose source it is.
+    fn read(&self, ty: i64, data: &Value) -> Result<Value> {
+        let id = self.hand(ty, data)?;
+        self.about(id, 0)
+            .ok_or_else(|| format!("read {id} returned nothing").into())
+    }
+
+    /// Writes the cite of `cited` by `doc` through the app's flow, and waits for its 2.
+    fn cite(&self, doc: &str, cited: &str) -> Result<()> {
+        let id = self.hand(40, &json!({ "doc": doc, "cited": cited }))?;
+        self.about(id, 2)
+            .map(drop)
+            .ok_or_else(|| format!("cite {id} has no 2").into())
+    }
+
+    fn stop(self) {
+        drop(self.signal);
+        self.rannoch.shutdown();
+        assert!(self.queue.join().is_ok());
+    }
+}
+
+/// The ids a walk's result reached, in order.
+fn ids(result: &Value) -> Vec<&str> {
+    let nodes = result["walk"]["nodes"].as_array().into_iter().flatten();
+    nodes.filter_map(|n| n["id"].as_str()).collect()
+}
+
+/// The names of the tables in the store at `conn`.
+fn tables(conn: &Connection) -> Vec<String> {
+    let sql = "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name";
+    let mut st = conn.prepare(sql).unwrap_or_else(|e| panic!("{e}"));
+    let names = st
+        .query_map([], |r| r.get(0))
+        .unwrap_or_else(|e| panic!("{e}"));
+    names.collect::<rusqlite::Result<_>>().unwrap_or_default()
+}
+
+/// FR-RANNOCH-125-c1: rannoch-graph has no _nodes or _edges tables.
+#[test]
+fn fr_rannoch_125_c1() {
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+    // Given a store with every one of rannoch's migrations applied
+    let path = migrated("c1").unwrap();
+
+    // Then it holds no _nodes or _edges, and rannoch-graph has no migrations to make them
+    let held = tables(&ready(&path).unwrap());
+    assert!(
+        !held.iter().any(|t| t == "_nodes" || t == "_edges"),
+        "{held:?}"
+    );
+    assert!(held.iter().any(|t| t == "_events"), "{held:?}");
+    let own = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    assert!(!own.exists());
+}
+
+/// FR-RANNOCH-125-c2 and 01a216a5-c6f6-7051-82f2-2c64fc1703ed: the app's shape is its
+/// ontology's tables, and they are what rannoch-graph's steps read.
+#[test]
+fn fr_rannoch_125_c2() {
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+    // Given an app whose ontology holds doc_titles and cites
+    let app = App::start("c2").unwrap();
+
+    // Then the store's tables beyond rannoch's _events are the ontology's
+    let mut held = tables(&app.conn);
+    held.retain(|t| t != "_events" && !t.starts_with("_migratr") && !t.starts_with("sqlite"));
+    assert_eq!(held, ["cites", "doc_titles"]);
+
+    // When a flow writes cites into the app's table, and a read walks them
+    app.cite("d1", "d2").unwrap();
+    app.cite("d2", "d3").unwrap();
+
+    // Then the walk reaches what the app's table holds
+    let walked = app.read(50, &json!({ "node": "d1" })).unwrap();
+    assert_eq!(ids(&walked), ["d2", "d3"]);
+    app.stop();
+}
+
+/// FR-RANNOCH-125-c4: every read is an event, and that event returns its result.
+#[test]
+fn fr_rannoch_125_c4() {
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+    // Given an app whose doc d1 was titled by one event and retitled by the next, at 1,000 and
+    // 2,000, and which cites d2 from d1
+    let app = App::start("c4").unwrap();
+    let (first, fix) = (Uuid::now_v7().to_string(), Uuid::now_v7().to_string());
+    let row = |id: &String| {
+        _events::factory()
+            .id(id.clone())
+            .ty(99)
+            .data("{}")
+            .status(2)
     };
-    assert!(until(|| about(-1) != "[]"));
-    assert_eq!(about(-1), r#"["\"store: FOREIGN KEY constraint failed\""]"#);
-    assert_eq!(about(2), "[]");
-    assert_eq!(about(0), r#"["{\"order\":\"none\"}"]"#);
-    let row = "SELECT count(*) FROM payments WHERE order_id = 'none'";
-    assert_eq!(count(&conn, row), 0);
-    assert!(!writes.lock().unwrap().contains_key(&none));
-    drop(signal);
-    rannoch.shutdown();
-    queue.join().unwrap();
+    row(&first).insert(&app.conn).unwrap();
+    row(&fix).source(first.clone()).insert(&app.conn).unwrap();
+    let title = "INSERT INTO doc_titles VALUES ('d1', ?1, ?2, ?3)";
+    app.conn
+        .execute(title, params!["graph notes", first, 1_000])
+        .unwrap();
+    app.conn
+        .execute(title, params!["graph store notes", fix, 2_000])
+        .unwrap();
+    app.cite("d1", "d2").unwrap();
+
+    // When the app sends a walk, a why and an as-of read, each as an event
+    let walked = app.read(50, &json!({ "node": "d1" })).unwrap();
+    let why = app.read(51, &json!({ "node": "d1" })).unwrap();
+    let then = app.read(52, &json!({ "node": "d1", "at": 1_500 })).unwrap();
+
+    // Then each read event returns its result as an event whose source it is
+    assert_eq!(
+        walked,
+        json!({ "walk": { "nodes": [{ "id": "d2", "hops": 1 }], "cut": false } })
+    );
+    assert_eq!(why, json!({ "why": [fix, first] }));
+    assert_eq!(then["row"]["title"], json!("graph notes"));
+    assert_eq!(then["row"]["event"], json!(first));
+    app.stop();
+}
+
+/// 01a2166f-db5e-76d0-9f75-25c911d0f98c: rannoch-graph reads nothing of its own: a step reads
+/// only the table its options name, and one the store does not have fails its read event.
+#[test]
+fn criterion_01a2166f_rannoch_graph_reads_nothing_of_its_own() {
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+    // Given an app with its ontology
+    let app = App::start("utils").unwrap();
+
+    // When a read's walk names a table the store does not have
+    let id = app.hand(53, &json!({ "node": "d1" })).unwrap();
+
+    // Then the read event gets a -1 naming it, and returns nothing
+    assert_eq!(app.about(id, -1), Some(json!("walk: no such table: nope")));
+    let returned = "SELECT count(*) FROM _events WHERE source = ?1 AND ty = 60";
+    let returned = app
+        .conn
+        .query_row(returned, [id.to_string()], |r| r.get::<_, i64>(0));
+    assert_eq!(returned.unwrap(), 0);
+    app.stop();
+}
+
+/// FR-RANNOCH-127-c1: warm hoods are part of rannoch-graph's core: a walk is kept warm, and a
+/// cite the app writes through `Warm` recomputes it, so the next read returns the new reach.
+#[test]
+fn fr_rannoch_127_c1() {
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+    // Given an app whose d1 cites d2, read once, which warms its hood
+    let app = App::start("hoods").unwrap();
+    app.cite("d1", "d2").unwrap();
+    let node = json!({ "node": "d1" });
+    assert_eq!(ids(&app.read(50, &node).unwrap()), ["d2"]);
+
+    // When d2 cites d3 through the app's flow
+    app.cite("d2", "d3").unwrap();
+
+    // Then the next read returns the hood as recomputed
+    assert_eq!(ids(&app.read(50, &node).unwrap()), ["d2", "d3"]);
+    app.stop();
 }

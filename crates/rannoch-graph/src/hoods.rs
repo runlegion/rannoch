@@ -1,333 +1,305 @@
-//! Warm hoods: a node and shape described once and kept, recomputed whole when a write touches
-//! any node it read.
+//! Warm hoods: a walk kept with its result, recomputed when a `store` row touches it.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use rusqlite::{Connection, Result};
-use serde_json::Value;
+use rannoch_core::{Append, Error, Event, Status};
+use rannoch_events::{StoreRow, Writes};
+use rusqlite::Connection;
+use serde_json::{Value, json};
+use uuid::Uuid;
 
-use crate::describe::{Opts, shaped};
+use crate::{Via, walk};
 
-/// One warm hood: its node and shape, their describe, and every node that describe read.
+/// Where a row touches a hood: its table, a `from` column, and a node the hood read.
+type Touch = (String, String, String);
+
+/// One warm hood: a walk's options and root, its result, and where a row touches it.
 #[derive(Debug)]
 struct Hood {
-    node: String,
-    shape: Value,
+    options: Value,
+    root: String,
     result: Value,
-    touched: HashSet<String>,
+    touches: Vec<Touch>,
 }
 
-/// The warm hoods: a describe with default opts warms its node and shape, later ones read the copy.
+/// The hoods and, for each place a row touches, the hoods it touches.
 #[derive(Debug, Default)]
-pub struct Hoods {
+struct Kept {
     hoods: HashMap<String, Hood>,
-    by_node: HashMap<String, HashSet<String>>,
+    by_touch: HashMap<Touch, HashSet<String>>,
 }
 
-/// A hood's key: its node and its shape's JSON text.
-fn hood_key(node: &str, shape: &Value) -> String {
-    format!("{node}\u{0}{shape}")
+/// The warm hoods the `walk` step reads through and a [`Warm`] append recomputes.
+#[derive(Debug, Clone, Default)]
+pub struct Hoods(Arc<Mutex<Kept>>);
+
+/// A walk's options, parsed: its via tables, its hops and its cap.
+fn parse(options: &Value) -> Result<(Vec<Via>, i64, usize), String> {
+    let via = options["via"].as_object().ok_or("via is not an object")?;
+    let via = via.iter().map(|(table, cols)| {
+        let col = |c: &str| cols[c].as_str().map(str::to_owned);
+        let not = || format!("via {table} has no from and to");
+        Ok((
+            table.clone(),
+            col("from").ok_or_else(not)?,
+            col("to").ok_or_else(not)?,
+        ))
+    });
+    let via = via.collect::<Result<Vec<_>, String>>()?;
+    let hops = options["hops"]
+        .as_i64()
+        .ok_or("hops is not a whole number")?;
+    let cap = options["cap"].as_u64().ok_or("cap is not a whole number")?;
+    Ok((via, hops, usize::try_from(cap).unwrap_or(usize::MAX)))
+}
+
+/// The walk from `root` by `options`, cold, as the step gives it, and where a row touches it.
+fn cold(conn: &Connection, options: &Value, root: &str) -> Result<(Value, Vec<Touch>), String> {
+    let (via, hops, cap) = parse(options)?;
+    let (nodes, cut) = walk(conn, &via, root, hops, cap).map_err(|e| e.to_string())?;
+    // A row from a node the walk did not return cannot change it, the cap's cut included: what
+    // such a row reaches is further than every node returned.
+    let read = nodes.iter().map(|(n, _)| n.as_str()).chain([root]);
+    let read: Vec<&str> = read.collect();
+    let touches = via.iter().flat_map(|(table, from, _)| {
+        read.iter()
+            .map(|n| (table.clone(), from.clone(), (*n).to_owned()))
+    });
+    let nodes: Vec<Value> = nodes
+        .iter()
+        .map(|(id, hops)| json!({ "id": id, "hops": hops }))
+        .collect();
+    Ok((json!({ "nodes": nodes, "cut": cut }), touches.collect()))
 }
 
 impl Hoods {
-    /// `node` shaped by `shape` with default opts: the warm copy, or a cold describe kept warm.
-    /// # Errors
-    /// As `describe`.
-    pub fn describe(&mut self, conn: &Connection, node: &str, shape: &Value) -> Result<Value> {
-        match self.hoods.get(&hood_key(node, shape)) {
-            Some(hood) => Ok(hood.result.clone()),
-            None => self.warm(conn, node.to_owned(), shape.clone()),
-        }
+    fn lock(&self) -> MutexGuard<'_, Kept> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Describes `node` by `shape` cold and keeps it warm, indexed by every node it read.
-    fn warm(&mut self, conn: &Connection, node: String, shape: Value) -> Result<Value> {
-        let (key, mut touched) = (hood_key(&node, &shape), HashSet::new());
-        let result = Value::Object(shaped(conn, &node, &shape, Opts::default(), &mut touched)?);
-        for n in &touched {
-            let keys = self.by_node.entry(n.clone()).or_default();
-            keys.insert(key.clone());
+    /// The walk from `root` by `options`: the warm copy, or a cold walk on `open`'s connection,
+    /// kept warm. The hoods stay locked while it reads, so no recompute passes it by.
+    pub(crate) fn walk(
+        &self,
+        options: &Value,
+        root: &str,
+        open: impl FnOnce() -> Result<Connection, String>,
+    ) -> Result<Value, String> {
+        let mut kept = self.lock();
+        let key = format!("{options}\u{0}{root}");
+        if let Some(hood) = kept.hoods.get(&key) {
+            return Ok(hood.result.clone());
         }
-        let hood = Hood {
-            node,
-            shape,
-            result: result.clone(),
-            touched,
-        };
-        self.hoods.insert(key, hood);
+        let (result, touches) = cold(&open()?, options, root)?;
+        kept.keep(
+            key,
+            options.clone(),
+            root.to_owned(),
+            result.clone(),
+            touches,
+        );
         Ok(result)
     }
 
-    /// Recomputes every warm hood that read a node in `touched`, and says how many it
-    /// recomputed; one whose recompute fails goes cold, so the next describe of it is a cold one.
-    pub(crate) fn rewarm(&mut self, conn: &Connection, touched: &HashSet<String>) -> usize {
-        let keys = touched.iter().filter_map(|n| self.by_node.get(n));
-        let keys: HashSet<String> = keys.flatten().cloned().collect();
+    /// Recomputes every hood a row of `rows` touches on `open`'s connection, and says how many
+    /// it recomputed. One whose recompute fails goes cold.
+    pub(crate) fn rewarm(
+        &self,
+        rows: &[StoreRow],
+        open: impl FnOnce() -> Result<Connection, String>,
+    ) -> usize {
+        let mut kept = self.lock();
+        let mut keys = HashSet::new();
+        for StoreRow::Store { table, row } in rows {
+            for (column, value) in row {
+                let node = value
+                    .as_str()
+                    .map_or_else(|| value.to_string(), str::to_owned);
+                let touch = (table.clone(), column.clone(), node);
+                keys.extend(kept.by_touch.get(&touch).into_iter().flatten().cloned());
+            }
+        }
+        if keys.is_empty() {
+            return 0;
+        }
+        let conn = open().ok();
         let mut recomputed = 0;
         for key in keys {
-            let Some(hood) = self.hoods.remove(&key) else {
+            let Some(hood) = kept.drop_hood(&key) else {
                 continue;
             };
-            for n in &hood.touched {
-                if let Some(keys) = self.by_node.get_mut(n) {
-                    keys.remove(&key);
-                }
+            let Some(conn) = &conn else { continue };
+            if let Ok((result, touches)) = cold(conn, &hood.options, &hood.root) {
+                kept.keep(key, hood.options, hood.root, result, touches);
+                recomputed += 1;
             }
-            recomputed += usize::from(self.warm(conn, hood.node, hood.shape).is_ok());
         }
         recomputed
     }
 }
 
+impl Kept {
+    /// Keeps a hood warm under `key`, indexed by where a row touches it.
+    fn keep(
+        &mut self,
+        key: String,
+        options: Value,
+        root: String,
+        result: Value,
+        touches: Vec<Touch>,
+    ) {
+        for touch in &touches {
+            self.by_touch
+                .entry(touch.clone())
+                .or_default()
+                .insert(key.clone());
+        }
+        let hood = Hood {
+            options,
+            root,
+            result,
+            touches,
+        };
+        self.hoods.insert(key, hood);
+    }
+
+    /// Takes the hood under `key` out, with its index entries.
+    fn drop_hood(&mut self, key: &str) -> Option<Hood> {
+        let hood = self.hoods.remove(key)?;
+        for touch in &hood.touches {
+            if let Some(keys) = self.by_touch.get_mut(touch) {
+                keys.remove(key);
+                if keys.is_empty() {
+                    self.by_touch.remove(touch);
+                }
+            }
+        }
+        Some(hood)
+    }
+}
+
+/// The app's append, with the hoods each batch's `store` rows touch recomputed once it commits.
+#[derive(Debug)]
+pub struct Warm<A> {
+    append: A,
+    writes: Writes,
+    hoods: Hoods,
+}
+
+impl<A> Warm<A> {
+    /// `append`, which writes the store rows the processor's `writes` holds, with `hoods`
+    /// recomputed after each batch it commits.
+    #[must_use]
+    pub fn new(append: A, writes: Writes, hoods: Hoods) -> Self {
+        Self {
+            append,
+            writes,
+            hoods,
+        }
+    }
+}
+
+impl<T, D, A: Append<T, D>> Append<T, D> for Warm<A> {
+    fn append(&self, batch: &[Event<T, D>]) -> Result<Vec<Event<T, D>>, Error> {
+        // The items of each 2, read before the append takes them.
+        let items: Vec<(Uuid, Vec<Value>)> = {
+            let held = self.writes.lock().unwrap_or_else(PoisonError::into_inner);
+            let twos = batch.iter().filter(|e| e.status == Status::Processed);
+            twos.filter_map(|e| Some((e.source?, held.get(&e.source?)?.clone())))
+                .collect()
+        };
+        let replies = self.append.append(batch)?;
+        // A 2 the append refused wrote no row, and recomputing a hood it names changes nothing.
+        let rows = items.into_iter().flat_map(|(_, items)| items);
+        let rows: Vec<StoreRow> = rows
+            .filter_map(|i| serde_json::from_value(i).ok())
+            .collect();
+        if !rows.is_empty() {
+            let open = || rannoch_store::Store::connection().map_err(|e| e.to_string());
+            self.hoods.rewarm(&rows, open);
+        }
+        Ok(replies)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-    use std::sync::{Arc, Mutex, mpsc};
-    use std::time::{Duration, Instant};
+    use std::cell::Cell;
+    use std::path::PathBuf;
 
-    use rannoch_core::{Append, Event, Status};
     use rusqlite::Connection;
     use serde_json::{Value, json};
     use uuid::Uuid;
 
-    use super::Hoods;
-    use crate::describe::{Opts, describe, shaped};
-    use crate::tests::{apply, link, set, small};
-    use crate::{GraphAppend, Op, commit, edges};
+    use rannoch_events::StoreRow;
 
-    /// The toy's xorshift, so the graph and the burst are the toy's.
-    struct Rng(u64);
-    impl Rng {
-        fn below(&mut self, n: usize) -> usize {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            usize::try_from(self.0 % n as u64).unwrap()
+    use super::{Hoods, cold};
+    use crate::tests::DOCS;
+
+    /// A store row into `table`.
+    fn row(table: &str, row: Value) -> StoreRow {
+        let row = serde_json::from_value(row).unwrap();
+        StoreRow::Store {
+            table: table.to_owned(),
+            row,
         }
     }
 
-    const DOCS: usize = 80_000;
-
-    /// The toy's graph at scale: 20,000 people, each knowing one before; 80,000 docs, each
-    /// written by one person and citing up to five earlier docs. 100,000 nodes, about 500,000 edges.
-    fn big(rng: &mut Rng) -> Connection {
-        let persons = 20_000;
-        let mut evs = Vec::with_capacity(persons + DOCS);
-        for p in 0..persons {
-            let id = format!("p{p}");
-            let name = json!(format!("person {p}"));
-            let mut ops = vec![set(&id, "type", json!("person")), set(&id, "name", name)];
-            if p > 0 {
-                ops.push(link(&id, "knows", &format!("p{}", rng.below(p)), json!({})));
-            }
-            evs.push((Uuid::now_v7(), None, ops));
-        }
-        for d in 0..DOCS {
-            let id = format!("d{d}");
-            let mut ops = vec![
-                set(&id, "type", json!("doc")),
-                set(
-                    &id,
-                    "title",
-                    json!(format!("doc {d} about topic {}", d % 97)),
-                ),
-                set(&id, "status", json!(["open", "closed", "draft"][d % 3])),
-                link(&format!("p{}", rng.below(persons)), "wrote", &id, json!({})),
-            ];
-            for _ in 0..5.min(d) {
-                ops.push(link(&id, "cites", &format!("d{}", rng.below(d)), json!({})));
-            }
-            evs.push((Uuid::now_v7(), None, ops));
-        }
-        let mut conn = rannoch_core::forgr::empty_store();
-        for chunk in evs.chunks(1_000) {
-            apply(&mut conn, &chunk.iter().collect::<Vec<_>>(), 0);
-        }
-        conn
+    fn ids(walked: &Value) -> Vec<&str> {
+        let nodes = walked["nodes"].as_array().unwrap();
+        nodes.iter().map(|n| n["id"].as_str().unwrap()).collect()
     }
 
-    /// The toy's two-level shape, and its 200 roots.
-    fn two_levels() -> (Value, Vec<String>) {
-        let cites = json!({ "shape": ["title"], "limit": 5 });
-        let cites = json!({ "shape": ["title", { "cites": cites }], "limit": 5 });
-        let shape = json!(["title", "status", { "wrote<-": ["name"] }, { "cites": cites }]);
-        (
-            shape,
-            (0..200)
-                .map(|i| format!("d{}", DOCS - 1 - i * 13))
-                .collect(),
-        )
+    fn none() -> Result<Connection, String> {
+        Err("no store".to_owned())
     }
 
-    fn p50<T: Ord + Copy>(mut v: Vec<T>) -> T {
-        v.sort_unstable();
-        v[v.len() / 2]
-    }
-
-    /// The toy's P9: a cold describe of each root, then a warm one; the p50 of each and the p50
-    /// of the nodes a describe reads.
-    fn timed(conn: &Connection) -> (Duration, Duration, usize) {
-        let (shape, roots) = two_levels();
-        let (mut cold, mut sizes, mut warm) = (Vec::new(), Vec::new(), Vec::new());
-        for r in &roots {
-            let mut touched = HashSet::new();
-            let start = Instant::now();
-            shaped(conn, r, &shape, Opts::default(), &mut touched).unwrap();
-            cold.push(start.elapsed());
-            sizes.push(touched.len());
-        }
-        let mut hoods = Hoods::default();
-        for r in &roots {
-            hoods.describe(conn, r, &shape).unwrap();
-        }
-        for r in &roots {
-            let start = Instant::now();
-            hoods.describe(conn, r, &shape).unwrap();
-            warm.push(start.elapsed());
-        }
-        let (cold, warm, nodes) = (p50(cold), p50(warm), p50(sizes));
-        println!("cold describe p50 {cold:?} ({nodes} nodes p50), warm p50 {warm:?}");
-        (cold, warm, nodes)
-    }
-
-    /// How many warm hoods equal a cold describe of their node and shape.
-    fn equal(hoods: &Hoods, conn: &Connection) -> usize {
-        let cold = |h: &&super::Hood| describe(conn, &h.node, &h.shape, Opts::default()).unwrap();
-        hoods.hoods.values().filter(|h| cold(h) == h.result).count()
-    }
-
-    /// 50 warm hoods equal a cold describe after a burst of 5,000 writes that touch them and after
-    /// its rerun, which recomputes nothing; a warm describe is at least 10 times faster than a
-    /// cold one (the toy's P8 and P9).
+    /// FR-RANNOCH-127-c1: every walk the step makes is warm. The second walk is the kept copy,
+    /// read with no connection; a store row that touches the hood recomputes it to equal a cold
+    /// walk, and one that touches no hood recomputes none.
     #[test]
-    fn fr_rannoch_123_c8() {
-        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
-        let mut conn = big(&mut rng);
-        let (cold, warm, _) = timed(&conn);
-        assert!(cold >= warm * 10, "cold {cold:?}, warm {warm:?}");
-
-        let (shape, roots) = two_levels();
-        let mut hoods = Hoods::default();
-        for r in roots.iter().take(50) {
-            hoods.describe(&conn, r, &shape).unwrap();
-        }
-        let mut pool: Vec<&String> = hoods.hoods.values().flat_map(|h| &h.touched).collect();
-        pool.retain(|n| n.starts_with('d'));
-        pool.sort();
-        pool.dedup();
-        let mut burst = Vec::new();
-        for i in 0..5_000 {
-            let n = pool[rng.below(pool.len())].clone();
-            let status = Op::Retract {
-                node: n.clone(),
-                key: "status".to_owned(),
-            };
-            let op = match i % 5 {
-                0 => set(
-                    &n,
-                    "status",
-                    json!(["open", "closed", "draft"][rng.below(3)]),
-                ),
-                1 => set(&n, "title", json!(format!("retitled {i}"))),
-                2 => link(
-                    &n,
-                    "cites",
-                    &format!("d{}", rng.below(DOCS)),
-                    json!({ "burst": i }),
-                ),
-                3 => {
-                    let cited = edges(&conn, &n, "cites", false, None).unwrap();
-                    if cited.is_empty() {
-                        status
-                    } else {
-                        let dst = cited[rng.below(cited.len())].0.clone();
-                        let name = "cites".to_owned();
-                        Op::Unlink { src: n, name, dst }
-                    }
-                }
-                _ => status,
-            };
-            burst.push((Uuid::now_v7(), vec![serde_json::to_value(op).unwrap()]));
-        }
-        let none: &[Event<u16, Value>] = &[];
-        let run = |conn: &mut Connection, hoods: &mut Hoods| {
-            let mut recomputes = 0;
-            for write in &burst {
-                let (_, touched) = commit(conn, none, std::slice::from_ref(write)).unwrap();
-                recomputes += hoods.rewarm(conn, &touched);
-            }
-            recomputes
-        };
-        let rows = |c: &Connection| {
-            let count = |sql: &str| c.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap();
-            (
-                count("SELECT count(*) FROM _nodes"),
-                count("SELECT count(*) FROM _edges"),
-            )
+    fn fr_rannoch_127_c1() {
+        let path: PathBuf =
+            std::env::temp_dir().join(format!("rannoch-hoods-{}.db", Uuid::now_v7()));
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(DOCS).unwrap();
+        conn.execute_batch("INSERT INTO cites VALUES ('d1', 'd2'), ('d2', 'd3'), ('d9', 'd8')")
+            .unwrap();
+        let options =
+            json!({ "via": { "cites": { "from": "doc", "to": "cited" } }, "hops": 3, "cap": 10 });
+        let hoods = Hoods::default();
+        let opened = Cell::new(0);
+        let open = || {
+            opened.set(opened.get() + 1);
+            Connection::open(&path).map_err(|e| e.to_string())
         };
 
-        let in_burst = run(&mut conn, &mut hoods);
-        let (after_burst, before) = (equal(&hoods, &conn), rows(&conn));
-        let in_rerun = run(&mut conn, &mut hoods);
+        let first = hoods.walk(&options, "d1", open).unwrap();
+        let again = hoods.walk(&options, "d1", none).unwrap();
+        assert_eq!((ids(&first), &again), (vec!["d2", "d3"], &first));
+        assert_eq!(opened.get(), 1);
 
-        println!("recomputes in the burst {in_burst}, in the rerun {in_rerun}");
-        assert_eq!((after_burst, equal(&hoods, &conn)), (50, 50));
-        assert!(in_burst > 0);
-        assert_eq!(in_rerun, 0);
-        assert_eq!(rows(&conn), before);
-    }
+        // d3 cites d4: d3 is a node the walk returned, so its hood is recomputed.
+        conn.execute("INSERT INTO cites VALUES ('d3', 'd4')", [])
+            .unwrap();
+        let touching = [row("cites", json!({ "doc": "d3", "cited": "d4" }))];
+        assert_eq!(hoods.rewarm(&touching, open), 1);
+        let warm = hoods.walk(&options, "d1", none).unwrap();
+        assert_eq!(warm, cold(&conn, &options, "d1").unwrap().0);
+        assert_eq!(ids(&warm), ["d2", "d3", "d4"]);
 
-    /// At 100,000 nodes and about 500,000 edges, a cold describe of a two-level shape answers at
-    /// 5 ms p50 or less (the toy's P9).
-    #[test]
-    fn fr_rannoch_123_c9() {
-        let conn = big(&mut Rng(0x9e37_79b9_7f4a_7c15));
-        let edges = conn.query_row("SELECT count(*) FROM _edges", [], |r| r.get::<_, i64>(0));
-        let (cold, _, _) = timed(&conn);
-        assert!(edges.unwrap() > 499_000);
-        assert!(
-            cold <= Duration::from_millis(5),
-            "cold describe p50 {cold:?}"
-        );
-    }
+        // d9 is no node the hood read, and doc_titles is none of its via tables.
+        let elsewhere = [
+            row("cites", json!({ "doc": "d9", "cited": "d1" })),
+            row("doc_titles", json!({ "doc": "d1" })),
+        ];
+        assert_eq!(hoods.rewarm(&elsewhere, none), 0);
 
-    /// An append through `GraphAppend` with hoods recomputes the warm hood its rows touched, even
-    /// through a far node the hood's filter left out.
-    #[test]
-    fn an_append_recomputes_the_hoods_its_rows_touch() {
-        let (conn, _) = small();
-        let shape = json!([{ "wrote": { "shape": ["title"], "where": { "status": "open" } } }]);
-        let hoods = Arc::new(Mutex::new(Hoods::default()));
-        let writes = rannoch_processor::Writes::default();
-        let (queue, _wake) = mpsc::channel();
-        let append = GraphAppend::new(conn, queue, writes.clone()).with_hoods(hoods.clone());
-        let warm = |append: &GraphAppend| {
-            let conn = append.conn.lock().unwrap();
-            hoods
-                .lock()
-                .unwrap()
-                .describe(&conn, "ada", &shape)
-                .unwrap()
-        };
-        assert_eq!(warm(&append)["wrote"].as_array().unwrap().len(), 1);
-
-        // doc1, left out by the filter, opens.
-        let source = Uuid::now_v7();
-        let open = serde_json::to_value(set("doc1", "status", json!("open"))).unwrap();
-        writes.lock().unwrap().insert(source, vec![open]);
-        let two = Event {
-            id: Uuid::now_v7(),
-            source: Some(source),
-            ty: 1_u16,
-            data: json!({}),
-            run_at: None,
-            status: Status::Processed,
-        };
-        append.append(&[two]).unwrap();
-
-        let now = warm(&append);
-        let cold = describe(&append.conn.lock().unwrap(), "ada", &shape, Opts::default());
-        assert_eq!(now, cold.unwrap());
-        assert_eq!(now["wrote"].as_array().unwrap().len(), 2);
+        // A recompute that cannot reach the store leaves the hood cold: the next walk reads.
+        assert_eq!(hoods.rewarm(&touching, none), 0);
+        assert!(hoods.walk(&options, "d1", none).is_err());
+        drop(conn);
+        std::fs::remove_file(&path).unwrap();
     }
 }
