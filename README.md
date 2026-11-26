@@ -31,7 +31,7 @@ The queue hands each due event at status 0 to the flow for its `ty`. A flow is a
 | `rannoch-processor-retrieve` | A step that queries one of the app's outside sources through `Source`. |
 | `rannoch-events-trim` | A step, `trim`, that an app calls from a flow it sets up: with options `{"older_than_ms": n}`, it deletes the rows in `_events` older than n milliseconds, by the time in each row's v7 id. It reaches the one store through `Store::connection`; the app adds its `SIGNATURES` and `actions()`, which take no arguments. |
 | `rannoch-events-log` | Sits on the event, not in a flow: `Log` wraps the app's append with the log file's path from its settings, and after the append commits a batch, writes each of its events to that file as one JSON line. |
-| `rannoch-graph` | Graph utils over the app's own ontology tables, each a step a read event's flow calls, its tables and columns named in the step's options: `as_of`, `why` and `walk`, a capped walk. Every walk is warm in `Hoods`, and `Warm` wraps the app's append to recompute the hoods each batch's `store` rows touch. It has no tables. |
+| `rannoch-graph` | Graph utils over the app's own ontology tables, each a step a read event's flow calls, its tables and columns named in the step's options: `as_of`, `why` and `walk`, a capped walk. Every walk is warm in `Hoods`, and `Warm` wraps the app's append to drop the hoods each batch's `store` rows touch, so their next walk reads again. It has no tables. |
 
 ## Starting rannoch in an app
 

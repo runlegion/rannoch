@@ -47,11 +47,12 @@
 //! let append = Warm::new(events, processor.writes(), hoods);
 //! ```
 //!
-//! After the append it wraps commits a batch, the `Warm` recomputes every hood that a `store`
-//! row of the batch touches: a row into one of a hood's via tables whose `from` column holds
-//! the hood's root or a node its walk returned. A hood whose recompute fails goes cold, and its
-//! next walk reads the store. A row the app writes by other means than the `store` step through
-//! the `Warm` touches no hood.
+//! After the append it wraps commits a batch, the `Warm` drops every hood that a `store` row
+//! of the batch touches: a row into one of a hood's via tables whose `from` column holds the
+//! hood's root or a node its walk returned. It reads nothing: the next walk of that node and
+//! those options reads the store, as a step of its read event, and keeps the result warm again.
+//! A row the app writes by other means than the `store` step through the `Warm` touches no
+//! hood, so its walks read as they were kept.
 
 mod hoods;
 

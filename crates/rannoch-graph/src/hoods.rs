@@ -1,4 +1,4 @@
-//! Warm hoods: a walk kept with its result, recomputed when a `store` row touches it.
+//! Warm hoods: a walk kept with its result, dropped when a `store` row touches it.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -14,11 +14,9 @@ use crate::{Via, walk};
 /// Where a row touches a hood: its table, a `from` column, and a node the hood read.
 type Touch = (String, String, String);
 
-/// One warm hood: a walk's options and root, its result, and where a row touches it.
+/// One warm hood: a walk's result, and where a row touches it.
 #[derive(Debug)]
 struct Hood {
-    options: Value,
-    root: String,
     result: Value,
     touches: Vec<Touch>,
 }
@@ -30,7 +28,7 @@ struct Kept {
     by_touch: HashMap<Touch, HashSet<String>>,
 }
 
-/// The warm hoods the `walk` step reads through and a [`Warm`] append recomputes.
+/// The warm hoods the `walk` step reads through and a [`Warm`] append drops.
 #[derive(Debug, Clone, Default)]
 pub struct Hoods(Arc<Mutex<Kept>>);
 
@@ -79,7 +77,7 @@ impl Hoods {
     }
 
     /// The walk from `root` by `options`: the warm copy, or a cold walk on `open`'s connection,
-    /// kept warm. The hoods stay locked while it reads, so no recompute passes it by.
+    /// kept warm. The hoods stay locked while it reads, so no drop passes it by.
     pub(crate) fn walk(
         &self,
         options: &Value,
@@ -92,23 +90,13 @@ impl Hoods {
             return Ok(hood.result.clone());
         }
         let (result, touches) = cold(&open()?, options, root)?;
-        kept.keep(
-            key,
-            options.clone(),
-            root.to_owned(),
-            result.clone(),
-            touches,
-        );
+        kept.keep(key, result.clone(), touches);
         Ok(result)
     }
 
-    /// Recomputes every hood a row of `rows` touches on `open`'s connection, and says how many
-    /// it recomputed. One whose recompute fails goes cold.
-    pub(crate) fn rewarm(
-        &self,
-        rows: &[StoreRow],
-        open: impl FnOnce() -> Result<Connection, String>,
-    ) -> usize {
+    /// Drops every hood a row of `rows` touches, so its next walk reads the store, and says how
+    /// many it dropped. It reads nothing.
+    pub(crate) fn cool(&self, rows: &[StoreRow]) -> usize {
         let mut kept = self.lock();
         let mut keys = HashSet::new();
         for StoreRow::Store { table, row } in rows {
@@ -120,53 +108,28 @@ impl Hoods {
                 keys.extend(kept.by_touch.get(&touch).into_iter().flatten().cloned());
             }
         }
-        if keys.is_empty() {
-            return 0;
-        }
-        let conn = open().ok();
-        let mut recomputed = 0;
-        for key in keys {
-            let Some(hood) = kept.drop_hood(&key) else {
-                continue;
-            };
-            let Some(conn) = &conn else { continue };
-            if let Ok((result, touches)) = cold(conn, &hood.options, &hood.root) {
-                kept.keep(key, hood.options, hood.root, result, touches);
-                recomputed += 1;
-            }
-        }
-        recomputed
+        keys.iter().filter(|key| kept.drop_hood(key)).count()
     }
 }
 
 impl Kept {
     /// Keeps a hood warm under `key`, indexed by where a row touches it.
-    fn keep(
-        &mut self,
-        key: String,
-        options: Value,
-        root: String,
-        result: Value,
-        touches: Vec<Touch>,
-    ) {
+    fn keep(&mut self, key: String, result: Value, touches: Vec<Touch>) {
         for touch in &touches {
             self.by_touch
                 .entry(touch.clone())
                 .or_default()
                 .insert(key.clone());
         }
-        let hood = Hood {
-            options,
-            root,
-            result,
-            touches,
-        };
+        let hood = Hood { result, touches };
         self.hoods.insert(key, hood);
     }
 
-    /// Takes the hood under `key` out, with its index entries.
-    fn drop_hood(&mut self, key: &str) -> Option<Hood> {
-        let hood = self.hoods.remove(key)?;
+    /// Drops the hood under `key`, with its index entries; whether there was one.
+    fn drop_hood(&mut self, key: &str) -> bool {
+        let Some(hood) = self.hoods.remove(key) else {
+            return false;
+        };
         for touch in &hood.touches {
             if let Some(keys) = self.by_touch.get_mut(touch) {
                 keys.remove(key);
@@ -175,11 +138,11 @@ impl Kept {
                 }
             }
         }
-        Some(hood)
+        true
     }
 }
 
-/// The app's append, with the hoods each batch's `store` rows touch recomputed once it commits.
+/// The app's append, with the hoods each batch's `store` rows touch dropped once it commits.
 #[derive(Debug)]
 pub struct Warm<A> {
     append: A,
@@ -188,8 +151,8 @@ pub struct Warm<A> {
 }
 
 impl<A> Warm<A> {
-    /// `append`, which writes the store rows the processor's `writes` holds, with `hoods`
-    /// recomputed after each batch it commits.
+    /// `append`, which writes the store rows the processor's `writes` holds, with the `hoods`
+    /// its rows touch dropped after each batch it commits.
     #[must_use]
     pub fn new(append: A, writes: Writes, hoods: Hoods) -> Self {
         Self {
@@ -210,15 +173,12 @@ impl<T, D, A: Append<T, D>> Append<T, D> for Warm<A> {
                 .collect()
         };
         let replies = self.append.append(batch)?;
-        // A 2 the append refused wrote no row, and recomputing a hood it names changes nothing.
+        // A 2 the append refused wrote no row; dropping a hood it names only makes it read again.
         let rows = items.into_iter().flat_map(|(_, items)| items);
         let rows: Vec<StoreRow> = rows
             .filter_map(|i| serde_json::from_value(i).ok())
             .collect();
-        if !rows.is_empty() {
-            let open = || rannoch_store::Store::connection().map_err(|e| e.to_string());
-            self.hoods.rewarm(&rows, open);
-        }
+        self.hoods.cool(&rows);
         Ok(replies)
     }
 }
@@ -226,7 +186,7 @@ impl<T, D, A: Append<T, D>> Append<T, D> for Warm<A> {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
-    use std::path::PathBuf;
+    use std::path::Path;
 
     use rusqlite::Connection;
     use serde_json::{Value, json};
@@ -256,12 +216,12 @@ mod tests {
     }
 
     /// FR-RANNOCH-127-c1: every walk the step makes is warm. The second walk is the kept copy,
-    /// read with no connection; a store row that touches the hood recomputes it to equal a cold
-    /// walk, and one that touches no hood recomputes none.
+    /// read with no connection; a store row that touches the hood drops it, reading nothing, so
+    /// the next walk reads and equals a cold walk; one that touches no hood drops none.
     #[test]
     fn fr_rannoch_127_c1() {
-        let path: PathBuf =
-            std::env::temp_dir().join(format!("rannoch-hoods-{}.db", Uuid::now_v7()));
+        let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
+        let path = target.join(format!("rannoch-hoods-{}.db", Uuid::now_v7()));
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(DOCS).unwrap();
         conn.execute_batch("INSERT INTO cites VALUES ('d1', 'd2'), ('d2', 'd3'), ('d9', 'd8')")
@@ -280,25 +240,24 @@ mod tests {
         assert_eq!((ids(&first), &again), (vec!["d2", "d3"], &first));
         assert_eq!(opened.get(), 1);
 
-        // d3 cites d4: d3 is a node the walk returned, so its hood is recomputed.
+        // d3 cites d4: d3 is a node the walk returned, so its hood is dropped.
         conn.execute("INSERT INTO cites VALUES ('d3', 'd4')", [])
             .unwrap();
         let touching = [row("cites", json!({ "doc": "d3", "cited": "d4" }))];
-        assert_eq!(hoods.rewarm(&touching, open), 1);
-        let warm = hoods.walk(&options, "d1", none).unwrap();
-        assert_eq!(warm, cold(&conn, &options, "d1").unwrap().0);
-        assert_eq!(ids(&warm), ["d2", "d3", "d4"]);
+        assert_eq!(hoods.cool(&touching), 1);
+        let read = hoods.walk(&options, "d1", open).unwrap();
+        assert_eq!(opened.get(), 2);
+        assert_eq!(read, cold(&conn, &options, "d1").unwrap().0);
+        assert_eq!(ids(&read), ["d2", "d3", "d4"]);
+        assert_eq!(hoods.walk(&options, "d1", none).unwrap(), read);
 
         // d9 is no node the hood read, and doc_titles is none of its via tables.
         let elsewhere = [
             row("cites", json!({ "doc": "d9", "cited": "d1" })),
             row("doc_titles", json!({ "doc": "d1" })),
         ];
-        assert_eq!(hoods.rewarm(&elsewhere, none), 0);
-
-        // A recompute that cannot reach the store leaves the hood cold: the next walk reads.
-        assert_eq!(hoods.rewarm(&touching, none), 0);
-        assert!(hoods.walk(&options, "d1", none).is_err());
+        assert_eq!(hoods.cool(&elsewhere), 0);
+        assert_eq!(hoods.walk(&options, "d1", none).unwrap(), read);
         drop(conn);
         std::fs::remove_file(&path).unwrap();
     }

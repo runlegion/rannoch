@@ -42,4 +42,4 @@ Feature: rannoch-graph is utils over the app's ontology tables, and every read i
   Scenario: Warm hoods are part of rannoch-graph's core (fr_rannoch_127_c1)
     Given an app whose d1 cites d2, read once, which warms its hood
     When d2 cites d3 through the app's flow
-    Then the next read returns the hood as recomputed
+    Then the next read returns the new reach

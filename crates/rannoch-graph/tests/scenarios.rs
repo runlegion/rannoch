@@ -305,7 +305,7 @@ fn criterion_01a2166f_rannoch_graph_reads_nothing_of_its_own() {
 }
 
 /// FR-RANNOCH-127-c1: warm hoods are part of rannoch-graph's core: a walk is kept warm, and a
-/// cite the app writes through `Warm` recomputes it, so the next read returns the new reach.
+/// cite the app writes through `Warm` drops it, so the next read returns the new reach.
 #[test]
 fn fr_rannoch_127_c1() {
     let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
@@ -318,7 +318,7 @@ fn fr_rannoch_127_c1() {
     // When d2 cites d3 through the app's flow
     app.cite("d2", "d3").unwrap();
 
-    // Then the next read returns the hood as recomputed
+    // Then the next read returns the new reach
     assert_eq!(ids(&app.read(50, &node).unwrap()), ["d2", "d3"]);
     app.stop();
 }
