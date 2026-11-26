@@ -29,9 +29,9 @@ static ONE: Mutex<()> = Mutex::new(());
 /// names.
 const ONTOLOGY: &str = "CREATE TABLE doc_titles (doc TEXT, title TEXT, event TEXT,
     written INTEGER, PRIMARY KEY (doc, event));
-    CREATE TABLE cites (doc TEXT, cited TEXT, PRIMARY KEY (doc, cited))";
+    CREATE TABLE cites (doc TEXT, cited TEXT, written INTEGER, PRIMARY KEY (doc, cited))";
 
-/// The app's flows: a cite written with `store`; three reads, each returning its result as an
+/// The app's flows: a cite written with `store`; the reads, each returning its result as an
 /// event of the app's; and the flows those events go to.
 const FLOWS: &str = r#"[
   ["cite.json", {"name": "cite", "ty": 40, "takes": {"doc": "string", "cited": "string"},
@@ -51,10 +51,18 @@ const FLOWS: &str = r#"[
   ["then.json", {"name": "then", "ty": 52, "takes": {"node": "string", "at": "number"},
     "steps": [{"do": "as_of", "with": {"as_of": {"table": "doc_titles", "key": "doc",
       "time": "written"}}, "next": {"ty": 62, "shape": {"row": "$row"}}}]}],
+  ["since.json", {"name": "since", "ty": 54, "takes": {"node": "string", "at": "number"},
+    "steps": [{"do": "walk", "with": {"walk": {
+      "via": {"cites": {"from": "doc", "to": "cited", "time": "written"}}, "hops": 3, "cap": 10}},
+      "next": {"ty": 60, "shape": {"walk": "$walk"}}}]}],
+  ["cited.json", {"name": "cited", "ty": 55, "takes": {"node": "string", "at": "number"},
+    "steps": [{"do": "edges", "with": {"edges": {"table": "cites", "from": "doc",
+      "time": "written"}}, "next": {"ty": 63, "shape": {"edges": "$edges"}}}]}],
   ["walked.json", {"name": "walked", "ty": 60, "takes": {"walk": "any"}, "steps": []}],
   ["explained.json", {"name": "explained", "ty": 61, "takes": {"why": "list<string>"},
     "steps": []}],
-  ["read.json", {"name": "read", "ty": 62, "takes": {"row": "any"}, "steps": []}]
+  ["read.json", {"name": "read", "ty": 62, "takes": {"row": "any"}, "steps": []}],
+  ["edged.json", {"name": "edged", "ty": 63, "takes": {"edges": "any"}, "steps": []}]
 ]"#;
 
 fn ready(path: &Path) -> Result<Connection> {
@@ -246,7 +254,7 @@ fn fr_rannoch_125_c2() {
 fn fr_rannoch_125_c4() {
     let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
     // Given an app whose doc d1 was titled by one event and retitled by the next, at 1,000 and
-    // 2,000, and which cites d2 from d1
+    // 2,000, and which cites d2 from d1 at 1,000
     let app = App::start("c4").unwrap();
     let (first, fix) = (Uuid::now_v7().to_string(), Uuid::now_v7().to_string());
     let row = |id: &String| {
@@ -265,12 +273,18 @@ fn fr_rannoch_125_c4() {
     app.conn
         .execute(title, params!["graph store notes", fix, 2_000])
         .unwrap();
-    app.cite("d1", "d2").unwrap();
+    let cite = "INSERT INTO cites VALUES ('d1', 'd2', 1000)";
+    app.conn.execute(cite, []).unwrap();
 
-    // When the app sends a walk, a why and an as-of read, each as an event
+    // When the app sends a walk, a why, and as-of reads of a row, a walk and edges, each as an
+    // event
     let walked = app.read(50, &json!({ "node": "d1" })).unwrap();
     let why = app.read(51, &json!({ "node": "d1" })).unwrap();
     let then = app.read(52, &json!({ "node": "d1", "at": 1_500 })).unwrap();
+    let before = app.read(54, &json!({ "node": "d1", "at": 999 })).unwrap();
+    let since = app.read(54, &json!({ "node": "d1", "at": 1_500 })).unwrap();
+    let none = app.read(55, &json!({ "node": "d1", "at": 999 })).unwrap();
+    let cited = app.read(55, &json!({ "node": "d1", "at": 1_500 })).unwrap();
 
     // Then each read event returns its result as an event whose source it is
     assert_eq!(
@@ -280,6 +294,11 @@ fn fr_rannoch_125_c4() {
     assert_eq!(why, json!({ "why": [fix, first] }));
     assert_eq!(then["row"]["title"], json!("graph notes"));
     assert_eq!(then["row"]["event"], json!(first));
+    assert_eq!(before, json!({ "walk": { "nodes": [], "cut": false } }));
+    assert_eq!(since, walked);
+    assert_eq!(none, json!({ "edges": { "rows": [] } }));
+    let row = json!({ "doc": "d1", "cited": "d2", "written": 1_000 });
+    assert_eq!(cited, json!({ "edges": { "rows": [row] } }));
     app.stop();
 }
 

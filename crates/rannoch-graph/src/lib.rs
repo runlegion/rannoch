@@ -26,7 +26,7 @@
 //! | `as_of` | `{"table": T, "key": K, "time": W}`; it also takes `at`, a number | `row`: the row of T whose K is `node` with the greatest W at or before `at`, as an object of its columns, or null when it has none |
 //! | `why` | `{"table": T, "key": K, "event": E}` | `why`: the greatest E among T's rows whose K is `node`, then that event's source chain through `_events`: its source, that event's source, and so on; empty when there is none in `_events` |
 //! | `walk` | `{"via": {T: {"from": F, "to": D, "time": W}, ..}, "hops": n, "cap": m}`, `time` optional; it also reads `at`, a number, when the event holds one | `walk`: `{"nodes": [{"id", "hops"}, ..], "cut": bool}`, each node reached from `node` over each T's rows from F to D, the root left out, once with its fewest hops: nearest first, then by id, at most m of them, and whether the cap cut the walk |
-//! | `edges` | `{"table": T, "from": F, "time": W}`; it also takes `at`, a number | `edges`: the rows of T whose F is `node` and whose W is at or before `at`, oldest first, each an object of its columns |
+//! | `edges` | `{"table": T, "from": F, "time": W}`; it also takes `at`, a number | `edges`: `{"rows": [..]}`, the rows of T whose F is `node` and whose W is at or before `at`, oldest first, each an object of its columns |
 //!
 //! A walk goes at most n hops. To follow a table the other way, swap its `from` and `to`. A walk
 //! with `at` is as of `at`: it follows only the rows of a via table that names `time` whose W is
@@ -132,7 +132,7 @@ impl Action for Step {
                 let [table, from, time] =
                     names(options, ["table", "from", "time"]).map_err(|e| fail(&e))?;
                 let rows = edges(&open()?, table, from, time, node, at).map_err(|e| fail(&e))?;
-                ("edges", json!(rows))
+                ("edges", json!({ "rows": rows }))
             }
         };
         Ok(Map::from_iter([(field.to_owned(), value)]))

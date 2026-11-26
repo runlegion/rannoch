@@ -26,8 +26,8 @@ Feature: rannoch-graph is utils over the app's ontology tables, and every read i
 
   @module-rannoch-graph @criterion-FR-RANNOCH-125-c4
   Scenario: Every read is an event, and that event returns its result (fr_rannoch_125_c4)
-    Given an app whose doc d1 was titled by one event and retitled by the next, at 1,000 and 2,000, and which cites d2 from d1
-    When the app sends a walk, a why and an as-of read, each as an event
+    Given an app whose doc d1 was titled by one event and retitled by the next, at 1,000 and 2,000, and which cites d2 from d1 at 1,000
+    When the app sends a walk, a why, and as-of reads of a row, a walk and edges, each as an event
     Then each read event returns its result as an event whose source it is
 
   @module-rannoch-graph @criterion-01a2166f-db5e-76d0-9f75-25c911d0f98c
