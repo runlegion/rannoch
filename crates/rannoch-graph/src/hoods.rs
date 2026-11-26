@@ -42,6 +42,7 @@ fn parse(options: &Value) -> Result<(Vec<Via>, i64, usize), String> {
             table.clone(),
             col("from").ok_or_else(not)?,
             col("to").ok_or_else(not)?,
+            col("time"),
         ))
     });
     let via = via.collect::<Result<Vec<_>, String>>()?;
@@ -52,15 +53,21 @@ fn parse(options: &Value) -> Result<(Vec<Via>, i64, usize), String> {
     Ok((via, hops, usize::try_from(cap).unwrap_or(usize::MAX)))
 }
 
-/// The walk from `root` by `options`, cold, as the step gives it, and where a row touches it.
-fn cold(conn: &Connection, options: &Value, root: &str) -> Result<(Value, Vec<Touch>), String> {
+/// The walk from `root` by `options` as of `at`, cold, as the step gives it, and where a row
+/// touches it.
+fn cold(
+    conn: &Connection,
+    options: &Value,
+    root: &str,
+    at: Option<i64>,
+) -> Result<(Value, Vec<Touch>), String> {
     let (via, hops, cap) = parse(options)?;
-    let (nodes, cut) = walk(conn, &via, root, hops, cap).map_err(|e| e.to_string())?;
+    let (nodes, cut) = walk(conn, &via, root, hops, cap, at).map_err(|e| e.to_string())?;
     // A row from a node the walk did not return cannot change it, the cap's cut included: what
     // such a row reaches is further than every node returned.
     let read = nodes.iter().map(|(n, _)| n.as_str()).chain([root]);
     let read: Vec<&str> = read.collect();
-    let touches = via.iter().flat_map(|(table, from, _)| {
+    let touches = via.iter().flat_map(|(table, from, ..)| {
         read.iter()
             .map(|n| (table.clone(), from.clone(), (*n).to_owned()))
     });
@@ -76,20 +83,21 @@ impl Hoods {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The walk from `root` by `options`: the warm copy, or a cold walk on `open`'s connection,
-    /// kept warm. The hoods stay locked while it reads, so no drop passes it by.
+    /// The walk from `root` by `options` as of `at`: the warm copy, or a cold walk on `open`'s
+    /// connection, kept warm. The hoods stay locked while it reads, so no drop passes it by.
     pub(crate) fn walk(
         &self,
         options: &Value,
         root: &str,
+        at: Option<i64>,
         open: impl FnOnce() -> Result<Connection, String>,
     ) -> Result<Value, String> {
         let mut kept = self.lock();
-        let key = format!("{options}\u{0}{root}");
+        let key = format!("{options}\u{0}{root}\u{0}{at:?}");
         if let Some(hood) = kept.hoods.get(&key) {
             return Ok(hood.result.clone());
         }
-        let (result, touches) = cold(&open()?, options, root)?;
+        let (result, touches) = cold(&open()?, options, root, at)?;
         kept.keep(key, result.clone(), touches);
         Ok(result)
     }
@@ -227,8 +235,10 @@ mod tests {
         let path = target.join(format!("rannoch-hoods-{}.db", Uuid::now_v7()));
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(DOCS).unwrap();
-        conn.execute_batch("INSERT INTO cites VALUES ('d1', 'd2'), ('d2', 'd3'), ('d9', 'd8')")
-            .unwrap();
+        conn.execute_batch(
+            "INSERT INTO cites (doc, cited) VALUES ('d1', 'd2'), ('d2', 'd3'), ('d9', 'd8')",
+        )
+        .unwrap();
         let options =
             json!({ "via": { "cites": { "from": "doc", "to": "cited" } }, "hops": 3, "cap": 10 });
         let hoods = Hoods::default();
@@ -238,21 +248,21 @@ mod tests {
             Connection::open(&path).map_err(|e| e.to_string())
         };
 
-        let first = hoods.walk(&options, "d1", open).unwrap();
-        let again = hoods.walk(&options, "d1", none).unwrap();
+        let first = hoods.walk(&options, "d1", None, open).unwrap();
+        let again = hoods.walk(&options, "d1", None, none).unwrap();
         assert_eq!((ids(&first), &again), (vec!["d2", "d3"], &first));
         assert_eq!(opened.get(), 1);
 
         // d3 cites d4: d3 is a node the walk returned, so its hood is dropped.
-        conn.execute("INSERT INTO cites VALUES ('d3', 'd4')", [])
+        conn.execute("INSERT INTO cites (doc, cited) VALUES ('d3', 'd4')", [])
             .unwrap();
         let touching = [row("cites", json!({ "doc": "d3", "cited": "d4" }))];
         assert_eq!(hoods.cool(&touching), 1);
-        let read = hoods.walk(&options, "d1", open).unwrap();
+        let read = hoods.walk(&options, "d1", None, open).unwrap();
         assert_eq!(opened.get(), 2);
-        assert_eq!(read, cold(&conn, &options, "d1").unwrap().0);
+        assert_eq!(read, cold(&conn, &options, "d1", None).unwrap().0);
         assert_eq!(ids(&read), ["d2", "d3", "d4"]);
-        assert_eq!(hoods.walk(&options, "d1", none).unwrap(), read);
+        assert_eq!(hoods.walk(&options, "d1", None, none).unwrap(), read);
 
         // d9 is no node the hood read, and doc_titles is none of its via tables.
         let elsewhere = [
@@ -260,9 +270,29 @@ mod tests {
             row("doc_titles", json!({ "doc": "d1" })),
         ];
         assert_eq!(hoods.cool(&elsewhere), 0);
-        assert_eq!(hoods.walk(&options, "d1", none).unwrap(), read);
+        assert_eq!(hoods.walk(&options, "d1", None, none).unwrap(), read);
         drop(conn);
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A walk as of a time is kept apart from the same walk now, and from one as of another time.
+    #[test]
+    fn an_as_of_walk_is_its_own_hood() {
+        let options = json!({ "via": { "cites": { "from": "doc", "to": "cited", "time": "written" } },
+            "hops": 2, "cap": 10 });
+        let open = || {
+            let conn = store(DOCS);
+            let cites = "INSERT INTO cites VALUES ('d1', 'd2', 1000), ('d1', 'd3', 2000)";
+            conn.execute_batch(cites).map_err(|e| e.to_string())?;
+            Ok(conn)
+        };
+        let hoods = Hoods::default();
+        let now = hoods.walk(&options, "d1", None, open).unwrap();
+        assert_eq!(ids(&now), ["d2", "d3"]);
+        let then = hoods.walk(&options, "d1", Some(1_500), open).unwrap();
+        assert_eq!(ids(&then), ["d2"]);
+        assert_eq!(hoods.walk(&options, "d1", Some(1_500), none).unwrap(), then);
+        assert_eq!(hoods.walk(&options, "d1", None, none).unwrap(), now);
     }
 
     /// An inner append that fails, or takes each event's held items as the real one does.
@@ -301,11 +331,11 @@ mod tests {
         let options =
             json!({ "via": { "cites": { "from": "doc", "to": "cited" } }, "hops": 2, "cap": 10 });
         let conn = store(DOCS);
-        conn.execute("INSERT INTO cites VALUES ('d1', 'd2')", [])
+        conn.execute("INSERT INTO cites (doc, cited) VALUES ('d1', 'd2')", [])
             .unwrap();
         let hoods = Hoods::default();
-        hoods.walk(&options, "d1", || Ok(conn)).unwrap();
-        let kept = || hoods.walk(&options, "d1", none).is_ok();
+        hoods.walk(&options, "d1", None, || Ok(conn)).unwrap();
+        let kept = || hoods.walk(&options, "d1", None, none).is_ok();
 
         let writes = Writes::default();
         let touching =
@@ -362,5 +392,13 @@ mod tests {
             "as_of: table is not a name"
         );
         assert_eq!(run(1, json!({}), json!({})), "why: node is not a string");
+        assert_eq!(
+            run(2, json!({}), json!({ "node": "d1", "at": "now" })),
+            "walk: at is not a whole number of ms"
+        );
+        assert_eq!(
+            run(3, json!({}), json!({ "node": "d1" })),
+            "edges: at is not a whole number of ms"
+        );
     }
 }

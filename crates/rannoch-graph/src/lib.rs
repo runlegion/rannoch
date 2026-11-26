@@ -25,10 +25,13 @@
 //! |---|---|---|
 //! | `as_of` | `{"table": T, "key": K, "time": W}`; it also takes `at`, a number | `row`: the row of T whose K is `node` with the greatest W at or before `at`, as an object of its columns, or null when it has none |
 //! | `why` | `{"table": T, "key": K, "event": E}` | `why`: the greatest E among T's rows whose K is `node`, then that event's source chain through `_events`: its source, that event's source, and so on; empty when there is none in `_events` |
-//! | `walk` | `{"via": {T: {"from": F, "to": D}, ..}, "hops": n, "cap": m}` | `walk`: `{"nodes": [{"id", "hops"}, ..], "cut": bool}`, each node reached from `node` over each T's rows from F to D, the root left out, once with its fewest hops: nearest first, then by id, at most m of them, and whether the cap cut the walk |
+//! | `walk` | `{"via": {T: {"from": F, "to": D, "time": W}, ..}, "hops": n, "cap": m}`, `time` optional; it also reads `at`, a number, when the event holds one | `walk`: `{"nodes": [{"id", "hops"}, ..], "cut": bool}`, each node reached from `node` over each T's rows from F to D, the root left out, once with its fewest hops: nearest first, then by id, at most m of them, and whether the cap cut the walk |
+//! | `edges` | `{"table": T, "from": F, "time": W}`; it also takes `at`, a number | `edges`: the rows of T whose F is `node` and whose W is at or before `at`, oldest first, each an object of its columns |
 //!
-//! A walk goes at most n hops. To follow a table the other way, swap its `from` and `to`. Node
-//! ids are read as text. A column holding a blob is read as a list of its bytes.
+//! A walk goes at most n hops. To follow a table the other way, swap its `from` and `to`. A walk
+//! with `at` is as of `at`: it follows only the rows of a via table that names `time` whose W is
+//! at or before `at`, and a via table with no `time` whole. Node ids are read as text. A column
+//! holding a blob is read as a list of its bytes.
 //!
 //! A step fails with its name and the reason, as `walk: no such table: nope`, when an option
 //! or what it takes does not parse, or the store cannot answer.
@@ -70,14 +73,14 @@ use serde_json::{Map, Value, json};
 /// The steps' signatures; the app's build gathers them.
 pub const SIGNATURES: &str = include_str!("../signatures.json");
 
-/// The `Sig`s in [`SIGNATURES`]: `as_of`, `why` and `walk`.
-static SIGS: LazyLock<[Sig; 3]> =
+/// The `Sig`s in [`SIGNATURES`]: `as_of`, `why`, `walk` and `edges`.
+static SIGS: LazyLock<[Sig; 4]> =
     LazyLock::new(|| serde_json::from_str(SIGNATURES).unwrap_or_default());
 
-/// The crate's three steps, `as_of`, `why` and `walk`, whose walks are warm in `hoods`.
+/// The crate's four steps, `as_of`, `why`, `walk` and `edges`, whose walks are warm in `hoods`.
 #[must_use]
 pub fn actions(hoods: &Hoods) -> Vec<Arc<dyn Action>> {
-    (0..3)
+    (0..4)
         .map(|util| Arc::new(Step(util, hoods.clone())) as Arc<dyn Action>)
         .collect()
 }
@@ -100,10 +103,15 @@ impl Action for Step {
         let node = input.get("node").and_then(Value::as_str);
         let node = node.ok_or_else(|| fail(&"node is not a string"))?;
         let open = || rannoch_store::Store::connection().map_err(|e| fail(&e));
+        let at = || {
+            let at = input.get("at").map(Value::as_i64);
+            at.map(|at| at.ok_or_else(|| fail(&"at is not a whole number of ms")))
+                .transpose()
+        };
+        let needed = || at()?.ok_or_else(|| fail(&"at is not a whole number of ms"));
         let (field, value) = match self.0 {
             0 => {
-                let at = input.get("at").and_then(Value::as_i64);
-                let at = at.ok_or_else(|| fail(&"at is not a whole number of ms"))?;
+                let at = needed()?;
                 let [table, key, time] =
                     names(options, ["table", "key", "time"]).map_err(|e| fail(&e))?;
                 let row = as_of(&open()?, table, key, time, node, at).map_err(|e| fail(&e))?;
@@ -115,10 +123,17 @@ impl Action for Step {
                 let why = why(&open()?, table, key, event, node).map_err(|e| fail(&e))?;
                 ("why", json!(why))
             }
-            _ => (
-                "walk",
-                self.1.walk(options, node, open).map_err(|e| fail(&e))?,
-            ),
+            2 => {
+                let walked = self.1.walk(options, node, at()?, open);
+                ("walk", walked.map_err(|e| fail(&e))?)
+            }
+            _ => {
+                let at = needed()?;
+                let [table, from, time] =
+                    names(options, ["table", "from", "time"]).map_err(|e| fail(&e))?;
+                let rows = edges(&open()?, table, from, time, node, at).map_err(|e| fail(&e))?;
+                ("edges", json!(rows))
+            }
         };
         Ok(Map::from_iter([(field.to_owned(), value)]))
     }
@@ -160,11 +175,36 @@ fn as_of(
     let mut st = conn.prepare_cached(&sql)?;
     let columns: Vec<String> = st.column_names().map(str::to_owned).collect();
     let mut rows = st.query(params![node, at])?;
-    let Some(r) = rows.next()? else {
-        return Ok(Value::Null);
-    };
+    rows.next()?
+        .map_or(Ok(Value::Null), |r| object(&columns, r))
+}
+
+/// The rows of `table` whose `from` is `node` and whose `time` is at or before `at`, oldest
+/// first, each as an object of its columns.
+fn edges(
+    conn: &Connection,
+    table: &str,
+    from: &str,
+    time: &str,
+    node: &str,
+    at: i64,
+) -> Result<Vec<Value>> {
+    let (table, from, time) = (quote(table), quote(from), quote(time));
+    let sql = format!("SELECT * FROM {table} WHERE {from} = ?1 AND {time} <= ?2 ORDER BY {time}");
+    let mut st = conn.prepare_cached(&sql)?;
+    let columns: Vec<String> = st.column_names().map(str::to_owned).collect();
+    let mut rows = st.query(params![node, at])?;
+    let mut out = Vec::new();
+    while let Some(r) = rows.next()? {
+        out.push(object(&columns, r)?);
+    }
+    Ok(out)
+}
+
+/// A row as an object of its `columns`.
+fn object(columns: &[String], r: &rusqlite::Row<'_>) -> Result<Value> {
     let mut row = Map::new();
-    for (i, column) in columns.into_iter().enumerate() {
+    for (i, column) in columns.iter().enumerate() {
         let value = match r.get_ref(i)? {
             ValueRef::Null => Value::Null,
             ValueRef::Integer(n) => json!(n),
@@ -172,7 +212,7 @@ fn as_of(
             ValueRef::Text(t) => json!(String::from_utf8_lossy(t)),
             ValueRef::Blob(b) => json!(b),
         };
-        row.insert(column, value);
+        row.insert(column.clone(), value);
     }
     Ok(Value::Object(row))
 }
@@ -192,35 +232,41 @@ fn why(conn: &Connection, table: &str, key: &str, event: &str, node: &str) -> Re
     ids.collect()
 }
 
-/// An edge table a walk follows: the table, the column it goes from and the one it goes to.
-pub(crate) type Via = (String, String, String);
+/// An edge table a walk follows: the table, the column it goes from, the one it goes to, and
+/// the column of its rows' time, when it names one.
+pub(crate) type Via = (String, String, String, Option<String>);
 
-/// The nodes reached from `root` over `via` in at most `hops` hops, nearest first as (node,
-/// hops), at most `cap`, and whether the cap cut it.
+/// The nodes reached from `root` over `via` in at most `hops` hops, as of `at` when given,
+/// nearest first as (node, hops), at most `cap`, and whether the cap cut it.
 pub(crate) fn walk(
     conn: &Connection,
     via: &[Via],
     root: &str,
     hops: i64,
     cap: usize,
+    at: Option<i64>,
 ) -> Result<(Vec<(String, i64)>, bool)> {
-    let steps = via.iter().map(|(table, from, to)| {
+    let steps = via.iter().map(|(table, from, to, time)| {
         let (table, from, to) = (quote(table), quote(from), quote(to));
+        let time = time.as_deref().map_or_else(String::new, |time| {
+            format!(" AND (?2 IS NULL OR e.{} <= ?2)", quote(time))
+        });
         format!(
             " UNION SELECT CAST(e.{to} AS TEXT), w.depth + 1 FROM w JOIN {table} e
-            ON e.{from} = w.node WHERE w.depth < ?2"
+            ON e.{from} = w.node WHERE w.depth < ?3{time}"
         )
     });
     let sql = format!(
         "WITH RECURSIVE w(node, depth) AS (SELECT ?1, 0{})
         SELECT node, min(depth) AS d FROM w WHERE node <> ?1 GROUP BY node ORDER BY d, node
-        LIMIT ?3",
+        LIMIT ?4",
         steps.collect::<String>()
     );
     // One past the cap, so a walk the cap cut tells itself from one that ended at it.
     let limit = i64::try_from(cap).map_or(i64::MAX, |cap| cap.saturating_add(1));
     let mut st = conn.prepare_cached(&sql)?;
-    let rows = st.query_map(params![root, hops, limit], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    let args = params![root, at, hops, limit];
+    let rows = st.query_map(args, |r| Ok((r.get(0)?, r.get(1)?)))?;
     let mut nodes = rows.collect::<Result<Vec<_>>>()?;
     let cut = nodes.len() > cap;
     nodes.truncate(cap);
@@ -235,18 +281,18 @@ pub(crate) mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
-    use super::{Via, as_of, walk, why};
+    use super::{Via, as_of, edges, walk, why};
 
     /// An app's ontology, as its ontology crate's migrations make it, with names the app chose:
-    /// docs with titles over time, and the docs each one cites.
+    /// docs with titles over time, and the docs each one cites, from when.
     pub(crate) const DOCS: &str = "CREATE TABLE doc_titles (doc TEXT, title TEXT, event TEXT,
         written INTEGER, PRIMARY KEY (doc, event));
-        CREATE TABLE cites (doc TEXT, cited TEXT, PRIMARY KEY (doc, cited));
+        CREATE TABLE cites (doc TEXT, cited TEXT, written INTEGER, PRIMARY KEY (doc, cited));
         CREATE TABLE wrote (author TEXT, doc TEXT, PRIMARY KEY (author, doc))";
 
     /// The same ontology under another app's names.
     const PAPERS: &str = "CREATE TABLE paper (pid TEXT, name TEXT, by_event TEXT, at_ms INTEGER);
-        CREATE TABLE refs (src TEXT, dst TEXT)";
+        CREATE TABLE refs (src TEXT, dst TEXT, at_ms INTEGER)";
 
     /// A store with rannoch's tables and the app's ontology `ddl`.
     pub(crate) fn store(ddl: &str) -> Connection {
@@ -265,11 +311,12 @@ pub(crate) mod tests {
     }
 
     fn via(table: &str, from: &str, to: &str) -> Via {
-        (table.to_owned(), from.to_owned(), to.to_owned())
+        (table.to_owned(), from.to_owned(), to.to_owned(), None)
     }
 
-    /// d1 cites d2 and d3, d2 cites d4, d4 cites d1; ada wrote d1 and d4. d1 is titled at
-    /// 1,000 by its first event, and retitled at 2,000 by an event whose source is the first.
+    /// d1 cites d2 and d3, d2 cites d4, d4 cites d1, each at 1,000 but d1's cite of d3 at 2,000;
+    /// ada wrote d1 and d4. d1 is titled at 1,000 by its first event, and retitled at 2,000 by
+    /// an event whose source is the first.
     fn small(conn: &Connection, [titles, cites, wrote]: [&str; 3]) -> [String; 2] {
         let first = event(conn, None);
         let fix = event(conn, Some(&first));
@@ -278,9 +325,13 @@ pub(crate) mod tests {
             .unwrap();
         conn.execute(&title, params!["d1", "graph store notes", fix, 2_000])
             .unwrap();
-        let cite = format!("INSERT INTO {cites} VALUES (?1, ?2)");
-        for (a, b) in [("d1", "d2"), ("d1", "d3"), ("d2", "d4"), ("d4", "d1")] {
-            conn.execute(&cite, [a, b]).unwrap();
+        let cite = format!("INSERT INTO {cites} VALUES (?1, ?2, ?3)");
+        let rows = [("d1", "d2", 1_000), ("d1", "d3", 2_000)];
+        for (a, b, at) in rows
+            .into_iter()
+            .chain([("d2", "d4", 1_000), ("d4", "d1", 1_000)])
+        {
+            conn.execute(&cite, params![a, b, at]).unwrap();
         }
         if !wrote.is_empty() {
             let wrote = format!("INSERT INTO {wrote} VALUES (?1, ?2)");
@@ -291,7 +342,8 @@ pub(crate) mod tests {
         [first, fix]
     }
 
-    /// FR-RANNOCH-125-c3: why, a capped walk and an as-of read, over the app's ontology tables.
+    /// FR-RANNOCH-125-c3: why, a capped walk and as-of reads, of a row, a walk and a node's
+    /// edges, over the app's ontology tables.
     #[test]
     fn fr_rannoch_125_c3() {
         let conn = store(DOCS);
@@ -316,15 +368,34 @@ pub(crate) mod tests {
 
         // A walk over cites and wrote backwards, each node once at its fewest hops; capped.
         let both = [via("cites", "doc", "cited"), via("wrote", "doc", "author")];
-        let (nodes, cut) = walk(&conn, &both, "d1", 2, 10).unwrap();
+        let (nodes, cut) = walk(&conn, &both, "d1", 2, 10, None).unwrap();
         let hops = |n: &[(String, i64)]| n.iter().map(|(n, h)| (n.clone(), *h)).collect::<Vec<_>>();
         let want = [("ada", 1), ("d2", 1), ("d3", 1), ("d4", 2)].map(|(n, h)| (n.to_owned(), h));
         assert_eq!((hops(&nodes), cut), (want.to_vec(), false));
         assert_eq!(
-            walk(&conn, &both, "d1", 2, 2).unwrap(),
+            walk(&conn, &both, "d1", 2, 2, None).unwrap(),
             (want[..2].to_vec(), true)
         );
-        assert!(!walk(&conn, &both, "d1", 2, 4).unwrap().1);
+        assert!(!walk(&conn, &both, "d1", 2, 4, None).unwrap().1);
+
+        // An as-of walk follows the cites written by then; wrote names no time and is whole.
+        let mut timed = both.clone();
+        timed[0].3 = Some("written".to_owned());
+        let then = walk(&conn, &timed, "d1", 2, 10, Some(1_500)).unwrap().0;
+        let want_then = [("ada", 1), ("d2", 1), ("d4", 2)].map(|(n, h)| (n.to_owned(), h));
+        assert_eq!(hops(&then), want_then);
+        let now = walk(&conn, &timed, "d1", 2, 10, Some(9_999)).unwrap();
+        assert_eq!(now, (want.to_vec(), false));
+        assert_eq!(walk(&conn, &timed, "d1", 2, 10, None).unwrap(), now);
+
+        // A node's edges as of a time: the rows written by then, oldest first.
+        let cited = |at| {
+            let rows = edges(&conn, "cites", "doc", "written", "d1", at).unwrap();
+            rows.iter().map(|r| r["cited"].clone()).collect::<Vec<_>>()
+        };
+        assert_eq!(cited(999), Vec::<serde_json::Value>::new());
+        assert_eq!(cited(1_500), [json!("d2")]);
+        assert_eq!(cited(9_999), [json!("d2"), json!("d3")]);
     }
 
     /// 01a216c8-b0d1-76f2-b5b2-b39d928247e3: the same utils on another app's tables and
@@ -349,7 +420,7 @@ pub(crate) mod tests {
             why(&papers, "paper", "pid", "by_event", "d1").unwrap()[0],
             fixed
         );
-        let reached = |conn, v: Via| walk(conn, &[v], "d1", 3, 10).unwrap();
+        let reached = |conn, v: Via| walk(conn, &[v], "d1", 3, 10, None).unwrap();
         assert_eq!(
             reached(&docs, via("cites", "doc", "cited")),
             reached(&papers, via("refs", "src", "dst"))
@@ -376,7 +447,7 @@ pub(crate) mod tests {
             if depth == hops {
                 continue;
             }
-            for (table, from, to) in via {
+            for (table, from, to, _) in via {
                 let sql = format!("SELECT {to} FROM {table} WHERE {from} = ?1");
                 let mut st = conn.prepare(&sql).unwrap();
                 let far = st.query_map([&node], |r| r.get::<_, String>(0)).unwrap();
@@ -409,7 +480,7 @@ pub(crate) mod tests {
             for _ in 0..d.min(5) {
                 let cited = format!("d{}", rng.below(d));
                 tx.execute(
-                    "INSERT OR IGNORE INTO cites VALUES (?1, ?2)",
+                    "INSERT OR IGNORE INTO cites (doc, cited) VALUES (?1, ?2)",
                     [&doc, &cited],
                 )
                 .unwrap();
@@ -422,8 +493,8 @@ pub(crate) mod tests {
             let root = format!("d{}", docs - 1 - r * 7);
             let full = bfs(&conn, &root, &both, 2);
 
-            let whole = walk(&conn, &both, &root, 2, 1_000_000).unwrap();
-            let (capped, cut) = walk(&conn, &both, &root, 2, 10).unwrap();
+            let whole = walk(&conn, &both, &root, 2, 1_000_000, None).unwrap();
+            let (capped, cut) = walk(&conn, &both, &root, 2, 10, None).unwrap();
 
             assert_eq!(whole, (full.clone(), false), "root {root}");
             assert_eq!(capped, full[..10.min(full.len())], "root {root}");

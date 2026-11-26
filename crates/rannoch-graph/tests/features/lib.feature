@@ -15,11 +15,14 @@ Feature: rannoch-graph is utils over the app's ontology tables, and every read i
     Then the walk reaches what the app's table holds
 
   @module-rannoch-graph @criterion-FR-RANNOCH-125-c3
-  Scenario: why, a capped walk and an as-of read over the app's tables (fr_rannoch_125_c3)
+  Scenario: why, a capped walk and as-of reads over the app's tables (fr_rannoch_125_c3)
     Given docs whose title was set at 1,000 and corrected at 2,000 by an event whose source is the first
+    And d1 cites d2 at 1,000 and d3 at 2,000
     Then as of 1,500 the title is the first, after 2,000 the correction, and before 1,000 none
     And why is the correction's event, then the first
     And a walk over cites and wrote backwards reaches each node once at its fewest hops, and a cap cuts it and says so
+    And a walk as of 1,500 follows only the cites written by then
+    And d1's edges as of 999 are none, as of 1,500 its cite of d2, and after 2,000 both
 
   @module-rannoch-graph @criterion-FR-RANNOCH-125-c4
   Scenario: Every read is an event, and that event returns its result (fr_rannoch_125_c4)
