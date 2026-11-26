@@ -558,36 +558,59 @@ pub(crate) mod tests {
             )
         };
         let ln2 = 2f64.ln().recip();
-        // d1 meets d2, d3 and d4, d2 meets d4, read both ways; for learned, a row weighs its time.
+        // d1 meets d2, d3 and d4, d2 meets d4, read both ways; a weighed case's row weighs its
+        // time: d1 to d3 2,000, the rest 1,000.
         let cases = [
             (
                 Scorer::Katz,
+                false,
                 json!({ "hops": 2, "beta": 0.5, "cap": 10 }),
                 vec![("d2", 0.75), ("d4", 0.75), ("d3", 0.5)],
             ),
             (
+                Scorer::Katz,
+                true,
+                json!({ "hops": 2, "beta": 0.0005, "cap": 10 }),
+                vec![("d3", 1.0), ("d2", 0.75), ("d4", 0.75)],
+            ),
+            (
                 Scorer::PageRank,
+                false,
                 json!({ "hops": 2, "restart": 0.5, "cap": 10 }),
                 vec![("d2", 5.0 / 48.0), ("d4", 5.0 / 48.0), ("d3", 1.0 / 12.0)],
             ),
             (
+                Scorer::PageRank,
+                true,
+                json!({ "hops": 2, "restart": 0.5, "cap": 10 }),
+                vec![("d3", 0.125), ("d2", 5.0 / 64.0), ("d4", 5.0 / 64.0)],
+            ),
+            (
                 Scorer::Shared,
+                false,
                 json!({ "rare": false, "cap": 10 }),
                 vec![("d2", 1.0), ("d4", 1.0)],
             ),
             (
                 Scorer::Shared,
+                false,
                 json!({ "rare": true, "cap": 1 }),
                 vec![("d2", ln2)],
             ),
             (
+                Scorer::Shared,
+                true,
+                json!({ "rare": true, "cap": 10 }),
+                vec![("d2", 1e6 / 2_000f64.ln()), ("d4", 1e6 / 2_000f64.ln())],
+            ),
+            (
                 Scorer::Learned,
+                true,
                 json!({ "cap": 10 }),
                 vec![("d3", 2_000.0), ("d2", 1_000.0), ("d4", 1_000.0)],
             ),
         ];
-        for (scorer, mut options, want) in cases {
-            let weighed = matches!(scorer, Scorer::Learned);
+        for (scorer, weighed, mut options, want) in cases {
             let mut via = |table: &str, from: &str, to: &str, weight: &str| {
                 let mut cols = json!({ "from": from, "to": to });
                 if weighed {
