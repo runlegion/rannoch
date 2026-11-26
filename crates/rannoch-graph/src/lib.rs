@@ -1,8 +1,8 @@
 #![warn(missing_docs)]
 //! Graph utils over the app's own ontology tables. rannoch-graph has no tables and defines no
 //! shape: an app's shape is its ontology crate's tables, and every table and column a util reads
-//! is one the app names in a step's options. The utils are why, capped walks, as-of reads and
-//! warm hoods.
+//! is one the app names in a step's options. The utils are why, capped walks, as-of reads,
+//! warm hoods and the scoring tools.
 //!
 //! A read is an event. Each util is a step, and an app reads by sending an event whose flow
 //! calls it; the step gives the result, and the step's `next` returns it as an event of the
@@ -27,11 +27,22 @@
 //! | `why` | `{"table": T, "key": K, "event": E}` | `why`: the greatest E among T's rows whose K is `node`, then that event's source chain through `_events`: its source, that event's source, and so on; empty when there is none in `_events` |
 //! | `walk` | `{"via": {T: {"from": F, "to": D, "time": W}, ..}, "hops": n, "cap": m}`, `time` optional; it also reads `at`, a number, when the event holds one | `walk`: `{"nodes": [{"id", "hops"}, ..], "cut": bool}`, each node reached from `node` over each T's rows from F to D, the root left out, once with its fewest hops: nearest first, then by id, at most m of them, and whether the cap cut the walk |
 //! | `edges` | `{"table": T, "from": F, "time": W}`; it also takes `at`, a number | `edges`: `{"rows": [..]}`, the rows of T whose F is `node` and whose W is at or before `at`, oldest first, each an object of its columns |
+//! | `katz` | `{"via": {T: {"from": F, "to": D, "weight": X}, ..}, "hops": n, "beta": b, "cap": m}` | `scores`: each node's Katz score from `node`, the sum over walks of 1 to n rows of b to the walk's length |
+//! | `pagerank` | `{"via": .., "hops": n, "restart": a, "cap": m}` | `scores`: each node's personalized page rank from `node`, a random walk that restarts at `node` with chance a, run n hops |
+//! | `shared` | `{"via": .., "rare": r, "cap": m}` | `scores`: each node's shared neighbours with `node`; with r true, each counts 1 over the log of its degree (Adamic-Adar) |
+//! | `learned` | `{"via": .., "cap": m}` | `scores`: each node's learned weight from `node`, the sum of X over the rows between them |
 //!
 //! A walk goes at most n hops. To follow a table the other way, swap its `from` and `to`. A walk
 //! with `at` is as of `at`: it follows only the rows of a via table that names `time` whose W is
 //! at or before `at`, and a via table with no `time` whole. Node ids are read as text. A column
 //! holding a blob is read as a list of its bytes.
+//!
+//! The scoring tools read graph structure alone: no vectors, and no score from outside the
+//! graph. Each reads each via table both ways, from F to D and from D to F, and counts a row by
+//! its X, or by 1 when the table names no `weight`; the app writes the learned weights into its
+//! own table. Each gives `scores`: `{"nodes": [{"id", "score"}, ..], "cut": bool}`, the nodes it
+//! scores, `node` left out, highest first, then by id, at most m of them, and whether the cap
+//! cut them.
 //!
 //! A step fails with its name and the reason, as `walk: no such table: nope`, when an option
 //! or what it takes does not parse, or the store cannot answer.
@@ -59,8 +70,10 @@
 //! batch and before the `Warm` drops its hoods may still return the kept result.
 
 mod hoods;
+mod score;
 
 pub use hoods::{Hoods, Warm};
+use score::Scorer;
 
 use std::fmt::Display;
 use std::sync::{Arc, LazyLock};
@@ -74,14 +87,16 @@ use uuid::Builder;
 /// The steps' signatures; the app's build gathers them.
 pub const SIGNATURES: &str = include_str!("../signatures.json");
 
-/// The `Sig`s in [`SIGNATURES`]: `as_of`, `why`, `walk` and `edges`.
-static SIGS: LazyLock<[Sig; 4]> =
+/// The `Sig`s in [`SIGNATURES`]: `as_of`, `why`, `walk`, `edges`, `katz`, `pagerank`, `shared`
+/// and `learned`.
+static SIGS: LazyLock<[Sig; 8]> =
     LazyLock::new(|| serde_json::from_str(SIGNATURES).unwrap_or_default());
 
-/// The crate's four steps, `as_of`, `why`, `walk` and `edges`, whose walks are warm in `hoods`.
+/// The crate's steps, `as_of`, `why`, `walk` and `edges`, whose walks are warm in `hoods`, and
+/// the scoring tools `katz`, `pagerank`, `shared` and `learned`.
 #[must_use]
 pub fn actions(hoods: &Hoods) -> Vec<Arc<dyn Action>> {
-    (0..4)
+    (0..8)
         .map(|util| Arc::new(Step(util, hoods.clone())) as Arc<dyn Action>)
         .collect()
 }
@@ -128,12 +143,22 @@ impl Action for Step {
                 let walked = self.1.walk(options, node, at()?, open);
                 ("walk", walked.map_err(|e| fail(&e))?)
             }
-            _ => {
+            3 => {
                 let at = needed()?;
                 let [table, from, time] =
                     names(options, ["table", "from", "time"]).map_err(|e| fail(&e))?;
                 let rows = edges(&open()?, table, from, time, node, at).map_err(|e| fail(&e))?;
                 ("edges", json!({ "rows": rows }))
+            }
+            util => {
+                let tools = [
+                    Scorer::Katz,
+                    Scorer::PageRank,
+                    Scorer::Shared,
+                    Scorer::Learned,
+                ];
+                let scored = score::score(&open()?, tools[util - 4], options, node);
+                ("scores", scored.map_err(|e| fail(&e))?)
             }
         };
         Ok(Map::from_iter([(field.to_owned(), value)]))
@@ -295,6 +320,7 @@ pub(crate) mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
+    use super::score::{Scorer, score};
     use super::{Via, as_of, edges, walk, why};
 
     /// An app's ontology, as its ontology crate's migrations make it, with names the app chose:
@@ -482,6 +508,74 @@ pub(crate) mod tests {
             reached(&docs, via("cites", "doc", "cited")),
             reached(&papers, via("refs", "src", "dst"))
         );
+    }
+
+    /// 01a216c8-b138-7ce1-8599-45d05b451b2c: the scoring tools on another app's tables and
+    /// columns give the same scores.
+    #[test]
+    fn criterion_01a216c8_scoring_tools_work_on_variable_tables_and_columns() {
+        let (docs, papers) = (store(DOCS), store(PAPERS));
+        small(&docs, ["doc_titles", "cites", "wrote"]);
+        small(&papers, ["paper", "refs", ""]);
+        let scored = |conn, scorer, options: serde_json::Value| {
+            let scores = score(conn, scorer, &options, "d1").unwrap();
+            let nodes = scores["nodes"].as_array().unwrap().iter();
+            let nodes = nodes.map(|n| (n["id"].as_str().unwrap().to_owned(), n["score"].as_f64()));
+            (
+                nodes.map(|(id, s)| (id, s.unwrap())).collect::<Vec<_>>(),
+                scores["cut"].clone(),
+            )
+        };
+        let ln2 = 2f64.ln().recip();
+        // d1 meets d2, d3 and d4, d2 meets d4, read both ways; for learned, a row weighs its time.
+        let cases = [
+            (
+                Scorer::Katz,
+                json!({ "hops": 2, "beta": 0.5, "cap": 10 }),
+                vec![("d2", 0.75), ("d4", 0.75), ("d3", 0.5)],
+            ),
+            (
+                Scorer::PageRank,
+                json!({ "hops": 2, "restart": 0.5, "cap": 10 }),
+                vec![("d2", 5.0 / 48.0), ("d4", 5.0 / 48.0), ("d3", 1.0 / 12.0)],
+            ),
+            (
+                Scorer::Shared,
+                json!({ "rare": false, "cap": 10 }),
+                vec![("d2", 1.0), ("d4", 1.0)],
+            ),
+            (
+                Scorer::Shared,
+                json!({ "rare": true, "cap": 1 }),
+                vec![("d2", ln2)],
+            ),
+            (
+                Scorer::Learned,
+                json!({ "cap": 10 }),
+                vec![("d3", 2_000.0), ("d2", 1_000.0), ("d4", 1_000.0)],
+            ),
+        ];
+        for (scorer, mut options, want) in cases {
+            let weighed = matches!(scorer, Scorer::Learned);
+            let mut via = |table: &str, from: &str, to: &str, weight: &str| {
+                let mut cols = json!({ "from": from, "to": to });
+                if weighed {
+                    cols["weight"] = json!(weight);
+                }
+                options["via"] = json!({ table: cols });
+                options.clone()
+            };
+            let mine = scored(&docs, scorer, via("cites", "doc", "cited", "written"));
+            let theirs = scored(&papers, scorer, via("refs", "src", "dst", "at_ms"));
+            assert_eq!(mine, theirs, "{scorer:?}");
+            let got: Vec<(&str, f64)> = mine.0.iter().map(|(id, s)| (id.as_str(), *s)).collect();
+            assert_eq!(got.len(), want.len(), "{scorer:?} {got:?}");
+            for ((id, s), (want_id, want_s)) in got.iter().zip(&want) {
+                assert_eq!(id, want_id, "{scorer:?} {got:?}");
+                assert!((s - want_s).abs() < 1e-12, "{scorer:?} {got:?}");
+            }
+            assert_eq!(mine.1, json!(options["cap"] == json!(1)), "{scorer:?}");
+        }
     }
 
     /// The toy's xorshift, so the graph below is the toy's.

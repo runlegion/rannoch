@@ -6,5 +6,13 @@
   { "action": "walk", "options": { "via": "any", "hops": "number", "cap": "number" },
     "takes": { "node": "string" }, "gives": { "walk": "any" } },
   { "action": "edges", "options": { "table": "string", "from": "string", "time": "string" },
-    "takes": { "node": "string", "at": "number" }, "gives": { "edges": "any" } }
+    "takes": { "node": "string", "at": "number" }, "gives": { "edges": "any" } },
+  { "action": "katz", "options": { "via": "any", "hops": "number", "beta": "number", "cap": "number" },
+    "takes": { "node": "string" }, "gives": { "scores": "any" } },
+  { "action": "pagerank", "options": { "via": "any", "hops": "number", "restart": "number", "cap": "number" },
+    "takes": { "node": "string" }, "gives": { "scores": "any" } },
+  { "action": "shared", "options": { "via": "any", "rare": "bool", "cap": "number" },
+    "takes": { "node": "string" }, "gives": { "scores": "any" } },
+  { "action": "learned", "options": { "via": "any", "cap": "number" },
+    "takes": { "node": "string" }, "gives": { "scores": "any" } }
 ]

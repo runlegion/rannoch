@@ -128,4 +128,4 @@ The row is written in the same transaction as the event's 2, under `Events::new(
 
 ### What the ontology crate owns
 
-What its tables mean, and the reads its app needs over them, such as the trees a UI shows. rannoch writes the rows a flow gives. rannoch-graph has no tables: its steps, `as_of`, `why`, `walk` and `edges`, read the ontology crate's tables when a read event's flow calls them, each table and column named in the step's options.
+What its tables mean, and the reads its app needs over them, such as the trees a UI shows. rannoch writes the rows a flow gives. rannoch-graph has no tables: its steps, `as_of`, `why`, `walk`, `edges` and the scoring tools `katz`, `pagerank`, `shared` and `learned`, read the ontology crate's tables when a read event's flow calls them, each table and column named in the step's options.

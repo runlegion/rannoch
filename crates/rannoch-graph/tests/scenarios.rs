@@ -1,4 +1,4 @@
-//! #134's and #135's scenarios through the real store, queue and rannoch-processor: an app whose ontology
+//! #134's, #135's and #136's scenarios through the real store, queue and rannoch-processor: an app whose ontology
 //! is its own tables, whose flows write them with the built-in `store` step through a `Warm`
 //! append, and whose reads are events whose flows call rannoch-graph's steps. Each event is
 //! written into `_events` from the app's forgr factory. rannoch-store has one store per
@@ -61,6 +61,22 @@ const FLOWS: &str = r#"[
   ["cited.json", {"name": "cited", "ty": 55, "takes": {"node": "string", "at": "number"},
     "steps": [{"do": "edges", "with": {"edges": {"table": "cites", "from": "doc",
       "time": "written"}}, "next": {"ty": 63, "shape": {"edges": "$edges"}}}]}],
+  ["katz.json", {"name": "katz", "ty": 57, "takes": {"node": "string"},
+    "steps": [{"do": "katz", "with": {"katz": {"via": {"cites": {"from": "doc", "to": "cited"}},
+      "hops": 2, "beta": 0.5, "cap": 10}}, "next": {"ty": 64, "shape": {"scores": "$scores"}}}]}],
+  ["pagerank.json", {"name": "pagerank", "ty": 58, "takes": {"node": "string"},
+    "steps": [{"do": "pagerank", "with": {"pagerank": {
+      "via": {"cites": {"from": "doc", "to": "cited"}}, "hops": 2, "restart": 0.5, "cap": 10}},
+      "next": {"ty": 64, "shape": {"scores": "$scores"}}}]}],
+  ["shared.json", {"name": "shared", "ty": 59, "takes": {"node": "string"},
+    "steps": [{"do": "shared", "with": {"shared": {
+      "via": {"cites": {"from": "doc", "to": "cited"}}, "rare": false, "cap": 10}},
+      "next": {"ty": 64, "shape": {"scores": "$scores"}}}]}],
+  ["learned.json", {"name": "learned", "ty": 65, "takes": {"node": "string"},
+    "steps": [{"do": "learned", "with": {"learned": {
+      "via": {"cites": {"from": "doc", "to": "cited", "weight": "written"}}, "cap": 10}},
+      "next": {"ty": 64, "shape": {"scores": "$scores"}}}]}],
+  ["scored.json", {"name": "scored", "ty": 64, "takes": {"scores": "any"}, "steps": []}],
   ["walked.json", {"name": "walked", "ty": 60, "takes": {"walk": "any"}, "steps": []}],
   ["explained.json", {"name": "explained", "ty": 61, "takes": {"why": "list<string>"},
     "steps": []}],
@@ -373,4 +389,70 @@ fn fr_rannoch_127_c1() {
     // Then the next read returns the new reach
     assert_eq!(ids(&app.read(50, &node).unwrap()), ["d2", "d3"]);
     app.stop();
+}
+
+/// The ids a scorer's result scored, highest first, with their scores.
+fn scored(result: &Value) -> Vec<(&str, f64)> {
+    let nodes = result["scores"]["nodes"].as_array().into_iter().flatten();
+    let scored = nodes.filter_map(|n| Some((n["id"].as_str()?, n["score"].as_f64()?)));
+    scored.collect()
+}
+
+/// FR-RANNOCH-128-c1: the scoring tools are part of rannoch-graph by default: the app hands
+/// `Processor::new` only rannoch-graph's actions, its flows calling each scorer pass `check`
+/// against [`SIGNATURES`], and each scoring read returns its scores as an event.
+#[test]
+fn fr_rannoch_128_c1() {
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+    // Given an app whose d1 cites d2 and d3, and d2 cites d4, each weighing its time
+    let app = App::start("scoring").unwrap();
+    let cite = "INSERT INTO cites VALUES (?1, ?2, ?3)";
+    for (doc, cited, at) in [
+        ("d1", "d2", 1_000),
+        ("d1", "d3", 2_000),
+        ("d2", "d4", 1_000),
+    ] {
+        app.conn.execute(cite, params![doc, cited, at]).unwrap();
+    }
+
+    // When the app sends a read by each scorer, each as an event
+    let node = json!({ "node": "d1" });
+    let [katz, pagerank, shared, learned] = [57, 58, 59, 65].map(|ty| app.read(ty, &node).unwrap());
+
+    // Then each read returns the scores of the nodes near d1, highest first
+    assert_eq!(scored(&katz), [("d2", 0.5), ("d3", 0.5), ("d4", 0.25)]);
+    assert_eq!(
+        scored(&pagerank),
+        [("d2", 0.125), ("d3", 0.125), ("d4", 0.031_25)]
+    );
+    assert_eq!(scored(&shared), [("d4", 1.0)]);
+    assert_eq!(scored(&learned), [("d3", 2_000.0), ("d2", 1_000.0)]);
+    assert_eq!(katz["scores"]["cut"], json!(false));
+    app.stop();
+}
+
+/// FR-RANNOCH-128-c2: no part of rannoch-graph stores or uses vectors: it has no tables, none
+/// of its steps takes or gives a list of numbers or takes a score from outside the graph, and
+/// it does not depend on rannoch-processor-onnx, rannoch's one maker of vectors.
+#[test]
+fn fr_rannoch_128_c2() {
+    let sigs: Vec<Sig> = serde_json::from_str(SIGNATURES).unwrap();
+    assert_eq!(sigs.len(), 8);
+    for sig in &sigs {
+        let fields = sig.takes.iter().chain(&sig.gives).chain(&sig.options);
+        for (field, ty) in fields {
+            assert_ne!(ty, "list<number>", "{} {field}", sig.action);
+        }
+        for field in sig.takes.keys() {
+            assert!(
+                ["node", "at"].contains(&field.as_str()),
+                "{} takes {field}",
+                sig.action
+            );
+        }
+    }
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let deps = fs::read_to_string(manifest.join("Cargo.toml")).unwrap();
+    assert!(!deps.contains("onnx"), "{deps}");
+    assert!(!manifest.join("migrations").exists());
 }
