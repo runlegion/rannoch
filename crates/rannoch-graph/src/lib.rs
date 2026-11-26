@@ -23,7 +23,7 @@
 //!
 //! | Step | Options | What it gives |
 //! |---|---|---|
-//! | `as_of` | `{"table": T, "key": K, "time": W}`; it also takes `at`, a number | `row`: the row of T whose K is `node` with the greatest W at or before `at`, as an object of its columns, or null when it has none |
+//! | `as_of` | `{"table": T, "key": K, "time": W}`; it also takes `at`, a number | `row`: the row of T whose K is `node` with the greatest W at or before `at`, as an object of its columns, or null when it has none. A W holding text is recorded time, the writing event's v7 id, read at or before the greatest v7 id of `at`; a W holding a number is valid time, in ms |
 //! | `why` | `{"table": T, "key": K, "event": E}` | `why`: the greatest E among T's rows whose K is `node`, then that event's source chain through `_events`: its source, that event's source, and so on; empty when there is none in `_events` |
 //! | `walk` | `{"via": {T: {"from": F, "to": D, "time": W}, ..}, "hops": n, "cap": m}`, `time` optional; it also reads `at`, a number, when the event holds one | `walk`: `{"nodes": [{"id", "hops"}, ..], "cut": bool}`, each node reached from `node` over each T's rows from F to D, the root left out, once with its fewest hops: nearest first, then by id, at most m of them, and whether the cap cut the walk |
 //! | `edges` | `{"table": T, "from": F, "time": W}`; it also takes `at`, a number | `edges`: `{"rows": [..]}`, the rows of T whose F is `node` and whose W is at or before `at`, oldest first, each an object of its columns |
@@ -69,6 +69,7 @@ use rannoch_processor::{Action, Sig};
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, Result, params};
 use serde_json::{Map, Value, json};
+use uuid::Builder;
 
 /// The steps' signatures; the app's build gathers them.
 pub const SIGNATURES: &str = include_str!("../signatures.json");
@@ -159,7 +160,8 @@ fn quote(name: &str) -> String {
 }
 
 /// The row of `table` whose `key` is `node` with the greatest `time` at or before `at`, as an
-/// object of its columns; null when it has none.
+/// object of its columns; null when it has none. A text `time` is a v7 id, bound by the
+/// greatest v7 id of `at`; any other is `at` itself.
 fn as_of(
     conn: &Connection,
     table: &str,
@@ -170,11 +172,23 @@ fn as_of(
 ) -> Result<Value> {
     let (table, key, time) = (quote(table), quote(key), quote(time));
     let sql = format!(
-        "SELECT * FROM {table} WHERE {key} = ?1 AND {time} <= ?2 ORDER BY {time} DESC LIMIT 1"
+        "SELECT * FROM {table} WHERE {key} = ?1
+        AND {time} <= CASE typeof({time}) WHEN 'text' THEN ?3 ELSE ?2 END
+        ORDER BY {time} DESC LIMIT 1"
+    );
+    // The greatest v7 id of ms `at`; before 1970 no id is at or before it.
+    let bound = u64::try_from(at).map_or_else(
+        |_| String::new(),
+        |at| {
+            let at = at.min(0xffff_ffff_ffff);
+            Builder::from_unix_timestamp_millis(at, &[0xff; 10])
+                .into_uuid()
+                .to_string()
+        },
     );
     let mut st = conn.prepare_cached(&sql)?;
     let columns: Vec<String> = st.column_names().map(str::to_owned).collect();
-    let mut rows = st.query(params![node, at])?;
+    let mut rows = st.query(params![node, at, bound])?;
     rows.next()?
         .map_or(Ok(Value::Null), |r| object(&columns, r))
 }
@@ -396,6 +410,49 @@ pub(crate) mod tests {
         assert_eq!(cited(999), Vec::<serde_json::Value>::new());
         assert_eq!(cited(1_500), [json!("d2")]);
         assert_eq!(cited(9_999), [json!("d2"), json!("d3")]);
+    }
+
+    /// d1 titled "graph notes" by an event at 1,000, valid from 1,000, and retitled "graph store
+    /// notes" by an event at 2,000, valid from 1,500: learned late.
+    fn late(conn: &Connection) {
+        let title = "INSERT INTO doc_titles VALUES ('d1', ?1, ?2, ?3)";
+        for (name, recorded, valid) in [
+            ("graph notes", 1_000, 1_000),
+            ("graph store notes", 2_000, 1_500),
+        ] {
+            let id = uuid::Builder::from_unix_timestamp_millis(recorded, &[0; 10]).into_uuid();
+            conn.execute(title, params![name, id.to_string(), valid])
+                .unwrap();
+        }
+    }
+
+    /// 01a219a7-4cc4-7d50-b375-8fdf0d724ded: an as-of read on the recorded-time column, the
+    /// writing event's v7 id, returns the latest row whose id is at or before t's v7 bound.
+    #[test]
+    fn criterion_01a219a7_as_of_by_recorded_time() {
+        let conn = store(DOCS);
+        late(&conn);
+        let title =
+            |at| as_of(&conn, "doc_titles", "doc", "event", "d1", at).unwrap()["title"].clone();
+        assert_eq!(title(-1), json!(null));
+        assert_eq!(title(999), json!(null));
+        assert_eq!(title(1_000), json!("graph notes"));
+        assert_eq!(title(1_999), json!("graph notes"));
+        assert_eq!(title(2_000), json!("graph store notes"));
+    }
+
+    /// 01a219a7-4cc4-7d50-b375-8feda7bb8f31: an as-of read on the valid-time column returns
+    /// the row valid at t, whenever it was recorded.
+    #[test]
+    fn criterion_01a219a7_as_of_by_valid_time() {
+        let conn = store(DOCS);
+        late(&conn);
+        let title =
+            |at| as_of(&conn, "doc_titles", "doc", "written", "d1", at).unwrap()["title"].clone();
+        assert_eq!(title(999), json!(null));
+        assert_eq!(title(1_000), json!("graph notes"));
+        assert_eq!(title(1_499), json!("graph notes"));
+        assert_eq!(title(1_500), json!("graph store notes"));
     }
 
     /// 01a216c8-b0d1-76f2-b5b2-b39d928247e3: the same utils on another app's tables and

@@ -1,4 +1,5 @@
-# #134's scenarios, from FR-RANNOCH-125 (revision 11) and FR-RANNOCH-127 (revision 2). Each
+# #134's scenarios, from FR-RANNOCH-125 (revision 11) and FR-RANNOCH-127 (revision 2), and
+# #135's, from FR-RANNOCH-126 (revision 6). Each
 # scenario names the test that drives it: in tests/scenarios.rs, or in src/ for the utils alone.
 Feature: rannoch-graph is utils over the app's ontology tables, and every read is an event
 
@@ -46,3 +47,19 @@ Feature: rannoch-graph is utils over the app's ontology tables, and every read i
     Given an app whose d1 cites d2, read once, which warms its hood
     When d2 cites d3 through the app's flow
     Then the next read returns the new reach
+
+  @module-rannoch-graph @criterion-FR-RANNOCH-126-c1
+  Scenario: rannoch-graph is bitemporal (fr_rannoch_126_c1)
+    Given d1 titled by an event at 1,000, valid from 1,000, and retitled by an event at 2,000, valid from 1,500
+    When the app reads d1 as of 1,700 by valid time and by recorded time, each as an event
+    Then valid time gives the retitle, and recorded time the title the store held by then
+
+  @module-rannoch-graph @criterion-01a219a7-4cc4-7d50-b375-8fdf0d724ded
+  Scenario: An as-of read by recorded time (criterion_01a219a7_as_of_by_recorded_time)
+    Given d1 titled by an event at 1,000 and retitled by an event at 2,000
+    Then as of its event column, before 1,000 none, from 1,000 to 1,999 the title, and from 2,000 the retitle
+
+  @module-rannoch-graph @criterion-01a219a7-4cc4-7d50-b375-8feda7bb8f31
+  Scenario: An as-of read by valid time (criterion_01a219a7_as_of_by_valid_time)
+    Given d1 titled valid from 1,000, and retitled at 2,000 valid from 1,500
+    Then as of its valid-time column, before 1,000 none, from 1,000 to 1,499 the title, and from 1,500 the retitle
