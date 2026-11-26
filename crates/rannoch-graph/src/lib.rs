@@ -310,10 +310,9 @@ pub(crate) mod tests {
             why(&conn, "doc_titles", "doc", "event", "d1").unwrap(),
             [fix, first]
         );
-        assert!(
-            why(&conn, "doc_titles", "doc", "event", "none")
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            why(&conn, "doc_titles", "doc", "event", "none").unwrap(),
+            Vec::<String>::new()
         );
 
         // A walk over cites and wrote backwards, each node once at its fewest hops; capped.
