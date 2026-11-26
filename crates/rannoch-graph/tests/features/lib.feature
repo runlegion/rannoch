@@ -1,5 +1,5 @@
 # #134's scenarios, from FR-RANNOCH-125 (revision 11) and FR-RANNOCH-127 (revision 2), and
-# #135's, from FR-RANNOCH-126 (revision 6). Each
+# #135's, from FR-RANNOCH-126 (revision 6), and #136's, from FR-RANNOCH-128 (revision 7). Each
 # scenario names the test that drives it: in tests/scenarios.rs, or in src/ for the utils alone.
 Feature: rannoch-graph is utils over the app's ontology tables, and every read is an event
 
@@ -63,3 +63,19 @@ Feature: rannoch-graph is utils over the app's ontology tables, and every read i
   Scenario: An as-of read by valid time (criterion_01a219a7_as_of_by_valid_time)
     Given d1 titled valid from 1,000, and retitled at 2,000 valid from 1,500
     Then as of its valid-time column, before 1,000 none, from 1,000 to 1,499 the title, and from 1,500 the retitle
+
+  @module-rannoch-graph @criterion-FR-RANNOCH-128-c1
+  Scenario: The scoring tools are part of rannoch-graph by default (fr_rannoch_128_c1)
+    Given an app whose d1 cites d2 and d3, and d2 cites d4, each weighing its time
+    When the app sends a read by each scorer, each as an event
+    Then each read returns the scores of the nodes near d1, highest first
+
+  @module-rannoch-graph @criterion-FR-RANNOCH-128-c2
+  Scenario: No part of rannoch-graph stores or uses vectors (fr_rannoch_128_c2)
+    Given rannoch-graph's signatures and manifest
+    Then it has no tables, no step takes or gives a list of numbers or takes a score from outside the graph, and it does not depend on rannoch-processor-onnx
+
+  @module-rannoch-graph @criterion-01a216c8-b138-7ce1-8599-45d05b451b2c
+  Scenario: The scoring tools work on variable tables and columns (criterion_01a216c8_scoring_tools_work_on_variable_tables_and_columns)
+    Given two apps whose ontologies hold the same docs under different table and column names
+    Then katz, pagerank, shared and learned give each app the same scores

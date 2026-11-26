@@ -9,7 +9,7 @@ use rusqlite::Connection;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::{Via, walk};
+use crate::{Via, cap, hops, vias, walk};
 
 /// Where a row touches a hood: its table, a `from` column, and a node the hood read.
 type Touch = (String, String, String);
@@ -34,23 +34,7 @@ pub struct Hoods(Arc<Mutex<Kept>>);
 
 /// A walk's options, parsed: its via tables, its hops and its cap.
 fn parse(options: &Value) -> Result<(Vec<Via>, i64, usize), String> {
-    let via = options["via"].as_object().ok_or("via is not an object")?;
-    let via = via.iter().map(|(table, cols)| {
-        let col = |c: &str| cols[c].as_str().map(str::to_owned);
-        let not = || format!("via {table} has no from and to");
-        Ok((
-            table.clone(),
-            col("from").ok_or_else(not)?,
-            col("to").ok_or_else(not)?,
-            col("time"),
-        ))
-    });
-    let via = via.collect::<Result<Vec<_>, String>>()?;
-    let hops = options["hops"]
-        .as_i64()
-        .ok_or("hops is not a whole number")?;
-    let cap = options["cap"].as_u64().ok_or("cap is not a whole number")?;
-    Ok((via, hops, usize::try_from(cap).unwrap_or(usize::MAX)))
+    Ok((vias(options, "time")?, hops(options)?, cap(options)?))
 }
 
 /// The walk from `root` by `options` as of `at`, cold, as the step gives it, and where a row
