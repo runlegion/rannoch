@@ -236,10 +236,8 @@
 //! `store`, an app action of that name included: `<link> gave a store row in $graph`. The rows of
 //! every link in the run are kept in order and, when the run
 //! succeeds, held in [`Processor::writes`] under the event's id; a failed run keeps none.
-//! rannoch-graph's `GraphAppend` takes them with the event's 2 and writes them in the same
-//! transaction; its `Op` is the form of an item, as in `{"set": {"node": "n1", "key": "name",
-//! "value": "Sam"}}`. rannoch-events' `Events` made `with_writes` takes them and writes the
-//! `store` rows among them; an event with any other item is refused: the append rolls back its
+//! rannoch-events' `Events` made `with_writes` takes them with the event's 2 and writes the
+//! `store` rows among them in the same transaction; an event with any other item is refused: the append rolls back its
 //! 2 and its rows, a -1 for the event is sent in their place, its data `graph: Events writes no
 //! graph rows`, and the rest of the batch commits. With any other append, nothing takes them.
 //!
@@ -254,7 +252,7 @@
 //! - `store`, with options `{"table": T, "row": {column: expression}}`, inserts one row into T,
 //!   each value worked out with [`eval`] from the step's input; it never updates, deletes or reads
 //!   a row. It gives the row as `$graph`, `{"store": {"table": T, "row": {column: value}}}`, and
-//!   the append that writes the event's 2, `GraphAppend` or `Events` made `with_writes`, inserts
+//!   the append that writes the event's 2, `Events` made `with_writes`, inserts
 //!   it in the same transaction with `INSERT ... ON CONFLICT DO NOTHING`, so T's own keys decide
 //!   whether a rerun adds a row and a flow that fails writes none. A table or a column the store
 //!   does not have fails the step, as `store: no such table: <T>` or `store: table <T> has no

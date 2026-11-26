@@ -1,7 +1,0 @@
-[
-  ["payment.json", {"name": "payment", "ty": 86, "takes": {"order": "string", "amount": "number"},
-    "steps": [{"do": "store", "with": {"store": {"table": "payments",
-      "row": {"order_id": "$order", "amount": "$amount"}}},
-      "next": {"ty": 87, "shape": {"order": "$order"}}}]}],
-  ["receipt.json", {"name": "receipt", "ty": 87, "takes": {"order": "string"}, "steps": []}]
-]

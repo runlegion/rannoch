@@ -14,11 +14,11 @@
 //! has dropped, and the sender in an [`Events`] drops when that `Events` does.
 //!
 //! [`write_in`] writes a batch and its 2s' items inside the caller's transaction, for an append
-//! that writes rows of its own in the same commit, as rannoch-graph's `GraphAppend` does.
+//! that writes rows of its own in the same commit.
 //!
 //! An `Events` made [`with_writes`](Events::with_writes) also writes the store rows that
 //! rannoch-processor's `store` step carries in its [`Writes`]: for each 2 in the batch,
-//! [`taking`] takes the items under the 2's source, as rannoch-graph's `GraphAppend` does, and
+//! [`taking`] takes the items under the 2's source, and
 //! [`write_in`] inserts each [`StoreRow`] in the batch's transaction, so every 2 has its rows. An
 //! item with a `store` key that is not a `StoreRow` fails the batch. A batch that fails puts the
 //! items back for its retry. The row is
@@ -31,8 +31,8 @@
 //! payments.amount`, which the inbox sends; the rest of the batch commits, the 2's nexts
 //! included. A row holding an integer above `i64::MAX`, or a number that is neither an integer
 //! nor a float, is refused the same way, since no INTEGER or REAL holds it exactly, as `store:
-//! 18446744073709551615 cannot be held exactly: payments.amount`. An item with no `store` key, as
-//! a graph `Op`, is refused the same way, since `Events` writes no graph rows; its -1's data is
+//! 18446744073709551615 cannot be held exactly: payments.amount`. An item with no `store` key is
+//! refused the same way, since `Events` writes no graph rows; its -1's data is
 //! `graph: Events writes no graph rows`. A deferred foreign key is checked only at commit,
 //! after every savepoint, so a row that breaks one fails its whole batch.
 //!
@@ -637,7 +637,7 @@ mod tests {
         assert_eq!(binned.data, "store: datatype mismatch");
     }
 
-    /// #123: an item that is not a `store` row, as a graph `Op`, is rolled back with its 2 and its
+    /// #123: an item that is not a `store` row is rolled back with its 2 and its
     /// event's store row, the append returns a -1 for the event naming the reason, and the rest
     /// of the batch commits.
     #[test]
@@ -645,7 +645,7 @@ mod tests {
         let (events, writes, signals) = with_tables("CREATE TABLE t (k TEXT PRIMARY KEY)");
         let row = |k| json!({ "store": { "table": "t", "row": { "k": k } } });
         let good = two_with(&writes, row("g"));
-        // A store row, then a graph Op.
+        // A store row, then an item that is not one.
         let source = Uuid::now_v7();
         let op = json!({ "set": { "node": "n", "key": "k", "value": 1 } });
         writes.lock().unwrap().insert(source, vec![row("b"), op]);

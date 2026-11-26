@@ -1,0 +1,10 @@
+[
+  { "action": "as_of", "options": { "table": "string", "key": "string", "time": "string" },
+    "takes": { "node": "string", "at": "number" }, "gives": { "row": "any" } },
+  { "action": "why", "options": { "table": "string", "key": "string", "event": "string" },
+    "takes": { "node": "string" }, "gives": { "why": "list<string>" } },
+  { "action": "walk", "options": { "via": "any", "hops": "number", "cap": "number" },
+    "takes": { "node": "string" }, "gives": { "walk": "any" } },
+  { "action": "edges", "options": { "table": "string", "from": "string", "time": "string" },
+    "takes": { "node": "string", "at": "number" }, "gives": { "edges": "any" } }
+]

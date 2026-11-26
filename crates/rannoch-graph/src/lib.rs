@@ -1,852 +1,506 @@
 #![warn(missing_docs)]
-//! The crate an app builds its ontology with: two tables in rannoch's file, `_nodes` and
-//! `_edges`, rows only added. Node types, property keys and edge names are the app's; the crate
-//! holds no ontology of its own and checks no schema.
+//! Graph utils over the app's own ontology tables. rannoch-graph has no tables and defines no
+//! shape: an app's shape is its ontology crate's tables, and every table and column a util reads
+//! is one the app names in a step's options. The utils are why, capped walks, as-of reads and
+//! warm hoods.
 //!
-//! A step writes the graph by giving `$graph` in its output: a list of [`Op`]s as JSON.
-//! rannoch-processor holds the list in its [`Writes`] under the id of the event the flow ran on,
-//! and [`GraphAppend`], the app's [`Append`], writes the rows in the same transaction as that
-//! event's 2, each row stamped with the event. Reads take a connection to the same file:
-//! [`prop`], [`props`], [`history`], [`edges`] and [`why`] read rows, [`walk`] follows named edges
-//! out from a node, [`describe`] shapes a node, and [`Hoods`] keeps a describe warm.
+//! A read is an event. Each util is a step, and an app reads by sending an event whose flow
+//! calls it; the step gives the result, and the step's `next` returns it as an event of the
+//! app's own. The step reaches the one store through rannoch-store's `Store::connection`, which
+//! is only storage. The app adds [`SIGNATURES`] to the signatures its `build.rs` hands
+//! `compile`, and [`actions`] to the actions it hands `Processor::new`:
 //!
-//! # Example
-//!
-//! In an app, the processor fills `Writes` from each step's `$graph`, and rannoch hands the
-//! append its batches. This example does both itself, so it can read the rows back at once: it
-//! writes a person, a doc and the edge between them, corrects the person's name, then reads them
-//! back.
-//!
-//! ```
-//! use std::sync::{PoisonError, mpsc};
-//! use std::{error::Error, thread, time::Duration};
-//!
-//! use rannoch_core::{Append, Event, Status, Storage};
-//! use rannoch_graph::{GraphAppend, Opts, State, describe, edges, history, prop, why};
-//! use rannoch_processor::Writes;
-//! use rannoch_store::{Opened, Store};
-//! use rusqlite::Connection;
-//! use serde_json::{Value, json};
-//! use uuid::Uuid;
-//!
-//! # fn main() -> Result<(), Box<dyn Error>> {
-//! // A store in a directory of its own, with every migration applied.
-//! let dir = std::env::temp_dir().join(format!("rannoch-graph-{}", Uuid::now_v7()));
-//! std::fs::create_dir_all(&dir)?;
-//! let path = dir.join("store.db");
-//! Store::new(path.clone(), rannoch_core::migrator()).apply()?;
-//! let open = || -> Result<Connection, Box<dyn Error>> {
-//!     match rannoch_store::open(&path, &rannoch_core::migrator())? {
-//!         Opened::Ready(conn) => Ok(conn),
-//!         Opened::Pending(versions) => Err(format!("pending: {versions:?}").into()),
-//!     }
-//! };
-//!
-//! // The append writes through one connection, and the reads go through another.
-//! let writes = Writes::default();
-//! let (signal, _wake) = mpsc::channel();
-//! let append = GraphAppend::new(open()?, signal, writes.clone());
-//! let conn = open()?;
-//!
-//! // An event with the `$graph` items its flow gave, appended with its 2; returns its id.
-//! let run = |source: Option<Uuid>, items: Vec<Value>| -> Result<Uuid, Box<dyn Error>> {
-//!     let id = Uuid::now_v7();
-//!     writes.lock().unwrap_or_else(PoisonError::into_inner).insert(id, items);
-//!     let event = |id, source, status| Event {
-//!         id,
-//!         source,
-//!         ty: 1_u16,
-//!         data: json!({}),
-//!         run_at: None,
-//!         status,
-//!     };
-//!     let two = event(Uuid::now_v7(), Some(id), Status::Processed);
-//!     append.append(&[event(id, source, Status::Added), two])?;
-//!     Ok(id)
-//! };
-//!
-//! let note = run(None, vec![
-//!     json!({ "set": { "node": "ada", "key": "name", "value": "Ada" } }),
-//!     json!({ "set": { "node": "doc1", "key": "title", "value": "graph store notes" } }),
-//!     json!({ "link": {
-//!         "src": "ada", "name": "wrote", "dst": "doc1", "props": { "year": 1843 }
-//!     } }),
-//! ])?;
-//! // A later millisecond, so that as of the first append leaves the correction out.
-//! thread::sleep(Duration::from_millis(5));
-//! let fix = run(Some(note), vec![
-//!     json!({ "set": { "node": "ada", "key": "name", "value": "Ada Lovelace" } }),
-//! ])?;
-//!
-//! // Now: the row with the greatest event id. As of the first append: the row it wrote.
-//! let name = prop(&conn, "ada", "name", None)?.ok_or("no name")?;
-//! assert_eq!((&name.value, name.event), (&json!("Ada Lovelace"), fix));
-//! let first = prop(&conn, "doc1", "title", None)?.ok_or("no title")?.written;
-//! let then = prop(&conn, "ada", "name", Some(first))?.ok_or("no name then")?;
-//! assert_eq!(then.value, json!("Ada"));
-//! let states: Vec<State> = history(&conn, "ada", "name", None)?.iter().map(|h| h.1).collect();
-//! assert_eq!(states, [State::Replaced, State::Current]);
-//!
-//! // Edges out of a node and into it; why: the row's event, then its source chain.
-//! let wrote = edges(&conn, "ada", "wrote", false, None)?;
-//! assert_eq!((wrote[0].0.as_str(), &wrote[0].1.value), ("doc1", &json!({ "year": 1843 })));
-//! assert_eq!(edges(&conn, "doc1", "wrote", true, None)?[0].0, "ada");
-//! assert_eq!(why(&conn, "ada", "name")?, [fix, note]);
-//!
-//! // A describe mirrors its shape, and every value and edge carries its event and written.
-//! let (note, fix) = (note.to_string(), fix.to_string());
-//! assert_eq!(
-//!     describe(&conn, "ada", &json!(["name", { "wrote": ["title"] }]), Opts::default())?,
-//!     json!({
-//!         "id": "ada",
-//!         "name": { "value": "Ada Lovelace", "event": fix, "written": name.written },
-//!         "wrote": [{
-//!             "id": "doc1",
-//!             "title": { "value": "graph store notes", "event": note, "written": first },
-//!             "edge": { "props": { "year": 1843 }, "event": note, "written": first }
-//!         }]
-//!     })
-//! );
-//! # drop(append);
-//! # drop(conn);
-//! # std::fs::remove_dir_all(&dir)?;
-//! # Ok(())
-//! # }
+//! ```json
+//! {"name": "reach", "ty": 50, "takes": {"node": "string"},
+//!  "steps": [{"do": "walk",
+//!    "with": {"walk": {"via": {"cites": {"from": "doc", "to": "cited"}}, "hops": 2, "cap": 10}},
+//!    "next": {"ty": 60, "shape": {"walk": "$walk"}}}]}
 //! ```
 //!
-//! # What a step writes: `$graph`
+//! # The steps
 //!
-//! Each `$graph` item is one [`Op`]: an object whose one key is the op's name, holding the op's
-//! fields. Every field is required, and node ids, keys and edge names are strings.
+//! Each takes `node`, a string: the key of the row it starts from.
 //!
-//! | Item | What it writes |
-//! |---|---|
-//! | `{"set": {"node": "ada", "key": "name", "value": "Ada"}}` | `node`'s `key` holds `value`, any JSON value |
-//! | `{"retract": {"node": "ada", "key": "name"}}` | `node`'s `key` holds no value |
-//! | `{"link": {"src": "ada", "name": "wrote", "dst": "doc1", "props": {}}}` | a `name` edge from `src` to `dst`, carrying `props`, any JSON value |
-//! | `{"unlink": {"src": "ada", "name": "wrote", "dst": "doc1"}}` | no `name` edge from `src` to `dst` |
+//! | Step | Options | What it gives |
+//! |---|---|---|
+//! | `as_of` | `{"table": T, "key": K, "time": W}`; it also takes `at`, a number | `row`: the row of T whose K is `node` with the greatest W at or before `at`, as an object of its columns, or null when it has none |
+//! | `why` | `{"table": T, "key": K, "event": E}` | `why`: the greatest E among T's rows whose K is `node`, then that event's source chain through `_events`: its source, that event's source, and so on; empty when there is none in `_events` |
+//! | `walk` | `{"via": {T: {"from": F, "to": D, "time": W}, ..}, "hops": n, "cap": m}`, `time` optional; it also reads `at`, a number, when the event holds one | `walk`: `{"nodes": [{"id", "hops"}, ..], "cut": bool}`, each node reached from `node` over each T's rows from F to D, the root left out, once with its fewest hops: nearest first, then by id, at most m of them, and whether the cap cut the walk |
+//! | `edges` | `{"table": T, "from": F, "time": W}`; it also takes `at`, a number | `edges`: `{"rows": [..]}`, the rows of T whose F is `node` and whose W is at or before `at`, oldest first, each an object of its columns |
 //!
-//! Each item takes effect as its key's or edge's current row only when its event has the greatest
-//! id among that key's or edge's rows, as **Now** below says.
+//! A walk goes at most n hops. To follow a table the other way, swap its `from` and `to`. A walk
+//! with `at` is as of `at`: it follows only the rows of a via table that names `time` whose W is
+//! at or before `at`, and a via table with no `time` whole. Node ids are read as text. A column
+//! holding a blob is read as a list of its bytes.
 //!
-//! A `set` with `"value": null` holds `null`; only `retract` takes a key's value away. A row's
-//! primary key includes its event, so one event writes each node's key, and each edge by its
-//! `src`, `name` and `dst`, at most once: when its items write the same one twice, the first is
-//! written and the later one is left out. A flow that sets a key and then retracts it keeps the
-//! set. For the same reason, applying the same event's items again adds no row and moves no
-//! stamp. A retry or a hunt's resend is a new event: its items add rows stamped with its own id,
-//! and they become current.
-//!
-//! A store row that rannoch-processor's `store` step carries, `{"store": {"table": T, "row":
-//! {..}}}`, is not an `Op`: rannoch-events' `write_in` inserts it in the same transaction, each
-//! 2's items inside a savepoint. When T refuses it, that 2's rows are rolled back and the 2 is not
-//! written; the append returns a -1 for its source naming the reason, which the inbox sends, and
-//! the rest of the batch commits, the 2's nexts included. Any other item that does not parse as
-//! an `Op` is refused the same way, its -1's data `graph: ` and serde's message, as
-//! `` graph: missing field `props` `` for a `link` without `props`. An append the store cannot
-//! write fails with [`Error::Store`]: nothing in the batch is written, and `Writes` gets the
-//! batch's items back, unless that same event has items there again by then.
-//!
-//! # What the reads return: now, as of T and why
-//!
-//! [`prop`], [`props`], [`history`] and [`edges`] return each row as a [`Row`]: its `value` (an
-//! edge's `props`), the `event` whose flow wrote it, and `written`, when the append that wrote it
-//! ran, in milliseconds since the Unix epoch; [`why`] returns event ids.
-//!
-//! - **Now.** The current row of a node's key, or of an edge, is its row with the greatest event
-//!   id, unless that row is a retraction, which leaves it no current row. Rannoch's event ids
-//!   are `UUIDv7`s set at accept, so the event accepted last wins, in whatever order the flows
-//!   ran. [`prop`] reads one key; [`props`] reads every key of a node that has a current row, in
-//!   key order; [`edges`] reads a node's current edges of one name, out of it or, with
-//!   `reverse`, into it, in far-node order.
-//! - **As of T.** Each of those reads takes `at`. `Some(T)`, in milliseconds since the Unix
-//!   epoch, reads only the rows written at or before T and picks the current one among them the
-//!   same way; `None` reads every row. `written`, not the event id, decides which rows T can
-//!   see, because an event can run long after it was accepted.
-//! - **History.** [`history`] returns every row of a node's key, as of `at`, in event-id order,
-//!   each with its [`State`]. A retraction is a row of its own, with a `null` value.
-//! - **Why.** [`why`] returns the event of a key's current row, then that event's source chain
-//!   through `_events`: its source, that event's source, and so on. It reads now only, and
-//!   returns an empty list when the key has no current row.
-//!
-//! # Walk: the nodes a node reaches
-//!
-//! [`walk`] follows named edges out from a node: each name in `via` follows its edges forwards,
-//! and `name<-` backwards. It reads the current edges as of `at`, goes at most `hops` steps, and
-//! returns each node it reaches, the root left out, once with its fewest hops: nearest first,
-//! then in node-id order, at most `cap` of them, and whether the cap cut the walk.
-//!
-//! # Describe: a node by a shape
-//!
-//! [`describe`] returns a node shaped by a shape, a JSON list whose items say what to read:
-//!
-//! | Item | What the result holds |
-//! |---|---|
-//! | `"title"` | under `"title"`, the key's current row as `{"value", "event", "written"}`; nothing when it has none |
-//! | `"*"` | every key with a current row, each under its own name, as above |
-//! | `{"wrote": shape}` | under `"wrote"`, a list of the far nodes of the node's current `wrote` edges, in far-node order, each shaped by `shape` |
-//! | `{"wrote<-": shape}` | under `"wrote<-"`, the same for the `wrote` edges into the node |
-//! | `{"wrote": {"shape": shape, "limit": 2, "where": {"status": "open"}}}` | the same, keeping only the far nodes whose current value of each `where` key equals the JSON given, and only the first `limit` of those |
-//!
-//! One object can name several edges. In `{"shape", "limit", "where"}` only `shape` is required;
-//! `limit` is ignored unless it is a non-negative integer, and `where` when it is not an object.
-//!
-//! The result is an object with the node's `"id"` and what each item reads; each far node also
-//! carries `"edge"`, the edge's `{"props", "event", "written"}`. A key named `id` replaces the
-//! node's `"id"` in the result, and on a far node the edge replaces a key named `edge`.
-//!
-//! [`Opts`] holds the options. With `at`, describe reads every row as of `at`: keys, edges and
-//! `where` values alike. With `history`, each key holds a list in place of its current row:
-//! every row it has had, in event-id order, each with a `"state"` of `"current"`, `"replaced"` or
-//! `"retracted"`; `"*"` still lists only the keys with a current row.
-//!
-//! A shape that is not a list of these items is refused with rusqlite's
-//! `ToSqlConversionFailure`. Describe reads each list when it reaches it, so a bad list under an
-//! edge that keeps no far node is not refused.
+//! A step fails with its name and the reason, as `walk: no such table: nope`, when an option
+//! or what it takes does not parse, or the store cannot answer.
 //!
 //! # Warm hoods
 //!
-//! [`Hoods`] keeps describes warm. A node and a shape are a hood: [`Hoods::describe`] describes
-//! them cold the first time and keeps the result, and later describes of the same node and shape
-//! return that copy. A [`GraphAppend`] made [`with_hoods`](GraphAppend::with_hoods) recomputes,
-//! after each commit and before it signals the queue, every warm hood that read a node its new
-//! rows touch: a `set` or `retract` touches its node, a `link` or `unlink` both its ends, and an
-//! item that adds no row touches nothing. A hood records every node its describe read,
-//! including far nodes its `where` left out, so while the graph's rows come through that append,
-//! a warm hood equals a cold describe of its node and shape once the append has recomputed it. A
-//! hood whose recompute fails goes cold, and its next describe is a cold one.
+//! Every walk is warm. The first walk of a node with given options reads the store and keeps
+//! its result as a hood, and later walks of the same node and options return that copy. Make
+//! one [`Hoods`], hand it to [`actions`], and wrap the app's append in a [`Warm`] with the same
+//! hoods and the processor's writes:
 //!
-//! `Hoods` warms only describes with default [`Opts`]; a describe with `at` or `history` goes
-//! through [`describe`] and is always cold. Only a failed recompute drops a warm hood; nothing
-//! else evicts one.
-//!
-//! With the store, `open` and `run` of the example above, and an append made with hoods:
-//!
+//! ```ignore
+//! let hoods = Hoods::default();
+//! let processor = Processor::new(FLOWS, rannoch_graph::actions(&hoods), conn)?;
+//! let events = Events::new(conn, signal).with_writes(processor.writes());
+//! let append = Warm::new(events, processor.writes(), hoods);
 //! ```
-//! # use std::sync::{Arc, Mutex, PoisonError, mpsc};
-//! # use std::error::Error;
-//! # use rannoch_core::{Append, Event, Status, Storage};
-//! # use rannoch_graph::{GraphAppend, Hoods, Opts, describe};
-//! # use rannoch_processor::Writes;
-//! # use rannoch_store::{Opened, Store};
-//! # use rusqlite::Connection;
-//! # use serde_json::{Value, json};
-//! # use uuid::Uuid;
-//! # fn main() -> Result<(), Box<dyn Error>> {
-//! # let dir = std::env::temp_dir().join(format!("rannoch-graph-{}", Uuid::now_v7()));
-//! # std::fs::create_dir_all(&dir)?;
-//! # let path = dir.join("store.db");
-//! # Store::new(path.clone(), rannoch_core::migrator()).apply()?;
-//! # let open = || -> Result<Connection, Box<dyn Error>> {
-//! #     match rannoch_store::open(&path, &rannoch_core::migrator())? {
-//! #         Opened::Ready(conn) => Ok(conn),
-//! #         Opened::Pending(versions) => Err(format!("pending: {versions:?}").into()),
-//! #     }
-//! # };
-//! # let writes = Writes::default();
-//! # let (signal, _wake) = mpsc::channel();
-//! # let conn = open()?;
-//! let hoods = Arc::new(Mutex::new(Hoods::default()));
-//! let append = GraphAppend::new(open()?, signal, writes.clone()).with_hoods(hoods.clone());
-//! # let run = |source: Option<Uuid>, items: Vec<Value>| -> Result<Uuid, Box<dyn Error>> {
-//! #     let id = Uuid::now_v7();
-//! #     writes.lock().unwrap_or_else(PoisonError::into_inner).insert(id, items);
-//! #     let event = |id, source, status| Event {
-//! #         id,
-//! #         source,
-//! #         ty: 1_u16,
-//! #         data: json!({}),
-//! #         run_at: None,
-//! #         status,
-//! #     };
-//! #     let two = event(Uuid::now_v7(), Some(id), Status::Processed);
-//! #     append.append(&[event(id, source, Status::Added), two])?;
-//! #     Ok(id)
-//! # };
-//! run(None, vec![
-//!     json!({ "set": { "node": "doc1", "key": "status", "value": "draft" } }),
-//!     json!({ "link": { "src": "ada", "name": "wrote", "dst": "doc1", "props": {} } }),
-//! ])?;
 //!
-//! // Ada's open docs: the first describe warms the hood; the lock is held only to describe.
-//! let shape = json!([{ "wrote": { "shape": ["status"], "where": { "status": "open" } } }]);
-//! let warm = |hoods: &Mutex<Hoods>| {
-//!     let mut hoods = hoods.lock().unwrap_or_else(PoisonError::into_inner);
-//!     hoods.describe(&conn, "ada", &shape)
-//! };
-//! assert_eq!(warm(&hoods)?["wrote"], json!([]));
-//!
-//! // doc1 opens. The hood read doc1, though its `where` left it out, so the append recomputes it.
-//! run(None, vec![json!({ "set": { "node": "doc1", "key": "status", "value": "open" } })])?;
-//! assert_eq!(warm(&hoods)?["wrote"][0]["id"], "doc1");
-//! assert_eq!(warm(&hoods)?, describe(&conn, "ada", &shape, Opts::default())?);
-//! # drop(append);
-//! # drop(conn);
-//! # std::fs::remove_dir_all(&dir)?;
-//! # Ok(())
-//! # }
-//! ```
+//! After the append it wraps commits a batch, the `Warm` drops every hood that a `store` row
+//! of the batch touches: a row into one of a hood's via tables whose `from` column holds the
+//! hood's root or a node its walk returned. It reads nothing: the next walk of that node and
+//! those options reads the store, as a step of its read event, and keeps the result warm again.
+//! A row the app writes by other means than the `store` step through the `Warm` touches no
+//! hood, so its walks read as they were kept. A walk that runs after the append commits a
+//! batch and before the `Warm` drops its hoods may still return the kept result.
 
-mod describe;
 mod hoods;
-mod queries;
-mod walk;
 
-pub use walk::walk;
+pub use hoods::{Hoods, Warm};
 
-use std::collections::HashSet;
-use std::sync::{Arc, Mutex, PoisonError, mpsc::Sender};
-use std::time::UNIX_EPOCH;
+use std::fmt::Display;
+use std::sync::{Arc, LazyLock};
 
-use rannoch_core::{Append, Error, Event};
-use rannoch_processor::Writes;
-use rusqlite::{CachedStatement, Connection, OptionalExtension, Params, Result, params};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use uuid::Uuid;
-/// Where this crate's migratr migrations directory is, for the app's `build.rs`.
-pub const MIGRATIONS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/migrations");
+use rannoch_processor::{Action, Sig};
+use rusqlite::types::ValueRef;
+use rusqlite::{Connection, Result, params};
+use serde_json::{Map, Value, json};
 
-pub use describe::{Opts, describe};
-pub use hoods::Hoods;
+/// The steps' signatures; the app's build gathers them.
+pub const SIGNATURES: &str = include_str!("../signatures.json");
 
-/// One `$graph` item: what a step writes. Serialized as JSON in an action's `$graph` output: an
-/// object whose one key is the op's name in lowercase, holding the op's fields. The crate doc
-/// lists the four.
-///
-/// ```
-/// use rannoch_graph::Op;
-/// use serde_json::json;
-///
-/// let item = json!({ "link": { "src": "ada", "name": "wrote", "dst": "doc1", "props": {} } });
-/// let (src, name, dst) = ("ada".to_owned(), "wrote".to_owned(), "doc1".to_owned());
-/// let link = Op::Link { src, name, dst, props: json!({}) };
-/// assert_eq!(serde_json::from_value::<Op>(item)?, link);
-///
-/// // Every field is required: a link without props is not an op.
-/// let bare = json!({ "link": { "src": "ada", "name": "wrote", "dst": "doc1" } });
-/// assert!(serde_json::from_value::<Op>(bare).is_err());
-/// # Ok::<(), serde_json::Error>(())
-/// ```
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Op {
-    /// `node`'s `key` holds `value`.
-    Set {
-        /// The node's id.
-        node: String,
-        /// The property key.
-        key: String,
-        /// Any JSON value; `null` is a value, not a retraction.
-        value: Value,
-    },
-    /// A retraction: `node`'s `key` has no current value, unless an event with a greater id sets
-    /// it again.
-    Retract {
-        /// The node's id.
-        node: String,
-        /// The property key.
-        key: String,
-    },
-    /// A `name` edge from `src` to `dst`, carrying `props`.
-    Link {
-        /// The id of the node the edge leaves.
-        src: String,
-        /// The edge's name.
-        name: String,
-        /// The id of the node the edge reaches.
-        dst: String,
-        /// Any JSON value, read back as the edge's [`Row::value`].
-        props: Value,
-    },
-    /// A retraction of the `name` edge from `src` to `dst`.
-    Unlink {
-        /// The id of the node the edge leaves.
-        src: String,
-        /// The edge's name.
-        name: String,
-        /// The id of the node the edge reaches.
-        dst: String,
-    },
+/// The `Sig`s in [`SIGNATURES`]: `as_of`, `why`, `walk` and `edges`.
+static SIGS: LazyLock<[Sig; 4]> =
+    LazyLock::new(|| serde_json::from_str(SIGNATURES).unwrap_or_default());
+
+/// The crate's four steps, `as_of`, `why`, `walk` and `edges`, whose walks are warm in `hoods`.
+#[must_use]
+pub fn actions(hoods: &Hoods) -> Vec<Arc<dyn Action>> {
+    (0..4)
+        .map(|util| Arc::new(Step(util, hoods.clone())) as Arc<dyn Action>)
+        .collect()
 }
 
-/// A row as read: its value, the event that wrote it, and when it was written.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Row {
-    /// The property's value, or the edge's `props`; `null` for a retraction, which only
-    /// [`history`] returns.
-    pub value: Value,
-    /// The id of the event whose flow wrote the row: the source of the 2 that carried it.
-    pub event: Uuid,
-    /// When the append that wrote the row ran, in milliseconds since the Unix epoch; the rows of
-    /// one append share it.
-    pub written: i64,
-}
+/// One step: its index in [`SIGS`], and the hoods its walks are warm in.
+struct Step(usize, Hoods);
 
-/// Where a row stands in its key's history.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum State {
-    /// The key's current row: the last in event-id order, and not a retraction.
-    Current,
-    /// A value a later row replaced or retracted.
-    Replaced,
-    /// A retraction.
-    Retracted,
-}
-
-/// rannoch-events' append, plus each 2's graph rows from `writes` in the same transaction.
-#[derive(Debug)]
-pub struct GraphAppend {
-    conn: Mutex<Connection>,
-    queue: Sender<()>,
-    writes: Writes,
-    hoods: Option<Arc<Mutex<Hoods>>>,
-}
-
-impl GraphAppend {
-    /// The append over `conn`, writing what `writes` holds and signalling `queue` on commit.
-    #[must_use]
-    pub fn new(conn: Connection, queue: Sender<()>, writes: Writes) -> Self {
-        Self {
-            conn: Mutex::new(conn),
-            queue,
-            writes,
-            hoods: None,
-        }
+impl Action for Step {
+    fn sig(&self) -> &Sig {
+        &SIGS[self.0]
     }
 
-    /// The append, recomputing after each commit the warm hoods in `hoods` its rows touched.
-    #[must_use]
-    pub fn with_hoods(self, hoods: Arc<Mutex<Hoods>>) -> Self {
-        let hoods = Some(hoods);
-        Self { hoods, ..self }
-    }
-}
-
-impl<T: Copy + Into<u16>, D: Serialize + From<String>> Append<T, D> for GraphAppend {
-    fn append(&self, batch: &[Event<T, D>]) -> Result<Vec<Event<T, D>>, Error> {
-        let mut conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
-        let (replies, touched) =
-            rannoch_events::taking(&self.writes, batch, |t| commit(&mut conn, batch, t))?;
-        if let Some(hoods) = &self.hoods {
-            let mut hoods = hoods.lock().unwrap_or_else(PoisonError::into_inner);
-            hoods.rewarm(&conn, &touched);
-        }
-        let _ = self.queue.send(());
-        Ok(replies)
-    }
-}
-
-/// The -1s an append returns, and the nodes of the rows it added.
-type Committed<T, D> = (Vec<Event<T, D>>, HashSet<String>);
-
-/// `batch` and the rows `taken` for its 2s, stamped with each 2's source, in one transaction,
-/// with rannoch-events' `write_in`: the -1s it returns, and the nodes of the rows it added.
-fn commit<T: Copy + Into<u16>, D: Serialize + From<String>>(
-    conn: &mut Connection,
-    batch: &[Event<T, D>],
-    taken: &[(Uuid, Vec<Value>)],
-) -> Result<Committed<T, D>, Error> {
-    let since = UNIX_EPOCH.elapsed().unwrap_or_default().as_millis();
-    let written = i64::try_from(since).unwrap_or(i64::MAX);
-    let mut tx = conn.transaction().map_err(|_| Error::Store)?;
-    let mut touched = Vec::new();
-    let replies = rannoch_events::write_in(&mut tx, batch, taken, |tx, source, item| {
-        let op = match Op::deserialize(item) {
-            Ok(op) => op,
-            // Refused like a store row: its 2's rows are rolled back and it gets a -1.
-            Err(e) => return Ok(Err(format!("graph: {e}"))),
+    fn run(
+        &self,
+        options: &Value,
+        input: &Map<String, Value>,
+    ) -> Result<Map<String, Value>, String> {
+        let name = &self.sig().action;
+        let fail = |e: &dyn Display| format!("{name}: {e}");
+        let node = input.get("node").and_then(Value::as_str);
+        let node = node.ok_or_else(|| fail(&"node is not a string"))?;
+        let open = || rannoch_store::Store::connection().map_err(|e| fail(&e));
+        let at = || {
+            let at = input.get("at").map(Value::as_i64);
+            at.map(|at| at.ok_or_else(|| fail(&"at is not a whole number of ms")))
+                .transpose()
         };
-        if write(tx, &source.to_string(), &op, written).map_err(|_| Error::Store)? == 1 {
-            match op {
-                Op::Set { node, .. } | Op::Retract { node, .. } => touched.push((*source, node)),
-                Op::Link { src, dst, .. } | Op::Unlink { src, dst, .. } => {
-                    touched.extend([(*source, src), (*source, dst)]);
-                }
+        let needed = || at()?.ok_or_else(|| fail(&"at is not a whole number of ms"));
+        let (field, value) = match self.0 {
+            0 => {
+                let at = needed()?;
+                let [table, key, time] =
+                    names(options, ["table", "key", "time"]).map_err(|e| fail(&e))?;
+                let row = as_of(&open()?, table, key, time, node, at).map_err(|e| fail(&e))?;
+                ("row", row)
             }
-        }
-        Ok(Ok(()))
-    })?;
-    tx.commit().map_err(|_| Error::Store)?;
-    // A source whose rows were rolled back touched nothing.
-    let added = touched.into_iter().filter(|(source, _)| {
-        !replies
-            .iter()
-            .any(|binned: &Event<T, D>| binned.source == Some(*source))
-    });
-    let added = added.map(|(_, node)| node).collect();
-    Ok((replies, added))
-}
-
-/// Adds `op`'s row, stamped with `event` and `written`; a row its key already holds stays.
-fn write(conn: &Connection, event: &str, op: &Op, written: i64) -> Result<usize> {
-    let (value, retracted) = match op {
-        Op::Set { value, .. } | Op::Link { props: value, .. } => (Some(value.to_string()), 0),
-        Op::Retract { .. } | Op::Unlink { .. } => (None, 1),
-    };
-    match op {
-        Op::Set { node, key, .. } | Op::Retract { node, key } => {
-            let row = params![node, key, value, event, written, retracted];
-            conn.prepare_cached(queries::NODE)?.execute(row)
-        }
-        Op::Link { src, name, dst, .. } | Op::Unlink { src, name, dst } => {
-            let row = params![src, name, dst, value, event, written, retracted];
-            conn.prepare_cached(queries::EDGE)?.execute(row)
-        }
+            1 => {
+                let [table, key, event] =
+                    names(options, ["table", "key", "event"]).map_err(|e| fail(&e))?;
+                let why = why(&open()?, table, key, event, node).map_err(|e| fail(&e))?;
+                ("why", json!(why))
+            }
+            2 => {
+                let walked = self.1.walk(options, node, at()?, open);
+                ("walk", walked.map_err(|e| fail(&e))?)
+            }
+            _ => {
+                let at = needed()?;
+                let [table, from, time] =
+                    names(options, ["table", "from", "time"]).map_err(|e| fail(&e))?;
+                let rows = edges(&open()?, table, from, time, node, at).map_err(|e| fail(&e))?;
+                ("edges", json!({ "rows": rows }))
+            }
+        };
+        Ok(Map::from_iter([(field.to_owned(), value)]))
     }
 }
 
-/// The current row of `node`'s `key` as of `at`: the greatest event id's, unless retracted.
-/// # Errors
-/// The store's error, or a value or event id in the row that does not parse.
-pub fn prop(conn: &Connection, node: &str, key: &str, at: Option<i64>) -> Result<Option<Row>> {
-    let mut st = conn.prepare_cached(queries::PROP)?;
-    let row = st.query_row(params![node, key, at], |r| read(r, 0));
-    let row = row.optional()?;
-    Ok(row.and_then(|(row, gone)| (!gone).then_some(row)))
-}
-
-/// The current row of each of `node`'s keys, as of `at` when given, by key.
-/// # Errors
-/// As `prop`.
-pub fn props(conn: &Connection, node: &str, at: Option<i64>) -> Result<Vec<(String, Row)>> {
-    current(&mut conn.prepare_cached(queries::PROPS)?, params![node, at])
-}
-
-/// Every row of `node`'s `key`, as of `at` when given, oldest first, each with its state.
-/// # Errors
-/// As `prop`.
-pub fn history(
-    conn: &Connection,
-    node: &str,
-    key: &str,
-    at: Option<i64>,
-) -> Result<Vec<(Row, State)>> {
-    let mut st = conn.prepare_cached(queries::HISTORY)?;
-    let rows = st.query_map(params![node, key, at], |r| read(r, 0))?;
-    let rows = rows.collect::<Result<Vec<_>>>()?;
-    let last = rows.len().saturating_sub(1);
-    let state = |i, gone| match (gone, i == last) {
-        (true, _) => State::Retracted,
-        (false, true) => State::Current,
-        (false, false) => State::Replaced,
-    };
-    let rows = rows.into_iter().enumerate();
-    Ok(rows.map(|(i, (row, gone))| (row, state(i, gone))).collect())
-}
-
-/// The current `name` edges from `node`, or into it when `reverse`, as of `at`, by far node.
-/// # Errors
-/// As `prop`.
-pub fn edges(
-    conn: &Connection,
-    node: &str,
-    name: &str,
-    reverse: bool,
-    at: Option<i64>,
-) -> Result<Vec<(String, Row)>> {
-    let sql = if reverse { queries::IN } else { queries::OUT };
-    current(&mut conn.prepare_cached(sql)?, params![node, name, at])
-}
-
-/// Why `node`'s `key` holds its current value: its event, then that event's source chain.
-/// # Errors
-/// As `prop`.
-pub fn why(conn: &Connection, node: &str, key: &str) -> Result<Vec<Uuid>> {
-    let event = prop(conn, node, key, None)?.map(|row| row.event.to_string());
-    let mut st = conn.prepare_cached(queries::WHY)?;
-    let ids = st.query_map([event], |r| r.get::<_, String>(0))?;
-    ids.map(|id| id?.parse().map_err(bad(0))).collect()
-}
-
-/// The first row of each group (a key or a far node, the first column), unless retracted.
-fn current(st: &mut CachedStatement<'_>, args: impl Params) -> Result<Vec<(String, Row)>> {
-    let (mut rows, mut out, mut last) = (st.query(args)?, Vec::new(), None);
-    while let Some(r) = rows.next()? {
-        let (group, (row, gone)) = (r.get::<_, String>(0)?, read(r, 1)?);
-        if last.replace(group.clone()).as_ref() != Some(&group) && !gone {
-            out.push((group, row));
-        }
+/// The options' names `fields`, each a string.
+fn names<'o, const N: usize>(
+    options: &'o Value,
+    fields: [&str; N],
+) -> Result<[&'o str; N], String> {
+    let mut out = [""; N];
+    for (slot, field) in out.iter_mut().zip(fields) {
+        *slot = options[field]
+            .as_str()
+            .ok_or_else(|| format!("{field} is not a name"))?;
     }
     Ok(out)
 }
 
-/// The value, event, written and retracted columns from column `at` on.
-fn read(r: &rusqlite::Row<'_>, at: usize) -> Result<(Row, bool)> {
-    let (value, event): (Option<String>, String) = (r.get(at)?, r.get(at + 1)?);
-    let value = value.map_or(Ok(Value::Null), |v| serde_json::from_str(&v));
-    let row = Row {
-        value: value.map_err(bad(at))?,
-        event: event.parse().map_err(bad(at + 1))?,
-        written: r.get(at + 2)?,
-    };
-    Ok((row, r.get::<_, i64>(at + 3)? == 1))
+/// A name as an SQL identifier, quoted.
+fn quote(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-/// A column's text that does not parse, as rusqlite's conversion failure.
-fn bad<E: std::error::Error + Send + Sync + 'static>(at: usize) -> impl Fn(E) -> rusqlite::Error {
-    move |e| rusqlite::Error::FromSqlConversionFailure(at, rusqlite::types::Type::Text, e.into())
+/// The row of `table` whose `key` is `node` with the greatest `time` at or before `at`, as an
+/// object of its columns; null when it has none.
+fn as_of(
+    conn: &Connection,
+    table: &str,
+    key: &str,
+    time: &str,
+    node: &str,
+    at: i64,
+) -> Result<Value> {
+    let (table, key, time) = (quote(table), quote(key), quote(time));
+    let sql = format!(
+        "SELECT * FROM {table} WHERE {key} = ?1 AND {time} <= ?2 ORDER BY {time} DESC LIMIT 1"
+    );
+    let mut st = conn.prepare_cached(&sql)?;
+    let columns: Vec<String> = st.column_names().map(str::to_owned).collect();
+    let mut rows = st.query(params![node, at])?;
+    rows.next()?
+        .map_or(Ok(Value::Null), |r| object(&columns, r))
+}
+
+/// The rows of `table` whose `from` is `node` and whose `time` is at or before `at`, oldest
+/// first, each as an object of its columns.
+fn edges(
+    conn: &Connection,
+    table: &str,
+    from: &str,
+    time: &str,
+    node: &str,
+    at: i64,
+) -> Result<Vec<Value>> {
+    let (table, from, time) = (quote(table), quote(from), quote(time));
+    let sql = format!("SELECT * FROM {table} WHERE {from} = ?1 AND {time} <= ?2 ORDER BY {time}");
+    let mut st = conn.prepare_cached(&sql)?;
+    let columns: Vec<String> = st.column_names().map(str::to_owned).collect();
+    let mut rows = st.query(params![node, at])?;
+    let mut out = Vec::new();
+    while let Some(r) = rows.next()? {
+        out.push(object(&columns, r)?);
+    }
+    Ok(out)
+}
+
+/// A row as an object of its `columns`.
+fn object(columns: &[String], r: &rusqlite::Row<'_>) -> Result<Value> {
+    let mut row = Map::new();
+    for (i, column) in columns.iter().enumerate() {
+        let value = match r.get_ref(i)? {
+            ValueRef::Null => Value::Null,
+            ValueRef::Integer(n) => json!(n),
+            ValueRef::Real(x) => json!(x),
+            ValueRef::Text(t) => json!(String::from_utf8_lossy(t)),
+            ValueRef::Blob(b) => json!(b),
+        };
+        row.insert(column.clone(), value);
+    }
+    Ok(Value::Object(row))
+}
+
+/// The greatest `event` among `table`'s rows whose `key` is `node`, then its source chain
+/// through `_events`.
+fn why(conn: &Connection, table: &str, key: &str, event: &str, node: &str) -> Result<Vec<String>> {
+    let (table, key, event) = (quote(table), quote(key), quote(event));
+    let sql = format!(
+        "WITH RECURSIVE c(id, source, depth) AS (
+        SELECT id, source, 0 FROM _events WHERE id = (SELECT max({event}) FROM {table} WHERE {key} = ?1)
+        UNION ALL SELECT e.id, e.source, c.depth + 1 FROM _events e JOIN c ON e.id = c.source)
+        SELECT id FROM c ORDER BY depth"
+    );
+    let mut st = conn.prepare_cached(&sql)?;
+    let ids = st.query_map([node], |r| r.get(0))?;
+    ids.collect()
+}
+
+/// An edge table a walk follows: the table, the column it goes from, the one it goes to, and
+/// the column of its rows' time, when it names one.
+pub(crate) type Via = (String, String, String, Option<String>);
+
+/// The nodes reached from `root` over `via` in at most `hops` hops, as of `at` when given,
+/// nearest first as (node, hops), at most `cap`, and whether the cap cut it.
+pub(crate) fn walk(
+    conn: &Connection,
+    via: &[Via],
+    root: &str,
+    hops: i64,
+    cap: usize,
+    at: Option<i64>,
+) -> Result<(Vec<(String, i64)>, bool)> {
+    let steps = via.iter().map(|(table, from, to, time)| {
+        let (table, from, to) = (quote(table), quote(from), quote(to));
+        let time = time.as_deref().map_or_else(String::new, |time| {
+            format!(" AND (?2 IS NULL OR e.{} <= ?2)", quote(time))
+        });
+        format!(
+            " UNION SELECT CAST(e.{to} AS TEXT), w.depth + 1 FROM w JOIN {table} e
+            ON e.{from} = w.node WHERE w.depth < ?3{time}"
+        )
+    });
+    let sql = format!(
+        "WITH RECURSIVE w(node, depth) AS (SELECT ?1, 0{})
+        SELECT node, min(depth) AS d FROM w WHERE node <> ?1 GROUP BY node ORDER BY d, node
+        LIMIT ?4",
+        steps.collect::<String>()
+    );
+    // One past the cap, so a walk the cap cut tells itself from one that ended at it.
+    let limit = i64::try_from(cap).map_or(i64::MAX, |cap| cap.saturating_add(1));
+    let mut st = conn.prepare_cached(&sql)?;
+    let args = params![root, at, hops, limit];
+    let rows = st.query_map(args, |r| Ok((r.get(0)?, r.get(1)?)))?;
+    let mut nodes = rows.collect::<Result<Vec<_>>>()?;
+    let cut = nodes.len() > cap;
+    nodes.truncate(cap);
+    Ok((nodes, cut))
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    use std::collections::{HashMap, VecDeque};
+
     use rusqlite::{Connection, params};
-    use serde_json::{Value, json};
-    use uuid::{NoContext, Timestamp, Uuid};
+    use serde_json::json;
+    use uuid::Uuid;
 
-    use super::{Op, prop, why, write};
+    use super::{Via, as_of, edges, walk, why};
 
-    /// A v7 id at `ms` milliseconds since the Unix epoch.
-    fn v7_at(ms: u64) -> Uuid {
-        let nanos = u32::try_from((ms % 1000) * 1_000_000).unwrap();
-        Uuid::new_v7(Timestamp::from_unix(NoContext, ms / 1000, nanos))
+    /// An app's ontology, as its ontology crate's migrations make it, with names the app chose:
+    /// docs with titles over time, and the docs each one cites, from when.
+    pub(crate) const DOCS: &str = "CREATE TABLE doc_titles (doc TEXT, title TEXT, event TEXT,
+        written INTEGER, PRIMARY KEY (doc, event));
+        CREATE TABLE cites (doc TEXT, cited TEXT, written INTEGER, PRIMARY KEY (doc, cited));
+        CREATE TABLE wrote (author TEXT, doc TEXT, PRIMARY KEY (author, doc))";
+
+    /// The same ontology under another app's names.
+    const PAPERS: &str = "CREATE TABLE paper (pid TEXT, name TEXT, by_event TEXT, at_ms INTEGER);
+        CREATE TABLE refs (src TEXT, dst TEXT, at_ms INTEGER)";
+
+    /// A store with rannoch's tables and the app's ontology `ddl`.
+    pub(crate) fn store(ddl: &str) -> Connection {
+        let conn = rannoch_core::forgr::empty_store();
+        conn.execute_batch(ddl).unwrap();
+        conn
     }
 
-    /// An event: its id, its source and the ops its flow wrote.
-    type Ev = (Uuid, Option<Uuid>, Vec<Op>);
-
-    fn ev(ms: u64, source: Option<&Ev>, ops: Vec<Op>) -> Ev {
-        (v7_at(ms), source.map(|s| s.0), ops)
+    /// An event in `_events` with `source`; returns its id.
+    fn event(conn: &Connection, source: Option<&str>) -> String {
+        let id = Uuid::now_v7().to_string();
+        let sql = "INSERT INTO _events (id, source, ty, data, run_at, status)
+            VALUES (?1, ?2, 1, '{}', NULL, 0)";
+        conn.execute(sql, params![id, source]).unwrap();
+        id
     }
 
-    pub(crate) fn set(node: &str, key: &str, value: Value) -> Op {
-        let (node, key) = (node.to_owned(), key.to_owned());
-        Op::Set { node, key, value }
+    fn via(table: &str, from: &str, to: &str) -> Via {
+        (table.to_owned(), from.to_owned(), to.to_owned(), None)
     }
 
-    pub(crate) fn link(src: &str, name: &str, dst: &str, props: Value) -> Op {
-        let (src, name, dst) = (src.to_owned(), name.to_owned(), dst.to_owned());
-        Op::Link {
-            src,
-            name,
-            dst,
-            props,
+    /// d1 cites d2 and d3, d2 cites d4, d4 cites d1, each at 1,000 but d1's cite of d3 at 2,000;
+    /// ada wrote d1 and d4. d1 is titled at 1,000 by its first event, and retitled at 2,000 by
+    /// an event whose source is the first.
+    fn small(conn: &Connection, [titles, cites, wrote]: [&str; 3]) -> [String; 2] {
+        let first = event(conn, None);
+        let fix = event(conn, Some(&first));
+        let title = format!("INSERT INTO {titles} VALUES (?1, ?2, ?3, ?4)");
+        conn.execute(&title, params!["d1", "graph notes", first, 1_000])
+            .unwrap();
+        conn.execute(&title, params!["d1", "graph store notes", fix, 2_000])
+            .unwrap();
+        let cite = format!("INSERT INTO {cites} VALUES (?1, ?2, ?3)");
+        let rows = [("d1", "d2", 1_000), ("d1", "d3", 2_000)];
+        for (a, b, at) in rows
+            .into_iter()
+            .chain([("d2", "d4", 1_000), ("d4", "d1", 1_000)])
+        {
+            conn.execute(&cite, params![a, b, at]).unwrap();
+        }
+        if !wrote.is_empty() {
+            let wrote = format!("INSERT INTO {wrote} VALUES (?1, ?2)");
+            for doc in ["d1", "d4"] {
+                conn.execute(&wrote, ["ada", doc]).unwrap();
+            }
+        }
+        [first, fix]
+    }
+
+    /// FR-RANNOCH-125-c3: why, a capped walk and as-of reads, of a row, a walk and a node's
+    /// edges, over the app's ontology tables.
+    #[test]
+    fn fr_rannoch_125_c3() {
+        let conn = store(DOCS);
+        let [first, fix] = small(&conn, ["doc_titles", "cites", "wrote"]);
+
+        // As of: the row at or before the time, or none before the first.
+        let title = |at| as_of(&conn, "doc_titles", "doc", "written", "d1", at).unwrap();
+        assert_eq!(title(1_500)["title"], json!("graph notes"));
+        assert_eq!(title(9_999)["title"], json!("graph store notes"));
+        assert_eq!(title(9_999)["event"], json!(fix));
+        assert_eq!(title(999), json!(null));
+
+        // Why: the latest row's event, then its source chain.
+        assert_eq!(
+            why(&conn, "doc_titles", "doc", "event", "d1").unwrap(),
+            [fix, first]
+        );
+        assert_eq!(
+            why(&conn, "doc_titles", "doc", "event", "none").unwrap(),
+            Vec::<String>::new()
+        );
+
+        // A walk over cites and wrote backwards, each node once at its fewest hops; capped.
+        let both = [via("cites", "doc", "cited"), via("wrote", "doc", "author")];
+        let (nodes, cut) = walk(&conn, &both, "d1", 2, 10, None).unwrap();
+        let hops = |n: &[(String, i64)]| n.iter().map(|(n, h)| (n.clone(), *h)).collect::<Vec<_>>();
+        let want = [("ada", 1), ("d2", 1), ("d3", 1), ("d4", 2)].map(|(n, h)| (n.to_owned(), h));
+        assert_eq!((hops(&nodes), cut), (want.to_vec(), false));
+        assert_eq!(
+            walk(&conn, &both, "d1", 2, 2, None).unwrap(),
+            (want[..2].to_vec(), true)
+        );
+        assert!(!walk(&conn, &both, "d1", 2, 4, None).unwrap().1);
+
+        // An as-of walk follows the cites written by then; wrote names no time and is whole.
+        let mut timed = both.clone();
+        timed[0].3 = Some("written".to_owned());
+        let then = walk(&conn, &timed, "d1", 2, 10, Some(1_500)).unwrap().0;
+        let want_then = [("ada", 1), ("d2", 1), ("d4", 2)].map(|(n, h)| (n.to_owned(), h));
+        assert_eq!(hops(&then), want_then);
+        let now = walk(&conn, &timed, "d1", 2, 10, Some(9_999)).unwrap();
+        assert_eq!(now, (want.to_vec(), false));
+        assert_eq!(walk(&conn, &timed, "d1", 2, 10, None).unwrap(), now);
+
+        // A node's edges as of a time: the rows written by then, oldest first.
+        let cited = |at| {
+            let rows = edges(&conn, "cites", "doc", "written", "d1", at).unwrap();
+            rows.iter().map(|r| r["cited"].clone()).collect::<Vec<_>>()
+        };
+        assert_eq!(cited(999), Vec::<serde_json::Value>::new());
+        assert_eq!(cited(1_500), [json!("d2")]);
+        assert_eq!(cited(9_999), [json!("d2"), json!("d3")]);
+    }
+
+    /// 01a216c8-b0d1-76f2-b5b2-b39d928247e3: the same utils on another app's tables and
+    /// columns give the same answers.
+    #[test]
+    fn criterion_01a216c8_utils_work_on_variable_tables_and_columns() {
+        let (docs, papers) = (store(DOCS), store(PAPERS));
+        let [_, fix] = small(&docs, ["doc_titles", "cites", "wrote"]);
+        let [_, fixed] = small(&papers, ["paper", "refs", ""]);
+
+        let title = as_of(&docs, "doc_titles", "doc", "written", "d1", 1_500).unwrap();
+        let name = as_of(&papers, "paper", "pid", "at_ms", "d1", 1_500).unwrap();
+        assert_eq!(
+            (&title["title"], &name["name"]),
+            (&json!("graph notes"), &json!("graph notes"))
+        );
+        assert_eq!(
+            why(&docs, "doc_titles", "doc", "event", "d1").unwrap()[0],
+            fix
+        );
+        assert_eq!(
+            why(&papers, "paper", "pid", "by_event", "d1").unwrap()[0],
+            fixed
+        );
+        let reached = |conn, v: Via| walk(conn, &[v], "d1", 3, 10, None).unwrap();
+        assert_eq!(
+            reached(&docs, via("cites", "doc", "cited")),
+            reached(&papers, via("refs", "src", "dst"))
+        );
+    }
+
+    /// The toy's xorshift, so the graph below is the toy's.
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            usize::try_from(self.0 % u64::try_from(n).unwrap()).unwrap()
         }
     }
 
-    /// The events' rows and their ops' rows in one transaction, each op's rows written at
-    /// `clock`, as the toy's `apply_many`.
-    pub(crate) fn apply(conn: &mut Connection, evs: &[&Ev], clock: i64) {
+    /// The same walk done in Rust, breadth first, one row at a time.
+    fn bfs(conn: &Connection, root: &str, via: &[Via], hops: i64) -> Vec<(String, i64)> {
+        let mut seen = HashMap::from([(root.to_owned(), 0)]);
+        let mut queue = VecDeque::from([(root.to_owned(), 0)]);
+        while let Some((node, depth)) = queue.pop_front() {
+            if depth == hops {
+                continue;
+            }
+            for (table, from, to, _) in via {
+                let sql = format!("SELECT {to} FROM {table} WHERE {from} = ?1");
+                let mut st = conn.prepare(&sql).unwrap();
+                let far = st.query_map([&node], |r| r.get::<_, String>(0)).unwrap();
+                for far in far.map(Result::unwrap) {
+                    seen.entry(far.clone()).or_insert_with(|| {
+                        queue.push_back((far, depth + 1));
+                        depth + 1
+                    });
+                }
+            }
+        }
+        let mut out: Vec<_> = seen.into_iter().filter(|(n, _)| n != root).collect();
+        out.sort_by(|a, b| (a.1, &a.0).cmp(&(b.1, &b.0)));
+        out
+    }
+
+    /// A capped walk equals a breadth-first walk in Rust on 50 roots of a graph of 2,000 people
+    /// and 8,000 docs, 2 hops over cites and wrote backwards, and a cap of 10 cuts and says so.
+    #[test]
+    fn a_capped_walk_equals_a_breadth_first_walk() {
+        let (people, docs) = (2_000, 8_000);
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let mut conn = store(DOCS);
         let tx = conn.transaction().unwrap();
-        for (id, source, ops) in evs {
-            let row = params![id.to_string(), source.map(|s| s.to_string())];
-            let sql = "INSERT OR IGNORE INTO _events (id, source, ty, data, run_at, status)
-                VALUES (?1, ?2, 1, '{}', NULL, 2)";
-            tx.execute(sql, row).unwrap();
-            for op in ops {
-                write(&tx, &id.to_string(), op, clock).unwrap();
+        for d in 0..docs {
+            let doc = format!("d{d}");
+            let author = format!("p{}", rng.below(people));
+            tx.execute("INSERT INTO wrote VALUES (?1, ?2)", [&author, &doc])
+                .unwrap();
+            for _ in 0..d.min(5) {
+                let cited = format!("d{}", rng.below(d));
+                tx.execute(
+                    "INSERT OR IGNORE INTO cites (doc, cited) VALUES (?1, ?2)",
+                    [&doc, &cited],
+                )
+                .unwrap();
             }
         }
         tx.commit().unwrap();
-    }
+        let both = [via("cites", "doc", "cited"), via("wrote", "doc", "author")];
+        let mut cut_seen = false;
+        for r in 0..50 {
+            let root = format!("d{}", docs - 1 - r * 7);
+            let full = bfs(&conn, &root, &both, 2);
 
-    fn count(conn: &Connection, sql: &str) -> i64 {
-        conn.query_row(sql, [], |r| r.get(0)).unwrap()
-    }
+            let whole = walk(&conn, &both, &root, 2, 1_000_000, None).unwrap();
+            let (capped, cut) = walk(&conn, &both, &root, 2, 10, None).unwrap();
 
-    fn value(conn: &Connection, node: &str, key: &str, at: Option<i64>) -> Option<Value> {
-        prop(conn, node, key, at).unwrap().map(|r| r.value)
-    }
-
-    /// The toy's small graph: ada wrote doc1..doc3; doc1 cites doc2 and doc3; then ada's name
-    /// is corrected and doc3's status retracted. Each event applied at its own time.
-    pub(crate) fn small() -> (Connection, [Ev; 4]) {
-        let e0 = ev(1_000, None, vec![]);
-        let e1 = ev(
-            1_100,
-            Some(&e0),
-            vec![
-                set("ada", "type", json!("person")),
-                set("ada", "name", json!("Ada")),
-                set("doc1", "title", json!("graph store notes")),
-                set("doc1", "status", json!("draft")),
-                set("doc2", "title", json!("queue notes")),
-                set("doc2", "status", json!("open")),
-                set("doc3", "title", json!("flow notes")),
-                set("doc3", "status", json!("closed")),
-                link("ada", "wrote", "doc1", json!({})),
-                link("ada", "wrote", "doc2", json!({})),
-                link("ada", "wrote", "doc3", json!({})),
-                link("doc1", "cites", "doc2", json!({ "page": 3 })),
-                link("doc1", "cites", "doc3", json!({})),
-            ],
-        );
-        let e2 = ev(
-            2_000,
-            Some(&e1),
-            vec![set("ada", "name", json!("Ada Lovelace"))],
-        );
-        let (node, key) = ("doc3".to_owned(), "status".to_owned());
-        let e3 = ev(3_000, Some(&e2), vec![Op::Retract { node, key }]);
-        let mut conn = rannoch_core::forgr::empty_store();
-        for (e, t) in [&e0, &e1, &e2, &e3]
-            .into_iter()
-            .zip([1_000, 1_100, 2_000, 3_000])
-        {
-            apply(&mut conn, &[e], t);
+            assert_eq!(whole, (full.clone(), false), "root {root}");
+            assert_eq!(capped, full[..10.min(full.len())], "root {root}");
+            assert_eq!(cut, full.len() > 10, "root {root}");
+            cut_seen |= cut;
         }
-        (conn, [e0, e1, e2, e3])
-    }
-
-    /// A rerun adds no row and moves no stamp (the toy's P1).
-    #[test]
-    fn fr_rannoch_123_c1() {
-        let (mut conn, small) = small();
-        let rows = |c: &Connection| {
-            let nodes = count(c, "SELECT count(*) FROM _nodes");
-            (nodes, count(c, "SELECT count(*) FROM _edges"))
-        };
-        let before = rows(&conn);
-
-        apply(&mut conn, &small.iter().collect::<Vec<_>>(), 9_999);
-
-        assert_eq!(before, (10, 5));
-        assert_eq!(rows(&conn), before);
-        let moved = count(&conn, "SELECT count(*) FROM _nodes WHERE written = 9999")
-            + count(&conn, "SELECT count(*) FROM _edges WHERE written = 9999");
-        assert_eq!(moved, 0);
-    }
-
-    /// The greater event id wins whichever is applied first (the toy's P2).
-    #[test]
-    fn fr_rannoch_123_c2() {
-        let mut conn = rannoch_core::forgr::empty_store();
-        let ops = |v: &str| vec![set("k", "v", json!(v)), set("k2", "v", json!(v))];
-        let (early, late) = (ev(4_000, None, ops("early")), ev(4_001, None, ops("late")));
-
-        apply(&mut conn, &[&late], 4_100);
-        apply(&mut conn, &[&early], 4_100);
-
-        assert_eq!(value(&conn, "k", "v", None), Some(json!("late")));
-        assert_eq!(value(&conn, "k2", "v", None), Some(json!("late")));
-    }
-
-    /// As of T leaves out a row written after T of an event accepted before it (the toy's P3).
-    #[test]
-    fn fr_rannoch_123_c3() {
-        let mut conn = rannoch_core::forgr::empty_store();
-        // d accepted at 5,000 and run at 9,000; b accepted at 6,000 and run at 6,000.
-        let d = ev(
-            5_000,
-            None,
-            vec![set("x", "K", json!("d")), set("x", "L", json!("d"))],
-        );
-        let b = ev(6_000, None, vec![set("x", "K", json!("b"))]);
-
-        apply(&mut conn, &[&b], 6_000);
-        apply(&mut conn, &[&d], 9_000);
-
-        // Read at 10,000.
-        assert_eq!(value(&conn, "x", "K", Some(7_000)), Some(json!("b")));
-        assert_eq!(value(&conn, "x", "L", Some(7_000)), None);
-        assert_eq!(value(&conn, "x", "K", None), Some(json!("b")));
-        assert_eq!(value(&conn, "x", "L", None), Some(json!("d")));
-    }
-
-    /// A 2's store row is inserted with its graph rows; one into a table the store does not have
-    /// fails the batch, writing none of it.
-    #[test]
-    fn a_store_row_is_written_with_its_2_and_one_the_store_does_not_have_fails_the_batch() {
-        use rannoch_core::{Event, Status};
-        let mut conn = rannoch_core::forgr::empty_store();
-        conn.execute_batch("CREATE TABLE t (k TEXT PRIMARY KEY)")
-            .unwrap();
-        let store = |table| json!({ "store": { "table": table, "row": { "k": "a" } } });
-        let set = json!({ "set": { "node": "a", "key": "k", "value": 1 } });
-        let two = |source| Event {
-            id: Uuid::now_v7(),
-            source: Some(source),
-            ty: 1_u16,
-            data: json!({}),
-            run_at: None,
-            status: Status::Processed,
-        };
-        let rows = |c: &Connection| {
-            let tables = ["t", "_nodes", "_events"];
-            tables.map(|t| count(c, &format!("SELECT count(*) FROM {t}")))
-        };
-
-        let (first, second) = (v7_at(1_000), v7_at(2_000));
-        let taken = [(first, vec![store("t"), set])];
-        super::commit(&mut conn, &[two(first)], &taken).unwrap();
-        assert_eq!(rows(&conn), [1, 1, 1]);
-
-        let taken = [(second, vec![store("nope")])];
-        assert!(super::commit(&mut conn, &[two(second)], &taken).is_err());
-        assert_eq!(rows(&conn), [1, 1, 1]);
-    }
-
-    /// #107: an item that is not an `Op` is rolled back with its 2 and its event's other rows,
-    /// the append returns a -1 for the event naming the reason, and the rest of the batch commits.
-    #[test]
-    fn an_item_that_is_not_an_op_is_rolled_back_with_its_2_and_gets_a_minus_1() {
-        use rannoch_core::{Append, Event, Status};
-        let (signal, wake) = std::sync::mpsc::channel();
-        let writes = rannoch_processor::Writes::default();
-        let conn = rannoch_core::forgr::empty_store();
-        let append = super::GraphAppend::new(conn, signal, writes.clone());
-        let event = |source, status| Event {
-            id: Uuid::now_v7(),
-            source,
-            ty: 1_u16,
-            data: json!({}),
-            run_at: None,
-            status,
-        };
-        let set = |node| json!({ "set": { "node": node, "key": "k", "value": 1 } });
-        // A link without props, which every link needs.
-        let bare = json!({ "link": { "src": "b", "name": "next", "dst": "c" } });
-        let (good, bad) = (event(None, Status::Added), event(None, Status::Added));
-        writes.lock().unwrap().insert(good.id, vec![set("g")]);
-        writes.lock().unwrap().insert(bad.id, vec![set("b"), bare]);
-        let good_two = event(Some(good.id), Status::Processed);
-        let batch = [
-            good.clone(),
-            bad.clone(),
-            good_two.clone(),
-            event(Some(bad.id), Status::Processed),
-        ];
-
-        let replies = append.append(&batch).unwrap();
-
-        // The rest of the batch commits and signals: both events, the good 2 and its row.
-        assert_eq!(wake.try_recv(), Ok(()));
-        let conn = append.conn.lock().unwrap();
-        let read = |sql| {
-            let mut select = conn.prepare(sql).unwrap();
-            let rows = select.query_map([], |r| r.get(0)).unwrap();
-            rows.collect::<rusqlite::Result<Vec<String>>>().unwrap()
-        };
-        let ids = [&good, &bad, &good_two].map(|e| e.id.to_string());
-        assert_eq!(read("SELECT id FROM _events ORDER BY rowid"), ids);
-        assert_eq!(read("SELECT node FROM _nodes"), ["g"]);
-        assert!(writes.lock().unwrap().is_empty());
-        // In the bad 2's place, a -1 for its source naming the reason, for the inbox to send.
-        let [binned] = replies.as_slice() else {
-            panic!("{replies:?}")
-        };
-        assert_eq!(
-            (binned.source, binned.status),
-            (Some(bad.id), Status::Binned)
-        );
-        assert_eq!(binned.data, json!("graph: missing field `props`"));
-    }
-
-    /// A correction and a retraction, now, as of and why (the toy's P4).
-    #[test]
-    fn fr_rannoch_123_c4() {
-        let (conn, [e0, e1, e2, _]) = small();
-
-        assert_eq!(
-            value(&conn, "ada", "name", None),
-            Some(json!("Ada Lovelace"))
-        );
-        assert_eq!(value(&conn, "ada", "name", Some(1_500)), Some(json!("Ada")));
-        assert_eq!(why(&conn, "ada", "name").unwrap(), [e2.0, e1.0, e0.0]);
-        assert_eq!(value(&conn, "doc3", "status", None), None);
-        assert_eq!(
-            value(&conn, "doc3", "status", Some(2_500)),
-            Some(json!("closed"))
-        );
+        assert!(cut_seen);
     }
 }

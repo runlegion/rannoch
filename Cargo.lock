@@ -1291,7 +1291,6 @@ dependencies = [
  "rannoch-queue",
  "rannoch-store",
  "rusqlite",
- "serde",
  "serde_json",
  "uuid",
 ]

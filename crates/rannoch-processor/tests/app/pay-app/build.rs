@@ -1,5 +1,5 @@
-//! The app's build: compiles its flows in, then copies the migrations of rannoch-events,
-//! rannoch-graph and onto-pay into the app's committed `migrations/` and writes `schema.json`
+//! The app's build: compiles its flows in, then copies the migrations of rannoch-events
+//! and onto-pay into the app's committed `migrations/` and writes `schema.json`
 //! there, each file only when its bytes differ, as rannoch-core's build does for rannoch's own
 //! crates. Each crate says where its migrations are with its `MIGRATIONS_DIR`.
 
@@ -9,11 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// The migrations directory of every crate with tables.
-const CRATES: &[&str] = &[
-    rannoch_events::MIGRATIONS_DIR,
-    rannoch_graph::MIGRATIONS_DIR,
-    onto_pay::MIGRATIONS_DIR,
-];
+const CRATES: &[&str] = &[rannoch_events::MIGRATIONS_DIR, onto_pay::MIGRATIONS_DIR];
 
 fn main() -> Result<(), Box<dyn Error>> {
     rannoch_processor::compile(Path::new("flows"), &[]);

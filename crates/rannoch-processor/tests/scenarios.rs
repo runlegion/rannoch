@@ -749,8 +749,8 @@ fn an_apps_ontology_crate_holds_the_table_its_store_step_writes() -> Result<()> 
     let _one = CARGO.lock().unwrap_or_else(PoisonError::into_inner);
     // Given an ontology crate, separate from the app, with a payments table in its own
     // migrations and its own MIGRATIONS_DIR
-    // And an app whose build.rs gathers rannoch-events', rannoch-graph's and the ontology
-    // crate's migrations into its migrations directory and embeds them
+    // And an app whose build.rs gathers rannoch-events' and the ontology crate's migrations
+    // into its migrations directory and embeds them
     let app = Fixture::copy("an_apps_ontology_crate")?;
     let path = app.0.join("store.db");
 
@@ -769,9 +769,9 @@ fn an_apps_ontology_crate_holds_the_table_its_store_step_writes() -> Result<()> 
     })?;
     assert_eq!(row, ("o1".to_owned(), 10));
 
-    // And rannoch-graph's tables are in the store beside it
+    // And the store holds no _nodes or _edges: the app's shape is its ontology crate's
     let graph = "SELECT count(*) FROM sqlite_master WHERE name IN ('_nodes', '_edges')";
-    assert_eq!(count(graph)?, 2);
+    assert_eq!(count(graph)?, 0);
     Ok(())
 }
 
@@ -1444,22 +1444,12 @@ fn the_hunt_resends_an_event_a_crash_dropped() {
 
 // #92: the README's "What you can rely on" and "How it fails", each item through the real store,
 // rannoch, `Events`, the queue and rannoch-processor, on `BUILT_IN`'s flows of `emit` and `store`.
-// An item a scenario above already drives is not driven again; a 2 with its `store` row through
-// `GraphAppend`, and a row the table refuses there, are in rannoch-graph's scenarios. A batch
-// written whole or not at all is driven here with `Events`: a payment whose row breaks a deferred
-// foreign key, which SQLite checks only at commit, makes the README's batch that can never be
-// written.
+// An item a scenario above already drives is not driven again. A batch written whole or not at
+// all is driven here with `Events`: a payment whose row breaks a deferred foreign key, which
+// SQLite checks only at commit, makes the README's batch that can never be written.
 //
-// No built-in step gives a graph op, so rannoch-graph tests its own rows and reads:
-// - "Reads are decided by ids and stamps": in crates/rannoch-graph/src/lib.rs, `fr_rannoch_123_c2`
-//   shows the greater event id wins whichever event is applied first; `fr_rannoch_123_c3` that as
-//   of T leaves out a row written after T by an event accepted before it; `fr_rannoch_123_c4` a
-//   correction and a retraction now, as of T, and `why` returning the event and its sources.
-// - "An event's 2 and its graph rows commit together": `fr_rannoch_123_c10` in rannoch-graph's
-//   scenarios shows every event with its 2 through the real queue has its rows, stamped with the
-//   event; `fr_rannoch_123_c1` that applying the same events again adds no row and moves no
-//   stamp; and `fr_rannoch_123_c4` that a new event whose source is an earlier one, as a retry or
-//   a resend is, adds its row beside the earlier event's.
+// rannoch-graph drives its own reads, why, capped walks and as-of reads over the app's tables,
+// each read an event, in its scenarios.
 //
 // Not driven, and why:
 // - A process that dies before its batch commits loses it, and a second process on the store:
