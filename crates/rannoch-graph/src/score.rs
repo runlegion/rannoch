@@ -7,11 +7,7 @@ use std::collections::HashMap;
 use rusqlite::{Connection, Result};
 use serde_json::{Value, json};
 
-use crate::quote;
-
-/// An edge table a scorer reads both ways: the table, its two node columns, and the column of
-/// its rows' weight, when it names one.
-type Link = (String, String, String, Option<String>);
+use crate::{Via, cap, hops, quote, vias};
 
 /// The scorers, in the order of their steps: `katz`, `pagerank`, `shared` and `learned`.
 #[derive(Debug, Clone, Copy)]
@@ -22,41 +18,38 @@ pub(crate) enum Scorer {
     Learned,
 }
 
-/// A scorer's options, parsed: its links, its hops, the number it is tuned by, and its cap.
-fn parse(scorer: Scorer, options: &Value) -> Result<(Vec<Link>, i64, f64, usize), String> {
-    let via = options["via"].as_object().ok_or("via is not an object")?;
-    let via = via.iter().map(|(table, cols)| {
-        let col = |c: &str| cols[c].as_str().map(str::to_owned);
-        let not = || format!("via {table} has no from and to");
-        Ok((
-            table.clone(),
-            col("from").ok_or_else(not)?,
-            col("to").ok_or_else(not)?,
-            col("weight"),
-        ))
-    });
-    let via = via.collect::<Result<Vec<_>, String>>()?;
+/// A scorer with the options it is tuned by.
+#[derive(Debug)]
+enum Tuned {
+    Katz { hops: i64, beta: f64 },
+    PageRank { hops: i64, restart: f64 },
+    Shared { rare: bool },
+    Learned,
+}
+
+/// A scorer's options, parsed: its via tables, the scorer tuned, and its cap.
+fn parse(scorer: Scorer, options: &Value) -> Result<(Vec<Via>, Tuned, usize), String> {
+    let via = vias(options, "weight")?;
     let number = |field: &str| {
         options[field]
             .as_f64()
             .ok_or_else(|| format!("{field} is not a number"))
     };
-    let hops = || {
-        options["hops"]
-            .as_i64()
-            .ok_or_else(|| "hops is not a whole number".to_owned())
+    let tuned = match scorer {
+        Scorer::Katz => Tuned::Katz {
+            hops: hops(options)?,
+            beta: number("beta")?,
+        },
+        Scorer::PageRank => Tuned::PageRank {
+            hops: hops(options)?,
+            restart: number("restart")?,
+        },
+        Scorer::Shared => Tuned::Shared {
+            rare: options["rare"].as_bool().ok_or("rare is not a bool")?,
+        },
+        Scorer::Learned => Tuned::Learned,
     };
-    let (hops, by) = match scorer {
-        Scorer::Katz => (hops()?, number("beta")?),
-        Scorer::PageRank => (hops()?, number("restart")?),
-        Scorer::Shared => {
-            let rare = options["rare"].as_bool().ok_or("rare is not a bool")?;
-            (2, f64::from(u8::from(rare)))
-        }
-        Scorer::Learned => (1, 1.0),
-    };
-    let cap = options["cap"].as_u64().ok_or("cap is not a whole number")?;
-    Ok((via, hops, by, usize::try_from(cap).unwrap_or(usize::MAX)))
+    Ok((via, tuned, cap(options)?))
 }
 
 /// The scores of the nodes near `root` by `scorer` and its `options`, as the step gives them:
@@ -67,24 +60,28 @@ pub(crate) fn score(
     options: &Value,
     root: &str,
 ) -> Result<Value, String> {
-    let (links, hops, by, cap) = parse(scorer, options)?;
+    let (links, tuned, cap) = parse(scorer, options)?;
+    let hops = match tuned {
+        Tuned::Katz { hops, .. } | Tuned::PageRank { hops, .. } => hops,
+        Tuned::Shared { .. } => 2,
+        Tuned::Learned => 1,
+    };
     // What a row passes on: from the hop it is in, its weight and its node's whole weight.
-    let pass = |hop: i64, w: f64, whole: f64| match scorer {
-        Scorer::Katz => by * w,
-        Scorer::PageRank => (1.0 - by) * w / whole,
-        Scorer::Shared if hop == 1 && by > 0.0 => w / whole.max(2.0).ln(),
-        Scorer::Shared | Scorer::Learned => w,
+    let pass = |hop: i64, w: f64, whole: f64| match tuned {
+        Tuned::Katz { beta, .. } => beta * w,
+        Tuned::PageRank { restart, .. } => (1.0 - restart) * w / whole,
+        Tuned::Shared { rare: true } if hop == 1 => w / whole.max(2.0).ln(),
+        Tuned::Shared { .. } | Tuned::Learned => w,
     };
     let mass = spread(conn, &links, root, hops, pass).map_err(|e| e.to_string())?;
     let mut totals: HashMap<String, f64> = HashMap::new();
-    let counted = match scorer {
-        Scorer::Katz | Scorer::PageRank => &mass[1..],
-        Scorer::Shared | Scorer::Learned => &mass[mass.len() - 1..],
+    let counted = match tuned {
+        Tuned::Katz { .. } | Tuned::PageRank { .. } => &mass[1..],
+        Tuned::Shared { .. } | Tuned::Learned => &mass[mass.len() - 1..],
     };
-    let keep = if matches!(scorer, Scorer::PageRank) {
-        by
-    } else {
-        1.0
+    let keep = match tuned {
+        Tuned::PageRank { restart, .. } => restart,
+        _ => 1.0,
     };
     for (node, m) in counted.iter().flatten() {
         *totals.entry(node.clone()).or_default() += keep * m;
@@ -106,7 +103,7 @@ pub(crate) fn score(
 /// node's rows' weights.
 fn spread(
     conn: &Connection,
-    links: &[Link],
+    links: &[Via],
     root: &str,
     hops: i64,
     pass: impl Fn(i64, f64, f64) -> f64,
@@ -128,7 +125,7 @@ fn spread(
 
 /// The rows of `links` that hold `node`, read both ways: each row's other node, as text, and
 /// its weight, 1 when its table names no weight.
-fn rows(conn: &Connection, links: &[Link], node: &str) -> Result<Vec<(String, f64)>> {
+fn rows(conn: &Connection, links: &[Via], node: &str) -> Result<Vec<(String, f64)>> {
     let mut out = Vec::new();
     for (table, a, b, weight) in links {
         let (table, a, b) = (quote(table), quote(a), quote(b));
@@ -144,4 +141,63 @@ fn rows(conn: &Connection, links: &[Link], node: &str) -> Result<Vec<(String, f6
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+
+    use super::{Scorer, parse};
+
+    #[test]
+    fn an_option_that_does_not_parse_fails_with_the_reason() {
+        let via = json!({ "cites": { "from": "doc", "to": "cited" } });
+        let cases = [
+            (Scorer::Katz, json!({ "hops": 2, "beta": 0.5 })),
+            (Scorer::PageRank, json!({ "hops": 2, "restart": 0.5 })),
+            (Scorer::Shared, json!({ "rare": true })),
+            (Scorer::Learned, json!({})),
+        ];
+        for (scorer, tuning) in cases {
+            let fails = |options: Value| parse(scorer, &options).unwrap_err();
+            assert_eq!(fails(json!({})), "via is not an object", "{scorer:?}");
+            assert_eq!(
+                fails(json!({ "via": { "cites": { "from": "doc" } } })),
+                "via cites has no from and to",
+                "{scorer:?}"
+            );
+            let mut options = tuning;
+            options["via"] = via.clone();
+            assert_eq!(
+                fails(options.clone()),
+                "cap is not a whole number",
+                "{scorer:?}"
+            );
+            options["cap"] = json!(-1);
+            assert_eq!(fails(options), "cap is not a whole number", "{scorer:?}");
+        }
+        let fails = |scorer, options: Value| parse(scorer, &options).unwrap_err();
+        for scorer in [Scorer::Katz, Scorer::PageRank] {
+            assert_eq!(
+                fails(scorer, json!({ "via": via, "hops": 1.5 })),
+                "hops is not a whole number",
+                "{scorer:?}"
+            );
+        }
+        assert_eq!(
+            fails(
+                Scorer::Katz,
+                json!({ "via": via, "hops": 2, "beta": "half" })
+            ),
+            "beta is not a number"
+        );
+        assert_eq!(
+            fails(Scorer::PageRank, json!({ "via": via, "hops": 2 })),
+            "restart is not a number"
+        );
+        assert_eq!(
+            fails(Scorer::Shared, json!({ "via": via, "rare": 1 })),
+            "rare is not a bool"
+        );
+    }
 }

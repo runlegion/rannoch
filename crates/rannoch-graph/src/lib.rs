@@ -271,9 +271,40 @@ fn why(conn: &Connection, table: &str, key: &str, event: &str, node: &str) -> Re
     ids.collect()
 }
 
-/// An edge table a walk follows: the table, the column it goes from, the one it goes to, and
-/// the column of its rows' time, when it names one.
+/// An edge table a walk or a scorer follows: the table, the column it goes from, the one it
+/// goes to, and the column of its rows' time for a walk, or of their weight for a scorer, when
+/// it names one.
 pub(crate) type Via = (String, String, String, Option<String>);
+
+/// The options' `via` tables, each with its `from` and `to` columns and its `fourth` column
+/// when it names one.
+pub(crate) fn vias(options: &Value, fourth: &str) -> Result<Vec<Via>, String> {
+    let via = options["via"].as_object().ok_or("via is not an object")?;
+    let via = via.iter().map(|(table, cols)| {
+        let col = |c: &str| cols[c].as_str().map(str::to_owned);
+        let not = || format!("via {table} has no from and to");
+        Ok((
+            table.clone(),
+            col("from").ok_or_else(not)?,
+            col("to").ok_or_else(not)?,
+            col(fourth),
+        ))
+    });
+    via.collect()
+}
+
+/// The options' `hops`.
+pub(crate) fn hops(options: &Value) -> Result<i64, String> {
+    options["hops"]
+        .as_i64()
+        .ok_or_else(|| "hops is not a whole number".to_owned())
+}
+
+/// The options' `cap`.
+pub(crate) fn cap(options: &Value) -> Result<usize, String> {
+    let cap = options["cap"].as_u64().ok_or("cap is not a whole number")?;
+    Ok(usize::try_from(cap).unwrap_or(usize::MAX))
+}
 
 /// The nodes reached from `root` over `via` in at most `hops` hops, as of `at` when given,
 /// nearest first as (node, hops), at most `cap`, and whether the cap cut it.
