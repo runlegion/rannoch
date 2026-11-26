@@ -31,7 +31,7 @@
 //! ids are read as text. A column holding a blob is read as a list of its bytes.
 //!
 //! A step fails with its name and the reason, as `walk: no such table: nope`, when an option
-//! does not parse or the store cannot answer.
+//! or what it takes does not parse, or the store cannot answer.
 //!
 //! # Warm hoods
 //!
@@ -52,7 +52,8 @@
 //! hood's root or a node its walk returned. It reads nothing: the next walk of that node and
 //! those options reads the store, as a step of its read event, and keeps the result warm again.
 //! A row the app writes by other means than the `store` step through the `Warm` touches no
-//! hood, so its walks read as they were kept.
+//! hood, so its walks read as they were kept. A walk that runs after the append commits a
+//! batch and before the `Warm` drops its hoods may still return the kept result.
 
 mod hoods;
 
@@ -96,10 +97,8 @@ impl Action for Step {
     ) -> Result<Map<String, Value>, String> {
         let name = &self.sig().action;
         let fail = |e: &dyn Display| format!("{name}: {e}");
-        let node = input
-            .get("node")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
+        let node = input.get("node").and_then(Value::as_str);
+        let node = node.ok_or_else(|| fail(&"node is not a string"))?;
         let open = || rannoch_store::Store::connection().map_err(|e| fail(&e));
         let (field, value) = match self.0 {
             0 => {

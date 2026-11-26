@@ -80,7 +80,7 @@ An app action named `emit` or `store` replaces the built-in step of that name.
 
 ## An ontology crate
 
-An app's ontology is its schema: a class is a table, a property a column, a relation a foreign key, and the migrations are its history. The ontology crate keeps those tables in its own migratr migrations directory and says where it is, as rannoch-events and rannoch-graph do:
+An app's ontology is its schema: a class is a table, a property a column, a relation a foreign key, and the migrations are its history. The ontology crate keeps those tables in its own migratr migrations directory and says where it is, as rannoch-events does:
 
 ```rust
 /// Where this crate's migratr migrations directory is, for the app's `build.rs`.

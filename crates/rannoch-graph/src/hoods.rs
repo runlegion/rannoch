@@ -192,10 +192,13 @@ mod tests {
     use serde_json::{Value, json};
     use uuid::Uuid;
 
-    use rannoch_events::StoreRow;
+    use rannoch_core::{Append, Error, Event, Status};
+    use rannoch_events::{StoreRow, Writes};
+    use rannoch_processor::Action;
 
-    use super::{Hoods, cold};
-    use crate::tests::DOCS;
+    use super::{Hoods, Warm, cold, parse};
+    use crate::Step;
+    use crate::tests::{DOCS, store};
 
     /// A store row into `table`.
     fn row(table: &str, row: Value) -> StoreRow {
@@ -260,5 +263,104 @@ mod tests {
         assert_eq!(hoods.walk(&options, "d1", none).unwrap(), read);
         drop(conn);
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// An inner append that fails, or takes each event's held items as the real one does.
+    #[derive(Debug)]
+    struct Stub(Writes, bool);
+
+    impl Append<u8, ()> for Stub {
+        fn append(&self, batch: &[Event<u8, ()>]) -> Result<Vec<Event<u8, ()>>, Error> {
+            if self.1 {
+                return Err(Error::Store);
+            }
+            let mut held = self.0.lock().unwrap();
+            for source in batch.iter().filter_map(|e| e.source) {
+                held.remove(&source);
+            }
+            Ok(Vec::new())
+        }
+    }
+
+    /// An event whose source is `source`, at `status`.
+    fn event(source: Uuid, status: Status) -> Event<u8, ()> {
+        Event {
+            id: Uuid::now_v7(),
+            source: Some(source),
+            ty: 1,
+            data: (),
+            run_at: None,
+            status,
+        }
+    }
+
+    /// A `Warm` drops the hood a 2's held store row touches once the inner append commits,
+    /// and drops nothing when the append fails or for an event that is not a 2.
+    #[test]
+    fn warm_drops_the_hoods_a_committed_2_touches() {
+        let options =
+            json!({ "via": { "cites": { "from": "doc", "to": "cited" } }, "hops": 2, "cap": 10 });
+        let conn = store(DOCS);
+        conn.execute("INSERT INTO cites VALUES ('d1', 'd2')", [])
+            .unwrap();
+        let hoods = Hoods::default();
+        hoods.walk(&options, "d1", || Ok(conn)).unwrap();
+        let kept = || hoods.walk(&options, "d1", none).is_ok();
+
+        let writes = Writes::default();
+        let touching =
+            json!({ "store": { "table": "cites", "row": { "doc": "d2", "cited": "d5" } } });
+        let (one, two) = (Uuid::now_v7(), Uuid::now_v7());
+        writes.lock().unwrap().insert(one, vec![touching.clone()]);
+        writes.lock().unwrap().insert(two, vec![touching]);
+
+        let failing = Warm::new(Stub(writes.clone(), true), writes.clone(), hoods.clone());
+        assert!(failing.append(&[event(two, Status::Processed)]).is_err());
+        assert!(kept());
+
+        let warm = Warm::new(Stub(writes.clone(), false), writes.clone(), hoods.clone());
+        warm.append(&[event(one, Status::InProgress)]).unwrap();
+        assert!(kept());
+
+        warm.append(&[event(two, Status::Processed)]).unwrap();
+        assert!(writes.lock().unwrap().is_empty());
+        assert!(!kept());
+    }
+
+    /// Each option or input that does not parse fails its step with the reason.
+    #[test]
+    fn an_option_that_does_not_parse_fails_with_the_reason() {
+        let fails = |options: Value| parse(&options).unwrap_err();
+        assert_eq!(fails(json!({})), "via is not an object");
+        assert_eq!(
+            fails(json!({ "via": { "cites": { "from": "doc" } } })),
+            "via cites has no from and to"
+        );
+        let via = json!({ "cites": { "from": "doc", "to": "cited" } });
+        assert_eq!(
+            fails(json!({ "via": via, "hops": 1.5 })),
+            "hops is not a whole number"
+        );
+        assert_eq!(
+            fails(json!({ "via": via, "hops": 2, "cap": -1 })),
+            "cap is not a whole number"
+        );
+
+        let run = |step, options: Value, input: Value| {
+            let input = input.as_object().unwrap().clone();
+            Step(step, Hoods::default())
+                .run(&options, &input)
+                .unwrap_err()
+        };
+        let as_of = json!({ "table": "doc_titles", "key": "doc", "time": "written" });
+        assert_eq!(
+            run(0, as_of.clone(), json!({ "node": "d1" })),
+            "as_of: at is not a whole number of ms"
+        );
+        assert_eq!(
+            run(0, json!({ "table": 7 }), json!({ "node": "d1", "at": 1 })),
+            "as_of: table is not a name"
+        );
+        assert_eq!(run(1, json!({}), json!({})), "why: node is not a string");
     }
 }
