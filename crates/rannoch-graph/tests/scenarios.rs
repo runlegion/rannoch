@@ -1,4 +1,4 @@
-//! #134's scenarios through the real store, queue and rannoch-processor: an app whose ontology
+//! #134's and #135's scenarios through the real store, queue and rannoch-processor: an app whose ontology
 //! is its own tables, whose flows write them with the built-in `store` step through a `Warm`
 //! append, and whose reads are events whose flows call rannoch-graph's steps. Each event is
 //! written into `_events` from the app's forgr factory. rannoch-store has one store per
@@ -51,6 +51,9 @@ const FLOWS: &str = r#"[
   ["then.json", {"name": "then", "ty": 52, "takes": {"node": "string", "at": "number"},
     "steps": [{"do": "as_of", "with": {"as_of": {"table": "doc_titles", "key": "doc",
       "time": "written"}}, "next": {"ty": 62, "shape": {"row": "$row"}}}]}],
+  ["known.json", {"name": "known", "ty": 56, "takes": {"node": "string", "at": "number"},
+    "steps": [{"do": "as_of", "with": {"as_of": {"table": "doc_titles", "key": "doc",
+      "time": "event"}}, "next": {"ty": 62, "shape": {"row": "$row"}}}]}],
   ["since.json", {"name": "since", "ty": 54, "takes": {"node": "string", "at": "number"},
     "steps": [{"do": "walk", "with": {"walk": {
       "via": {"cites": {"from": "doc", "to": "cited", "time": "written"}}, "hops": 3, "cap": 10}},
@@ -299,6 +302,36 @@ fn fr_rannoch_125_c4() {
     assert_eq!(none, json!({ "edges": { "rows": [] } }));
     let row = json!({ "doc": "d1", "cited": "d2", "written": 1_000 });
     assert_eq!(cited, json!({ "edges": { "rows": [row] } }));
+    app.stop();
+}
+
+/// FR-RANNOCH-126-c1: rannoch-graph is bitemporal: as of one time, a read by recorded time and
+/// a read by valid time give each its own row.
+#[test]
+fn fr_rannoch_126_c1() {
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+    // Given d1 titled by an event at 1,000, valid from 1,000, and retitled by an event at 2,000,
+    // valid from 1,500
+    let app = App::start("bitemporal").unwrap();
+    let title = "INSERT INTO doc_titles VALUES ('d1', ?1, ?2, ?3)";
+    for (name, recorded, valid) in [
+        ("graph notes", 1_000, 1_000),
+        ("graph store notes", 2_000, 1_500),
+    ] {
+        let id = uuid::Builder::from_unix_timestamp_millis(recorded, &[0; 10]).into_uuid();
+        app.conn
+            .execute(title, params![name, id.to_string(), valid])
+            .unwrap();
+    }
+
+    // When the app reads d1 as of 1,700 by valid time and by recorded time, each as an event
+    let at = json!({ "node": "d1", "at": 1_700 });
+    let valid = app.read(52, &at).unwrap();
+    let recorded = app.read(56, &at).unwrap();
+
+    // Then valid time gives the retitle, and recorded time the title the store held by then
+    assert_eq!(valid["row"]["title"], json!("graph store notes"));
+    assert_eq!(recorded["row"]["title"], json!("graph notes"));
     app.stop();
 }
 
