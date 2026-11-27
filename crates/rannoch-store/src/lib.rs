@@ -9,6 +9,11 @@
 //! [`Store`] is alive it checkpoints the WAL once a second from a connection
 //! of its own, never inside an append.
 //!
+//! [`Store::new`] reads the `[store]` section of the settings `rannoch_settings::load` loaded, so
+//! an app that sets it loads the settings first: `cache_size_kib` sets the page cache in KiB
+//! (65536 when absent) and `checkpoint_every_ms` how often the WAL is checkpointed (1000 when
+//! absent).
+//!
 //! Rannoch keeps the [`Store`] in its `Config` for as long as it runs. A checkpoint query that
 //! fails is logged at `error`, and so is each try at opening the checkpointer's connection that
 //! fails. Either way it tries again a second later.
@@ -68,28 +73,56 @@ use std::time::Duration;
 
 use rannoch_core::{Error, Storage};
 use rusqlite::Connection;
+use serde::Deserialize;
 
-/// The pragmas every connection the store opens has.
+/// The pragmas every connection the store opens has, beside its page cache.
 const PRAGMAS: &str = "PRAGMA foreign_keys = ON;
 PRAGMA journal_mode = WAL;
-PRAGMA cache_size = -65536;
 PRAGMA wal_autocheckpoint = 0;
 PRAGMA fullfsync = ON;";
 
-/// How often the store checkpoints the WAL.
-const CHECKPOINT_EVERY: Duration = Duration::from_secs(1);
+/// The store's `[store]` section; a key absent keeps its default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+struct Settings {
+    /// The page cache of every connection, in KiB.
+    cache_size_kib: u32,
+    /// How often the store checkpoints the WAL, in milliseconds.
+    checkpoint_every_ms: u64,
+}
 
-/// The database path of the one store, which [`Store::new`] sets.
-static PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
+impl Default for Settings {
+    /// The store's values when no `[store]` section sets them.
+    fn default() -> Self {
+        Self {
+            cache_size_kib: 65536,
+            checkpoint_every_ms: 1000,
+        }
+    }
+}
+
+/// The database path of the one store and the settings it read, which [`Store::new`] sets.
+static STORE: Mutex<Option<(PathBuf, Settings)>> = Mutex::new(None);
+
+/// The settings of the one store, or the defaults when no store has been made.
+fn settings() -> Settings {
+    STORE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+        .map_or_else(Settings::default, |(_, settings)| *settings)
+}
 
 /// A connection to the database at `path` with the store's pragmas.
 fn connection(path: &Path) -> Result<Connection, Error> {
     let conn = Connection::open(path).map_err(|_| Error::Store)?;
     conn.execute_batch(PRAGMAS).map_err(|_| Error::Store)?;
+    conn.pragma_update(None, "cache_size", -i64::from(settings().cache_size_kib))
+        .map_err(|_| Error::Store)?;
     Ok(conn)
 }
 
-/// The thread that checkpoints the WAL once a second; dropping it stops it.
+/// The thread that checkpoints the WAL every `every`; dropping it stops it.
 #[derive(Debug)]
 struct Checkpointer {
     stop: Option<mpsc::Sender<()>>,
@@ -97,11 +130,11 @@ struct Checkpointer {
 }
 
 impl Checkpointer {
-    fn start(path: PathBuf) -> Self {
+    fn start(path: PathBuf, every: Duration) -> Self {
         let (stop, wait) = mpsc::channel::<()>();
         let thread = thread::spawn(move || {
             let mut conn = None;
-            while wait.recv_timeout(CHECKPOINT_EVERY) == Err(RecvTimeoutError::Timeout) {
+            while wait.recv_timeout(every) == Err(RecvTimeoutError::Timeout) {
                 if conn.is_none() {
                     match connection(&path) {
                         Ok(opened) => conn = Some(opened),
@@ -143,13 +176,19 @@ pub struct Store {
 }
 
 impl Store {
-    /// The store for the database at `path`, against the app's one `migrator`.
-    /// It checkpoints the WAL once a second until it is dropped. It is the one store: each
-    /// `new` replaces the path [`Store::connection`] opens.
+    /// The store for the database at `path`, against the app's one `migrator`, with the
+    /// `[store]` section of the loaded settings.
+    /// It checkpoints the WAL every `checkpoint_every_ms` until it is dropped. It is the one
+    /// store: each `new` replaces the path [`Store::connection`] opens and the settings every
+    /// connection has.
     #[must_use]
     pub fn new(path: PathBuf, migrator: migratr::Migrator) -> Self {
-        *PATH.lock().unwrap_or_else(PoisonError::into_inner) = Some(path.clone());
-        let checkpointer = Checkpointer::start(path.clone());
+        let settings: Settings = rannoch_settings::section("store");
+        *STORE.lock().unwrap_or_else(PoisonError::into_inner) = Some((path.clone(), settings));
+        let checkpointer = Checkpointer::start(
+            path.clone(),
+            Duration::from_millis(settings.checkpoint_every_ms),
+        );
         Self {
             path,
             migrator,
@@ -164,7 +203,11 @@ impl Store {
     ///
     /// `Error::Store` when no store has been made, or its database cannot be opened.
     pub fn connection() -> Result<Connection, Error> {
-        let path = PATH.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        let path = STORE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(|(path, _)| path.clone());
         connection(&path.ok_or(Error::Store)?)
     }
 }
@@ -230,7 +273,31 @@ mod tests {
 
     use rannoch_core::Storage;
 
-    use super::{Error, Store, open};
+    use super::{Error, Settings, Store, connection, open};
+
+    #[test]
+    fn with_no_settings_loaded_the_store_keeps_todays_values() {
+        let settings: Settings = rannoch_settings::section("store");
+        assert_eq!(
+            settings,
+            Settings {
+                cache_size_kib: 65536,
+                checkpoint_every_ms: 1000,
+            }
+        );
+
+        let dir =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp/rannoch-store-defaults");
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("store.db");
+        let _store = Store::new(db.clone(), rannoch_core::migrator());
+        // Another test may make its own store meanwhile, so this opens its database by path.
+        let cache: i64 = connection(&db)
+            .unwrap()
+            .query_row("PRAGMA cache_size", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cache, -65536);
+    }
 
     #[test]
     fn store_reports_pending_then_applies_through_its_migrator() {
