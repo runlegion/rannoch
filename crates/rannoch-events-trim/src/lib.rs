@@ -1,7 +1,9 @@
 #![warn(missing_docs)]
-//! A step, `trim`, that deletes the rows in `_events` older than its options say. An app calls
-//! it from a flow it sets up; its options are `{"older_than_ms": n}`, the app's choice, and it
-//! deletes every row whose v7 id was made more than n milliseconds before the step runs:
+//! A step, `trim`, that deletes the processed events in `_events` older than its options say. An
+//! app calls it from a flow it sets up; its options are `{"older_than_ms": n}`, the app's
+//! choice, and it deletes each event whose v7 id was made more than n milliseconds before the
+//! step runs and that has a 2, together with its status rows: the rows whose source is the
+//! event and whose status is not 0. It leaves every event with no 2, and its status rows:
 //!
 //! ```json
 //! {"do": "trim", "with": {"trim": {"older_than_ms": 86400000}}}

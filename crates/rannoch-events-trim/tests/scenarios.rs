@@ -1,4 +1,4 @@
-//! #128's scenario. The store is the app's database through the real store, its rows from the
+//! #128's scenario, with #142's events that have no 2. The store is the app's database through the real store, its rows from the
 //! app's forgr factory, handed over by the real queue to rannoch-processor running the trim
 //! step, which the app adds with no arguments. This binary holds one test, so the one store is
 //! this test's.
@@ -60,21 +60,35 @@ fn migrated() -> Result<PathBuf> {
     Ok(path)
 }
 
-/// A finished event made `ago_ms` before now, from the app's forgr factory: its 0 of ty 11 and
-/// that 0's 1 and 2, so the queue never takes it. Returns the three ids.
-fn finished(conn: &Connection, ago_ms: u64, n: u8) -> Result<[Uuid; 3]> {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
-    let at = u64::try_from(now)? - ago_ms;
-    let id = |s| Builder::from_unix_timestamp_millis(at, &[n, s, 0, 0, 0, 0, 0, 0, 0, 0]);
-    let ids = [0, 1, 2].map(|s| id(s).into_uuid());
-    for (status, id) in ids.iter().enumerate() {
-        let row = _events::factory().id(id.to_string()).ty(11).data("{}");
-        let row = row.status(i64::try_from(status)?);
-        match status {
-            0 => row,
-            _ => row.source(ids[0].to_string()),
-        }
-        .insert(conn)?;
+const HOUR: u64 = 3_600_000;
+
+/// An event of ty 11 from the app's forgr factory: its 0, made `ago_ms` before now with `source`
+/// and a `run_at` in 2999, so the queue never takes it; then a row about it for each (status,
+/// made that many ms before now) in `statuses`. Returns the ids, the 0's first.
+fn event(
+    conn: &Connection,
+    n: u8,
+    ago_ms: u64,
+    source: Option<Uuid>,
+    statuses: &[(i64, u64)],
+) -> Result<Vec<Uuid>> {
+    let now = u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?;
+    let id =
+        |s, ago| Builder::from_unix_timestamp_millis(now - ago, &[n, s, 0, 0, 0, 0, 0, 0, 0, 0]);
+    let zero = id(0, ago_ms).into_uuid();
+    let row = _events::factory().id(zero.to_string()).ty(11).data("{}");
+    let row = row.status(0).run_at("2999-01-01T00:00:00.000Z");
+    match source {
+        Some(s) => row.source(s.to_string()),
+        None => row,
+    }
+    .insert(conn)?;
+    let mut ids = vec![zero];
+    for (s, &(status, ago)) in (1..).zip(statuses) {
+        let about = id(s, ago).into_uuid();
+        let row = _events::factory().id(about.to_string()).ty(11).data("{}");
+        row.status(status).source(zero.to_string()).insert(conn)?;
+        ids.push(about);
     }
     Ok(ids)
 }
@@ -92,16 +106,36 @@ fn ids(path: &Path) -> Result<BTreeSet<Uuid>> {
 }
 
 #[test]
-fn a_flow_whose_step_is_trim_deletes_the_rows_older_than_its_options_say_and_keeps_the_rest() {
+fn a_flow_whose_step_is_trim_deletes_the_processed_events_older_than_its_options_say_and_keeps_the_rest()
+ {
     // Given a store holding two events an hour old and one made now, each with its 1 and 2
     let path = migrated().unwrap();
     let seed = ready(&path).unwrap();
-    let old: BTreeSet<Uuid> = [1, 2]
+    let done = [(1, HOUR), (2, HOUR)];
+    let first = event(&seed, 1, HOUR, None, &done).unwrap();
+    let mut old: BTreeSet<Uuid> = first.iter().copied().collect();
+    old.extend(event(&seed, 2, HOUR, None, &done).unwrap());
+    let fresh: BTreeSet<Uuid> = event(&seed, 3, 0, None, &[(1, 0), (2, 0)])
+        .unwrap()
         .into_iter()
-        .flat_map(|n| finished(&seed, 3_600_000, n).unwrap())
         .collect();
-    let fresh: BTreeSet<Uuid> = finished(&seed, 0, 3).unwrap().into();
-    assert_eq!(ids(&path).unwrap(), &old | &fresh);
+
+    // And an event an hour old whose 1 and 2 were made now
+    old.extend(event(&seed, 4, HOUR, None, &[(1, 0), (2, 0)]).unwrap());
+
+    // And events an hour old with no 2: one waiting, one running, one failed, and one waiting
+    // whose source is the first old event
+    let undone: BTreeSet<Uuid> = [
+        event(&seed, 5, HOUR, None, &[]),
+        event(&seed, 6, HOUR, None, &[(1, HOUR)]),
+        event(&seed, 7, HOUR, None, &[(1, HOUR), (-1, HOUR)]),
+        event(&seed, 8, HOUR, Some(first[0]), &[]),
+    ]
+    .into_iter()
+    .flat_map(Result::unwrap)
+    .collect();
+    assert_eq!(undone.len(), 7);
+    assert_eq!(ids(&path).unwrap(), &(&old | &fresh) | &undone);
 
     // And an app whose flow's step is trim, older than a minute, the step added to its
     // signatures and its actions with no arguments
@@ -136,7 +170,8 @@ fn a_flow_whose_step_is_trim_deletes_the_rows_older_than_its_options_say_and_kee
     row.status(0).insert(&seed).unwrap();
     signal.send(()).unwrap();
 
-    // Then the event has its 2, and _events holds no row an hour old and every other row
+    // Then the event has its 2, and _events holds no row of an old event with a 2 and every
+    // other row
     let about = |status: i64| {
         let sql = "SELECT id FROM _events WHERE source = ?1 AND status = ?2";
         let id = seed.query_row(sql, (trim.to_string(), status), |r| r.get::<_, String>(0));
@@ -144,10 +179,23 @@ fn a_flow_whose_step_is_trim_deletes_the_rows_older_than_its_options_say_and_kee
     };
     assert!(until(|| about(2).is_some()));
     let ran = [Some(trim), about(1), about(2)].into_iter().flatten();
-    let kept: BTreeSet<Uuid> = fresh.iter().copied().chain(ran).collect();
-    assert_eq!(kept.len(), 6);
+    let kept: BTreeSet<Uuid> = fresh.iter().chain(&undone).copied().chain(ran).collect();
+    assert_eq!(kept.len(), 13);
     let left = ids(&path).unwrap();
     assert_eq!(left, kept, "old: {old:?}");
+
+    // And no event the step deleted waits at 0 with no status row, so none is due again
+    let waiting = "SELECT e.id FROM _events e WHERE e.status = 0
+        AND NOT EXISTS (SELECT 1 FROM _events s WHERE s.source = e.id AND s.status <> 0)";
+    let mut waiting = seed.prepare(waiting).unwrap();
+    let waiting = waiting.query_map([], |r| r.get::<_, String>(0)).unwrap();
+    let waiting: BTreeSet<Uuid> = waiting.map(|i| i.unwrap().parse().unwrap()).collect();
+    assert!(
+        waiting.is_disjoint(&old),
+        "due again: {:?}",
+        &waiting & &old
+    );
+    assert_eq!(waiting.len(), 2);
 
     drop(signal);
     rannoch.shutdown();
