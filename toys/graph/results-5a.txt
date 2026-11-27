@@ -1,0 +1,20 @@
+== baseline (BUDGET=1 KEEP_STORE=1)
+load (BUDGET+KEEP_STORE): 1,000 import events to their 2 in 126.224582833s: 2916400 node rows, 3791318 edge rows, 53141 graph rows/s; disk written 26414 MB, 3938 bytes per graph row; gap writes 0
+relay (BUDGET+KEEP_STORE): steps [("R3 A1", true), ("R3 B", true), ("R7", true), ("R6 B", true), ("R6 A1", true), ("noise", true)]; delivered 5 of 205; all held and control equal: true
+latency (BUDGET+KEEP_STORE): 20 single judgments, send to 2: p50 34.206708ms, p99 45.942708ms, max 45.942708ms
+shutdown (BUDGET+KEEP_STORE): 554.542µs
+134.49 real        91.16 user        54.38 sys
+192987760  peak memory footprint
+WAL largest, sampled from outside every 100 ms: 271149592 bytes (258 MiB)
+== 5a-trace (BUDGET=1 KEEP_STORE=1 TRACE=1)
+load (BUDGET+KEEP_STORE+TRACE): 1,000 import events to their 2 in 121.050749666s: 2916400 node rows, 3791318 edge rows, 55412 graph rows/s; disk written 25918 MB, 3864 bytes per graph row; gap writes 0
+P5a BUDGET+KEEP_STORE+TRACE: 168 write starts, 0 (0.0%) with a read open on another connection; 691 reads traced; open reads by kind: []
+relay (BUDGET+KEEP_STORE+TRACE): steps [("R3 A1", true), ("R3 B", true), ("R7", true), ("R6 B", true), ("R6 A1", true), ("noise", true)]; delivered 5 of 205; all held and control equal: true
+latency (BUDGET+KEEP_STORE+TRACE): 20 single judgments, send to 2: p50 33.451583ms, p99 42.212041ms, max 42.212041ms
+shutdown (BUDGET+KEEP_STORE+TRACE): 237.042µs
+126.02 real        91.23 user        53.08 sys
+193610472  peak memory footprint
+WAL largest, sampled from outside every 100 ms: 250772072 bytes (239 MiB)
+== 5a control (synthetic writer, reader every 1 ms)
+other1: 300 transactions of 2,000 rows in 24.412901333s; reads 16194; WAL file largest 10.1 MiB
+P5a control other1: 300 write starts, 0 (0.0%) with a read open on another connection; 16194 reads traced; open reads by kind: []

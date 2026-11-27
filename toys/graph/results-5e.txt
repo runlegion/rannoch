@@ -1,0 +1,6 @@
+seq-big: 300 transactions of 6700 rows in 85.141305375s; WAL file largest 18.1 MiB; disk written 18733 MB, 9320 bytes per row
+rand-big: 300 transactions of 6700 rows in 127.3204165s; WAL file largest 47.7 MiB; disk written 36924 MB, 18371 bytes per row
+rand-small: 3000 transactions of 670 rows in 390.131197458s; WAL file largest 10.5 MiB; disk written 73841 MB, 36737 bytes per row
+time-big: 300 transactions of 6700 rows in 176.713018917s; WAL file largest 46.5 MiB; disk written 41922 MB, 20857 bytes per row
+
+[exited with code 0]

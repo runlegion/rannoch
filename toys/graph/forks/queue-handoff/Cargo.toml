@@ -1,0 +1,14 @@
+[package]
+name = "queue-handoff"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "graph toy round 5c: rannoch-queue's loop woken by the committed events themselves. Never merged."
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["alloc", "clock"] }
+log = "0.4"
+rannoch-core = { path = "../../../../crates/rannoch-core" }
+rannoch-queue = { path = "../../../../crates/rannoch-queue" }
+rusqlite = { version = "0.41", features = ["bundled"] }
+uuid = "1"

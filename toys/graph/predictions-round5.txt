@@ -1,0 +1,178 @@
+graph toy, round 5: design and predictions, written before any round 5 code (2026-11-22).
+
+The operator: "Design your toys". After round 4 (RESEARCH 01a2023e: the WAL creeps about 1 MiB/s on
+rannoch's flow path under the 5 MiB checkpoint budget) and the prior art (RESEARCH 01a20240:
+SQLite restarts the WAL only when a write begins with no reader in it; reader gaps or blocking
+TRUNCATE are its remedies).
+
+Each toy answers one question with one change, in one harness, on the same data.
+
+Harness, every toy:
+- WAL size sampled by a separate process that only stats files and never opens the database.
+- Disk writes: the process's own bytes written (proc_pid_rusage, ri_diskio_byteswritten), not
+  /usr/bin/time's block outputs, which read 0 on this machine in round 4.
+- Peak memory footprint; load in graph rows/s.
+- Latency: from send to the event's 2, signalled in process; no polling reads of the database.
+- Checks after quiesce, indexed queries only.
+- The process exits within 10 s of shutdown, or the run fails.
+- Baseline: round 4's budget pragmas, rerun in this harness.
+- Forks of crates under toys/graph/forks/, never merged.
+
+Round 4's mistakes this harness removes: the bench polled the database it measured; its own
+check query was quadratic; shutdown hung on the bench's own Sender clone; block outputs measured
+nothing; settings changed between runs.
+
+5a  Why the WAL will not restart. No change, measurement only: a profile hook on every
+    connection the toy opens logs each statement's start and end and each commit; count the
+    write starts that overlap an open read, and whose read. 60 s of the T4 load.
+    P5a: at least 90% of write starts overlap a read, mostly the queue's due select and the
+    processor's wait lookup; the round 4c synthetic writer with a reader every 1 ms (bounded at
+    10.1 MiB) overlaps under 10%.
+    Kill: if refuted, the inference is wrong; stop and drop 5b and 5c.
+
+5b  Make the reader gap. One change: a fork of rannoch-events whose append, after its commit and
+    before it signals the queue, runs a PASSIVE checkpoint once the WAL is over 5 MiB.
+    P5b: over the full T4 load the WAL stays under 5 MiB plus the largest transaction (under 16
+    MiB); the load stays within 10% of round 4; median latency is at most round 4's plus 5 ms.
+
+5c  Stop the hot path reading back. One change, separate from 5b: forks of rannoch-queue and
+    rannoch-events in which the append hands the committed events to the queue over its channel;
+    the queue reads _events only at start and in the hunt.
+    P5c: the WAL stays bounded as P5b; the queue's hand-off costs the same at 1,000,000 events of
+    history as at 10,000, within 10%; a process killed with SIGKILL mid-load and restarted takes
+    every event to its 2 exactly once.
+
+5d  With a game on the machine. 5b and 5c together, beside a process that keeps every core but
+    one busy and writes 50 MB/s to disk.
+    P5d: single-event latency at p99 is 50 ms or less (warden's figure); the WAL stays bounded as
+    P5b; bytes written per graph row are no more than round 4's.
+
+Order: 5a, then 5b and 5c, then 5d. Each lands a RESEARCH document.
+
+Correction to 5b, written before any round 5 code (2026-11-22): a PASSIVE checkpoint after the
+commit is what wal_autocheckpoint 1280 already does inside the writer's COMMIT, and round 4 shows
+that is not enough; SQLite rewinds the WAL at the next write's start (wal.html 2.2), not at the
+checkpoint. So 5b's append, after its commit and while the WAL is over 5 MiB, runs the PASSIVE
+checkpoint and then one tiny write of its own (one row in a one-row table), and only then
+signals the queue, so the rewind is attempted inside the gap. P5b is unchanged.
+
+Notes on 5c, written before code: the fork keeps the queue's per-event reads that are not on
+the plain path: root() reads only for an event that has a source (a retry or a next), and the
+hunt and a delayed event's timer read _events. rannoch-processor is not forked: its wait lookup
+per event stays.
+
+5a result (results-5a.txt): REFUTED. In the first 60 s of the real flow, 0 of 168 write starts
+had a read open on another connection; the synthetic control, 0 of 300. Readers do not keep the
+WAL from restarting, so by 5a's kill rule 5b and 5c are dropped: both fix a cause that is not
+there. The baseline in this harness wrote 26,414 MB to disk for 6,707,718 graph rows, 3,938
+bytes per row, about one 4 KiB page per row, and its WAL reached 258 MiB.
+
+5e, designed from 5a and written before it ran (2026-11-22). New lead: transaction size times key
+order. An import commits about 6,700 graph rows in one transaction, its keys spread over the
+B-trees, so one transaction dirties thousands of pages, and the WAL must hold the whole
+transaction; as the tables grow each transaction touches more distinct pages. The 4c synthetic
+writer stayed bounded with 2,000 rows a transaction and sequential node keys. The operator: "UUID
+is time": rows keyed by the event, a UUIDv7, append at the right edge of the tree.
+Synthetic writer, the budget pragmas, 300 transactions, the WAL sampled every 20 ms, bytes
+written from proc_pid_rusage, four cases:
+  seq-big    6,700 rows a transaction, node keys in insert order (as 4c, bigger)
+  rand-big   6,700 rows a transaction, node keys random (hashed), as the T4 import's are
+  rand-small 670 rows a transaction, node keys random
+  time-big   6,700 rows a transaction, node keys random, but _nodes and _edges keyed by event
+             first (event, node, key) and (event, src, name, dst), with the lookups the graph
+             crate needs as secondary indexes (node, key, event) and (dst, name, src, event)
+P5e-1 rand-big: the WAL grows past 64 MiB and bytes written are 2,000 or more per row.
+P5e-2 seq-big: the WAL stays under 32 MiB and bytes written are under 500 per row.
+P5e-3 rand-small: the WAL stays under 16 MiB; bytes per row stay 2,000 or more (random pages).
+P5e-4 time-big: the WAL and the bytes per row both fall between seq-big and rand-big.
+
+5e partial results (results-5e.txt), recorded before 5f was designed: seq-big WAL 18.1 MiB,
+9,320 bytes per row (P5e-2 holds for the WAL, refuted for bytes; the edges' source keys were
+random in every case, a flaw of 5e's design, so seq-big was not sequential for _edges);
+rand-big WAL 47.7 MiB (P5e-1 refuted for the WAL), 18,371 bytes per row (holds); rand-small WAL
+10.5 MiB (P5e-3 holds), 36,737 bytes per row (holds). Bytes per row rise with commits: on this
+machine each commit's full flush costs more than its pages.
+
+5f, written before it ran (2026-11-22): the real flow (baseline: BUDGET=1 KEEP_STORE=1), one
+change each:
+  small    IMPORTS=10000: the same statements in 10,000 import events of about 670 rows
+  time     TIMEKEYS=1: _nodes and _edges keyed (event, ...) first, lookups as indexes
+P5f-1 small: the WAL stays under 16 MiB; bytes per graph row are at least the baseline's (more
+      commits); the load stays within 30% of the baseline's rows/s; the relay holds.
+P5f-2 time: bytes per graph row are lower than the baseline's; the relay holds and the control
+      equals it; a cold describe is no slower than 2x the baseline's seed.
+
+5d, rewritten from 5a's result, before it ran: the better of 5f's cases (the one with the WAL
+bounded and the least bytes per row; both if both bound it) beside a process that keeps 9 of
+this machine's 10 cores busy and writes 50 MB/s with a flush each write.
+P5d: single-event latency p99 50 ms or less over 200 judgments; the WAL as bounded as in 5f;
+     bytes per graph row within 20% of 5f's.
+
+5f results (results-5f.txt), before 5g was designed: small (IMPORTS=10000) held the WAL at 19 MiB
+(P5f-1 refuted narrowly: 16 MiB predicted) but the load did not finish within the harness's
+900 s (736 s user CPU): rannoch-queue's loop runs taken.retain(|id| due.iter().any(..)) on every
+wake, |taken| x |due| comparisons, about 10^8 with 10,000 events due. time (TIMEKEYS=1) wrote
+3,560 bytes per graph row against the baseline's 3,938 (P5f-2 holds for bytes), the relay held,
+latency p50 32 ms, but the WAL reached 281 MiB; P5f-2's describe timing was not printed by the
+harness, so it is unmeasured.
+
+5g, written before it ran (2026-11-22): 5f-small with the 5c fork of the queue (HANDOFF=1), which
+forgets a taken event when its status row is handed to it instead of comparing every taken event
+with every due one. Same baseline otherwise.
+P5g: the load of 10,000 import events finishes; the WAL stays under 24 MiB; bytes per graph row
+     are at least the baseline's 3,938; the load is within 30% of the baseline's 53,141 rows/s;
+     the relay holds and the control equals it; latency p50 is 50 ms or less.
+
+Correction, recorded before any rerun (2026-11-22): the cause given above for 5f-small not
+finishing was an inference, not a measurement. Sampling the 5g run (r5g-sample.txt) put the
+busy thread in the toy's own import action: its source query's plan is SEARCH said USING INDEX
+link_dst (kind=? AND dst>?), only the lower bound reaching the index, so each import scans the
+T8 file's link table from its first statement to the end. With 10,000 imports that alone passes
+900 s. rannoch-queue's taken.retain is O(|taken| x |due|) per wake in the code, but its cost in
+5f-small was not measured. The same import query bounds every earlier round's load rate (the
+roughly 55,000 graph rows/s of rounds 3 to 5f measured the toy's reads of the T8 file, not
+rannoch; round 2d's flow bench is the rannoch figure). 5g was stopped. Fix: the import query
+also bounds said.dst by the range. Then 5f-small and 5g run again with predictions unchanged.
+
+Rerun with the import query fixed (results-5fg.txt): baseline 29.6 s, 226,625 graph rows/s, 371
+bytes per row, WAL 465 MiB, peak footprint 714 MB; 5f-small 338 bytes per row, WAL 606 MiB
+(P5f-1 refuted); 5f-time 519 bytes per row, WAL 681 MiB (P5f-2 refuted: more bytes than the
+baseline); 5g (small + fork) finished, 361 bytes per row, WAL 529 MiB (P5g refuted for the WAL,
+holds for the load and the relay). The relay held and latency p50 stayed about 35 ms in all four.
+
+5h and 5i, written before they ran (2026-11-22). Reading: when the processor runs ahead of the
+writer, the inbox gathers more finished events into each batch, and the append writes the whole
+batch, every event's graph rows, as one transaction; transactions grow with the backlog, the WAL
+grows to hold the largest, and the rows waiting in memory fill the footprint.
+5h  Measurement only, the baseline: the append records the graph rows of each transaction.
+    P5h: the largest append transaction holds 100,000 graph rows or more, and the WAL's largest
+    size is within 2x of that transaction's share of the WAL (about 300 bytes a row or more).
+5i  One change: CAP=5000, the append commits after the event that takes its transaction to
+    5,000 graph rows and begins another, so an event's rows still commit with its 2; the queue
+    is woken after the batch's last commit.
+    P5i: the WAL stays under 24 MiB; bytes per graph row at most 2x the baseline's 371; the load
+    at least half the baseline's 226,625 rows/s; the relay holds; latency p50 50 ms or less; the
+    peak footprint stays above 300 MB (the cap bounds the WAL, not the rows waiting in memory).
+
+5h and 5i results (results-5hi.txt): 5h baseline 87.8 s (the earlier fixed baseline took 29.6 s:
+runs vary widely on this machine), 2,837 bytes per row, WAL 138 MiB, 54 append transactions,
+largest 144,368 graph rows (P5h holds for the transaction; refuted for the WAL's ratio, 3.3x).
+5i CAP=5000: WAL 20 MiB (holds), 994 transactions, largest 10,035 rows; but 405.7 s, 16,534 rows/s
+and 12,452 bytes per row (refuted: each commit's full flush), relay held, latency p50 37 ms, peak
+footprint 141 MB (refuted: the waiting rows did not fill memory).
+
+5j, written before it ran (2026-11-22): 5i plus PRAGMA synchronous = NORMAL on the append's
+connection only (in WAL mode a commit then appends without a flush; flushes happen at
+checkpoints; a power loss can lose the last commits, a process crash cannot). Also the baseline
+once more, to see its spread.
+P5j: the WAL stays under 24 MiB; bytes per graph row at most the slower baseline's 2,837; the load
+     at least the slower baseline's 76,416 rows/s; the relay holds; latency p50 50 ms or less.
+
+5j and the second baseline (results-5j.txt), recorded before the fix below: 5j matched 5i to the
+megabyte (83,524 MB, 404 s), and the second baseline matched 5h (89.3 s, 2,903 bytes per row, WAL
+136 MiB). Cause, found in the toy: the rewritten append (for 5h) holds the pending-rows lock
+across every commit, so rannoch-processor's action, which hands its rows to that map, stalls
+through each flush. The four runs before the rewrite loaded in about 30 s. So 5h's, 5i's and 5j's
+load times and bytes are the toy's lock, not the cap or the flush; their WAL figures and
+transaction counts stand. Fix: take each group's rows out of the map under the lock, release it,
+then write and commit. Rerun the baseline, 5i and 5j with predictions unchanged.

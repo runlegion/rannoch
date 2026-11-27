@@ -1,0 +1,12 @@
+== 5f-small (BUDGET=1 KEEP_STORE=1 IMPORTS=10000)
+904.00 real       736.76 user       283.85 sys
+34701816  peak memory footprint
+WAL largest, sampled from outside every 100 ms: 20764832 bytes (19 MiB)
+== 5f-time (BUDGET=1 KEEP_STORE=1 TIMEKEYS=1)
+load (BUDGET+KEEP_STORE+TIMEKEYS): 1000 import events to their 2 in 127.834441125s: 2916400 node rows, 3791318 edge rows, 52472 graph rows/s; disk written 23882 MB, 3560 bytes per graph row; gap writes 0
+relay (BUDGET+KEEP_STORE+TIMEKEYS): steps [("R3 A1", true), ("R3 B", true), ("R7", true), ("R6 B", true), ("R6 A1", true), ("noise", true)]; delivered 5 of 205; all held and control equal: true
+latency (BUDGET+KEEP_STORE+TIMEKEYS): 20 single judgments, send to 2: p50 32.191417ms, p99 35.611959ms, max 35.611959ms
+shutdown (BUDGET+KEEP_STORE+TIMEKEYS): 559.5µs
+134.48 real        93.82 user        56.20 sys
+221987560  peak memory footprint
+WAL largest, sampled from outside every 100 ms: 295082672 bytes (281 MiB)

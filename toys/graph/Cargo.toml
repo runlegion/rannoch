@@ -7,7 +7,7 @@ publish = false
 [workspace]
 
 [dependencies]
-rusqlite = { version = "0.41", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled", "trace"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v7"] }
 rannoch-core = { path = "../../crates/rannoch-core" }
@@ -16,3 +16,5 @@ rannoch-queue = { path = "../../crates/rannoch-queue" }
 rannoch-processor = { path = "../../crates/rannoch-processor" }
 rannoch-store = { path = "../../crates/rannoch-store" }
 chrono = { version = "0.4", default-features = false, features = ["alloc", "clock"] }
+libc = "0.2"
+queue-handoff = { path = "forks/queue-handoff" }

@@ -325,6 +325,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "queue-handoff"
+version = "0.0.0"
+dependencies = [
+ "chrono",
+ "log",
+ "rannoch-core",
+ "rannoch-queue",
+ "rusqlite",
+ "uuid",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -567,6 +579,8 @@ name = "toy-graph"
 version = "0.0.0"
 dependencies = [
  "chrono",
+ "libc",
+ "queue-handoff",
  "rannoch-core",
  "rannoch-events",
  "rannoch-processor",

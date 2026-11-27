@@ -1,0 +1,16 @@
+== 5h-baseline (BUDGET=1 KEEP_STORE=1)
+load (BUDGET+KEEP_STORE): 1000 import events to their 2 in 87.779056s: 2916400 node rows, 3791318 edge rows, 76416 graph rows/s; disk written 19031 MB, 2837 bytes per graph row; gap writes 0; P5h append transactions 54, largest 144368 graph rows
+relay (BUDGET+KEEP_STORE): steps [("R3 A1", true), ("R3 B", true), ("R7", true), ("R6 B", true), ("R6 A1", true), ("noise", true)]; delivered 5 of 205; all held and control equal: true
+latency (BUDGET+KEEP_STORE): 20 single judgments, send to 2: p50 34.752625ms, p99 39.446625ms, max 39.446625ms
+shutdown (BUDGET+KEEP_STORE): 558.417µs
+93.09 real        14.54 user        28.04 sys
+150553152  peak memory footprint
+WAL largest, sampled from outside every 100 ms: 145609072 bytes (138 MiB)
+== 5i-cap5000 (BUDGET=1 KEEP_STORE=1 CAP=5000)
+load (BUDGET+KEEP_STORE+CAP): 1000 import events to their 2 in 405.697606583s: 2916400 node rows, 3791318 edge rows, 16534 graph rows/s; disk written 83523 MB, 12452 bytes per graph row; gap writes 0; P5h append transactions 994, largest 10035 graph rows
+relay (BUDGET+KEEP_STORE+CAP): steps [("R3 A1", true), ("R3 B", true), ("R7", true), ("R6 B", true), ("R6 A1", true), ("noise", true)]; delivered 5 of 205; all held and control equal: true
+latency (BUDGET+KEEP_STORE+CAP): 20 single judgments, send to 2: p50 37.029208ms, p99 39.596ms, max 39.596ms
+shutdown (BUDGET+KEEP_STORE+CAP): 6.081875ms
+410.84 real        16.39 user       102.37 sys
+140640832  peak memory footprint
+WAL largest, sampled from outside every 100 ms: 21588832 bytes (20 MiB)

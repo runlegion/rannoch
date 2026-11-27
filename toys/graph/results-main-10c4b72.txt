@@ -1,0 +1,13 @@
+== main-10c4b72 ()
+load (): 1000 import events to their 2 in 16.427184375s: 2916400 node rows, 3791318 edge rows, 408330 graph rows/s; disk written 2097 MB, 313 bytes per graph row; gap writes 0; P5h append transactions 10, largest 3234575 graph rows
+relay (): steps [("R3 A1", true), ("R3 B", true), ("R7", true), ("R6 B", true), ("R6 A1", true), ("noise", true)]; delivered 5 of 205; all held and control equal: true
+latency (): 20 single judgments, send to 2: p50 28.631625ms, p99 30.190625ms, max 30.190625ms
+shutdown (): 52.150583ms
+28.32 real        13.51 user         8.90 sys
+830801000  peak memory footprint
+WAL largest, sampled from outside every 100 ms: 1164670472 bytes (1110 MiB)
+== flow bench, 100,000 events
+noop: 100000 of 100000 events to their 2 in 1.743893042s = 57343 events/s; 1s 100000; graph nodes 0; events with a 2 and no graph rows 100000
+noop: WAL file largest 65.1 MiB
+batched: 100000 of 100000 events to their 2 in 1.998365875s = 50041 events/s; 1s 100000; graph nodes 100000; events with a 2 and no graph rows 0
+batched: WAL file largest 109.4 MiB

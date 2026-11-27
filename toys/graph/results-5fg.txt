@@ -1,0 +1,32 @@
+== baseline-fixed (BUDGET=1 KEEP_STORE=1)
+load (BUDGET+KEEP_STORE): 1000 import events to their 2 in 29.5983585s: 2916400 node rows, 3791318 edge rows, 226625 graph rows/s; disk written 2488 MB, 371 bytes per graph row; gap writes 0
+relay (BUDGET+KEEP_STORE): steps [("R3 A1", true), ("R3 B", true), ("R7", true), ("R6 B", true), ("R6 A1", true), ("noise", true)]; delivered 5 of 205; all held and control equal: true
+latency (BUDGET+KEEP_STORE): 20 single judgments, send to 2: p50 34.936541ms, p99 35.930917ms, max 35.930917ms
+shutdown (BUDGET+KEEP_STORE): 1.236875ms
+36.29 real        14.04 user        17.08 sys
+714409112  peak memory footprint
+WAL largest, sampled from outside every 100 ms: 488413672 bytes (465 MiB)
+== 5f-small-fixed (BUDGET=1 KEEP_STORE=1 IMPORTS=10000)
+load (BUDGET+KEEP_STORE): 10000 import events to their 2 in 28.975789s: 2916400 node rows, 3791318 edge rows, 231494 graph rows/s; disk written 2267 MB, 338 bytes per graph row; gap writes 0
+relay (BUDGET+KEEP_STORE): steps [("R3 A1", true), ("R3 B", true), ("R7", true), ("R6 B", true), ("R6 A1", true), ("noise", true)]; delivered 5 of 205; all held and control equal: true
+latency (BUDGET+KEEP_STORE): 20 single judgments, send to 2: p50 34.891166ms, p99 38.121083ms, max 38.121083ms
+shutdown (BUDGET+KEEP_STORE): 2.33025ms
+34.54 real        14.70 user        16.82 sys
+802391264  peak memory footprint
+WAL largest, sampled from outside every 100 ms: 635559472 bytes (606 MiB)
+== 5f-time-fixed (BUDGET=1 KEEP_STORE=1 TIMEKEYS=1)
+load (BUDGET+KEEP_STORE+TIMEKEYS): 1000 import events to their 2 in 35.653451875s: 2916400 node rows, 3791318 edge rows, 188137 graph rows/s; disk written 3480 MB, 519 bytes per graph row; gap writes 0
+relay (BUDGET+KEEP_STORE+TIMEKEYS): steps [("R3 A1", true), ("R3 B", true), ("R7", true), ("R6 B", true), ("R6 A1", true), ("noise", true)]; delivered 5 of 205; all held and control equal: true
+latency (BUDGET+KEEP_STORE+TIMEKEYS): 20 single judgments, send to 2: p50 34.306208ms, p99 35.447333ms, max 35.447333ms
+shutdown (BUDGET+KEEP_STORE+TIMEKEYS): 553.209µs
+40.76 real        17.58 user        17.01 sys
+762545328  peak memory footprint
+WAL largest, sampled from outside every 100 ms: 714515152 bytes (681 MiB)
+== 5g-small-handoff (BUDGET=1 KEEP_STORE=1 IMPORTS=10000 HANDOFF=1)
+load (BUDGET+KEEP_STORE+HANDOFF): 10000 import events to their 2 in 29.619583041s: 2916400 node rows, 3791318 edge rows, 226462 graph rows/s; disk written 2419 MB, 361 bytes per graph row; gap writes 0
+relay (BUDGET+KEEP_STORE+HANDOFF): steps [("R3 A1", true), ("R3 B", true), ("R7", true), ("R6 B", true), ("R6 A1", true), ("noise", true)]; delivered 5 of 205; all held and control equal: true
+latency (BUDGET+KEEP_STORE+HANDOFF): 20 single judgments, send to 2: p50 34.691084ms, p99 38.073666ms, max 38.073666ms
+shutdown (BUDGET+KEEP_STORE+HANDOFF): 534.959µs
+34.69 real        14.33 user        16.82 sys
+817644816  peak memory footprint
+WAL largest, sampled from outside every 100 ms: 555384272 bytes (529 MiB)

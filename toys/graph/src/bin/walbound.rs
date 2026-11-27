@@ -1,4 +1,8 @@
 //! graph toy round 4c: what keeps the WAL from restarting. Predictions in predictions-budget.txt.
+//! Round 5a adds TRACE=1, the same statement tracer as round5, for the control.
+
+#[path = "../trace5.rs"]
+mod trace5;
 
 use rusqlite::{Connection, params};
 use std::sync::Arc;
@@ -23,7 +27,11 @@ fn main() {
     for ext in ["", "-wal", "-shm"] {
         let _ = std::fs::remove_file(format!("{path}{ext}"));
     }
+    let tracer = std::env::var("TRACE").is_ok().then(|| trace5::Tracer::new(Duration::from_secs(600)));
     let mut w = open(&path);
+    if let Some(t) = &tracer {
+        t.attach(&mut w, "writer");
+    }
     w.execute_batch(
         "CREATE TABLE _nodes (node TEXT NOT NULL, key TEXT NOT NULL, value TEXT, event TEXT NOT NULL, written INTEGER NOT NULL,
            retracted INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (node, key, event)) WITHOUT ROWID;
@@ -49,9 +57,12 @@ fn main() {
         _ => None,
     };
     if let Some(ms) = every {
-        let (stop, reads, p) = (stop.clone(), reads.clone(), path.clone());
+        let (stop, reads, p, tr) = (stop.clone(), reads.clone(), path.clone(), tracer.clone());
         std::thread::spawn(move || {
-            let r = open(&p);
+            let mut r = open(&p);
+            if let Some(t) = &tr {
+                t.attach(&mut r, "reader");
+            }
             while !stop.load(Ordering::SeqCst) {
                 let _: i64 = r.query_row("SELECT count(*) FROM (SELECT 1 FROM _edges ORDER BY dst DESC LIMIT 100)", [], |x| x.get(0)).unwrap_or(0);
                 reads.fetch_add(1, Ordering::SeqCst);
@@ -87,4 +98,7 @@ fn main() {
         reads.load(Ordering::SeqCst),
         max.load(Ordering::SeqCst) as f64 / 1_048_576.0
     );
+    if let Some(t) = &tracer {
+        println!("P5a control {}", t.report(&mode));
+    }
 }
