@@ -1227,7 +1227,7 @@ dependencies = [
 
 [[package]]
 name = "rannoch-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "forgr",
@@ -1242,7 +1242,7 @@ dependencies = [
 
 [[package]]
 name = "rannoch-events"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "rannoch-core",
@@ -1255,7 +1255,7 @@ dependencies = [
 
 [[package]]
 name = "rannoch-events-log"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "log",
@@ -1269,7 +1269,7 @@ dependencies = [
 
 [[package]]
 name = "rannoch-events-trim"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rannoch-core",
  "rannoch-events",
@@ -1283,7 +1283,7 @@ dependencies = [
 
 [[package]]
 name = "rannoch-graph"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rannoch-core",
  "rannoch-events",
@@ -1297,7 +1297,7 @@ dependencies = [
 
 [[package]]
 name = "rannoch-processor"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "log",
@@ -1313,7 +1313,7 @@ dependencies = [
 
 [[package]]
 name = "rannoch-processor-agent"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rannoch-core",
  "rannoch-events",
@@ -1327,7 +1327,7 @@ dependencies = [
 
 [[package]]
 name = "rannoch-processor-onnx"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ort",
  "prost",
@@ -1344,7 +1344,7 @@ dependencies = [
 
 [[package]]
 name = "rannoch-processor-retrieve"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rannoch-core",
  "rannoch-events",
@@ -1358,7 +1358,7 @@ dependencies = [
 
 [[package]]
 name = "rannoch-queue"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "log",
@@ -1373,7 +1373,7 @@ dependencies = [
 
 [[package]]
 name = "rannoch-store"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "log",
  "migratr",
