@@ -9,7 +9,9 @@ publish.workspace = true
 log = "0.4"
 migratr = "0.3"
 rannoch-core = { path = "../rannoch-core" }
+rannoch-settings = { path = "../rannoch-settings" }
 rusqlite = { version = "0.41", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 rannoch-core = { path = "../rannoch-core", features = ["testing"] }
