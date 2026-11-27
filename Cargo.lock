@@ -1272,6 +1272,7 @@ dependencies = [
  "rannoch-settings",
  "rannoch-store",
  "rusqlite",
+ "serde",
  "uuid",
 ]
 

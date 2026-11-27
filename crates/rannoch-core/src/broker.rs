@@ -1,6 +1,7 @@
 //! The configuration, open, and the broker that passes each event to its inbox.
 
 use chrono::TimeDelta;
+use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -74,6 +75,14 @@ impl<T, D> Default for Config<T, D> {
     }
 }
 
+/// rannoch-core's `[core]` section of the app's settings.
+#[derive(Debug, Default, Deserialize)]
+struct CoreSettings {
+    /// The default inbox's batch interval in milliseconds; present, it replaces
+    /// `Config::default_interval`.
+    default_interval_ms: Option<i64>,
+}
+
 /// One inbox: its name, the `ty` values that go to it, and its batch interval.
 #[derive(Debug, Clone)]
 pub struct InboxConfig<T> {
@@ -127,7 +136,8 @@ pub struct Rannoch<T, D> {
 
 impl<T: PartialEq + Send + 'static, D: Send + 'static> Rannoch<T, D> {
     /// Opens rannoch with a configuration. Before anything else, loads the settings when the app
-    /// has not: the file at `settings`, else `rannoch.config.toml` beside the running binary. Then
+    /// has not: the file at `settings`, else `rannoch.config.toml` beside the running binary. A
+    /// `default_interval_ms` in the settings' `[core]` section replaces `default_interval`. Then
     /// applies the store's pending migrations. With an append, it starts one thread for each
     /// inbox, the default inbox included.
     ///
@@ -150,6 +160,12 @@ impl<T: PartialEq + Send + 'static, D: Send + 'static> Rannoch<T, D> {
                 return Err(Error::Config);
             }
         }
+        let default_interval =
+            match rannoch_settings::section::<CoreSettings>("core").default_interval_ms {
+                // Only a negative value is out of range.
+                Some(ms) => TimeDelta::try_milliseconds(ms).ok_or(Error::Config)?,
+                None => config.default_interval,
+            };
         if let Some(store) = &config.store
             && store.pending().map_err(|_| Error::Store)?
         {
@@ -168,7 +184,7 @@ impl<T: PartialEq + Send + 'static, D: Send + 'static> Rannoch<T, D> {
         let mut inboxes = vec![Inbox::new(
             "default".to_owned(),
             Vec::new(),
-            config.default_interval,
+            default_interval,
         )];
         inboxes.extend(
             config
