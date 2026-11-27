@@ -170,10 +170,7 @@ impl StoreRow {
         let quote = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
         let columns: Vec<String> = row.keys().map(|c| quote(c)).collect();
         let (columns, marks) = (columns.join(", "), vec!["?"; row.len()].join(", "));
-        let sql = format!(
-            "INSERT INTO {} ({columns}) VALUES ({marks}) ON CONFLICT DO NOTHING",
-            quote(table)
-        );
+        let sql = queries::store_row(&quote(table), &columns, &marks);
         conn.prepare_cached(&sql)
     }
 }
