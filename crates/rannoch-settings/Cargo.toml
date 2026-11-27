@@ -1,0 +1,17 @@
+[package]
+name = "rannoch-settings"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+config = { version = "0.15", default-features = false, features = ["toml"] }
+serde = "1"
+
+[dev-dependencies]
+rannoch-core = { path = "../rannoch-core" }
+serde = { version = "1", features = ["derive"] }
+
+[lints]
+workspace = true

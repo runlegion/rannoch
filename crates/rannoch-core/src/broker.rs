@@ -1,11 +1,12 @@
 //! The configuration, open, and the broker that passes each event to its inbox.
 
 use chrono::TimeDelta;
-use std::fmt;
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+use std::{env, fmt};
 
 use crate::inbox::{Inbox, run};
 use crate::{Error, Event, Status};
@@ -56,6 +57,9 @@ pub struct Config<T, D> {
     pub store: Option<Arc<dyn Storage>>,
     /// The events crate's append; with none, no inbox hands anything over.
     pub append: Option<Arc<dyn Append<T, D>>>,
+    /// The app's settings file, which the first open loads when the app has not loaded its
+    /// settings itself; with none, `rannoch.config.toml` in the directory of the running binary.
+    pub settings: Option<PathBuf>,
 }
 
 impl<T, D> Default for Config<T, D> {
@@ -65,6 +69,7 @@ impl<T, D> Default for Config<T, D> {
             inboxes: Vec::new(),
             store: None,
             append: None,
+            settings: None,
         }
     }
 }
@@ -121,16 +126,30 @@ pub struct Rannoch<T, D> {
 }
 
 impl<T: PartialEq + Send + 'static, D: Send + 'static> Rannoch<T, D> {
-    /// Opens rannoch with a configuration. Before anything else, applies the
-    /// store's pending migrations. With an append, it starts one thread for each inbox, the
-    /// default inbox included.
+    /// Opens rannoch with a configuration. Before anything else, loads the settings when the app
+    /// has not: the file at `settings`, else `rannoch.config.toml` beside the running binary. Then
+    /// applies the store's pending migrations. With an append, it starts one thread for each
+    /// inbox, the default inbox included.
     ///
     /// # Errors
     ///
     /// `Store` when the store cannot tell what is pending or applying fails;
-    /// `Config` when the same `ty` is listed in two inboxes, or an interval
-    /// is negative.
+    /// `Config` when the settings file does not parse, the same `ty` is listed in two inboxes,
+    /// or an interval is negative.
     pub fn open(config: Config<T, D>) -> Result<Self, Error> {
+        if !rannoch_settings::loaded() {
+            let path = config.settings.clone().or_else(|| {
+                let exe = env::current_exe().ok()?;
+                Some(exe.parent()?.join("rannoch.config.toml"))
+            });
+            // A load refused because an open on another thread loaded first is not a failure.
+            if let Some(path) = path
+                && rannoch_settings::load(&path).is_err()
+                && !rannoch_settings::loaded()
+            {
+                return Err(Error::Config);
+            }
+        }
         if let Some(store) = &config.store
             && store.pending().map_err(|_| Error::Store)?
         {
