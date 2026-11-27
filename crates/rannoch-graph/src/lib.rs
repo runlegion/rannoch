@@ -70,6 +70,7 @@
 //! batch and before the `Warm` drops its hoods may still return the kept result.
 
 mod hoods;
+mod queries;
 mod score;
 
 pub use hoods::{Hoods, Warm};
@@ -196,11 +197,7 @@ fn as_of(
     at: i64,
 ) -> Result<Value> {
     let (table, key, time) = (quote(table), quote(key), quote(time));
-    let sql = format!(
-        "SELECT * FROM {table} WHERE {key} = ?1
-        AND {time} <= CASE typeof({time}) WHEN 'text' THEN ?3 ELSE ?2 END
-        ORDER BY {time} DESC LIMIT 1"
-    );
+    let sql = queries::as_of(&table, &key, &time);
     // The greatest v7 id of ms `at`; before 1970 no id is at or before it.
     let bound = u64::try_from(at).map_or_else(
         |_| String::new(),
@@ -229,7 +226,7 @@ fn edges(
     at: i64,
 ) -> Result<Vec<Value>> {
     let (table, from, time) = (quote(table), quote(from), quote(time));
-    let sql = format!("SELECT * FROM {table} WHERE {from} = ?1 AND {time} <= ?2 ORDER BY {time}");
+    let sql = queries::edges(&table, &from, &time);
     let mut st = conn.prepare_cached(&sql)?;
     let columns: Vec<String> = st.column_names().map(str::to_owned).collect();
     let mut rows = st.query(params![node, at])?;
@@ -260,12 +257,7 @@ fn object(columns: &[String], r: &rusqlite::Row<'_>) -> Result<Value> {
 /// through `_events`.
 fn why(conn: &Connection, table: &str, key: &str, event: &str, node: &str) -> Result<Vec<String>> {
     let (table, key, event) = (quote(table), quote(key), quote(event));
-    let sql = format!(
-        "WITH RECURSIVE c(id, source, depth) AS (
-        SELECT id, source, 0 FROM _events WHERE id = (SELECT max({event}) FROM {table} WHERE {key} = ?1)
-        UNION ALL SELECT e.id, e.source, c.depth + 1 FROM _events e JOIN c ON e.id = c.source)
-        SELECT id FROM c ORDER BY depth"
-    );
+    let sql = queries::why(&table, &key, &event);
     let mut st = conn.prepare_cached(&sql)?;
     let ids = st.query_map([node], |r| r.get(0))?;
     ids.collect()
@@ -318,20 +310,9 @@ pub(crate) fn walk(
 ) -> Result<(Vec<(String, i64)>, bool)> {
     let steps = via.iter().map(|(table, from, to, time)| {
         let (table, from, to) = (quote(table), quote(from), quote(to));
-        let time = time.as_deref().map_or_else(String::new, |time| {
-            format!(" AND (?2 IS NULL OR e.{} <= ?2)", quote(time))
-        });
-        format!(
-            " UNION SELECT CAST(e.{to} AS TEXT), w.depth + 1 FROM w JOIN {table} e
-            ON e.{from} = w.node WHERE w.depth < ?3{time}"
-        )
+        queries::walk_step(&table, &from, &to, time.as_deref().map(quote).as_deref())
     });
-    let sql = format!(
-        "WITH RECURSIVE w(node, depth) AS (SELECT ?1, 0{})
-        SELECT node, min(depth) AS d FROM w WHERE node <> ?1 GROUP BY node ORDER BY d, node
-        LIMIT ?4",
-        steps.collect::<String>()
-    );
+    let sql = queries::walk(&steps.collect::<String>());
     // One past the cap, so a walk the cap cut tells itself from one that ended at it.
     let limit = i64::try_from(cap).map_or(i64::MAX, |cap| cap.saturating_add(1));
     let mut st = conn.prepare_cached(&sql)?;
