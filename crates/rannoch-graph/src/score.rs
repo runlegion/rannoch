@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use rusqlite::{Connection, Result};
 use serde_json::{Value, json};
 
-use crate::{Via, cap, hops, quote, vias};
+use crate::{Via, cap, hops, queries, quote, vias};
 
 /// The scorers, in the order of their steps: `katz`, `pagerank`, `shared` and `learned`.
 #[derive(Debug, Clone, Copy)]
@@ -129,11 +129,8 @@ fn rows(conn: &Connection, links: &[Via], node: &str) -> Result<Vec<(String, f64
     let mut out = Vec::new();
     for (table, a, b, weight) in links {
         let (table, a, b) = (quote(table), quote(a), quote(b));
-        let weight = weight.as_deref().map_or_else(|| "1.0".to_owned(), quote);
-        let sql = format!(
-            "SELECT CAST({b} AS TEXT), {weight} FROM {table} WHERE {a} = ?1
-            UNION ALL SELECT CAST({a} AS TEXT), {weight} FROM {table} WHERE {b} = ?1"
-        );
+        let weight = weight.as_deref().map(quote);
+        let sql = queries::rows(&table, &a, &b, weight.as_deref());
         let mut st = conn.prepare_cached(&sql)?;
         let found = st.query_map([node], |r| Ok((r.get(0)?, r.get(1)?)))?;
         for row in found {
