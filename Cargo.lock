@@ -1296,6 +1296,7 @@ dependencies = [
  "log",
  "rannoch-core",
  "rannoch-events",
+ "rannoch-settings",
  "rannoch-store",
  "serde",
  "serde_json",

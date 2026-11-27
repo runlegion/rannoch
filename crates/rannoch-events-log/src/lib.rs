@@ -5,6 +5,10 @@
 //! `Log::new(Events::new(conn, signal), path)`. After the append it wraps commits a batch, the
 //! `Log` writes each event of the batch to the file as one JSON line: `{"id": .., "source": ..,
 //! "ty": .., "data": .., "run_at": .., "status": ..}`.
+//!
+//! The `[events-log]` section of the app's settings may set `path`; when it does, that path
+//! replaces the one passed to [`Log::new`]. The log reads its section when it is built, so an app
+//! that sets it loads its settings first, with `rannoch_settings::load`.
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -12,8 +16,15 @@ use std::path::PathBuf;
 
 use chrono::SecondsFormat;
 use rannoch_core::{Append, Error, Event};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
+
+/// The `[events-log]` section of the app's settings.
+#[derive(Debug, Default, Deserialize)]
+struct Settings {
+    /// The log file's path, in place of the one passed to [`Log::new`].
+    path: Option<PathBuf>,
+}
 
 /// The app's append, with each event of each batch it commits also written to the file at its
 /// path.
@@ -25,9 +36,13 @@ pub struct Log<A> {
 
 impl<A> Log<A> {
     /// `append`, with each event of each batch it commits written to the file at `path`, which
-    /// is created when it is not there.
+    /// is created when it is not there. The `[events-log]` section's `path`, when set, replaces
+    /// `path`.
     #[must_use]
     pub fn new(append: A, path: PathBuf) -> Self {
+        let path = rannoch_settings::section::<Settings>("events-log")
+            .path
+            .unwrap_or(path);
         Self { append, path }
     }
 
