@@ -1400,8 +1400,10 @@ dependencies = [
  "rannoch-core",
  "rannoch-events",
  "rannoch-processor",
+ "rannoch-settings",
  "rannoch-store",
  "rusqlite",
+ "serde",
  "serde_json",
  "uuid",
 ]

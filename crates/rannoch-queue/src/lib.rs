@@ -62,6 +62,14 @@
 //! [`Settings::first_wait`], never binned: the due events, the next `run_at` and a due event's
 //! chain; when the hunt cannot read the 1s or an event's tree, it runs again after `first_wait`.
 //!
+//! # Settings
+//!
+//! [`Queue::start`] takes the `[queue]` section of the app's settings file through
+//! rannoch-settings. Each of its keys is optional: `attempts`, `first_wait_ms`, `window_ms` and
+//! `hunt_ms` replace the [`Settings`] passed in, and `idle_ms` replaces the hour the queue waits
+//! for a signal when nothing it knows of comes due. A key absent, or no section, leaves the value
+//! passed in; a section that does not read as these keys is taken as none.
+//!
 //! # Stopping
 //!
 //! The queue stops when every sender on its signal channel has dropped. The sender in the append
@@ -229,6 +237,7 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, SecondsFormat, Utc};
 use rannoch_core::{Error, Event, Sender, Status};
 use rusqlite::{Connection, Params, params};
+use serde::Deserialize;
 use uuid::Uuid;
 
 /// An event as `_events` holds it: `ty` as its `u16`, data as its JSON text.
@@ -269,6 +278,31 @@ impl Settings {
     }
 }
 
+/// The `[queue]` section of the app's settings file: each key, when present, replaces the value
+/// it names.
+#[derive(Debug, Default, Deserialize)]
+struct Section {
+    attempts: Option<u32>,
+    first_wait_ms: Option<u64>,
+    window_ms: Option<u64>,
+    hunt_ms: Option<u64>,
+    idle_ms: Option<u64>,
+}
+
+impl Section {
+    /// `settings` and `idle` with each key present in the section in place of its value.
+    fn apply(&self, settings: Settings, idle: Duration) -> (Settings, Duration) {
+        let ms = |key: Option<u64>, value| key.map_or(value, Duration::from_millis);
+        let settings = Settings {
+            attempts: self.attempts.unwrap_or(settings.attempts),
+            first_wait: ms(self.first_wait_ms, settings.first_wait),
+            window: ms(self.window_ms, settings.window),
+            hunt: ms(self.hunt_ms, settings.hunt),
+        };
+        (settings, ms(self.idle_ms, idle))
+    }
+}
+
 /// What runs an event: the processor, and whether its flow has a job step.
 pub struct Flow<T, D> {
     /// Long-running work: a job runs on a thread of its own and never holds up a run.
@@ -302,7 +336,8 @@ impl Queue {
     /// Starts the queue over `conn`, woken by `signal`, sending through `sender`, on a thread of
     /// its own. `T` is the app's `ty`, read back from its `u16` in `_events`; `D` is the app's
     /// data, made from text: the queue's own, such as `"taken"`, and a failed run's result for a
-    /// retry.
+    /// retry. Each key the `[queue]` section of the app's settings file holds replaces its value
+    /// in `settings`.
     #[must_use]
     pub fn start<T, D>(
         conn: Connection,
@@ -315,8 +350,10 @@ impl Queue {
         T: TryFrom<u16> + Copy + PartialEq + Send + 'static,
         D: From<String> + Send + 'static,
     {
+        let section = rannoch_settings::section::<Section>("queue");
+        let (settings, idle) = section.apply(settings, IDLE);
         Self {
-            thread: thread::spawn(move || run(&conn, &signal, &sender, &*flows, settings)),
+            thread: thread::spawn(move || run(&conn, &signal, &sender, &*flows, settings, idle)),
         }
     }
 
@@ -334,7 +371,8 @@ impl Queue {
     }
 }
 
-/// How long the queue waits for a signal when nothing it knows of comes due.
+/// How long the queue waits for a signal when nothing it knows of comes due, unless the
+/// `[queue]` section's `idle_ms` says otherwise.
 const IDLE: Duration = Duration::from_secs(3600);
 
 /// The data of the hunt's resend, by which [`root`] knows it.
@@ -346,6 +384,7 @@ fn run<T, D>(
     sender: &Sender<T, D>,
     flows: &dyn Flows<T, D>,
     settings: Settings,
+    idle: Duration,
 ) where
     T: TryFrom<u16> + Copy + PartialEq + Send + 'static,
     D: From<String> + Send + 'static,
@@ -426,7 +465,7 @@ fn run<T, D>(
             }
         }
         wait = next_due(conn, settings.first_wait)
-            .unwrap_or(IDLE)
+            .unwrap_or(idle)
             .min(next_hunt.saturating_duration_since(Instant::now()));
         if unread {
             wait = wait.min(settings.first_wait);
@@ -864,6 +903,29 @@ mod tests {
         assert_eq!(super::backoff(settings, 0), ms(100));
         assert_eq!(super::backoff(settings, 1), ms(200));
         assert_eq!(super::backoff(settings, 2), None);
+    }
+
+    #[test]
+    fn a_key_in_the_section_replaces_its_value_and_an_absent_one_leaves_it() {
+        use std::time::Duration;
+        let given = super::Settings::new(Duration::from_millis(100));
+        let section = super::Section {
+            attempts: Some(2),
+            idle_ms: Some(50),
+            ..super::Section::default()
+        };
+
+        let (settings, idle) = section.apply(given, super::IDLE);
+
+        assert_eq!(settings.attempts, 2);
+        assert_eq!(idle, Duration::from_millis(50));
+        assert_eq!(settings.first_wait, given.first_wait);
+        assert_eq!(settings.window, given.window);
+        assert_eq!(settings.hunt, given.hunt);
+
+        let (settings, idle) = super::Section::default().apply(given, super::IDLE);
+        assert_eq!(settings.attempts, given.attempts);
+        assert_eq!(idle, super::IDLE);
     }
 
     #[test]
