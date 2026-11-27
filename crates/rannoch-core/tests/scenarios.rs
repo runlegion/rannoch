@@ -660,3 +660,75 @@ fn a_flat_out_producer_beats_the_peak_load() {
     println!("flat out from one producer over 50,000 kept: {rate:.0} events a second");
     assert!(rate > 200.0, "{rate:.0} a second");
 }
+
+/// Set in the child process a `core_settings` scenario runs: the settings file it opens with.
+const CORE_SETTINGS: &str = "RANNOCH_CORE_SETTINGS";
+
+/// Runs `test` alone in a child process of this test binary, with `settings` as the file it
+/// opens with, and checks it passed. The settings are held for the life of the process.
+fn with_settings(test: &str, settings: &Path) -> Result<()> {
+    let output = Command::new(env::current_exe()?)
+        .args([test, "--exact", "--nocapture"])
+        .env(CORE_SETTINGS, settings)
+        .output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(stdout.contains("1 passed"), "{stdout}");
+    Ok(())
+}
+
+/// Opens rannoch over a fresh store under `name` with the settings file at `settings` and a
+/// default inbox of an hour, sends one event, and returns rannoch and the append's signals.
+fn open_an_hour(
+    name: &str,
+    settings: PathBuf,
+) -> Result<(Rannoch<u8, String>, mpsc::Receiver<()>)> {
+    let path = empty_store(name)?;
+    let (queue, signals) = mpsc::channel();
+    let rannoch = Rannoch::open(Config {
+        default_interval: TimeDelta::hours(1),
+        append: Some(events(&path, queue)?),
+        settings: Some(settings),
+        ..Config::default()
+    })?;
+    rannoch.sender().send(event())?;
+    Ok((rannoch, signals))
+}
+
+#[test]
+fn core_settings_c1() -> Result<()> {
+    if let Ok(settings) = env::var(CORE_SETTINGS) {
+        // When Rannoch::open is called with that file's path and an event is sent
+        let (rannoch, signals) = open_an_hour("core_settings_c1", settings.into())?;
+
+        // Then the default inbox hands it over at the interval the [core] section gives
+        assert_eq!(signals.recv_timeout(Duration::from_secs(5)), Ok(()));
+        rannoch.shutdown();
+        return Ok(());
+    }
+    // Given a settings file whose [core] section sets default_interval_ms
+    let settings = database("core_settings_c1_file")?.with_file_name("app.toml");
+    fs::write(&settings, "[core]\ndefault_interval_ms = 50\n")?;
+    with_settings("core_settings_c1", &settings)
+}
+
+#[test]
+fn core_settings_c2() -> Result<()> {
+    if let Ok(settings) = env::var(CORE_SETTINGS) {
+        // When Rannoch::open is called with that file's path and an event is sent
+        let (rannoch, signals) = open_an_hour("core_settings_c2", settings.into())?;
+
+        // Then the default inbox does not hand it over before shutdown
+        assert_eq!(
+            signals.recv_timeout(Duration::from_millis(500)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+        rannoch.shutdown();
+        assert_eq!(signals.try_recv(), Ok(()));
+        return Ok(());
+    }
+    // Given a settings file with no [core] section
+    let settings = database("core_settings_c2_file")?.with_file_name("app.toml");
+    fs::write(&settings, "[queue]\ndepth = 4\n")?;
+    with_settings("core_settings_c2", &settings)
+}
