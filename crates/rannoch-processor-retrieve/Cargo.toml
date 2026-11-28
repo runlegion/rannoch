@@ -15,7 +15,7 @@ rannoch-events = { path = "../rannoch-events" }
 rannoch-queue = { path = "../rannoch-queue" }
 rannoch-store = { path = "../rannoch-store" }
 rusqlite = { version = "0.41", features = ["bundled"] }
-tokio = { version = "1", features = ["sync"] }
+tokio = { version = "1", features = ["macros", "rt", "sync", "test-util"] }
 uuid = { version = "1", features = ["v7"] }
 
 [lints]

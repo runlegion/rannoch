@@ -118,14 +118,14 @@ mod tests {
         Retrieve::new(sig, Arc::new(Stub(gave)))
     }
 
-    #[test]
-    fn a_field_of_the_wrong_type_fails_naming_it() {
+    #[tokio::test(start_paused = true)]
+    async fn a_field_of_the_wrong_type_fails_naming_it() {
         let got = retrieve(json!({ "email": 7 })).run(&json!({}), &Map::new());
         assert_eq!(got, Err("email as number".to_owned()));
     }
 
-    #[test]
-    fn a_fitting_result_passes_through() {
+    #[tokio::test(start_paused = true)]
+    async fn a_fitting_result_passes_through() {
         let gave = json!({ "email": "a@b.c", "name": "a" });
         let got = retrieve(gave.clone()).run(&json!({}), &Map::new());
         assert_eq!(got.map(Value::Object), Ok(gave));
