@@ -9,12 +9,13 @@ publish.workspace = true
 testing = ["dep:forgr", "forgr/fake"]
 
 [dependencies]
-chrono = { version = "0.4", default-features = false }
+chrono = { version = "0.4", default-features = false, features = ["now"] }
 forgr = { version = "0.1", optional = true }
 log = "0.4"
 migratr = "0.3"
 rannoch-settings = { path = "../rannoch-settings" }
 serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time"] }
 uuid = { version = "1", features = ["v7"] }
 
 [dev-dependencies]
@@ -23,6 +24,7 @@ rannoch-core = { path = ".", features = ["testing"] }
 rannoch-events = { path = "../rannoch-events" }
 rannoch-store = { path = "../rannoch-store" }
 rusqlite = { version = "0.41", features = ["bundled"] }
+tokio = { version = "1", features = ["macros", "test-util"] }
 
 [build-dependencies]
 migratr = "0.3"

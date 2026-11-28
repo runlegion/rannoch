@@ -26,10 +26,17 @@
 //! holds up its inbox: nothing sent to that inbox after it is written either.
 //!
 //! [`Rannoch::shutdown`] refuses every send after it with [`Error::Closed`], has each inbox hand
-//! over what is left on its heap, and joins each inbox's thread. When that last hand-over fails,
-//! the failure is logged and those events are not written.
+//! over what is left on its heap, and blocks until each inbox's task has returned. When that last
+//! hand-over fails, the failure is logged and those events are not written.
 //!
 //! With no append in the [`Config`], no inbox hands anything over and no sent event is written.
+//!
+//! # Time
+//!
+//! Every time rannoch reads or waits on goes through [`clock`], on tokio's time. Each inbox runs
+//! as a task on the tokio runtime [`Rannoch::open`] is called in, or on one it starts when called
+//! outside a runtime. [`Rannoch::shutdown`] blocks, so async code calls it through
+//! `tokio::task::spawn_blocking`.
 //!
 //! # Failures and logs
 //!
@@ -57,7 +64,9 @@
 //!     Asset,
 //! }
 //!
-//! fn main() -> Result<(), Error> {
+//! // The clock frozen, as in every rannoch-core test.
+//! #[tokio::main(flavor = "current_thread", start_paused = true)]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     // Assets go to an inbox with a half-second interval; every other ty goes to the default
 //!     // inbox.
 //!     let assets = InboxConfig {
@@ -90,13 +99,16 @@
 //!     };
 //!     assert_eq!(sender.send(page.clone())?, Status::Added);
 //!
-//!     rannoch.shutdown();
+//!     // Shutdown blocks, so async code runs it through spawn_blocking.
+//!     tokio::task::spawn_blocking(move || rannoch.shutdown())
+//!         .await?;
 //!     assert_eq!(sender.send(page), Err(Error::Closed));
 //!     Ok(())
 //! }
 //! ```
 
 mod broker;
+pub mod clock;
 mod inbox;
 
 pub use broker::{Append, Config, InboxConfig, Rannoch, Sender, Storage};
@@ -213,8 +225,8 @@ mod tests {
 
     static LOGGER: TestLogger = TestLogger(Mutex::new(Vec::new()));
 
-    #[test]
-    fn fr_rannoch_007_c1() {
+    #[tokio::test(start_paused = true)]
+    async fn fr_rannoch_007_c1() {
         log::set_logger(&LOGGER).unwrap();
         log::set_max_level(log::LevelFilter::Debug);
         log::error!("an error line");
@@ -224,8 +236,8 @@ mod tests {
         assert!(lines.contains(&(Level::Debug, "a debug line".to_owned())));
     }
 
-    #[test]
-    fn status_is_stored_as_an_int() {
+    #[tokio::test(start_paused = true)]
+    async fn status_is_stored_as_an_int() {
         let ints = [
             Status::Binned,
             Status::Added,

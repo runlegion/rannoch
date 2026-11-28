@@ -3,11 +3,11 @@
 use chrono::TimeDelta;
 use serde::Deserialize;
 use std::path::PathBuf;
-use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use std::{env, fmt};
+use tokio::runtime::{Handle, Runtime};
+use tokio::sync::{mpsc, oneshot};
 
 use crate::inbox::{Inbox, run};
 use crate::{Error, Event, Status};
@@ -127,9 +127,13 @@ pub(crate) fn lock<T, D>(broker: &Shared<T, D>) -> MutexGuard<'_, Broker<T, D>> 
 #[derive(Debug)]
 pub struct Rannoch<T, D> {
     broker: Shared<T, D>,
-    /// Dropping these wakes each inbox's thread for its last hand-over.
-    stops: Vec<mpsc::Sender<()>>,
-    threads: Vec<JoinHandle<()>>,
+    /// Dropping these wakes each inbox's task for its last hand-over.
+    stops: Vec<oneshot::Sender<()>>,
+    /// Closes once every inbox's task has returned: each holds a sender until then.
+    done: mpsc::Receiver<()>,
+    /// The runtime open started when it was called outside one, kept for as long as rannoch
+    /// runs.
+    runtime: Option<Runtime>,
     /// The app's store, kept for as long as rannoch runs.
     _store: Option<Arc<dyn Storage>>,
 }
@@ -138,8 +142,14 @@ impl<T: PartialEq + Send + 'static, D: Send + 'static> Rannoch<T, D> {
     /// Opens rannoch with a configuration. Before anything else, loads the settings when the app
     /// has not: the file at `settings`, else `rannoch.config.toml` beside the running binary. A
     /// `default_interval_ms` in the settings' `[core]` section replaces `default_interval`. Then
-    /// applies the store's pending migrations. With an append, it starts one thread for each
-    /// inbox, the default inbox included.
+    /// applies the store's pending migrations. With an append, it spawns one task for each
+    /// inbox, the default inbox included, on the tokio runtime it is called in, or on one it
+    /// starts when called outside a runtime.
+    ///
+    /// # Panics
+    ///
+    /// When it is called outside a runtime and the runtime it starts cannot be built, as the
+    /// operating system refusing it threads.
     ///
     /// # Errors
     ///
@@ -201,22 +211,32 @@ impl<T: PartialEq + Send + 'static, D: Send + 'static> Rannoch<T, D> {
             inboxes,
             closed: false,
         }));
-        let (mut stops, mut threads) = (Vec::new(), Vec::new());
-        for (index, every) in intervals.into_iter().enumerate() {
-            let Some(append) = config.append.clone() else {
-                break;
-            };
-            let (stop, wait) = mpsc::channel::<()>();
-            let broker = Arc::clone(&broker);
-            stops.push(stop);
-            threads.push(thread::spawn(move || {
-                run(&broker, index, every, &wait, &*append);
-            }));
+        let (finished, done) = mpsc::channel::<()>(1);
+        let (mut stops, mut runtime) = (Vec::new(), None);
+        if let Some(append) = config.append {
+            let handle = Handle::try_current().unwrap_or_else(|_| {
+                // Building a runtime fails only when the system refuses its threads or its
+                // driver, as `std::thread::spawn` panicked on before.
+                #[allow(clippy::expect_used)]
+                let started = Runtime::new().expect("rannoch could not start a tokio runtime");
+                runtime.insert(started).handle().clone()
+            });
+            for (index, every) in intervals.into_iter().enumerate() {
+                let (stop, wait) = oneshot::channel::<()>();
+                let (broker, append, finished) =
+                    (Arc::clone(&broker), Arc::clone(&append), finished.clone());
+                stops.push(stop);
+                handle.spawn(async move {
+                    run(broker, index, every, wait, append).await;
+                    drop(finished);
+                });
+            }
         }
         Ok(Self {
             broker,
             stops,
-            threads,
+            done,
+            runtime,
             _store: config.store,
         })
     }
@@ -230,14 +250,23 @@ impl<T: PartialEq + Send + 'static, D: Send + 'static> Rannoch<T, D> {
     }
 
     /// Shuts rannoch down: every send after this fails with `Closed`, each
-    /// inbox hands over what is left on its heap, and its thread is joined. When that last
-    /// hand-over fails, the failure is logged and those events are not written.
+    /// inbox hands over what is left on its heap, and this blocks until each inbox's task has
+    /// returned. When that last hand-over fails, the failure is logged and those events are not
+    /// written.
+    ///
+    /// It blocks, so async code calls it through `tokio::task::spawn_blocking`.
+    ///
+    /// # Panics
+    ///
+    /// When it is called on a thread that runs async tasks, rather than through
+    /// `spawn_blocking`.
     pub fn shutdown(self) {
         lock(&self.broker).closed = true;
         drop(self.stops);
-        for thread in self.threads {
-            let _ = thread.join();
-        }
+        let mut done = self.done;
+        // No task sends; the channel closes once the last one has returned.
+        let _ = done.blocking_recv();
+        drop(self.runtime);
     }
 }
 
@@ -312,23 +341,23 @@ mod tests {
         (opened, applied)
     }
 
-    #[test]
-    fn pending_migrations_are_applied_once_then_open_succeeds() {
+    #[tokio::test(start_paused = true)]
+    async fn pending_migrations_are_applied_once_then_open_succeeds() {
         assert_eq!(open_with(Ok(true), Ok(())), (Ok(()), 1));
     }
 
-    #[test]
-    fn nothing_pending_applies_nothing() {
+    #[tokio::test(start_paused = true)]
+    async fn nothing_pending_applies_nothing() {
         assert_eq!(open_with(Ok(false), Ok(())), (Ok(()), 0));
     }
 
-    #[test]
-    fn a_failed_pending_check_fails_open_with_store_and_applies_nothing() {
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_pending_check_fails_open_with_store_and_applies_nothing() {
         assert_eq!(open_with(Err(Error::Queue), Ok(())), (Err(Error::Store), 0));
     }
 
-    #[test]
-    fn a_failed_apply_fails_open_with_store() {
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_apply_fails_open_with_store() {
         assert_eq!(
             open_with(Ok(true), Err(Error::Queue)),
             (Err(Error::Store), 1)
@@ -360,16 +389,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn fr_rannoch_003_c1() {
+    #[tokio::test(start_paused = true)]
+    async fn fr_rannoch_003_c1() {
         let rannoch = Rannoch::<Ty, &str>::open(Config::default()).unwrap();
         let broker = lock(&rannoch.broker);
         assert_eq!(broker.inboxes.len(), 1);
         assert_eq!(broker.inboxes[0].interval, TimeDelta::milliseconds(20));
     }
 
-    #[test]
-    fn fr_rannoch_003_c2() {
+    #[tokio::test(start_paused = true)]
+    async fn fr_rannoch_003_c2() {
         let config = Config {
             inboxes: vec![assets("assets")],
             ..Config::default()
@@ -387,8 +416,8 @@ mod tests {
         assert_eq!(heap_of("default"), [Ty::Page]);
     }
 
-    #[test]
-    fn fr_rannoch_003_c3() {
+    #[tokio::test(start_paused = true)]
+    async fn fr_rannoch_003_c3() {
         let config = Config {
             inboxes: vec![assets("assets"), assets("large")],
             ..Config::default()
@@ -399,8 +428,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn fr_rannoch_004_c1() {
+    #[tokio::test(start_paused = true)]
+    async fn fr_rannoch_004_c1() {
         let rannoch = Rannoch::open(Config::default()).unwrap();
         let answer = rannoch.sender().send(event(Ty::Page)).unwrap();
         assert_eq!(answer as i8, 0);
@@ -410,11 +439,13 @@ mod tests {
         assert_eq!(accepted.status, Status::Added);
     }
 
-    #[test]
-    fn fr_rannoch_004_c2() {
+    #[tokio::test(start_paused = true)]
+    async fn fr_rannoch_004_c2() {
         let rannoch = Rannoch::open(Config::default()).unwrap();
         let sender = rannoch.sender().clone();
-        rannoch.shutdown();
+        tokio::task::spawn_blocking(move || rannoch.shutdown())
+            .await
+            .unwrap();
         assert_eq!(sender.send(event(Ty::Page)).unwrap_err(), Error::Closed);
     }
 
@@ -440,8 +471,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn shutdown_hands_over_what_is_left_on_each_heap() {
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_hands_over_what_is_left_on_each_heap() {
         let recorder = Arc::new(Recorder::default());
         let config = Config {
             default_interval: TimeDelta::hours(1),
@@ -453,21 +484,23 @@ mod tests {
         rannoch.sender().send(event(Ty::Asset)).unwrap();
         rannoch.sender().send(event(Ty::Page)).unwrap();
 
-        rannoch.shutdown();
+        tokio::task::spawn_blocking(move || rannoch.shutdown())
+            .await
+            .unwrap();
 
         let mut batches = recorder.batches.lock().unwrap().clone();
         batches.sort_by_key(|b| b[0] as u8);
         assert_eq!(batches, [vec![Ty::Asset], vec![Ty::Page]]);
     }
 
-    #[test]
-    fn rannoch_holding_its_store_is_send_and_sync() {
+    #[tokio::test(start_paused = true)]
+    async fn rannoch_holding_its_store_is_send_and_sync() {
         fn send_and_sync<S: Send + Sync>() {}
         send_and_sync::<Rannoch<Ty, &str>>();
     }
 
-    #[test]
-    fn a_negative_interval_fails_open_with_config() {
+    #[tokio::test(start_paused = true)]
+    async fn a_negative_interval_fails_open_with_config() {
         let config = Config::<Ty, &str> {
             default_interval: TimeDelta::milliseconds(-1),
             ..Config::default()
