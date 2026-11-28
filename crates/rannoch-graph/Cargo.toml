@@ -17,7 +17,7 @@ uuid = "1"
 [dev-dependencies]
 rannoch-core = { path = "../rannoch-core", features = ["testing"] }
 rannoch-queue = { path = "../rannoch-queue" }
-uuid = { version = "1", features = ["v7"] }
+tokio = { version = "1", features = ["macros", "rt", "sync", "test-util"] }
 
 [lints]
 workspace = true

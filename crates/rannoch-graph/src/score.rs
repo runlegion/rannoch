@@ -146,8 +146,8 @@ mod tests {
 
     use super::{Scorer, parse};
 
-    #[test]
-    fn an_option_that_does_not_parse_fails_with_the_reason() {
+    #[tokio::test(start_paused = true)]
+    async fn an_option_that_does_not_parse_fails_with_the_reason() {
         let via = json!({ "cites": { "from": "doc", "to": "cited" } });
         let cases = [
             (Scorer::Katz, json!({ "hops": 2, "beta": 0.5 })),

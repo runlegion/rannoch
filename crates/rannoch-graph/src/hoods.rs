@@ -213,10 +213,13 @@ mod tests {
     /// FR-RANNOCH-127-c1: every walk the step makes is warm. The second walk is the kept copy,
     /// read with no connection; a store row that touches the hood drops it, reading nothing, so
     /// the next walk reads and equals a cold walk; one that touches no hood drops none.
-    #[test]
-    fn fr_rannoch_127_c1() {
+    #[tokio::test(start_paused = true)]
+    async fn fr_rannoch_127_c1() {
         let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
-        let path = target.join(format!("rannoch-hoods-{}.db", Uuid::now_v7()));
+        let path = target.join(format!(
+            "rannoch-hoods-{}.db",
+            rannoch_core::clock::new_id()
+        ));
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(DOCS).unwrap();
         conn.execute_batch(
@@ -260,8 +263,8 @@ mod tests {
     }
 
     /// A walk as of a time is kept apart from the same walk now, and from one as of another time.
-    #[test]
-    fn an_as_of_walk_is_its_own_hood() {
+    #[tokio::test(start_paused = true)]
+    async fn an_as_of_walk_is_its_own_hood() {
         let options = json!({ "via": { "cites": { "from": "doc", "to": "cited", "time": "written" } },
             "hops": 2, "cap": 10 });
         let open = || {
@@ -299,7 +302,7 @@ mod tests {
     /// An event whose source is `source`, at `status`.
     fn event(source: Uuid, status: Status) -> Event<u8, ()> {
         Event {
-            id: Uuid::now_v7(),
+            id: rannoch_core::clock::new_id(),
             source: Some(source),
             ty: 1,
             data: (),
@@ -310,8 +313,8 @@ mod tests {
 
     /// A `Warm` drops the hood a 2's held store row touches once the inner append commits,
     /// and drops nothing when the append fails or for an event that is not a 2.
-    #[test]
-    fn warm_drops_the_hoods_a_committed_2_touches() {
+    #[tokio::test(start_paused = true)]
+    async fn warm_drops_the_hoods_a_committed_2_touches() {
         let options =
             json!({ "via": { "cites": { "from": "doc", "to": "cited" } }, "hops": 2, "cap": 10 });
         let conn = store(DOCS);
@@ -324,7 +327,7 @@ mod tests {
         let writes = Writes::default();
         let touching =
             json!({ "store": { "table": "cites", "row": { "doc": "d2", "cited": "d5" } } });
-        let (one, two) = (Uuid::now_v7(), Uuid::now_v7());
+        let (one, two) = (rannoch_core::clock::new_id(), rannoch_core::clock::new_id());
         writes.lock().unwrap().insert(one, vec![touching.clone()]);
         writes.lock().unwrap().insert(two, vec![touching]);
 
@@ -342,8 +345,8 @@ mod tests {
     }
 
     /// Each option or input that does not parse fails its step with the reason.
-    #[test]
-    fn an_option_that_does_not_parse_fails_with_the_reason() {
+    #[tokio::test(start_paused = true)]
+    async fn an_option_that_does_not_parse_fails_with_the_reason() {
         let fails = |options: Value| parse(&options).unwrap_err();
         assert_eq!(fails(json!({})), "via is not an object");
         assert_eq!(

@@ -1330,6 +1330,7 @@ dependencies = [
  "rannoch-store",
  "rusqlite",
  "serde_json",
+ "tokio",
  "uuid",
 ]
 

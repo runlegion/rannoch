@@ -330,7 +330,6 @@ pub(crate) mod tests {
 
     use rusqlite::{Connection, params};
     use serde_json::json;
-    use uuid::Uuid;
 
     use super::score::{Scorer, score};
     use super::{Via, as_of, edges, walk, why};
@@ -355,7 +354,7 @@ pub(crate) mod tests {
 
     /// An event in `_events` with `source`; returns its id.
     fn event(conn: &Connection, source: Option<&str>) -> String {
-        let id = Uuid::now_v7().to_string();
+        let id = rannoch_core::clock::new_id().to_string();
         let sql = "INSERT INTO _events (id, source, ty, data, run_at, status)
             VALUES (?1, ?2, 1, '{}', NULL, 0)";
         conn.execute(sql, params![id, source]).unwrap();
@@ -396,8 +395,8 @@ pub(crate) mod tests {
 
     /// FR-RANNOCH-125-c3: why, a capped walk and as-of reads, of a row, a walk and a node's
     /// edges, over the app's ontology tables.
-    #[test]
-    fn fr_rannoch_125_c3() {
+    #[tokio::test(start_paused = true)]
+    async fn fr_rannoch_125_c3() {
         let conn = store(DOCS);
         let [first, fix] = small(&conn, ["doc_titles", "cites", "wrote"]);
 
@@ -466,8 +465,8 @@ pub(crate) mod tests {
 
     /// 01a219a7-4cc4-7d50-b375-8fdf0d724ded: an as-of read on the recorded-time column, the
     /// writing event's v7 id, returns the latest row whose id is at or before t's v7 bound.
-    #[test]
-    fn criterion_01a219a7_as_of_by_recorded_time() {
+    #[tokio::test(start_paused = true)]
+    async fn criterion_01a219a7_as_of_by_recorded_time() {
         let conn = store(DOCS);
         late(&conn);
         let title =
@@ -481,8 +480,8 @@ pub(crate) mod tests {
 
     /// 01a219a7-4cc4-7d50-b375-8feda7bb8f31: an as-of read on the valid-time column returns
     /// the row valid at t, whenever it was recorded.
-    #[test]
-    fn criterion_01a219a7_as_of_by_valid_time() {
+    #[tokio::test(start_paused = true)]
+    async fn criterion_01a219a7_as_of_by_valid_time() {
         let conn = store(DOCS);
         late(&conn);
         let title =
@@ -495,8 +494,8 @@ pub(crate) mod tests {
 
     /// 01a216c8-b0d1-76f2-b5b2-b39d928247e3: the same utils on another app's tables and
     /// columns give the same answers.
-    #[test]
-    fn criterion_01a216c8_utils_work_on_variable_tables_and_columns() {
+    #[tokio::test(start_paused = true)]
+    async fn criterion_01a216c8_utils_work_on_variable_tables_and_columns() {
         let (docs, papers) = (store(DOCS), store(PAPERS));
         let [_, fix] = small(&docs, ["doc_titles", "cites", "wrote"]);
         let [_, fixed] = small(&papers, ["paper", "refs", ""]);
@@ -524,8 +523,8 @@ pub(crate) mod tests {
 
     /// 01a216c8-b138-7ce1-8599-45d05b451b2c: the scoring tools on another app's tables and
     /// columns give the same scores.
-    #[test]
-    fn criterion_01a216c8_scoring_tools_work_on_variable_tables_and_columns() {
+    #[tokio::test(start_paused = true)]
+    async fn criterion_01a216c8_scoring_tools_work_on_variable_tables_and_columns() {
         let (docs, papers) = (store(DOCS), store(PAPERS));
         small(&docs, ["doc_titles", "cites", "wrote"]);
         small(&papers, ["paper", "refs", ""]);
@@ -652,8 +651,8 @@ pub(crate) mod tests {
 
     /// A capped walk equals a breadth-first walk in Rust on 50 roots of a graph of 2,000 people
     /// and 8,000 docs, 2 hops over cites and wrote backwards, and a cap of 10 cuts and says so.
-    #[test]
-    fn a_capped_walk_equals_a_breadth_first_walk() {
+    #[tokio::test(start_paused = true)]
+    async fn a_capped_walk_equals_a_breadth_first_walk() {
         let (people, docs) = (2_000, 8_000);
         let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
         let mut conn = store(DOCS);
