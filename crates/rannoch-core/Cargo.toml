@@ -15,6 +15,7 @@ log = "0.4"
 migratr = "0.3"
 rannoch-settings = { path = "../rannoch-settings" }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time"] }
 uuid = { version = "1", features = ["v7"] }
 

@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
 use rannoch_core::forgr::_events;
-use rannoch_core::{Append, Config, Error, Event, InboxConfig, Rannoch, Status, clock};
+use rannoch_core::{Append, Config, Error, Event, Rannoch, Status, clock};
 use rannoch_events::Events;
 use rannoch_processor::{Action, FlowDoc, Processor, Sig, check};
 use rannoch_queue::{Flows, Queue, Settings};
@@ -1591,12 +1591,41 @@ async fn built_in_with(name: &str, config: Config<Ty, Value>) -> Result<App> {
     App::built_in_at(database(name)?, &flows, config).await
 }
 
-/// A default inbox that hands over every `ms` milliseconds.
-fn every(ms: i64) -> Config<Ty, Value> {
-    Config {
-        default_interval: TimeDelta::milliseconds(ms),
-        ..Config::default()
+/// Set in the child process a test with lanes of its own runs: the settings file it opens with.
+const LANES: &str = "RANNOCH_PROCESSOR_LANES";
+
+/// The lanes `lanes` gives, a settings file's `[lane.<name>]` sections. The settings are held for
+/// the life of the process, so in the parent this runs `test` alone in a child process with a
+/// settings file holding `lanes`, checks it passed, and returns None; in the child it returns the
+/// `Config` that opens with that file.
+fn with_lanes(test: &str, lanes: &str) -> Result<Option<Config<Ty, Value>>> {
+    if let Ok(settings) = std::env::var(LANES) {
+        // The first open loads the settings, so this one does, before the store's.
+        let config = Config {
+            settings: Some(settings.into()),
+            ..Config::default()
+        };
+        drop(Rannoch::<Ty, Value>::open(config.clone())?);
+        return Ok(Some(config));
     }
+    let settings = database(&format!("{test}_settings"))?.with_file_name("app.toml");
+    fs::write(&settings, lanes)?;
+    let output = std::process::Command::new(std::env::current_exe()?)
+        .args([test, "--exact", "--nocapture"])
+        .env(LANES, &settings)
+        .output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "{stdout}{stderr}"
+    );
+    Ok(None)
+}
+
+/// A default lane whose heartbeat is `ms` milliseconds.
+fn every(test: &str, ms: u32) -> Result<Option<Config<Ty, Value>>> {
+    with_lanes(test, &format!("[lane.default]\nheartbeat_ms = {ms}\n"))
 }
 
 /// When a row was accepted: its v7 id's time.
@@ -1667,7 +1696,7 @@ async fn logged() -> tokio::sync::MutexGuard<'static, ()> {
 /// The failed hand-overs of the default inbox logged so far: how many events each held.
 fn failed_hand_overs() -> Vec<usize> {
     let held = |line: &String| {
-        let rest = line.strip_prefix("inbox 0 could not hand over ")?;
+        let rest = line.strip_prefix("lane default could not hand over ")?;
         rest.split(' ').next()?.parse().ok()
     };
     let lines = ERRORS.0.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1676,13 +1705,16 @@ fn failed_hand_overs() -> Vec<usize> {
 
 #[tokio::test(start_paused = true)]
 async fn an_accepted_event_is_in_memory_until_its_inbox_hands_it_over() {
+    // Given an app whose default lane hands over every 400 ms
+    let Some(config) = every(
+        "an_accepted_event_is_in_memory_until_its_inbox_hands_it_over",
+        400,
+    )
+    .unwrap() else {
+        return;
+    };
     let _turn = TURN.lock().await;
-    // Given an app whose default inbox hands over every 400 ms; under Config::default, every 20
-    assert_eq!(
-        Config::<Ty, Value>::default().default_interval,
-        TimeDelta::milliseconds(20)
-    );
-    let app = built_in_with("in_memory", every(400)).await.unwrap();
+    let app = built_in_with("in_memory", config).await.unwrap();
     let landed = || app.count(ROOTS);
 
     // When it sends three events
@@ -1747,14 +1779,11 @@ async fn a_batch_the_store_never_takes_stops_its_inbox_and_is_lost_at_shutdown()
     // Given an app whose payments must name an order the store has by the time their batch
     // commits, whose default inbox hands over every 300 ms, and whose queued tickets have an inbox
     // of their own
-    let queued = InboxConfig {
-        name: "queued".to_owned(),
-        types: vec![Ty(82)],
-        interval: TimeDelta::milliseconds(20),
-    };
-    let config = Config {
-        inboxes: vec![queued],
-        ..every(300)
+    let lanes =
+        "[lane.default]\nheartbeat_ms = 300\n[lane.queued]\ntys = [82]\nheartbeat_ms = 20\n";
+    let test = "a_batch_the_store_never_takes_stops_its_inbox_and_is_lost_at_shutdown";
+    let Some(config) = with_lanes(test, lanes).unwrap() else {
+        return;
     };
     let app = built_in_with("never_taken", config).await.unwrap();
     app.read.execute_batch(DEFERRED).unwrap();
@@ -1822,7 +1851,14 @@ async fn a_failed_hand_over_is_tried_again_ahead_of_what_arrived_since() {
         attempts: 1,
         ..Settings::new(Duration::from_millis(100))
     };
-    let config = (every(300), Some(told));
+    let Some(config) = every(
+        "a_failed_hand_over_is_tried_again_ahead_of_what_arrived_since",
+        300,
+    )
+    .unwrap() else {
+        return;
+    };
+    let config = (config, Some(told));
     let app = App::told(path, &flows, |_, _| Vec::new(), config, settings)
         .await
         .unwrap();
@@ -1884,7 +1920,10 @@ async fn a_failed_hand_over_is_tried_again_ahead_of_what_arrived_since() {
 async fn the_queue_takes_each_due_event_once() {
     let _turn = TURN.lock().await;
     // Given an app whose default inbox hands over every 300 ms, so each 1 is on the heap a while
-    let app = built_in_with("taken_once", every(300)).await.unwrap();
+    let Some(config) = every("the_queue_takes_each_due_event_once", 300).unwrap() else {
+        return;
+    };
+    let app = built_in_with("taken_once", config).await.unwrap();
 
     // When it sends ten events, and the queue is woken every 10 ms until each has its 2
     let events: Vec<Value> = (0..10)
@@ -2116,10 +2155,13 @@ async fn after_shutdown_a_send_is_closed_and_join_waits_for_signal_senders_and_r
 async fn a_second_app_on_the_same_store_is_not_stopped() {
     let _turn = TURN.lock().await;
     // Given an app whose default inbox hands over every second
+    let Some(config) = every("a_second_app_on_the_same_store_is_not_stopped", 1000).unwrap() else {
+        return;
+    };
     let path = database("second_app").unwrap();
     let open = async || {
         let flows = built_in().unwrap();
-        App::built_in_at(path.clone(), &flows, every(1000))
+        App::built_in_at(path.clone(), &flows, config.clone())
             .await
             .unwrap()
     };
