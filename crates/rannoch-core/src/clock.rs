@@ -44,23 +44,17 @@ pub fn elapsed() -> Instant {
     Instant::now()
 }
 
-/// A new `UUIDv7` made from [`now`]. Ids made within the same millisecond increase, as long as
-/// the clock does not move back; when it does, as when two paused runtimes stand at different
-/// times, the id still carries [`now`].
+/// A new `UUIDv7` made from [`now`], greater than every id made before it in this process. Its
+/// one counter is never started over, so when the clock moves back, as when two paused runtimes
+/// stand at different times, the id carries the latest time the counter has seen.
 #[must_use]
 pub fn new_id() -> Uuid {
-    static CONTEXT: Mutex<(i64, ContextV7)> = Mutex::new((i64::MIN, ContextV7::new()));
+    static CONTEXT: Mutex<ContextV7> = Mutex::new(ContextV7::new());
     let now = now();
-    let mut context = CONTEXT.lock().unwrap_or_else(PoisonError::into_inner);
-    // The context never gives a time before the latest it has seen, so it starts over when the
-    // clock moves back.
-    if now.timestamp_millis() < context.0 {
-        context.1 = ContextV7::new();
-    }
-    context.0 = now.timestamp_millis();
+    let context = CONTEXT.lock().unwrap_or_else(PoisonError::into_inner);
     let seconds = u64::try_from(now.timestamp()).unwrap_or(0);
     Uuid::new_v7(Timestamp::from_unix(
-        &context.1,
+        &*context,
         seconds,
         now.timestamp_subsec_nanos(),
     ))
