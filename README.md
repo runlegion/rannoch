@@ -82,6 +82,8 @@ All on one developer machine, as recorded on PRs #74, #76 and #114 and issues #6
 | A flow whose step writes nothing, 100,000 events to their 2 | 55,679 to 58,795 events/s | 55,679: `toys/graph/src/bin/flow.rs` in `noop` mode on the `toys/graph` branch, which is in the repo (PR #74); 57,011 to 58,795: the `noop` mode of the copy in the next row, which is not |
 | A flow whose built-in `store` step writes one row per event through `Events`, 100,000 events to their 2 | 46,442 to 47,450 events/s over 3 runs on `main` at d0c604a; 46,617 to 49,806 before #102 put each event's rows in a savepoint | `the_store_flow_rate` in `crates/rannoch-processor/tests/scenarios.rs`, which is ignored: `cargo test --release -p rannoch-processor --test scenarios -- --ignored --nocapture the_store_flow_rate` |
 
+The inbox benchmark (NFR-RANNOCH-030) runs on demand, not in CI: `cargo bench -p rannoch-core --bench inbox` sends 1,000,000 events from one producer on a real-time runtime and prints the events a second the inbox accepts, the commit rate and the send-to-commit p99.
+
 ## What the app owns
 
 - One process opens the store and runs rannoch over it. Keeping a second process from doing the same is the app's job.
