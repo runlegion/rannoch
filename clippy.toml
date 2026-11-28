@@ -1,2 +1,9 @@
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true
+disallowed-methods = [
+    { path = "std::thread::sleep", reason = "wait on rannoch_core::clock's tokio time" },
+    { path = "std::time::Instant::now", reason = "use rannoch_core::clock::elapsed" },
+    { path = "std::time::SystemTime::now", reason = "use rannoch_core::clock::now" },
+    { path = "chrono::Utc::now", reason = "use rannoch_core::clock::now" },
+    { path = "uuid::Uuid::now_v7", reason = "use rannoch_core::clock::new_id" },
+]

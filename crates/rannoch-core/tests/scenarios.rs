@@ -7,7 +7,8 @@
 //! a developer's edit never touches the real checkout.
 //!
 //! Every test runs with the clock frozen and calls [`Rannoch::shutdown`] through
-//! `spawn_blocking`. The two scenarios of `fr_rannoch_131.feature` check the clock itself.
+//! `spawn_blocking`. The first two scenarios of `fr_rannoch_131.feature` check the clock itself;
+//! the third runs clippy on a copy of this workspace.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -688,4 +689,48 @@ async fn advancing_the_clock_moves_time_exactly_and_wakes_the_waits_it_passes() 
     let handed: Vec<u8> = ids.0.lock().unwrap().iter().map(|(ty, _)| *ty).collect();
     assert_eq!(handed, [1]);
     shutdown(rannoch).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn no_real_time_call_outside_the_clock() {
+    // Given the rannoch workspace with clippy's disallowed-methods rule on
+    let ws = copy_workspace("no_real_time_call_outside_the_clock").unwrap();
+    let clippy = [
+        "clippy",
+        "--workspace",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings",
+    ];
+
+    // When clippy runs over every crate, its code and its tests
+    let out = cargo(&ws, &clippy).unwrap();
+
+    // Then it passes, and adding a call to any of std::thread::sleep, Instant::now,
+    // SystemTime::now, Utc::now or Uuid::now_v7 outside rannoch-core's clock makes it fail
+    assert!(out.status.success(), "{}", text(&out));
+    let lib = ws.join("crates/rannoch-core/src/lib.rs");
+    let mut source = fs::read_to_string(&lib).unwrap();
+    source.push_str(
+        "\npub fn real_time() {\n    std::thread::sleep(std::time::Duration::ZERO);\n    \
+         let _ = std::time::Instant::now();\n    let _ = std::time::SystemTime::now();\n    \
+         let _ = chrono::Utc::now();\n    let _ = uuid::Uuid::now_v7();\n}\n",
+    );
+    fs::write(&lib, source).unwrap();
+    let out = cargo(&ws, &clippy).unwrap();
+    let report = text(&out);
+    assert!(!out.status.success(), "{report}");
+    for method in [
+        "std::thread::sleep",
+        "std::time::Instant::now",
+        "std::time::SystemTime::now",
+        "chrono::Utc::now",
+        "uuid::Uuid::now_v7",
+    ] {
+        assert!(
+            report.contains(&format!("use of a disallowed method `{method}`")),
+            "{method}: {report}"
+        );
+    }
 }
