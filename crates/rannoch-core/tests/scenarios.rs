@@ -784,3 +784,46 @@ fn ids_from_one_rannoch_keep_their_order() {
         assert!(ids.windows(2).all(|w| w[0] < w[1]), "{ids:?}");
     }
 }
+
+#[test]
+fn ids_from_new_id_keep_their_order_across_frozen_clocks() {
+    const TURNS: usize = 100;
+    // Given two paused runtimes in one process, one clock an hour ahead of the other: each makes
+    // an id with clock::new_id on its turn, in one frozen millisecond, and records it in order
+    let made = Arc::new(Mutex::new(Vec::new()));
+    let turn = Arc::new(std::sync::Barrier::new(2));
+    let runtimes = [Duration::ZERO, Duration::from_secs(3_600)]
+        .into_iter()
+        .enumerate()
+        .map(|(which, ahead)| {
+            let (made, turn) = (Arc::clone(&made), Arc::clone(&turn));
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .start_paused(true)
+                    .build()
+                    .unwrap();
+                runtime.block_on(async move {
+                    tokio::time::advance(ahead).await;
+                    let first = clock::now();
+                    // When they take turns making ids with clock::new_id
+                    for round in 0..TURNS {
+                        if round % 2 == which {
+                            made.lock().unwrap().push(clock::new_id());
+                        }
+                        turn.wait();
+                    }
+                    assert_eq!(clock::now(), first);
+                });
+            })
+        })
+        .collect::<Vec<_>>();
+    for runtime in runtimes {
+        runtime.join().unwrap();
+    }
+
+    // Then all the ids, in the order they were made, strictly increase
+    let made = made.lock().unwrap();
+    assert_eq!(made.len(), TURNS);
+    assert!(made.windows(2).all(|w| w[0] < w[1]), "{made:?}");
+}
