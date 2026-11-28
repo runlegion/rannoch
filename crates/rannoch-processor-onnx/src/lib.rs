@@ -390,8 +390,8 @@ mod tests {
 
     use super::{Infer, Model, nearest, tokenize};
 
-    #[test]
-    fn tokenize_splits_punctuation_and_word_pieces_and_drops_unknowns() {
+    #[tokio::test(start_paused = true)]
+    async fn tokenize_splits_punctuation_and_word_pieces_and_drops_unknowns() {
         let vocab = [
             ("the", 1),
             ("app", 2),
@@ -407,8 +407,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn nearest_picks_the_label_nearest_by_cosine() {
+    #[tokio::test(start_paused = true)]
+    async fn nearest_picks_the_label_nearest_by_cosine() {
         let labels = [("bug", vec![3.0, 0.0]), ("question", vec![0.0, 1.0])];
         let labels: Vec<(String, Vec<f64>)> =
             labels.into_iter().map(|(l, v)| (l.into(), v)).collect();
@@ -416,15 +416,15 @@ mod tests {
         assert_eq!(nearest("classify", &[1.0, 1.2], &labels), Ok("question"));
     }
 
-    #[test]
-    fn nearest_fails_on_a_zero_vector() {
+    #[tokio::test(start_paused = true)]
+    async fn nearest_fails_on_a_zero_vector() {
         let labels = [("bug".to_owned(), vec![3.0, 0.0])];
         let zero = Err("classify: a zero vector has no nearest label".to_owned());
         assert_eq!(nearest("classify", &[0.0, 0.0], &labels), zero);
     }
 
-    #[test]
-    fn infer_on_add_gives_the_sum() {
+    #[tokio::test(start_paused = true)]
+    async fn infer_on_add_gives_the_sum() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/models/add.onnx");
         let number = |f: &str| (f.to_owned(), "number".to_owned());
         let sig = Sig {

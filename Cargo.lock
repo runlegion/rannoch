@@ -1383,7 +1383,6 @@ dependencies = [
  "serde_json",
  "tokio",
  "tract-onnx",
- "uuid",
 ]
 
 [[package]]

@@ -3,16 +3,21 @@
 //! with the `tract` feature, c5 without it. c5 and c6 embed with the fixture model2vec model of
 //! `tests/fixtures/model2vec`, which `tests/fixtures/generate.rs` writes; no scenario reaches the
 //! network.
+//!
+//! Every test runs with the clock frozen (`#[tokio::test(start_paused = true)]`): a wait sleeps on
+//! tokio's time, which auto-advances while the app's tasks wait, and the blocking calls
+//! (`Rannoch::shutdown`, `Queue::join`) run through `spawn_blocking`. The two scenarios of
+//! `clock.feature` read the crate's code and tests for that.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
+use std::{fs, process::Command};
 
-use std::time::{Duration, Instant};
-use std::{fs, process::Command, thread};
 use tokio::sync::mpsc::{self, UnboundedSender};
 
 use rannoch_core::forgr::_events;
-use rannoch_core::{Append, Config, Rannoch};
+use rannoch_core::{Append, Config, Rannoch, clock};
 use rannoch_events::Events;
 use rannoch_processor::{Action, Processor, Sig};
 use rannoch_processor_onnx::{Classify, Embed, Infer, Model};
@@ -20,7 +25,6 @@ use rannoch_queue::{Flows, Queue, Settings};
 use rannoch_store::{Opened, Store};
 use rusqlite::Connection;
 use serde_json::{Value, json};
-use uuid::Uuid;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -80,7 +84,7 @@ struct App(
 
 impl App {
     /// The app over a fresh store, every migration applied by opening rannoch once.
-    fn start(name: &str, actions: Vec<Arc<dyn Action>>) -> Result<Self> {
+    async fn start(name: &str, actions: Vec<Arc<dyn Action>>) -> Result<Self> {
         drop(fs::remove_dir_all(tmp(name)));
         fs::create_dir_all(tmp(name))?;
         let path = tmp(name).join("store.db");
@@ -90,7 +94,8 @@ impl App {
             append,
             ..Config::default()
         };
-        Rannoch::<u16, Value>::open(config(None))?.shutdown();
+        let migrated = Rannoch::<u16, Value>::open(config(None))?;
+        tokio::task::spawn_blocking(move || migrated.shutdown()).await?;
         let processor = Arc::new(Processor::new(&flows()?, actions, ready(&path)?)?);
         let (signal, wake) = mpsc::unbounded_channel();
         let events = Events::new(ready(&path)?, signal.clone());
@@ -102,13 +107,13 @@ impl App {
 
     /// The (ty, status, data) of every row about an event of `ty` with `data`, from the app's
     /// forgr factory, once its flow has sent its 2 or its -1.
-    fn ran(&self, ty: i64, data: &Value) -> Result<Vec<(i64, i64, Value)>> {
-        let id = Uuid::now_v7().to_string();
+    async fn ran(&self, ty: i64, data: &Value) -> Result<Vec<(i64, i64, Value)>> {
+        let id = clock::new_id().to_string();
         let row = _events::factory().id(id.clone()).ty(ty);
         row.data(data.to_string()).status(0).insert(&self.0)?;
         self.1.send(())?;
         let sql = "SELECT ty, status, data FROM _events WHERE source = ?1 ORDER BY id";
-        let (mut select, start) = (self.0.prepare(sql)?, Instant::now());
+        let (mut select, start) = (self.0.prepare(sql)?, clock::elapsed());
         loop {
             let rows = select.query_map([&id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
             let rows: Vec<(i64, i64, String)> = rows.collect::<rusqlite::Result<_>>()?;
@@ -117,14 +122,14 @@ impl App {
                 return rows.into_iter().map(row).collect();
             }
             assert!(start.elapsed() < Duration::from_secs(10), "{ty} {data} ran");
-            thread::sleep(Duration::from_millis(20));
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 
     /// The (ty, data) of every next sent about an event of `ty` with `data` once its flow has
     /// sent its 2.
-    fn hand(&self, ty: i64, data: &Value) -> Result<Vec<(i64, Value)>> {
-        let rows = self.ran(ty, data)?;
+    async fn hand(&self, ty: i64, data: &Value) -> Result<Vec<(i64, Value)>> {
+        let rows = self.ran(ty, data).await?;
         assert!(rows.iter().any(|r| r.1 == 2), "{ty} {data}: {rows:?}");
         Ok(rows
             .into_iter()
@@ -136,8 +141,8 @@ impl App {
     /// The data of the -1 the flow for `ty` sends about `data`, which must send no next and no
     /// 2; a row of `ty` at 0 is the queue's retry.
     #[cfg(not(feature = "tract"))]
-    fn failed(&self, ty: i64, data: &Value) -> Result<Value> {
-        let rows = self.ran(ty, data)?;
+    async fn failed(&self, ty: i64, data: &Value) -> Result<Value> {
+        let rows = self.ran(ty, data).await?;
         let sent = |r: &(i64, i64, Value)| r.1 == 2 || (r.1 == 0 && r.0 != ty);
         assert!(!rows.iter().any(sent), "{ty} {data}: {rows:?}");
         let failed = rows.into_iter().find(|r| r.1 == -1);
@@ -145,15 +150,31 @@ impl App {
     }
 
     /// The `field` of the one next the flow for `ty` sends about `text`.
-    fn ask(&self, ty: i64, text: &str, field: &str) -> Result<Value> {
-        let next = self.hand(ty, &json!({ "text": text }))?;
+    async fn ask(&self, ty: i64, text: &str, field: &str) -> Result<Value> {
+        let next = self.hand(ty, &json!({ "text": text })).await?;
         Ok(next.first().map_or(Value::Null, |n| n.1[field].clone()))
     }
 
-    fn stop(self) {
-        drop(self.1);
-        self.2.shutdown();
-        assert_eq!(self.3.join(), Ok(()));
+    /// Shuts rannoch down, then joins the queue: both block, so they run through
+    /// `spawn_blocking`.
+    async fn stop(self) -> Result<()> {
+        let App(_, signal, rannoch, queue, _) = self;
+        drop(signal);
+        tokio::task::spawn_blocking(move || rannoch.shutdown()).await?;
+        assert_eq!(
+            tokio::task::spawn_blocking(move || queue.join()).await?,
+            Ok(())
+        );
+        Ok(())
+    }
+
+    /// The `field` of the one next the flow for `ty` sends about each of `texts`, in order.
+    async fn ask_each(&self, ty: i64, texts: &[&str], field: &str) -> Result<Vec<Value>> {
+        let mut answers = Vec::new();
+        for text in texts {
+            answers.push(self.ask(ty, text, field).await?);
+        }
+        Ok(answers)
     }
 }
 
@@ -173,13 +194,14 @@ fn text_actions(
 /// classify choosing among `labels`. Like c5, it runs without the `tract` feature, which cannot
 /// load the fixture's model.
 #[cfg(not(feature = "tract"))]
-fn fixture(name: &str, labels: &[(&str, &str)]) -> Result<App> {
+async fn fixture(name: &str, labels: &[(&str, &str)]) -> Result<App> {
     let model = Path::new(MODEL);
     let tokenizer = fs::read_to_string(model.join("tokenizer.json"))?;
     App::start(
         name,
         text_actions(&model.join("onnx/model.onnx"), &tokenizer, labels)?,
     )
+    .await
 }
 
 /// Runs cargo with `args` on the test app of `tests/app`, the workspace's Cargo.lock copied in:
@@ -196,8 +218,8 @@ fn cargo(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8(out.stdout)?)
 }
 
-#[test]
-fn a_flow_step_runs_a_local_model() -> Result<()> {
+#[tokio::test(start_paused = true)]
+async fn a_flow_step_runs_a_local_model() -> Result<()> {
     // Given an app that does not enable the onnx feature
     // When the app is built
     // Then rannoch-processor-onnx is not built
@@ -218,69 +240,65 @@ fn a_flow_step_runs_a_local_model() -> Result<()> {
     // one-node Add model, kept as a local file
     // Then the flow reports a job step
     let add = Infer::new(sig("add")?, Model::open(Path::new(ADD))?);
-    let app = App::start("runs_a_local_model", vec![Arc::new(add)])?;
+    let app = App::start("runs_a_local_model", vec![Arc::new(add)]).await?;
     assert!(app.4.flow(10).is_some_and(|f| f.job));
 
     // When the queue hands rannoch-processor an event whose inputs are 2.5 and 4.0
     // Then the step's next carries the sum 6.5
-    let nexts = app.hand(10, &json!({ "a": 2.5, "b": 4.0 }))?;
+    let nexts = app.hand(10, &json!({ "a": 2.5, "b": 4.0 })).await?;
     assert_eq!(nexts, [(11, json!({ "sum": 6.5 }))]);
-    app.stop();
-    Ok(())
+    app.stop().await
 }
 
 #[cfg(not(feature = "tract"))]
-#[test]
-fn a_flow_embeds_and_classifies_text_with_a_local_model() -> Result<()> {
+#[tokio::test(start_paused = true)]
+async fn a_flow_embeds_and_classifies_text_with_a_local_model() -> Result<()> {
     // Given an app that enables the onnx feature, built with flows whose steps embed and
     // classify text with the fixture model2vec model, kept as a local file, classify's labels
     // being bug, question and praise, each with a description
     let model = Path::new(MODEL);
     let tokenizer = fs::read_to_string(model.join("tokenizer.json"))?;
     let actions = text_actions(&model.join("onnx/model.onnx"), &tokenizer, &LABELS)?;
-    let app = App::start("embeds_and_classifies", actions)?;
+    let app = App::start("embeds_and_classifies", actions).await?;
 
     // When the queue hands rannoch-processor an event to embed a text, twice
     // Then each next carries a vector of 8 numbers, identical both times
     // (the processor checks each next's vector is a list<number>, as embed's sig gives)
-    let once = app.ask(20, TEXTS[0], "vector")?;
+    let once = app.ask(20, TEXTS[0], "vector").await?;
     assert_eq!(once.as_array().map(Vec::len), Some(8));
-    assert_eq!(app.ask(20, TEXTS[0], "vector")?, once);
+    assert_eq!(app.ask(20, TEXTS[0], "vector").await?, once);
 
     // When the queue hands rannoch-processor an event to embed a different text
     // Then its vector differs
-    assert_ne!(app.ask(20, TEXTS[1], "vector")?, once);
+    assert_ne!(app.ask(20, TEXTS[1], "vector").await?, once);
 
     // When the queue hands rannoch-processor events to classify 'the app crashes when I click
     // save', 'how do I export my notes?' and 'thank you, this tool is wonderful'
     // Then the nexts carry bug, question and praise
-    let label = |t: &&str| app.ask(30, t, "label");
-    let labels: Vec<Value> = TEXTS[..3].iter().map(label).collect::<Result<_>>()?;
+    let labels = app.ask_each(30, &TEXTS[..3], "label").await?;
     assert_eq!(labels, ["bug", "question", "praise"]);
-    app.stop();
-    Ok(())
+    app.stop().await
 }
 
 #[cfg(feature = "tract")]
-#[test]
-fn a_local_model_gives_the_same_answers_through_tract_as_through_ort() -> Result<()> {
+#[tokio::test(start_paused = true)]
+async fn a_local_model_gives_the_same_answers_through_tract_as_through_ort() -> Result<()> {
     // Given an app that enables the onnx feature with the tract feature, built with a flow
     // whose step runs the one-node Add model, kept as a local file
     let add = Infer::new(sig("add")?, Model::open(Path::new(ADD))?);
-    let app = App::start("same_answers", vec![Arc::new(add)])?;
+    let app = App::start("same_answers", vec![Arc::new(add)]).await?;
 
     // When the queue hands rannoch-processor events whose inputs are (2.5, 4.0), (-1.0, 0.25),
     // (1e6, 3.0) and (0, 0)
     // Then each step's next carries the sum of its two inputs, the same answer the ort build
     // gives
     for (a, b) in [(2.5f32, 4.0f32), (-1.0, 0.25), (1e6, 3.0), (0.0, 0.0)] {
-        let nexts = app.hand(10, &json!({ "a": a, "b": b }))?;
+        let nexts = app.hand(10, &json!({ "a": a, "b": b })).await?;
         let by_ort = ort(Path::new(ADD), vec![("a", vec![a]), ("b", vec![b])])?[0];
         assert_eq!(by_ort, a + b, "{a} + {b} through ort");
         assert_eq!(nexts, [(11, json!({ "sum": by_ort }))], "{a} + {b}");
     }
-    app.stop();
-    Ok(())
+    app.stop().await
 }
 
 /// The first output of `model` through ort on `inputs`: what the onnx feature's build gives.
@@ -401,8 +419,8 @@ fn ids(vocab: &Value, text: &str) -> Vec<i64> {
 }
 
 #[cfg(feature = "tract")]
-#[test]
-fn a_tract_build_runs_the_model_shipped_as_an_export_tract_can_load() -> Result<()> {
+#[tokio::test(start_paused = true)]
+async fn a_tract_build_runs_the_model_shipped_as_an_export_tract_can_load() -> Result<()> {
     // Given the fixture model2vec model shipped as a Loop-free export, Gather and ReduceMean
     // with the L2 step its config's normalize asks for, kept as a local file
     let model = Path::new(MODEL);
@@ -410,7 +428,7 @@ fn a_tract_build_runs_the_model_shipped_as_an_export_tract_can_load() -> Result<
     // And one app built with the onnx feature and one built with the tract feature, each with
     // flows that embed and classify text with that export
     let tokenizer = fs::read_to_string(model.join("tokenizer.json"))?;
-    let app = App::start("tract_build", text_actions(&export, &tokenizer, &LABELS)?)?;
+    let app = App::start("tract_build", text_actions(&export, &tokenizer, &LABELS)?).await?;
     let vocab = serde_json::from_str::<Value>(&tokenizer)?["model"]["vocab"].take();
     let unit = |v: Vec<f32>| {
         let n = v.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
@@ -424,7 +442,7 @@ fn a_tract_build_runs_the_model_shipped_as_an_export_tract_can_load() -> Result<
     // When each is handed the same five texts to embed
     // Then the two builds' vectors give the same answers, as the original model gives through ort
     for text in TEXTS {
-        let tract: Vec<f64> = serde_json::from_value(app.ask(20, text, "vector")?)?;
+        let tract: Vec<f64> = serde_json::from_value(app.ask(20, text, "vector").await?)?;
         let original = vec![("input_ids", ids(&vocab, text)), ("offsets", vec![0])];
         let original = unit(ort(&model.join("onnx/model.onnx"), original)?);
         assert_eq!(tract.len(), 8);
@@ -435,8 +453,7 @@ fn a_tract_build_runs_the_model_shipped_as_an_export_tract_can_load() -> Result<
     // When each is handed 'the app crashes when I click save', 'how do I export my notes?' and
     // 'thank you, this tool is wonderful' to classify
     // Then both give bug, question and praise
-    let label = |t: &&str| app.ask(30, t, "label");
-    let labels: Vec<Value> = TEXTS[..3].iter().map(label).collect::<Result<_>>()?;
+    let labels = app.ask_each(30, &TEXTS[..3], "label").await?;
     assert_eq!(labels, ["bug", "question", "praise"]);
     let about = LABELS.map(|(l, d)| by_ort(d).map(|v| (l, v)));
     let about = about.into_iter().collect::<Result<Vec<_>>>()?;
@@ -446,57 +463,130 @@ fn a_tract_build_runs_the_model_shipped_as_an_export_tract_can_load() -> Result<
         let best = about.iter().max_by(|a, b| cos(&a.1).total_cmp(&cos(&b.1)));
         assert_eq!(best.map(|b| b.0), Some(want), "the ort build on {text}");
     }
-    app.stop();
-    Ok(())
+    app.stop().await
 }
 
 /// Not a scenario: #109. A text that is missing, or not a string, fails the step that embeds or
 /// classifies it.
 #[cfg(not(feature = "tract"))]
-#[test]
-fn a_text_that_is_missing_or_not_a_string_fails_its_step() -> Result<()> {
+#[tokio::test(start_paused = true)]
+async fn a_text_that_is_missing_or_not_a_string_fails_its_step() -> Result<()> {
     // Given an app whose flows embed and classify text with the fixture model2vec model
-    let app = fixture("a_text_that_is_missing", &LABELS)?;
+    let app = fixture("a_text_that_is_missing", &LABELS).await?;
 
     // When an event to embed holds no text, and an event to classify holds a number as its text
     // Then each one's -1 names text, and no next is sent
-    let embed = app.failed(20, &json!({}))?;
+    let embed = app.failed(20, &json!({})).await?;
     assert_eq!(embed, json!("embed takes text, a string"));
-    let classify = app.failed(30, &json!({ "text": 5 }))?;
+    let classify = app.failed(30, &json!({ "text": 5 })).await?;
     assert_eq!(classify, json!("classify takes text, a string"));
-    app.stop();
-    Ok(())
+    app.stop().await
 }
 
 /// Not a scenario: #109. A text none of whose words is in the vocabulary fails its step.
 #[cfg(not(feature = "tract"))]
-#[test]
-fn a_text_with_no_word_in_the_vocabulary_fails_its_step() -> Result<()> {
+#[tokio::test(start_paused = true)]
+async fn a_text_with_no_word_in_the_vocabulary_fails_its_step() -> Result<()> {
     // Given an app whose flows embed and classify text with the fixture model2vec model
-    let app = fixture("a_text_with_no_word", &LABELS)?;
+    let app = fixture("a_text_with_no_word", &LABELS).await?;
 
     // When an event to embed holds a text none of whose words is in the fixture's vocabulary
     // Then its -1 says so, and no next is sent
-    let embed = app.failed(20, &json!({ "text": "zzz qqq" }))?;
+    let embed = app.failed(20, &json!({ "text": "zzz qqq" })).await?;
     assert_eq!(
         embed,
         json!("embed: no word of the text is in the vocabulary")
     );
-    app.stop();
-    Ok(())
+    app.stop().await
 }
 
 /// Not a scenario: #109. Classify with no labels fails its step.
 #[cfg(not(feature = "tract"))]
-#[test]
-fn classify_with_no_labels_fails_its_step() -> Result<()> {
+#[tokio::test(start_paused = true)]
+async fn classify_with_no_labels_fails_its_step() -> Result<()> {
     // Given an app whose classify, over the fixture model2vec model, has no labels
-    let app = fixture("classify_with_no_labels", &[])?;
+    let app = fixture("classify_with_no_labels", &[]).await?;
 
     // When an event to classify a text is handed over
     // Then its -1 says classify has no labels, and no next is sent
-    let classify = app.failed(30, &json!({ "text": TEXTS[0] }))?;
+    let classify = app.failed(30, &json!({ "text": TEXTS[0] })).await?;
     assert_eq!(classify, json!("classify has no labels"));
-    app.stop();
+    app.stop().await
+}
+
+/// Every `.rs` file of rannoch-processor-onnx's code and tests, the test app and the fixture
+/// generator among them, with its path.
+fn sources() -> std::io::Result<Vec<(PathBuf, String)>> {
+    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let (mut dirs, mut files) = (vec![crate_dir.join("src"), crate_dir.join("tests")], vec![]);
+    while let Some(dir) = dirs.pop() {
+        for entry in fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let text = fs::read_to_string(&path)?;
+                files.push((path, text));
+            }
+        }
+    }
+    Ok(files)
+}
+
+#[tokio::test(start_paused = true)]
+async fn rannoch_processor_onnx_calls_no_real_time_function() -> Result<()> {
+    // Given rannoch-processor-onnx's code and tests
+    let files = sources()?;
+    assert!(files.len() >= 5, "{files:?}");
+
+    // When they are read for a call to any real-time function; the opening paren is added here,
+    // so this list is not itself a call
+    let names = [
+        "thread::sleep",
+        "thread::spawn",
+        "recv_timeout",
+        "Instant::now",
+        "SystemTime::now",
+        "Utc::now",
+        "now_v7",
+    ];
+    let calls: Vec<String> = names.iter().map(|name| format!("{name}(")).collect();
+
+    // Then none is found
+    for (path, text) in &files {
+        for call in &calls {
+            assert!(
+                !text.contains(call.as_str()),
+                "{} calls {call}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn every_rannoch_processor_onnx_test_runs_with_the_clock_frozen() -> Result<()> {
+    // Given rannoch-processor-onnx's tests
+    let files = sources()?;
+
+    // When they are read for how each one runs
+    let mut runs = 0;
+    for (path, text) in &files {
+        for line in text.lines().map(str::trim) {
+            // Then none runs as a plain test, and each tokio test freezes the clock
+            assert_ne!(line, "#[test]", "{} has a plain test", path.display());
+            if line.starts_with("#[tokio::test") || line.starts_with("#[tokio::main") {
+                assert!(
+                    line.ends_with("start_paused = true)]"),
+                    "{}: {line}",
+                    path.display()
+                );
+                runs += 1;
+            }
+        }
+    }
+    // 4 in the library and 9 here
+    assert_eq!(runs, 13);
     Ok(())
 }
