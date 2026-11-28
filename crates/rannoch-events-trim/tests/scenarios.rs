@@ -4,13 +4,13 @@
 //! this test's.
 
 use std::collections::BTreeSet;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use std::{fs, thread};
+use std::time::Duration;
 
 use rannoch_core::forgr::_events;
-use rannoch_core::{Append, Config, Rannoch};
+use rannoch_core::{Append, Config, Rannoch, clock};
 use rannoch_events::Events;
 use rannoch_processor::{FlowDoc, Processor, Sig, check};
 use rannoch_queue::{Queue, Settings};
@@ -33,30 +33,31 @@ fn ready(path: &Path) -> Result<Connection> {
     }
 }
 
-/// Waits up to five seconds for `done`.
-fn until(done: impl Fn() -> bool) -> bool {
-    let start = Instant::now();
+/// Waits up to five seconds on the clock for `done`.
+async fn until(done: impl Fn() -> bool) -> bool {
+    let start = clock::elapsed();
     while start.elapsed() < Duration::from_secs(5) {
         if done() {
             return true;
         }
-        thread::sleep(Duration::from_millis(20));
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
     done()
 }
 
 /// A fresh store for the app, with every migration applied by opening rannoch once.
-fn migrated() -> Result<PathBuf> {
+async fn migrated() -> Result<PathBuf> {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("events-trim");
     drop(fs::remove_dir_all(&dir));
     fs::create_dir_all(&dir)?;
     let path = dir.join("store.db");
     let store = Some(Arc::new(Store::new(path.clone(), rannoch_core::migrator())) as _);
-    Rannoch::<u16, Value>::open(Config {
+    let rannoch = Rannoch::<u16, Value>::open(Config {
         store,
         ..Config::default()
-    })?
-    .shutdown();
+    })?;
+    // Shutdown blocks, so async code runs it through spawn_blocking.
+    tokio::task::spawn_blocking(move || rannoch.shutdown()).await?;
     Ok(path)
 }
 
@@ -72,7 +73,7 @@ fn event(
     source: Option<Uuid>,
     statuses: &[(i64, u64)],
 ) -> Result<Vec<Uuid>> {
-    let now = u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?;
+    let now = u64::try_from(clock::now().timestamp_millis())?;
     let id =
         |s, ago| Builder::from_unix_timestamp_millis(now - ago, &[n, s, 0, 0, 0, 0, 0, 0, 0, 0]);
     let zero = id(0, ago_ms).into_uuid();
@@ -105,11 +106,11 @@ fn ids(path: &Path) -> Result<BTreeSet<Uuid>> {
         .collect::<std::result::Result<_, _>>()?)
 }
 
-#[test]
-fn a_flow_whose_step_is_trim_deletes_the_processed_events_older_than_its_options_say_and_keeps_the_rest()
+#[tokio::test(start_paused = true)]
+async fn a_flow_whose_step_is_trim_deletes_the_processed_events_older_than_its_options_say_and_keeps_the_rest()
  {
     // Given a store holding two events an hour old and one made now, each with its 1 and 2
-    let path = migrated().unwrap();
+    let path = migrated().await.unwrap();
     let seed = ready(&path).unwrap();
     let done = [(1, HOUR), (2, HOUR)];
     let first = event(&seed, 1, HOUR, None, &done).unwrap();
@@ -165,7 +166,7 @@ fn a_flow_whose_step_is_trim_deletes_the_processed_events_older_than_its_options
     let queue = Queue::start(conn, wake, sender, Arc::new(processor), settings);
 
     // When the queue hands the flow an event
-    let trim = Uuid::now_v7();
+    let trim = clock::new_id();
     let row = _events::factory().id(trim.to_string()).ty(10).data("{}");
     row.status(0).insert(&seed).unwrap();
     signal.send(()).unwrap();
@@ -177,7 +178,7 @@ fn a_flow_whose_step_is_trim_deletes_the_processed_events_older_than_its_options
         let id = seed.query_row(sql, (trim.to_string(), status), |r| r.get::<_, String>(0));
         id.ok().and_then(|i| i.parse::<Uuid>().ok())
     };
-    assert!(until(|| about(2).is_some()));
+    assert!(until(|| about(2).is_some()).await);
     let ran = [Some(trim), about(1), about(2)].into_iter().flatten();
     let kept: BTreeSet<Uuid> = fresh.iter().chain(&undone).copied().chain(ran).collect();
     assert_eq!(kept.len(), 13);
@@ -197,7 +198,11 @@ fn a_flow_whose_step_is_trim_deletes_the_processed_events_older_than_its_options
     );
     assert_eq!(waiting.len(), 2);
 
+    // Shutdown and join block, so async code runs them through spawn_blocking.
     drop(signal);
-    rannoch.shutdown();
-    assert_eq!(queue.join(), Ok(()));
+    let joined = tokio::task::spawn_blocking(move || {
+        rannoch.shutdown();
+        queue.join()
+    });
+    assert_eq!(joined.await.unwrap(), Ok(()));
 }

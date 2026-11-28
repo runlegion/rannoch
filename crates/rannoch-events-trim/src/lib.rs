@@ -19,8 +19,8 @@
 mod queries;
 
 use std::sync::{Arc, LazyLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 
+use rannoch_core::clock;
 use rannoch_processor::{Action, Sig};
 use rannoch_store::Store;
 use serde_json::{Map, Value};
@@ -49,11 +49,8 @@ impl Action for Trim {
         let n = n
             .as_u64()
             .ok_or_else(|| fail(&format!("{n} is not a whole number of ms")))?;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|e| fail(&e))?;
-        let at = now.as_millis().saturating_sub(u128::from(n));
-        let at = u64::try_from(at).map_err(|e| fail(&e))?;
+        let now = u64::try_from(clock::now().timestamp_millis()).map_err(|e| fail(&e))?;
+        let at = now.saturating_sub(n);
         // The least v7 id of that millisecond: every id below it was made before it.
         let cutoff = Builder::from_unix_timestamp_millis(at, &[0; 10]).into_uuid();
         let conn = Store::connection().map_err(|e| fail(&e))?;
