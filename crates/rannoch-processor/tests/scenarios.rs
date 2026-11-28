@@ -156,7 +156,7 @@ type Made = fn(&Calls, &Arc<Mutex<Obj>>) -> Vec<Arc<dyn Action>>;
 struct App {
     path: PathBuf,
     read: Connection,
-    signal: mpsc::Sender<()>,
+    signal: tokio::sync::mpsc::UnboundedSender<()>,
     rannoch: Rannoch<Ty, Value>,
     queue: Queue,
     processor: Arc<Processor<Ty, Value>>,
@@ -232,7 +232,7 @@ impl App {
         let (calls, rating) = (Calls::default(), Arc::default());
         let actions = made(&calls, &rating);
         let processor = Arc::new(Processor::new(flows, actions, ready(&path)?)?);
-        let (signal, wake) = mpsc::channel();
+        let (signal, wake) = tokio::sync::mpsc::unbounded_channel();
         let events = Events::new(ready(&path)?, signal.clone()).with_writes(processor.writes());
         let append = Arc::new(events) as Arc<dyn Append<Ty, Value>>;
         let rannoch = Rannoch::open(Config {

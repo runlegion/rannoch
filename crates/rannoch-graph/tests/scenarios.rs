@@ -5,7 +5,7 @@
 //! process, so the scenarios take turns.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError, mpsc};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
@@ -121,7 +121,7 @@ fn until(done: impl Fn() -> bool) -> bool {
 /// The app running: rannoch, the queue, a connection and the signal it hands events with.
 struct App {
     conn: Connection,
-    signal: mpsc::Sender<()>,
+    signal: tokio::sync::mpsc::UnboundedSender<()>,
     rannoch: Rannoch<u16, Value>,
     queue: Queue,
 }
@@ -139,7 +139,7 @@ impl App {
         let hoods = Hoods::default();
         let actions = rannoch_graph::actions(&hoods);
         let processor: Processor<u16, Value> = Processor::new(&flows, actions, ready(&path)?)?;
-        let (signal, wake) = mpsc::channel();
+        let (signal, wake) = tokio::sync::mpsc::unbounded_channel();
         let writes = processor.writes();
         let events = Events::new(ready(&path)?, signal.clone()).with_writes(writes.clone());
         let append = Warm::new(events, writes, hoods);

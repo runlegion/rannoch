@@ -57,14 +57,13 @@
 //! use std::error::Error;
 //! use std::fs;
 //! use std::path::Path;
-//! use std::sync::mpsc;
 //!
+//! use rannoch_core::clock::new_id;
 //! use rannoch_core::{Append, Event, Status, Storage};
 //! use rannoch_events::Events;
 //! use rannoch_store::{Opened, Store};
 //! use rusqlite::Connection;
 //! use serde_json::json;
-//! use uuid::Uuid;
 //!
 //! /// The app's event types, written to `_events` as their `u16`.
 //! #[derive(Debug, Clone, Copy)]
@@ -86,8 +85,10 @@
 //!     }
 //! }
 //!
-//! fn main() -> Result<(), Box<dyn Error>> {
-//!     let dir = std::env::temp_dir().join(Uuid::now_v7().to_string());
+//! // The clock frozen, as in every rannoch-events test.
+//! #[tokio::main(flavor = "current_thread", start_paused = true)]
+//! async fn main() -> Result<(), Box<dyn Error>> {
+//!     let dir = std::env::temp_dir().join(new_id().to_string());
 //!     fs::create_dir_all(&dir)?;
 //!     let path = dir.join("app.db");
 //!     let store = Store::new(path.clone(), rannoch_core::migrator());
@@ -95,7 +96,7 @@
 //!         store.apply()?;
 //!     }
 //!
-//!     let (signal, wake) = mpsc::channel();
+//!     let (signal, mut wake) = tokio::sync::mpsc::unbounded_channel();
 //!     let events = Events::new(ready(&path)?, signal);
 //!     let page = |id| Event {
 //!         id,
@@ -107,12 +108,12 @@
 //!     };
 //!
 //!     // One batch, one write, one signal.
-//!     let first = Uuid::now_v7();
+//!     let first = new_id();
 //!     events.append(&[page(first)])?;
 //!     wake.try_recv()?;
 //!
 //!     // A batch holding an id already written fails whole: nothing written, no signal.
-//!     let failed = events.append(&[page(Uuid::now_v7()), page(first)]);
+//!     let failed = events.append(&[page(new_id()), page(first)]);
 //!     assert_eq!(failed.err(), Some(rannoch_core::Error::Store));
 //!     assert!(wake.try_recv().is_err());
 //!
@@ -128,7 +129,6 @@
 mod queries;
 
 use std::collections::HashMap;
-use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use chrono::SecondsFormat;
@@ -137,6 +137,7 @@ use rusqlite::types::Value as Sql;
 use rusqlite::{CachedStatement, Connection, ErrorCode, Transaction, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
 /// Where this crate's migratr migrations directory is, for the app's `build.rs`.
 pub const MIGRATIONS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/migrations");
@@ -180,14 +181,14 @@ impl StoreRow {
 #[derive(Debug)]
 pub struct Events {
     conn: Mutex<Connection>,
-    queue: Sender<()>,
+    queue: UnboundedSender<()>,
     writes: Writes,
 }
 
 impl Events {
     /// The append over `conn`, signalling `queue` after each commit.
     #[must_use]
-    pub fn new(conn: Connection, queue: Sender<()>) -> Self {
+    pub fn new(conn: Connection, queue: UnboundedSender<()>) -> Self {
         Self {
             conn: Mutex::new(conn),
             queue,
@@ -251,7 +252,7 @@ pub fn taking<T, D, R>(
 pub fn append<T, D>(
     conn: &mut Connection,
     batch: &[Event<T, D>],
-    queue: &Sender<()>,
+    queue: &UnboundedSender<()>,
 ) -> Result<(), Error>
 where
     T: Copy + Into<u16>,
@@ -438,8 +439,10 @@ fn append_in<'e, T: Copy + Into<u16> + 'e, D: 'e>(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::{Arc, Mutex, mpsc};
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::mpsc;
 
+    use rannoch_core::clock::new_id;
     use rannoch_core::{Append, Error, Event, Status};
     use serde_json::json;
     use uuid::Uuid;
@@ -474,23 +477,23 @@ mod tests {
             .unwrap()
     }
 
-    #[test]
-    fn a_batch_that_fails_part_way_writes_none_of_it() {
+    #[tokio::test(start_paused = true)]
+    async fn a_batch_that_fails_part_way_writes_none_of_it() {
         let mut store = rannoch_core::forgr::empty_store();
-        let (queue, signals) = mpsc::channel();
-        let first = Uuid::now_v7();
-        let batch = [event(first), event(Uuid::now_v7()), event(first)];
+        let (queue, mut signals) = mpsc::unbounded_channel();
+        let first = new_id();
+        let batch = [event(first), event(new_id()), event(first)];
 
         assert_eq!(append(&mut store, &batch, &queue), Err(Error::Store));
         assert_eq!(count(&store), 0);
         assert!(signals.try_recv().is_err());
     }
 
-    #[test]
-    fn events_appends_through_core_append_and_signals() {
-        let (queue, signals) = mpsc::channel();
+    #[tokio::test(start_paused = true)]
+    async fn events_appends_through_core_append_and_signals() {
+        let (queue, mut signals) = mpsc::unbounded_channel();
         let events = Events::new(rannoch_core::forgr::empty_store(), queue);
-        let batch = [event(Uuid::now_v7()), event(Uuid::now_v7())];
+        let batch = [event(new_id()), event(new_id())];
 
         Append::append(&events, &batch).unwrap();
 
@@ -498,19 +501,19 @@ mod tests {
         assert_eq!(signals.try_recv(), Ok(()));
     }
 
-    #[test]
-    fn with_writes_inserts_each_2s_store_rows_and_a_failed_batch_puts_them_back() {
+    #[tokio::test(start_paused = true)]
+    async fn with_writes_inserts_each_2s_store_rows_and_a_failed_batch_puts_them_back() {
         let store = rannoch_core::forgr::empty_store();
         let sql = "CREATE TABLE t (k TEXT PRIMARY KEY, n INTEGER, b INTEGER, l TEXT, z TEXT)";
         store.execute_batch(sql).unwrap();
-        let (queue, signals) = mpsc::channel();
+        let (queue, mut signals) = mpsc::unbounded_channel();
         let writes = Arc::new(Mutex::new(HashMap::new()));
         let row = json!({ "k": "a", "n": 2, "b": true, "l": [1], "z": null });
         let item = |table| json!({ "store": { "table": table, "row": row } });
         let two = |source| Event {
             source: Some(source),
             status: Status::Processed,
-            ..event(Uuid::now_v7())
+            ..event(new_id())
         };
         let events = Events::new(store, queue).with_writes(writes.clone());
         let rows = |events: &Events| {
@@ -528,7 +531,7 @@ mod tests {
         // Two 2s, each of a source holding a store row of key a: the first's row is written, and
         // the second's adds none.
         for _ in 0..2 {
-            let source = Uuid::now_v7();
+            let source = new_id();
             writes.lock().unwrap().insert(source, vec![item("t")]);
             Append::append(&events, &[two(source)]).unwrap();
             assert_eq!(signals.try_recv(), Ok(()));
@@ -538,16 +541,16 @@ mod tests {
         assert!(writes.lock().unwrap().is_empty());
 
         // A store row into a table the store does not have fails the batch, which puts it back.
-        let source = Uuid::now_v7();
+        let source = new_id();
         writes.lock().unwrap().insert(source, vec![item("nope")]);
-        let failed = Append::append(&events, &[event(Uuid::now_v7()), two(source)]);
+        let failed = Append::append(&events, &[event(new_id()), two(source)]);
         assert_eq!(failed.err(), Some(Error::Store));
         assert!(signals.try_recv().is_err());
         assert_eq!(count(&events.conn.lock().unwrap()), 2);
         assert_eq!(writes.lock().unwrap()[&source], [item("nope")]);
 
         // An item with a store key that is not a StoreRow fails the batch the same way.
-        let near = Uuid::now_v7();
+        let near = new_id();
         let item = json!({ "store": { "table": "t" } });
         writes.lock().unwrap().insert(near, vec![item]);
         let failed = Append::append(&events, &[two(near)]);
@@ -556,10 +559,10 @@ mod tests {
 
     /// An `Events` with writes over an empty store that `sql` gives its tables: the append, its
     /// writes and the receiver of its signal.
-    fn with_tables(sql: &str) -> (Events, Writes, mpsc::Receiver<()>) {
+    fn with_tables(sql: &str) -> (Events, Writes, mpsc::UnboundedReceiver<()>) {
         let store = rannoch_core::forgr::empty_store();
         store.execute_batch(sql).unwrap();
-        let (queue, signals) = mpsc::channel();
+        let (queue, signals) = mpsc::unbounded_channel();
         let writes = Arc::new(Mutex::new(HashMap::new()));
         (
             Events::new(store, queue).with_writes(writes.clone()),
@@ -570,24 +573,24 @@ mod tests {
 
     /// A 2 whose source's store row `item` is in `writes`.
     fn two_with(writes: &Writes, item: serde_json::Value) -> Event<Ty, String> {
-        let source = Uuid::now_v7();
+        let source = new_id();
         writes.lock().unwrap().insert(source, vec![item]);
         Event {
             source: Some(source),
             status: Status::Processed,
-            ..event(Uuid::now_v7())
+            ..event(new_id())
         }
     }
 
-    #[test]
-    fn a_store_row_t_refuses_is_rolled_back_with_its_2_and_the_rest_of_the_batch_commits() {
-        let (events, writes, signals) =
+    #[tokio::test(start_paused = true)]
+    async fn a_store_row_t_refuses_is_rolled_back_with_its_2_and_the_rest_of_the_batch_commits() {
+        let (events, writes, mut signals) =
             with_tables("CREATE TABLE t (k TEXT PRIMARY KEY, n INTEGER NOT NULL)");
         // `n` is null, as `eval` gives for a field the input lacks.
         let row = |k, n| json!({ "store": { "table": "t", "row": { "k": k, "n": n } } });
         let refused = two_with(&writes, row("a", json!(null)));
         let taken = two_with(&writes, row("b", json!(1)));
-        let other = event(Uuid::now_v7());
+        let other = event(new_id());
 
         let batch = [other.clone(), refused.clone(), taken.clone()];
         let replies = Append::append(&events, &batch).unwrap();
@@ -616,8 +619,8 @@ mod tests {
         assert_eq!(binned.data, "store: NOT NULL constraint failed: t.n");
     }
 
-    #[test]
-    fn a_value_an_integer_primary_key_cannot_hold_is_refused_too() {
+    #[tokio::test(start_paused = true)]
+    async fn a_value_an_integer_primary_key_cannot_hold_is_refused_too() {
         let (events, writes, _signals) = with_tables("CREATE TABLE r (id INTEGER PRIMARY KEY)");
         let two = two_with(
             &writes,
@@ -637,21 +640,21 @@ mod tests {
     /// #123: an item that is not a `store` row is rolled back with its 2 and its
     /// event's store row, the append returns a -1 for the event naming the reason, and the rest
     /// of the batch commits.
-    #[test]
-    fn an_item_that_is_not_a_store_row_is_rolled_back_with_its_2_and_gets_a_minus_1() {
-        let (events, writes, signals) = with_tables("CREATE TABLE t (k TEXT PRIMARY KEY)");
+    #[tokio::test(start_paused = true)]
+    async fn an_item_that_is_not_a_store_row_is_rolled_back_with_its_2_and_gets_a_minus_1() {
+        let (events, writes, mut signals) = with_tables("CREATE TABLE t (k TEXT PRIMARY KEY)");
         let row = |k| json!({ "store": { "table": "t", "row": { "k": k } } });
         let good = two_with(&writes, row("g"));
         // A store row, then an item that is not one.
-        let source = Uuid::now_v7();
+        let source = new_id();
         let op = json!({ "set": { "node": "n", "key": "k", "value": 1 } });
         writes.lock().unwrap().insert(source, vec![row("b"), op]);
         let bad = Event {
             source: Some(source),
             status: Status::Processed,
-            ..event(Uuid::now_v7())
+            ..event(new_id())
         };
-        let other = event(Uuid::now_v7());
+        let other = event(new_id());
 
         let batch = [other.clone(), bad, good.clone()];
         let replies = Append::append(&events, &batch).unwrap();
@@ -695,19 +698,20 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_2_whose_data_does_not_serialize_is_binned_for_its_source_and_any_other_event_for_itself() {
+    #[tokio::test(start_paused = true)]
+    async fn a_2_whose_data_does_not_serialize_is_binned_for_its_source_and_any_other_event_for_itself()
+     {
         let (events, writes, _signals) = with_tables("CREATE TABLE t (k TEXT PRIMARY KEY)");
         let unwritable = || Data::ByPair([((1, 2), 3)].into_iter().collect());
         let at = |source, status, data| Event {
-            id: Uuid::now_v7(),
+            id: new_id(),
             source,
             ty: Ty::Page,
             data,
             run_at: None,
             status,
         };
-        let (x, y) = (Uuid::now_v7(), Uuid::now_v7());
+        let (x, y) = (new_id(), new_id());
         let row = json!({ "store": { "table": "t", "row": { "k": "a" } } });
         writes.lock().unwrap().insert(x, vec![row]);
         // A 2 of x, with a store row; a 0 the app sent with y as its source; and one that serializes
@@ -732,9 +736,9 @@ mod tests {
         assert_eq!(binned, [minus_1(x), minus_1(sourced.id)]);
     }
 
-    #[test]
-    fn an_event_whose_data_does_not_serialize_gets_a_minus_1_and_its_inbox_goes_on() {
-        let (queue, signals) = mpsc::channel();
+    #[tokio::test(start_paused = true)]
+    async fn an_event_whose_data_does_not_serialize_gets_a_minus_1_and_its_inbox_goes_on() {
+        let (queue, mut signals) = mpsc::unbounded_channel();
         let events = Arc::new(Events::new(rannoch_core::forgr::empty_store(), queue));
         let rannoch = rannoch_core::Rannoch::<Ty, Data>::open(rannoch_core::Config {
             append: Some(events.clone()),
@@ -755,10 +759,14 @@ mod tests {
         let pairs = [((1, 2), 3)].into_iter().collect();
         sender.send(sent(Data::ByPair(pairs))).unwrap();
         sender.send(sent(text("first"))).unwrap();
-        let handed = signals.recv_timeout(std::time::Duration::from_secs(5));
-        assert_eq!(handed, Ok(()));
+        // The default inbox's 20 ms interval passes, with the clock frozen.
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert_eq!(signals.try_recv(), Ok(()));
         sender.send(sent(text("later"))).unwrap();
-        rannoch.shutdown();
+        // Shutdown blocks, so async code runs it through spawn_blocking.
+        tokio::task::spawn_blocking(move || rannoch.shutdown())
+            .await
+            .unwrap();
 
         // The other event is written, and so is a later one; in the first's place, a -1 for it
         // naming the reason, its source the id the first was accepted with, which is not stored
@@ -780,12 +788,12 @@ mod tests {
         assert_eq!(stored, 0);
     }
 
-    #[test]
-    fn append_in_a_transaction_that_is_rolled_back_writes_nothing() {
+    #[tokio::test(start_paused = true)]
+    async fn append_in_a_transaction_that_is_rolled_back_writes_nothing() {
         let mut store = rannoch_core::forgr::empty_store();
         let tx = store.transaction().unwrap();
 
-        let (a, b) = (event(Uuid::now_v7()), event(Uuid::now_v7()));
+        let (a, b) = (event(new_id()), event(new_id()));
         super::append_in(&tx, &[(&a, "{}".to_owned()), (&b, "{}".to_owned())]).unwrap();
         assert_eq!(count(&tx), 2);
         tx.rollback().unwrap();
@@ -793,14 +801,14 @@ mod tests {
         assert_eq!(count(&store), 0);
     }
 
-    #[test]
-    fn run_at_is_rfc3339_utc_at_millis() {
+    #[tokio::test(start_paused = true)]
+    async fn run_at_is_rfc3339_utc_at_millis() {
         let mut store = rannoch_core::forgr::empty_store();
-        let (queue, _signals) = mpsc::channel();
+        let (queue, _signals) = mpsc::unbounded_channel();
         let at = chrono::DateTime::from_timestamp_micros(1_763_100_000_123_456).unwrap();
         let batch = [Event {
             run_at: Some(at),
-            ..event(Uuid::now_v7())
+            ..event(new_id())
         }];
 
         append(&mut store, &batch, &queue).unwrap();

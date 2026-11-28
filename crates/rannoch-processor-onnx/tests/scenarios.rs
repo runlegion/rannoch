@@ -5,9 +5,11 @@
 //! network.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, mpsc, mpsc::Sender};
+use std::sync::Arc;
+
 use std::time::{Duration, Instant};
 use std::{fs, process::Command, thread};
+use tokio::sync::mpsc::{self, UnboundedSender};
 
 use rannoch_core::forgr::_events;
 use rannoch_core::{Append, Config, Rannoch};
@@ -70,7 +72,7 @@ fn flows() -> Result<String> {
 /// The app: its database, the queue's signal, rannoch, the queue, and rannoch-processor.
 struct App(
     Connection,
-    Sender<()>,
+    UnboundedSender<()>,
     Rannoch<u16, Value>,
     Queue,
     Arc<Processor<u16, Value>>,
@@ -90,7 +92,7 @@ impl App {
         };
         Rannoch::<u16, Value>::open(config(None))?.shutdown();
         let processor = Arc::new(Processor::new(&flows()?, actions, ready(&path)?)?);
-        let (signal, wake) = mpsc::channel();
+        let (signal, wake) = mpsc::unbounded_channel();
         let events = Events::new(ready(&path)?, signal.clone());
         let rannoch = Rannoch::open(config(Some(Arc::new(events) as Arc<dyn Append<_, _>>)))?;
         let (flows, settings) = (processor.clone(), Settings::new(Duration::from_millis(100)));

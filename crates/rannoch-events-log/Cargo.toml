@@ -16,7 +16,7 @@ serde_json = "1"
 [dev-dependencies]
 rannoch-events = { path = "../rannoch-events" }
 rannoch-store = { path = "../rannoch-store" }
-uuid = { version = "1", features = ["v7"] }
+tokio = { version = "1", features = ["macros", "rt", "test-util"] }
 
 [lints]
 workspace = true

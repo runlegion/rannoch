@@ -6,17 +6,15 @@
 //! `@criterion-FR-RANNOCH-011-c2` runs cargo on a copy of this workspace, so
 //! a developer's edit never touches the real checkout.
 //!
-//! Every test but `an_app_opens_rannoch_over_its_database` runs with the clock frozen and
-//! calls [`Rannoch::shutdown`] through `spawn_blocking`; that one waits on rannoch-store's
-//! checkpointer, which still runs on real time. The two scenarios of `fr_rannoch_131.feature`
-//! check the clock itself.
+//! Every test runs with the clock frozen and calls [`Rannoch::shutdown`] through
+//! `spawn_blocking`. The two scenarios of `fr_rannoch_131.feature` check the clock itself.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Once, mpsc};
+use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
-use std::{env, fs, process, thread};
+use std::{env, fs, process};
 
 use chrono::TimeDelta;
 use log::{Level, Log, Metadata, Record};
@@ -187,7 +185,7 @@ fn open_with(
 }
 
 /// The events crate's append over the store at `path`, signalling `queue`.
-fn events(path: &Path, queue: mpsc::Sender<()>) -> Result<Arc<Events>> {
+fn events(path: &Path, queue: tokio::sync::mpsc::UnboundedSender<()>) -> Result<Arc<Events>> {
     Ok(Arc::new(Events::new(
         rusqlite::Connection::open(path)?,
         queue,
@@ -198,7 +196,7 @@ fn events(path: &Path, queue: mpsc::Sender<()>) -> Result<Arc<Events>> {
 async fn fr_rannoch_005_c1() {
     // Given events on an inbox's heap
     let path = empty_store("fr_rannoch_005_c1").unwrap();
-    let (queue, signals) = mpsc::channel();
+    let (queue, mut signals) = tokio::sync::mpsc::unbounded_channel();
     let rannoch = open_with(events(&path, queue).unwrap(), TimeDelta::milliseconds(200)).unwrap();
     let sender = rannoch.sender();
     for _ in 0..3 {
@@ -215,7 +213,10 @@ async fn fr_rannoch_005_c1() {
 
     // And the heap is empty: shutdown hands over what is left, and nothing is
     shutdown(rannoch).await;
-    assert_eq!(signals.try_recv(), Err(mpsc::TryRecvError::Disconnected));
+    assert_eq!(
+        signals.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+    );
     assert_eq!(events_in(&path).unwrap(), 3);
 }
 
@@ -227,7 +228,7 @@ async fn fr_rannoch_005_c2() {
     if let Ok(path) = env::var(CRASH_STORE) {
         // The child: events on an inbox's heap, then the process stops
         // before the batch is handed over.
-        let (queue, _signals) = mpsc::channel();
+        let (queue, _signals) = tokio::sync::mpsc::unbounded_channel();
         let rannoch = open_with(
             events(Path::new(&path), queue).unwrap(),
             TimeDelta::hours(1),
@@ -313,7 +314,7 @@ async fn fr_rannoch_005_c3() {
 
     // Given the events crate cannot append
     let path = empty_store("fr_rannoch_005_c3").unwrap();
-    let (queue, signals) = mpsc::channel();
+    let (queue, mut signals) = tokio::sync::mpsc::unbounded_channel();
     let flaky = Arc::new(Flaky {
         failing: AtomicBool::new(true),
         events: events(&path, queue).unwrap(),
@@ -331,7 +332,10 @@ async fn fr_rannoch_005_c3() {
 
     // And the events are still on the heap: none reached _events
     assert_eq!(events_in(&path).unwrap(), 0);
-    assert_eq!(signals.try_recv(), Err(mpsc::TryRecvError::Empty));
+    assert_eq!(
+        signals.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    );
 
     // When the events crate can append again and the next interval passes
     flaky.failing.store(false, Ordering::SeqCst);
@@ -453,8 +457,8 @@ fn pragma(conn: &rusqlite::Connection, pragma: &str) -> rusqlite::Result<String>
     })
 }
 
-#[test]
-fn an_app_opens_rannoch_over_its_database() {
+#[tokio::test(start_paused = true)]
+async fn an_app_opens_rannoch_over_its_database() {
     // Given an app's database without its newest migration
     let path = database("an_app_opens_rannoch_over_its_database").unwrap();
     let newest = missing_newest(&path).unwrap();
@@ -469,7 +473,7 @@ fn an_app_opens_rannoch_over_its_database() {
     // Then the newest migration is applied before rannoch accepts an event
     assert!(applied(&path).unwrap().contains(&newest));
     assert_eq!(opened.sender().send(event()), Ok(Status::Added));
-    opened.shutdown();
+    shutdown(opened).await;
 
     // And every connection the store opens has foreign keys on, journal mode
     // WAL, a 64 MiB cache, automatic checkpoints off and fullfsync on
@@ -488,7 +492,7 @@ fn an_app_opens_rannoch_over_its_database() {
     let held = rusqlite::Connection::open(&path).unwrap();
     held.query_row("SELECT count(*) FROM _events", [], |r| r.get::<_, i64>(0))
         .unwrap();
-    let (queue, _signals) = mpsc::channel();
+    let (queue, _signals) = tokio::sync::mpsc::unbounded_channel();
     let rannoch = Rannoch::<u8, String>::open(Config {
         store: Some(Arc::new(Store::new(path.clone(), rannoch_core::migrator()))),
         append: Some(Arc::new(Events::new(conn, queue))),
@@ -499,7 +503,7 @@ fn an_app_opens_rannoch_over_its_database() {
     for _ in 0..3 {
         sender.send(event()).unwrap();
     }
-    thread::sleep(Duration::from_secs(2));
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     // Then the WAL's frames are in the database file while rannoch runs: a
     // copy of the file alone, without its WAL, holds the events
@@ -510,7 +514,7 @@ fn an_app_opens_rannoch_over_its_database() {
         .query_row("SELECT count(*) FROM _events", [], |r| r.get(0))
         .unwrap();
     assert_eq!(kept, 3);
-    rannoch.shutdown();
+    shutdown(rannoch).await;
     drop(held);
 
     // When the app opens rannoch over a path the store cannot open
@@ -545,9 +549,12 @@ fn with_settings(test: &str, settings: &Path) -> Result<()> {
 fn open_an_hour(
     name: &str,
     settings: PathBuf,
-) -> Result<(Rannoch<u8, String>, mpsc::Receiver<()>)> {
+) -> Result<(
+    Rannoch<u8, String>,
+    tokio::sync::mpsc::UnboundedReceiver<()>,
+)> {
     let path = empty_store(name)?;
-    let (queue, signals) = mpsc::channel();
+    let (queue, signals) = tokio::sync::mpsc::unbounded_channel();
     let rannoch = Rannoch::open(Config {
         default_interval: TimeDelta::hours(1),
         append: Some(events(&path, queue)?),
@@ -562,7 +569,7 @@ fn open_an_hour(
 async fn core_settings_c1() -> Result<()> {
     if let Ok(settings) = env::var(CORE_SETTINGS) {
         // When Rannoch::open is called with that file's path and an event is sent
-        let (rannoch, signals) = open_an_hour("core_settings_c1", settings.into())?;
+        let (rannoch, mut signals) = open_an_hour("core_settings_c1", settings.into())?;
 
         // Then the default inbox hands it over at the interval the [core] section gives
         tokio::time::sleep(Duration::from_millis(60)).await;
@@ -580,11 +587,14 @@ async fn core_settings_c1() -> Result<()> {
 async fn core_settings_c2() -> Result<()> {
     if let Ok(settings) = env::var(CORE_SETTINGS) {
         // When Rannoch::open is called with that file's path and an event is sent
-        let (rannoch, signals) = open_an_hour("core_settings_c2", settings.into())?;
+        let (rannoch, mut signals) = open_an_hour("core_settings_c2", settings.into())?;
 
         // Then the default inbox does not hand it over before shutdown
         tokio::time::sleep(Duration::from_millis(500)).await;
-        assert_eq!(signals.try_recv(), Err(mpsc::TryRecvError::Empty));
+        assert_eq!(
+            signals.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        );
         shutdown(rannoch).await;
         assert_eq!(signals.try_recv(), Ok(()));
         return Ok(());

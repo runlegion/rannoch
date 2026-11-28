@@ -1,21 +1,20 @@
 //! #132's scenario. The app's append is rannoch-events' over the app's database through the real
 //! store, wrapped in the log; after it commits a batch, each event of the batch is one JSON line
-//! in the log file.
+//! in the log file. It runs with the clock frozen, and calls the sync, blocking append through
+//! `tokio::task::spawn_blocking`.
 
 use std::fs;
 use std::path::Path;
-use std::sync::mpsc;
 
 use chrono::DateTime;
-use rannoch_core::{Append, Event, Status, Storage};
+use rannoch_core::{Append, Event, Status, Storage, clock};
 use rannoch_events::Events;
 use rannoch_events_log::Log;
 use rannoch_store::{Opened, Store};
 use serde_json::{Value, json};
-use uuid::Uuid;
 
-#[test]
-fn each_event_of_a_committed_batch_is_one_json_line_in_the_log() {
+#[tokio::test(start_paused = true)]
+async fn each_event_of_a_committed_batch_is_one_json_line_in_the_log() {
     // Given an app whose append over its store is wrapped in the log, with the path its settings
     // give
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("events-log");
@@ -30,12 +29,15 @@ fn each_event_of_a_committed_batch_is_one_json_line_in_the_log() {
         Opened::Pending(p) => panic!("pending: {p:?}"),
     };
     let file = dir.join("events.log");
-    let log = Log::new(Events::new(ready(), mpsc::channel().0), file.clone());
+    let log = Log::new(
+        Events::new(ready(), tokio::sync::mpsc::unbounded_channel().0),
+        file.clone(),
+    );
 
     // When it commits a batch of three events
     let at = DateTime::from_timestamp_millis(1_790_000_000_000);
     let event = |source, data, run_at, status| Event {
-        id: Uuid::now_v7(),
+        id: clock::new_id(),
         source,
         ty: 10_u16,
         data,
@@ -48,7 +50,12 @@ fn each_event_of_a_committed_batch_is_one_json_line_in_the_log() {
         event(None, json!({ "n": 2 }), at, Status::Added),
         page,
     ];
-    log.append(&batch).unwrap();
+    let batch = tokio::task::spawn_blocking(move || {
+        log.append(&batch).unwrap();
+        batch
+    })
+    .await
+    .unwrap();
     let rows: i64 = ready()
         .query_row("SELECT count(*) FROM _events", [], |r| r.get(0))
         .unwrap();
