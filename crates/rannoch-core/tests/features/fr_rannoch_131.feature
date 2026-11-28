@@ -12,3 +12,9 @@ Feature: rannoch has one clock, on tokio's time, and tests freeze it
     Given a frozen clock, and two waits with deadlines 50 ms and 200 ms from now
     When the test advances the clock by 100 ms
     Then the wall time, the elapsed time and a new id's time have each moved by exactly 100 ms, the 50 ms wait has woken and the 200 ms wait has not
+
+  @module-rannoch-core @criterion-01a220b8-d5bd-7151-baf4-97a3c4b86d45
+  Scenario: No real-time call outside the clock
+    Given the rannoch workspace with clippy's disallowed-methods rule on
+    When clippy runs over every crate, its code and its tests
+    Then it passes, and adding a call to any of std::thread::sleep, Instant::now, SystemTime::now, Utc::now or Uuid::now_v7 outside rannoch-core's clock makes it fail

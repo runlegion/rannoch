@@ -14,6 +14,10 @@ use uuid::{Timestamp, Uuid};
 
 /// The wall time and tokio's time when the clock started: the first time any of its functions
 /// is called in this process.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the clock alone reads the real wall time, once, when it starts"
+)]
 fn start() -> &'static (DateTime<Utc>, Instant) {
     static START: OnceLock<(DateTime<Utc>, Instant)> = OnceLock::new();
     START.get_or_init(|| (Utc::now(), Instant::now()))
