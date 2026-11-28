@@ -4,13 +4,13 @@
 //! written into `_events` from the app's forgr factory. rannoch-store has one store per
 //! process, so the scenarios take turns.
 
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
-use std::{fs, thread};
+use std::sync::Arc;
+use std::time::Duration;
 
 use rannoch_core::forgr::_events;
-use rannoch_core::{Append, Config, Rannoch};
+use rannoch_core::{Append, Config, Rannoch, clock};
 use rannoch_events::Events;
 use rannoch_graph::{Hoods, SIGNATURES, Warm};
 use rannoch_processor::{FlowDoc, Processor, Sig, check};
@@ -18,12 +18,13 @@ use rannoch_queue::{Queue, Settings};
 use rannoch_store::{Opened, Store};
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 /// One scenario at a time: the store is the process's one.
-static ONE: Mutex<()> = Mutex::new(());
+static ONE: Mutex<()> = Mutex::const_new(());
 
 /// The app's ontology, as its ontology crate's migrations make it: names rannoch-graph never
 /// names.
@@ -92,28 +93,28 @@ fn ready(path: &Path) -> Result<Connection> {
 }
 
 /// A fresh store `name`, with every migration of rannoch's applied by opening rannoch once.
-fn migrated(name: &str) -> Result<PathBuf> {
+async fn migrated(name: &str) -> Result<PathBuf> {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
     drop(fs::remove_dir_all(&dir));
     fs::create_dir_all(&dir)?;
     let path = dir.join("store.db");
     let store = Some(Arc::new(Store::new(path.clone(), rannoch_core::migrator())) as _);
-    Rannoch::<u16, Value>::open(Config {
+    let rannoch = Rannoch::<u16, Value>::open(Config {
         store,
         ..Config::default()
-    })?
-    .shutdown();
+    })?;
+    tokio::task::spawn_blocking(move || rannoch.shutdown()).await?;
     Ok(path)
 }
 
 /// Waits up to thirty seconds for `done`.
-fn until(done: impl Fn() -> bool) -> bool {
-    let start = Instant::now();
+async fn until(done: impl Fn() -> bool) -> bool {
+    let start = clock::elapsed();
     while start.elapsed() < Duration::from_secs(30) {
         if done() {
             return true;
         }
-        thread::sleep(Duration::from_millis(20));
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
     done()
 }
@@ -129,8 +130,8 @@ struct App {
 impl App {
     /// The app over a fresh store `name` holding its ontology, its flows checked against
     /// rannoch-graph's signatures, and its append `Events` with its writes, in a `Warm`.
-    fn start(name: &str) -> Result<Self> {
-        let path = migrated(name)?;
+    async fn start(name: &str) -> Result<Self> {
+        let path = migrated(name).await?;
         let conn = ready(&path)?;
         conn.execute_batch(ONTOLOGY)?;
         let docs: Vec<(String, FlowDoc)> = serde_json::from_str(FLOWS)?;
@@ -161,7 +162,7 @@ impl App {
 
     /// Hands the queue an event of `ty` with `data`; returns its id.
     fn hand(&self, ty: i64, data: &Value) -> Result<Uuid> {
-        let id = Uuid::now_v7();
+        let id = clock::new_id();
         let row = _events::factory()
             .id(id.to_string())
             .ty(ty)
@@ -183,31 +184,37 @@ impl App {
     }
 
     /// The data of the row about `id` at `status`, once there is one.
-    fn about(&self, id: Uuid, status: i64) -> Option<Value> {
-        until(|| self.now(id, status).is_some());
+    async fn about(&self, id: Uuid, status: i64) -> Option<Value> {
+        until(|| self.now(id, status).is_some()).await;
         self.now(id, status)
     }
 
     /// Hands a read of `ty` with `data`, and returns its result: the data of the event it
     /// returns, whose source it is.
-    fn read(&self, ty: i64, data: &Value) -> Result<Value> {
+    async fn read(&self, ty: i64, data: &Value) -> Result<Value> {
         let id = self.hand(ty, data)?;
         self.about(id, 0)
+            .await
             .ok_or_else(|| format!("read {id} returned nothing").into())
     }
 
     /// Writes the cite of `cited` by `doc` through the app's flow, and waits for its 2.
-    fn cite(&self, doc: &str, cited: &str) -> Result<()> {
+    async fn cite(&self, doc: &str, cited: &str) -> Result<()> {
         let id = self.hand(40, &json!({ "doc": doc, "cited": cited }))?;
         self.about(id, 2)
+            .await
             .map(drop)
             .ok_or_else(|| format!("cite {id} has no 2").into())
     }
 
-    fn stop(self) {
+    async fn stop(self) {
         drop(self.signal);
-        self.rannoch.shutdown();
-        assert!(self.queue.join().is_ok());
+        let (rannoch, queue) = (self.rannoch, self.queue);
+        let stopped = tokio::task::spawn_blocking(move || {
+            rannoch.shutdown();
+            queue.join().is_ok()
+        });
+        assert!(matches!(stopped.await, Ok(true)));
     }
 }
 
@@ -228,11 +235,11 @@ fn tables(conn: &Connection) -> Vec<String> {
 }
 
 /// FR-RANNOCH-125-c1: rannoch-graph has no _nodes or _edges tables.
-#[test]
-fn fr_rannoch_125_c1() {
-    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+#[tokio::test(start_paused = true)]
+async fn fr_rannoch_125_c1() {
+    let _one = ONE.lock().await;
     // Given a store with every one of rannoch's migrations applied
-    let path = migrated("c1").unwrap();
+    let path = migrated("c1").await.unwrap();
 
     // Then it holds no _nodes or _edges, and rannoch-graph has no migrations to make them
     let held = tables(&ready(&path).unwrap());
@@ -247,11 +254,11 @@ fn fr_rannoch_125_c1() {
 
 /// FR-RANNOCH-125-c2 and 01a216a5-c6f6-7051-82f2-2c64fc1703ed: the app's shape is its
 /// ontology's tables, and they are what rannoch-graph's steps read.
-#[test]
-fn fr_rannoch_125_c2() {
-    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+#[tokio::test(start_paused = true)]
+async fn fr_rannoch_125_c2() {
+    let _one = ONE.lock().await;
     // Given an app whose ontology holds doc_titles and cites
-    let app = App::start("c2").unwrap();
+    let app = App::start("c2").await.unwrap();
 
     // Then the store's tables beyond rannoch's _events are the ontology's
     let mut held = tables(&app.conn);
@@ -259,23 +266,23 @@ fn fr_rannoch_125_c2() {
     assert_eq!(held, ["cites", "doc_titles"]);
 
     // When a flow writes cites into the app's table, and a read walks them
-    app.cite("d1", "d2").unwrap();
-    app.cite("d2", "d3").unwrap();
+    app.cite("d1", "d2").await.unwrap();
+    app.cite("d2", "d3").await.unwrap();
 
     // Then the walk reaches what the app's table holds
-    let walked = app.read(50, &json!({ "node": "d1" })).unwrap();
+    let walked = app.read(50, &json!({ "node": "d1" })).await.unwrap();
     assert_eq!(ids(&walked), ["d2", "d3"]);
-    app.stop();
+    app.stop().await;
 }
 
 /// FR-RANNOCH-125-c4: every read is an event, and that event returns its result.
-#[test]
-fn fr_rannoch_125_c4() {
-    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+#[tokio::test(start_paused = true)]
+async fn fr_rannoch_125_c4() {
+    let _one = ONE.lock().await;
     // Given an app whose doc d1 was titled by one event and retitled by the next, at 1,000 and
     // 2,000, and which cites d2 from d1 at 1,000
-    let app = App::start("c4").unwrap();
-    let (first, fix) = (Uuid::now_v7().to_string(), Uuid::now_v7().to_string());
+    let app = App::start("c4").await.unwrap();
+    let (first, fix) = (clock::new_id().to_string(), clock::new_id().to_string());
     let row = |id: &String| {
         _events::factory()
             .id(id.clone())
@@ -297,13 +304,28 @@ fn fr_rannoch_125_c4() {
 
     // When the app sends a walk, a why, and as-of reads of a row, a walk and edges, each as an
     // event
-    let walked = app.read(50, &json!({ "node": "d1" })).unwrap();
-    let why = app.read(51, &json!({ "node": "d1" })).unwrap();
-    let then = app.read(52, &json!({ "node": "d1", "at": 1_500 })).unwrap();
-    let before = app.read(54, &json!({ "node": "d1", "at": 999 })).unwrap();
-    let since = app.read(54, &json!({ "node": "d1", "at": 1_500 })).unwrap();
-    let none = app.read(55, &json!({ "node": "d1", "at": 999 })).unwrap();
-    let cited = app.read(55, &json!({ "node": "d1", "at": 1_500 })).unwrap();
+    let walked = app.read(50, &json!({ "node": "d1" })).await.unwrap();
+    let why = app.read(51, &json!({ "node": "d1" })).await.unwrap();
+    let then = app
+        .read(52, &json!({ "node": "d1", "at": 1_500 }))
+        .await
+        .unwrap();
+    let before = app
+        .read(54, &json!({ "node": "d1", "at": 999 }))
+        .await
+        .unwrap();
+    let since = app
+        .read(54, &json!({ "node": "d1", "at": 1_500 }))
+        .await
+        .unwrap();
+    let none = app
+        .read(55, &json!({ "node": "d1", "at": 999 }))
+        .await
+        .unwrap();
+    let cited = app
+        .read(55, &json!({ "node": "d1", "at": 1_500 }))
+        .await
+        .unwrap();
 
     // Then each read event returns its result as an event whose source it is
     assert_eq!(
@@ -318,17 +340,17 @@ fn fr_rannoch_125_c4() {
     assert_eq!(none, json!({ "edges": { "rows": [] } }));
     let row = json!({ "doc": "d1", "cited": "d2", "written": 1_000 });
     assert_eq!(cited, json!({ "edges": { "rows": [row] } }));
-    app.stop();
+    app.stop().await;
 }
 
 /// FR-RANNOCH-126-c1: rannoch-graph is bitemporal: as of one time, a read by recorded time and
 /// a read by valid time give each its own row.
-#[test]
-fn fr_rannoch_126_c1() {
-    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+#[tokio::test(start_paused = true)]
+async fn fr_rannoch_126_c1() {
+    let _one = ONE.lock().await;
     // Given d1 titled by an event at 1,000, valid from 1,000, and retitled by an event at 2,000,
     // valid from 1,500
-    let app = App::start("bitemporal").unwrap();
+    let app = App::start("bitemporal").await.unwrap();
     let title = "INSERT INTO doc_titles VALUES ('d1', ?1, ?2, ?3)";
     for (name, recorded, valid) in [
         ("graph notes", 1_000, 1_000),
@@ -342,53 +364,56 @@ fn fr_rannoch_126_c1() {
 
     // When the app reads d1 as of 1,700 by valid time and by recorded time, each as an event
     let at = json!({ "node": "d1", "at": 1_700 });
-    let valid = app.read(52, &at).unwrap();
-    let recorded = app.read(56, &at).unwrap();
+    let valid = app.read(52, &at).await.unwrap();
+    let recorded = app.read(56, &at).await.unwrap();
 
     // Then valid time gives the retitle, and recorded time the title the store held by then
     assert_eq!(valid["row"]["title"], json!("graph store notes"));
     assert_eq!(recorded["row"]["title"], json!("graph notes"));
-    app.stop();
+    app.stop().await;
 }
 
 /// 01a2166f-db5e-76d0-9f75-25c911d0f98c: rannoch-graph reads nothing of its own: a step reads
 /// only the table its options name, and one the store does not have fails its read event.
-#[test]
-fn criterion_01a2166f_rannoch_graph_reads_nothing_of_its_own() {
-    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+#[tokio::test(start_paused = true)]
+async fn criterion_01a2166f_rannoch_graph_reads_nothing_of_its_own() {
+    let _one = ONE.lock().await;
     // Given an app with its ontology
-    let app = App::start("utils").unwrap();
+    let app = App::start("utils").await.unwrap();
 
     // When a read's walk names a table the store does not have
     let id = app.hand(53, &json!({ "node": "d1" })).unwrap();
 
     // Then the read event gets a -1 naming it, and returns nothing
-    assert_eq!(app.about(id, -1), Some(json!("walk: no such table: nope")));
+    assert_eq!(
+        app.about(id, -1).await,
+        Some(json!("walk: no such table: nope"))
+    );
     let returned = "SELECT count(*) FROM _events WHERE source = ?1 AND ty = 60";
     let returned = app
         .conn
         .query_row(returned, [id.to_string()], |r| r.get::<_, i64>(0));
     assert_eq!(returned.unwrap(), 0);
-    app.stop();
+    app.stop().await;
 }
 
 /// FR-RANNOCH-127-c1: warm hoods are part of rannoch-graph's core: a walk is kept warm, and a
 /// cite the app writes through `Warm` drops it, so the next read returns the new reach.
-#[test]
-fn fr_rannoch_127_c1() {
-    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+#[tokio::test(start_paused = true)]
+async fn fr_rannoch_127_c1() {
+    let _one = ONE.lock().await;
     // Given an app whose d1 cites d2, read once, which warms its hood
-    let app = App::start("hoods").unwrap();
-    app.cite("d1", "d2").unwrap();
+    let app = App::start("hoods").await.unwrap();
+    app.cite("d1", "d2").await.unwrap();
     let node = json!({ "node": "d1" });
-    assert_eq!(ids(&app.read(50, &node).unwrap()), ["d2"]);
+    assert_eq!(ids(&app.read(50, &node).await.unwrap()), ["d2"]);
 
     // When d2 cites d3 through the app's flow
-    app.cite("d2", "d3").unwrap();
+    app.cite("d2", "d3").await.unwrap();
 
     // Then the next read returns the new reach
-    assert_eq!(ids(&app.read(50, &node).unwrap()), ["d2", "d3"]);
-    app.stop();
+    assert_eq!(ids(&app.read(50, &node).await.unwrap()), ["d2", "d3"]);
+    app.stop().await;
 }
 
 /// The ids a scorer's result scored, highest first, with their scores.
@@ -401,11 +426,11 @@ fn scored(result: &Value) -> Vec<(&str, f64)> {
 /// FR-RANNOCH-128-c1: the scoring tools are part of rannoch-graph by default: the app hands
 /// `Processor::new` only rannoch-graph's actions, its flows calling each scorer pass `check`
 /// against [`SIGNATURES`], and each scoring read returns its scores as an event.
-#[test]
-fn fr_rannoch_128_c1() {
-    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+#[tokio::test(start_paused = true)]
+async fn fr_rannoch_128_c1() {
+    let _one = ONE.lock().await;
     // Given an app whose d1 cites d2 and d3, and d2 cites d4, each weighing its time
-    let app = App::start("scoring").unwrap();
+    let app = App::start("scoring").await.unwrap();
     let cite = "INSERT INTO cites VALUES (?1, ?2, ?3)";
     for (doc, cited, at) in [
         ("d1", "d2", 1_000),
@@ -417,7 +442,11 @@ fn fr_rannoch_128_c1() {
 
     // When the app sends a read by each scorer, each as an event
     let node = json!({ "node": "d1" });
-    let [katz, pagerank, shared, learned] = [57, 58, 59, 65].map(|ty| app.read(ty, &node).unwrap());
+    let mut reads = Vec::new();
+    for ty in [57, 58, 59, 65] {
+        reads.push(app.read(ty, &node).await.unwrap());
+    }
+    let [katz, pagerank, shared, learned] = <[Value; 4]>::try_from(reads).unwrap();
 
     // Then each read returns the scores of the nodes near d1, highest first
     assert_eq!(scored(&katz), [("d2", 0.5), ("d3", 0.5), ("d4", 0.25)]);
@@ -428,14 +457,14 @@ fn fr_rannoch_128_c1() {
     assert_eq!(scored(&shared), [("d4", 1.0)]);
     assert_eq!(scored(&learned), [("d3", 2_000.0), ("d2", 1_000.0)]);
     assert_eq!(katz["scores"]["cut"], json!(false));
-    app.stop();
+    app.stop().await;
 }
 
 /// FR-RANNOCH-128-c2: no part of rannoch-graph stores or uses vectors: it has no tables, none
 /// of its steps takes or gives a list of numbers or takes a score from outside the graph, and
 /// it does not depend on rannoch-processor-onnx, rannoch's one maker of vectors.
-#[test]
-fn fr_rannoch_128_c2() {
+#[tokio::test(start_paused = true)]
+async fn fr_rannoch_128_c2() {
     let sigs: Vec<Sig> = serde_json::from_str(SIGNATURES).unwrap();
     assert_eq!(sigs.len(), 8);
     for sig in &sigs {
@@ -455,4 +484,86 @@ fn fr_rannoch_128_c2() {
     let deps = fs::read_to_string(manifest.join("Cargo.toml")).unwrap();
     assert!(!deps.contains("onnx"), "{deps}");
     assert!(!manifest.join("migrations").exists());
+}
+
+/// The text of each of rannoch-graph's Rust files, in src/ and tests/, with its path.
+fn sources() -> Result<Vec<(PathBuf, String)>> {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    for dir in ["src", "tests"] {
+        for entry in fs::read_dir(manifest.join(dir))? {
+            let path = entry?.path();
+            if path.extension().is_some_and(|e| e == "rs") {
+                let text = fs::read_to_string(&path)?;
+                files.push((path, text));
+            }
+        }
+    }
+    Ok(files)
+}
+
+/// 01a220b8-d5bd-7151-baf4-97a3c4b86d45: rannoch-graph's code and tests call no real-time
+/// function; its time and waiting go through rannoch-core's clock and tokio.
+#[tokio::test(start_paused = true)]
+async fn rannoch_graph_calls_no_real_time_function() {
+    // Given rannoch-graph's code and tests
+    let files = sources().unwrap();
+    assert!(files.len() >= 5, "{}", files.len());
+
+    // Then none calls a real-time function. Each name is joined here, so this file does not
+    // hold the call it looks for.
+    let calls = [
+        ["thread", "sleep"],
+        ["thread", "spawn"],
+        ["Instant", "now"],
+        ["SystemTime", "now"],
+        ["Utc", "now"],
+        ["Uuid", "now_v7"],
+    ]
+    .map(|parts| parts.join("::"));
+    let calls = calls.into_iter().chain([["recv", "timeout"].join("_")]);
+    let calls: Vec<String> = calls.collect();
+    for (path, text) in &files {
+        for call in &calls {
+            assert!(
+                !text.contains(call.as_str()),
+                "{} calls {call}",
+                path.display()
+            );
+        }
+    }
+}
+
+/// 01a220b8-d5bd-7151-baf4-97a3c4b86d45: every rannoch-graph test runs with the clock frozen,
+/// and moves time only with `tokio::time::advance` or tokio's auto-advance.
+#[tokio::test(start_paused = true)]
+async fn every_rannoch_graph_test_runs_with_the_clock_frozen() {
+    // Given rannoch-graph's tests
+    let files = sources().unwrap();
+    let frozen = "#[tokio::test(start_paused = true)]";
+    let tests: usize = files
+        .iter()
+        .map(|(_, text)| text.matches(frozen).count())
+        .sum();
+    assert!(tests >= 20, "{tests}");
+
+    // Then each runs as a frozen tokio test: none is a plain test, and every tokio test starts
+    // paused
+    let plain = ["#[", "test]"].concat();
+    let any = ["#[tokio", "::test"].concat();
+    for (path, text) in &files {
+        assert!(
+            !text.contains(&plain),
+            "{} has a plain test",
+            path.display()
+        );
+        let all = text.matches(&any).count();
+        let paused = text.matches(frozen).count();
+        assert_eq!(
+            all,
+            paused,
+            "{} has a tokio test not frozen",
+            path.display()
+        );
+    }
 }
