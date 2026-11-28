@@ -299,8 +299,8 @@ mod doc;
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::{collections::HashMap, time::Duration};
 
-use chrono::{TimeDelta, Utc};
-use rannoch_core::{Event, Sender, Status};
+use chrono::TimeDelta;
+use rannoch_core::{Event, Sender, Status, clock};
 use rannoch_events::StoreRow;
 use rannoch_queue::{Flow, Flows, Row};
 use rusqlite::Connection;
@@ -460,7 +460,7 @@ impl<T: TryFrom<u16> + PartialEq + 'static, D: From<Value> + 'static> Processor<
                             ty(event.ty).map(|t| (id, t, said.into(), None, Status::Processed));
                         let nexts = outs.into_iter().map(|(source, to, data, delay)| {
                             let at = TimeDelta::from_std(Duration::from_millis(delay)).ok();
-                            let at = at.and_then(|d| Utc::now().checked_add_signed(d));
+                            let at = at.and_then(|d| clock::now().checked_add_signed(d));
                             let range =
                                 || format!("a delay of {delay} ms to ty {to} is out of range");
                             let at = Some(at.ok_or_else(range)?);
@@ -744,13 +744,20 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::sync::{Arc, Mutex};
 
-    use rannoch_core::{Append, Config, Event, Rannoch, Status};
+    use rannoch_core::{Append, Config, Event, Rannoch, Status, clock};
     use rannoch_queue::Flows;
     use rusqlite::Connection;
     use serde_json::{Map, Value, json};
     use uuid::Uuid;
 
     use super::{Action, FlowDoc, Processor, Sig};
+
+    /// Shuts `rannoch` down from async code: shutdown blocks, so it runs through `spawn_blocking`.
+    async fn shutdown(rannoch: Rannoch<u16, Value>) {
+        tokio::task::spawn_blocking(move || rannoch.shutdown())
+            .await
+            .unwrap();
+    }
 
     type Out = (Uuid, u16, Map<String, Value>, u64);
 
@@ -810,8 +817,8 @@ mod tests {
         (ran, calls)
     }
 
-    #[test]
-    fn a_links_graph_is_in_neither_the_next_links_options_nor_the_nexts_data() {
+    #[tokio::test(start_paused = true)]
+    async fn a_links_graph_is_in_neither_the_next_links_options_nor_the_nexts_data() {
         let flow = json!({ "name": "f", "ty": 1, "takes": {}, "steps": [{ "do": "a.b", "as": "got",
             "next": { "ty": 2, "shape": { "got": "$got" } } }] });
         let flow: FlowDoc = serde_json::from_value(flow).unwrap();
@@ -838,7 +845,7 @@ mod tests {
     /// `ty`: 70 gives a write and succeeds, 71 gives a write and then fails, 72 gives a write and
     /// then a `$graph` that is not a list. Returns the run's result, the event's id, what the
     /// processor's writes then hold and what it sent.
-    fn wrote(ty: u16) -> (Result<(), String>, Uuid, HashMap<Uuid, Vec<Value>>, Sent) {
+    async fn wrote(ty: u16) -> (Result<(), String>, Uuid, HashMap<Uuid, Vec<Value>>, Sent) {
         let flows = json!([
             { "name": "writes", "ty": 70, "takes": {}, "steps": [{ "do": "a" }] },
             { "name": "fails", "ty": 71, "takes": {}, "steps": [{ "do": "a.fail" }] },
@@ -855,7 +862,7 @@ mod tests {
             &Arc::default(),
         );
         let links = links.into_values().collect();
-        let conn = events(Uuid::now_v7(), &[]);
+        let conn = events(clock::new_id(), &[]);
         let processor = Processor::<u16, Value>::new(&flows.to_string(), links, conn).unwrap();
         let kept = Arc::new(Kept::default());
         let append = Some(kept.clone() as Arc<dyn Append<u16, Value>>);
@@ -864,7 +871,7 @@ mod tests {
             ..Config::default()
         })
         .unwrap();
-        let (root, event) = (Uuid::now_v7(), Uuid::now_v7());
+        let (root, event) = (clock::new_id(), clock::new_id());
         let row = |id, source| Event {
             id,
             source,
@@ -875,38 +882,38 @@ mod tests {
         };
         let flow = processor.flow(ty).unwrap();
         let ran = (flow.run)(&row(event, Some(root)), &row(root, None), &rannoch.sender());
-        rannoch.shutdown();
+        shutdown(rannoch).await;
         let writes = processor.writes().lock().unwrap().clone();
         let sent = kept.0.lock().unwrap().clone();
         (ran, event, writes, sent)
     }
 
-    #[test]
-    fn a_flow_that_succeeds_leaves_its_writes_under_the_events_id() {
-        let (ran, event, writes, _) = wrote(70);
+    #[tokio::test(start_paused = true)]
+    async fn a_flow_that_succeeds_leaves_its_writes_under_the_events_id() {
+        let (ran, event, writes, _) = wrote(70).await;
         assert_eq!(ran, Ok(()));
         let node = json!({ "node": "n1" });
         assert_eq!(writes, HashMap::from([(event, vec![node])]));
     }
 
-    #[test]
-    fn a_failing_step_leaves_no_writes() {
-        let (ran, _, writes, _) = wrote(71);
+    #[tokio::test(start_paused = true)]
+    async fn a_failing_step_leaves_no_writes() {
+        let (ran, _, writes, _) = wrote(71).await;
         assert_eq!(ran, Err("fail: no".to_owned()));
         assert!(writes.is_empty());
     }
 
-    #[test]
-    fn a_graph_that_is_not_a_list_fails_the_step_with_one_binned_no_next_and_no_writes() {
-        let (ran, event, writes, sent) = wrote(72);
+    #[tokio::test(start_paused = true)]
+    async fn a_graph_that_is_not_a_list_fails_the_step_with_one_binned_no_next_and_no_writes() {
+        let (ran, event, writes, sent) = wrote(72).await;
         let failure = "odd gave $graph as string, not list";
         assert_eq!(ran, Err(failure.to_owned()));
         assert_eq!(sent, [(72, Some(event), -1, json!(failure))]);
         assert!(writes.is_empty());
     }
 
-    #[test]
-    fn run_merges_each_links_output_into_the_next_links_input_the_later_winning() {
+    #[tokio::test(start_paused = true)]
+    async fn run_merges_each_links_output_into_the_next_links_input_the_later_winning() {
         let flow = json!({ "name": "f", "ty": 1, "takes": {}, "steps": [{ "do": "a.b.c",
             "next": { "ty": 2, "shape": { "x": "$x", "y": "$y", "keep": "$keep" } } }] });
         let (ran, calls) = run(
@@ -926,8 +933,8 @@ mod tests {
         assert_eq!(ran.unwrap(), [(2, next, 0)]);
     }
 
-    #[test]
-    fn run_puts_a_steps_result_under_as_and_keeps_the_input() {
+    #[tokio::test(start_paused = true)]
+    async fn run_puts_a_steps_result_under_as_and_keeps_the_input() {
         let flow = json!({ "name": "f", "ty": 1, "takes": {}, "steps": [{ "do": "a", "as": "got",
             "next": { "ty": 2, "shape": { "got": "$got", "text": "$text" } } }] });
         let (ran, _) = run(
@@ -939,8 +946,8 @@ mod tests {
         assert_eq!(ran.unwrap(), [(2, next, 0)]);
     }
 
-    #[test]
-    fn run_returns_the_failure_naming_the_field_an_actions_output_lacks() {
+    #[tokio::test(start_paused = true)]
+    async fn run_returns_the_failure_naming_the_field_an_actions_output_lacks() {
         let flow = json!({ "name": "f", "ty": 1, "takes": {}, "steps": [{ "do": "rate" }] });
         let (ran, _) = run(
             &flow,
@@ -958,8 +965,8 @@ mod tests {
         assert_eq!(ran.unwrap_err(), "rate gave severity as number, not string");
     }
 
-    #[test]
-    fn run_stops_at_a_failing_link_and_no_later_link_runs() {
+    #[tokio::test(start_paused = true)]
+    async fn run_stops_at_a_failing_link_and_no_later_link_runs() {
         let flow = json!({ "name": "f", "ty": 1, "takes": {}, "steps": [{ "do": "a.fail.c",
             "next": { "ty": 2 } }] });
         let (ran, calls) = run(
@@ -976,8 +983,8 @@ mod tests {
         assert_eq!(names, ["a", "fail"]);
     }
 
-    #[test]
-    fn a_store_row_in_any_links_graph_but_the_built_in_stores_fails_the_step() {
+    #[tokio::test(start_paused = true)]
+    async fn a_store_row_in_any_links_graph_but_the_built_in_stores_fails_the_step() {
         let item = |_: &Map<String, Value>| Ok(obj(&json!({ "$graph": [{ "store": {} }] })));
         for link in ["a", "store"] {
             let flow = json!({ "name": "f", "ty": 1, "takes": {}, "steps": [{ "do": link }] });
@@ -989,8 +996,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn run_with_a_branch_picks_the_case_by_json_value_and_falls_to_else() {
+    #[tokio::test(start_paused = true)]
+    async fn run_with_a_branch_picks_the_case_by_json_value_and_falls_to_else() {
         let flow = json!({ "name": "f", "ty": 1, "takes": {}, "steps": [{ "do": "a",
             "next": { "branch": { "on": "level", "cases": [{ "when": 1, "next": { "ty": 31 } }],
                 "else": { "ty": 33 } } } }] });
@@ -1007,8 +1014,9 @@ mod tests {
         assert_eq!(ran(json!(2)), [33]);
     }
 
-    #[test]
-    fn store_gives_its_row_as_graph_and_fails_naming_a_table_or_column_the_store_does_not_have() {
+    #[tokio::test(start_paused = true)]
+    async fn store_gives_its_row_as_graph_and_fails_naming_a_table_or_column_the_store_does_not_have()
+     {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE t (k TEXT PRIMARY KEY, n INTEGER)")
             .unwrap();
@@ -1028,8 +1036,8 @@ mod tests {
         assert_eq!(ran("t", json!({ "x": "$k" })), column);
     }
 
-    #[test]
-    fn shaped_with_each_gives_one_next_per_item_with_item() {
+    #[tokio::test(start_paused = true)]
+    async fn shaped_with_each_gives_one_next_per_item_with_item() {
         let to = json!({ "ty": 41, "each": "list", "shape": { "word": "$item", "n": "$n" } });
         let to: super::To = serde_json::from_value(to).unwrap();
         let nexts = super::shaped(&to, &obj(&json!({ "list": ["a", "b", "c"], "n": 7 }))).unwrap();
@@ -1063,7 +1071,7 @@ mod tests {
             "vals": { "order": "o1" } });
         let rows = rows
             .iter()
-            .map(|(s, d)| (Uuid::now_v7(), Some(w), *s, d.clone()));
+            .map(|(s, d)| (clock::new_id(), Some(w), *s, d.clone()));
         for (id, source, status, data) in [(w, None, 0, wait)].into_iter().chain(rows) {
             let (id, source) = (id.to_string(), source.map(|s| s.to_string()));
             let row = (id, source, data.to_string(), status);
@@ -1076,7 +1084,7 @@ mod tests {
     fn pay(conn: &Connection, answered: &HashSet<Uuid>, order: &str) -> (Vec<Out>, &'static str) {
         let data = obj(&json!({ "order": order, "amount": 5 }));
         let answered = &mut answered.clone();
-        super::waits(conn, answered, &waiting(), (Uuid::now_v7(), 61), &data).unwrap()
+        super::waits(conn, answered, &waiting(), (clock::new_id(), 61), &data).unwrap()
     }
 
     fn due(conn: &Connection, w: Uuid) -> (Vec<Out>, &'static str) {
@@ -1114,7 +1122,7 @@ mod tests {
 
     /// Runs each payment for `orders` through the processor's flow 61 over `conn`, its sends
     /// never reaching `conn`; returns what was sent, as (ty, source).
-    fn through(conn: Connection, orders: &[&str]) -> Vec<(u16, Option<Uuid>)> {
+    async fn through(conn: Connection, orders: &[&str]) -> Vec<(u16, Option<Uuid>)> {
         let kept = Arc::new(Kept::default());
         let append = Some(kept.clone() as Arc<dyn Append<u16, Value>>);
         let rannoch = Rannoch::open(Config {
@@ -1127,7 +1135,7 @@ mod tests {
         let flow = processor.flow(61).unwrap();
         for order in orders {
             let data = json!({ "order": order, "amount": 5 }).to_string();
-            let (id, source, run_at, status) = (Uuid::now_v7(), None, None, Status::Added);
+            let (id, source, run_at, status) = (clock::new_id(), None, None, Status::Added);
             let row = Event {
                 id,
                 source,
@@ -1138,14 +1146,14 @@ mod tests {
             };
             (flow.run)(&row, &row, &rannoch.sender()).unwrap();
         }
-        rannoch.shutdown();
+        shutdown(rannoch).await;
         let sent = kept.0.lock().unwrap().clone();
         let sent = sent.into_iter().filter(|s| s.0 != 61);
         sent.map(|(ty, source, _, _)| (ty, source)).collect()
     }
 
-    #[test]
-    fn a_wait_is_an_event_of_the_flows_ty_with_its_step_key_and_vals_due_within_ms() {
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_is_an_event_of_the_flows_ty_with_its_step_key_and_vals_due_within_ms() {
         let (ran, _) = run(
             &serde_json::to_value(&waiting()[0]).unwrap(),
             &json!({ "order": "o1" }),
@@ -1156,9 +1164,9 @@ mod tests {
         assert_eq!(ran.unwrap(), [(60, data, 2000)]);
     }
 
-    #[test]
-    fn a_matching_event_adds_the_match_next_once_and_a_second_adds_none() {
-        let w = Uuid::now_v7();
+    #[tokio::test(start_paused = true)]
+    async fn a_matching_event_adds_the_match_next_once_and_a_second_adds_none() {
+        let w = clock::new_id();
         let conn = events(w, &[]);
         let next = (w, 62, obj(&json!({ "order": "o1", "paid": 5 })), 0);
         assert_eq!(
@@ -1170,21 +1178,24 @@ mod tests {
         let conn = events(w, &[(0, Value::Object(next.2))]);
         assert_eq!(pay(&conn, &HashSet::new(), "o1"), (vec![], "done"));
         // Through the processor, the first match's next still on its way: sent once.
-        assert_eq!(through(events(w, &[]), &["o1", "o1"]), [(62, Some(w))]);
+        assert_eq!(
+            through(events(w, &[]), &["o1", "o1"]).await,
+            [(62, Some(w))]
+        );
     }
 
-    #[test]
-    fn a_due_wait_with_no_match_sends_its_timeout_and_says_timeout() {
-        let w = Uuid::now_v7();
+    #[tokio::test(start_paused = true)]
+    async fn a_due_wait_with_no_match_sends_its_timeout_and_says_timeout() {
+        let w = clock::new_id();
         let timeout = (w, 63, obj(&json!({ "order": "o1" })), 0);
         assert_eq!(due(&events(w, &[]), w), (vec![timeout], "timeout"));
         let matched = events(w, &[(0, json!({ "order": "o1", "paid": 5 }))]);
         assert_eq!(due(&matched, w), (vec![], "matched"));
     }
 
-    #[test]
-    fn a_match_after_timeout_sends_late_once() {
-        let w = Uuid::now_v7();
+    #[tokio::test(start_paused = true)]
+    async fn a_match_after_timeout_sends_late_once() {
+        let w = clock::new_id();
         let timed_out = [(0, json!({ "order": "o1" })), (2, json!("timeout"))];
         let late = (w, 64, obj(&json!({ "paid": 5 })), 0);
         assert_eq!(
@@ -1206,8 +1217,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn waits_for_searches_the_wait_index_on_a_migrated_store() {
+    #[tokio::test(start_paused = true)]
+    async fn waits_for_searches_the_wait_index_on_a_migrated_store() {
         use rannoch_core::Storage;
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/tmp/rannoch-processor-wait-index");

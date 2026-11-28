@@ -233,74 +233,74 @@ mod tests {
         check(&[("a.json", a), ("n.json", notice())]).unwrap_err()
     }
 
-    #[test]
-    fn e1_a_link_naming_no_action() {
+    #[tokio::test(start_paused = true)]
+    async fn e1_a_link_naming_no_action() {
         let errors = errors("string", &json!([{ "do": "trim.nope" }]));
         assert_eq!(errors, ["E1 a.json step 0 nope: no action named nope"]);
     }
 
-    #[test]
-    fn e2_options_with_an_unknown_field() {
+    #[tokio::test(start_paused = true)]
+    async fn e2_options_with_an_unknown_field() {
         let steps = json!([{ "do": "greet", "with": { "greet": { "salut": "hi" } } }]);
         let want =
             "E2 a.json step 0 greet: the options for greet do not parse: unknown field `salut`";
         assert_eq!(errors("string", &steps), [want]);
     }
 
-    #[test]
-    fn e3_a_link_taking_a_field_nothing_gives() {
+    #[tokio::test(start_paused = true)]
+    async fn e3_a_link_taking_a_field_nothing_gives() {
         let a = flow(&json!({ "x": "number" }), &json!([{ "do": "upper" }]));
         let want = "E3 a.json step 0 upper: upper takes text, which nothing before it gives";
         assert_eq!(check(&[("a.json", a)]).unwrap_err(), [want]);
     }
 
-    #[test]
-    fn e4_a_link_taking_a_field_of_another_type() {
+    #[tokio::test(start_paused = true)]
+    async fn e4_a_link_taking_a_field_of_another_type() {
         let want = "E4 a.json step 0 upper: upper takes text as string, it is number";
         assert_eq!(errors("number", &json!([{ "do": "upper" }])), [want]);
     }
 
-    #[test]
-    fn e5_a_next_missing_a_field_the_flow_takes() {
+    #[tokio::test(start_paused = true)]
+    async fn e5_a_next_missing_a_field_the_flow_takes() {
         let steps = json!([{ "do": "upper", "next": { "ty": 20, "shape": { "msg": "$text" } } }]);
         let want = "E5 a.json step 0 next: the next to notice gives no who, which it takes";
         assert_eq!(errors("string", &steps), [want]);
     }
 
-    #[test]
-    fn e5_a_concat_naming_a_field_nothing_in_scope_gives() {
+    #[tokio::test(start_paused = true)]
+    async fn e5_a_concat_naming_a_field_nothing_in_scope_gives() {
         let shape = json!({ "msg": { "$concat": ["$greeting", "!"] }, "who": "x" });
         let steps = json!([{ "do": "upper", "next": { "ty": 20, "shape": shape } }]);
         let want = "E5 a.json step 0 next: $greeting names nothing in scope";
         assert_eq!(errors("string", &steps), [want]);
     }
 
-    #[test]
-    fn e6_a_next_giving_a_field_of_another_type() {
+    #[tokio::test(start_paused = true)]
+    async fn e6_a_next_giving_a_field_of_another_type() {
         let shape = json!({ "msg": "$text", "who": 5 });
         let steps = json!([{ "do": "upper", "next": { "ty": 20, "shape": shape } }]);
         let want = "E6 a.json step 0 next: the next to notice gives who as number, it takes string";
         assert_eq!(errors("string", &steps), [want]);
     }
 
-    #[test]
-    fn e7_a_next_to_a_ty_no_flow_takes() {
+    #[tokio::test(start_paused = true)]
+    async fn e7_a_next_to_a_ty_no_flow_takes() {
         let steps = json!([{ "do": "upper", "next": { "ty": 99 } }]);
         let want = "E7 a.json step 0 next: the next goes to ty 99, which no flow takes";
         assert_eq!(errors("string", &steps), [want]);
     }
 
-    #[test]
-    fn e8_two_flows_with_the_same_ty() {
+    #[tokio::test(start_paused = true)]
+    async fn e8_two_flows_with_the_same_ty() {
         let a = flow(&json!({ "text": "string" }), &json!([]));
         let b = json!({ "name": "b", "ty": 1, "takes": { "text": "string" }, "steps": [] });
         let want = "E8 b.json: ty 1, which a.json also takes";
         assert_eq!(check(&[("a.json", a), ("b.json", b)]).unwrap_err(), [want]);
     }
 
-    #[test]
-    fn compile_fails_on_two_flows_with_the_same_ty() {
-        let dir = std::env::temp_dir().join(uuid::Uuid::now_v7().to_string());
+    #[tokio::test(start_paused = true)]
+    async fn compile_fails_on_two_flows_with_the_same_ty() {
+        let dir = std::env::temp_dir().join(rannoch_core::clock::new_id().to_string());
         std::fs::create_dir_all(&dir).unwrap();
         for (file, name) in [("a.json", "a"), ("b.json", "b")] {
             let doc = json!({ "name": name, "ty": 1, "takes": {}, "steps": [] });
@@ -315,8 +315,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn three_errors_in_two_docs_are_all_returned() {
+    #[tokio::test(start_paused = true)]
+    async fn three_errors_in_two_docs_are_all_returned() {
         let a = flow(
             &json!({ "text": "string" }),
             &json!([{ "do": "trim.nope", "next": { "ty": 99 } }]),
@@ -331,8 +331,8 @@ mod tests {
         assert_eq!(check(&[("a.json", a), ("b.json", b)]).unwrap_err(), want);
     }
 
-    #[test]
-    fn a_valid_set_compiles_with_job_set_on_the_flow_using_a_job_action() {
+    #[tokio::test(start_paused = true)]
+    async fn a_valid_set_compiles_with_job_set_on_the_flow_using_a_job_action() {
         let shape = json!({ "msg": { "$concat": ["$greeting", "!"] },
             "who": { "$": "$nick", "or": "friend" } });
         let greet = json!([{ "do": "trim.upper.greet", "with": { "greet": { "salutation": "hi" } },
@@ -351,8 +351,8 @@ mod tests {
             .collect();
         assert_eq!(jobs, ["1 false", "20 false", "30 true"]);
     }
-    #[test]
-    fn e3_a_branch_on_a_field_nothing_gives() {
+    #[tokio::test(start_paused = true)]
+    async fn e3_a_branch_on_a_field_nothing_gives() {
         let to = json!({ "ty": 20, "shape": { "msg": "$text", "who": "x" } });
         let branch = json!({ "on": "level", "cases": [], "else": to });
         let steps = json!([{ "do": "upper", "next": { "branch": branch } }]);
@@ -360,8 +360,8 @@ mod tests {
         assert_eq!(errors("string", &steps), [want]);
     }
 
-    #[test]
-    fn emit_and_store_are_built_in_and_their_options_are_checked() {
+    #[tokio::test(start_paused = true)]
+    async fn emit_and_store_are_built_in_and_their_options_are_checked() {
         let store = json!({ "store": { "table": "t", "row": { "k": "$text" } } });
         let steps = json!([{ "do": "emit" }, { "do": "store", "with": store }]);
         let flows = super::check(
@@ -387,8 +387,8 @@ mod tests {
         assert_eq!(super::check(&[a], &emit).unwrap_err(), [want]);
     }
 
-    #[test]
-    fn e4_each_over_a_non_list() {
+    #[tokio::test(start_paused = true)]
+    async fn e4_each_over_a_non_list() {
         let next = json!({ "ty": 20, "each": "text", "shape": { "msg": "$text", "who": "x" } });
         let steps = json!([{ "do": "upper", "next": next }]);
         let want = "E4 a.json step 0 next: each over text, which is not a list";
