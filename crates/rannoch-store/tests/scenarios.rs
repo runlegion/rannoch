@@ -41,7 +41,7 @@ async fn fr_rannoch_011_c1() {
     let path = database("fr_rannoch_011_c1").unwrap();
     current(&path).unwrap();
     let mut conn = ready(open(&path, &rannoch_core::migrator()).unwrap());
-    let (queue, _signals) = std::sync::mpsc::channel();
+    let (queue, _signals) = tokio::sync::mpsc::unbounded_channel();
     let event = rannoch_core::Event {
         id: "01a1dd40-c99f-7113-bb63-037e4ec38675".parse().unwrap(),
         source: None,

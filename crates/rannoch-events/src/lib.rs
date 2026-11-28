@@ -57,7 +57,6 @@
 //! use std::error::Error;
 //! use std::fs;
 //! use std::path::Path;
-//! use std::sync::mpsc;
 //!
 //! use rannoch_core::clock::new_id;
 //! use rannoch_core::{Append, Event, Status, Storage};
@@ -97,7 +96,7 @@
 //!         store.apply()?;
 //!     }
 //!
-//!     let (signal, wake) = mpsc::channel();
+//!     let (signal, mut wake) = tokio::sync::mpsc::unbounded_channel();
 //!     let events = Events::new(ready(&path)?, signal);
 //!     let page = |id| Event {
 //!         id,
@@ -130,7 +129,6 @@
 mod queries;
 
 use std::collections::HashMap;
-use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use chrono::SecondsFormat;
@@ -139,6 +137,7 @@ use rusqlite::types::Value as Sql;
 use rusqlite::{CachedStatement, Connection, ErrorCode, Transaction, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
 /// Where this crate's migratr migrations directory is, for the app's `build.rs`.
 pub const MIGRATIONS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/migrations");
@@ -182,14 +181,14 @@ impl StoreRow {
 #[derive(Debug)]
 pub struct Events {
     conn: Mutex<Connection>,
-    queue: Sender<()>,
+    queue: UnboundedSender<()>,
     writes: Writes,
 }
 
 impl Events {
     /// The append over `conn`, signalling `queue` after each commit.
     #[must_use]
-    pub fn new(conn: Connection, queue: Sender<()>) -> Self {
+    pub fn new(conn: Connection, queue: UnboundedSender<()>) -> Self {
         Self {
             conn: Mutex::new(conn),
             queue,
@@ -253,7 +252,7 @@ pub fn taking<T, D, R>(
 pub fn append<T, D>(
     conn: &mut Connection,
     batch: &[Event<T, D>],
-    queue: &Sender<()>,
+    queue: &UnboundedSender<()>,
 ) -> Result<(), Error>
 where
     T: Copy + Into<u16>,
@@ -440,7 +439,8 @@ fn append_in<'e, T: Copy + Into<u16> + 'e, D: 'e>(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::{Arc, Mutex, mpsc};
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::mpsc;
 
     use rannoch_core::clock::new_id;
     use rannoch_core::{Append, Error, Event, Status};
@@ -480,7 +480,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_batch_that_fails_part_way_writes_none_of_it() {
         let mut store = rannoch_core::forgr::empty_store();
-        let (queue, signals) = mpsc::channel();
+        let (queue, mut signals) = mpsc::unbounded_channel();
         let first = new_id();
         let batch = [event(first), event(new_id()), event(first)];
 
@@ -491,7 +491,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn events_appends_through_core_append_and_signals() {
-        let (queue, signals) = mpsc::channel();
+        let (queue, mut signals) = mpsc::unbounded_channel();
         let events = Events::new(rannoch_core::forgr::empty_store(), queue);
         let batch = [event(new_id()), event(new_id())];
 
@@ -506,7 +506,7 @@ mod tests {
         let store = rannoch_core::forgr::empty_store();
         let sql = "CREATE TABLE t (k TEXT PRIMARY KEY, n INTEGER, b INTEGER, l TEXT, z TEXT)";
         store.execute_batch(sql).unwrap();
-        let (queue, signals) = mpsc::channel();
+        let (queue, mut signals) = mpsc::unbounded_channel();
         let writes = Arc::new(Mutex::new(HashMap::new()));
         let row = json!({ "k": "a", "n": 2, "b": true, "l": [1], "z": null });
         let item = |table| json!({ "store": { "table": table, "row": row } });
@@ -559,10 +559,10 @@ mod tests {
 
     /// An `Events` with writes over an empty store that `sql` gives its tables: the append, its
     /// writes and the receiver of its signal.
-    fn with_tables(sql: &str) -> (Events, Writes, mpsc::Receiver<()>) {
+    fn with_tables(sql: &str) -> (Events, Writes, mpsc::UnboundedReceiver<()>) {
         let store = rannoch_core::forgr::empty_store();
         store.execute_batch(sql).unwrap();
-        let (queue, signals) = mpsc::channel();
+        let (queue, signals) = mpsc::unbounded_channel();
         let writes = Arc::new(Mutex::new(HashMap::new()));
         (
             Events::new(store, queue).with_writes(writes.clone()),
@@ -584,7 +584,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_store_row_t_refuses_is_rolled_back_with_its_2_and_the_rest_of_the_batch_commits() {
-        let (events, writes, signals) =
+        let (events, writes, mut signals) =
             with_tables("CREATE TABLE t (k TEXT PRIMARY KEY, n INTEGER NOT NULL)");
         // `n` is null, as `eval` gives for a field the input lacks.
         let row = |k, n| json!({ "store": { "table": "t", "row": { "k": k, "n": n } } });
@@ -642,7 +642,7 @@ mod tests {
     /// of the batch commits.
     #[tokio::test(start_paused = true)]
     async fn an_item_that_is_not_a_store_row_is_rolled_back_with_its_2_and_gets_a_minus_1() {
-        let (events, writes, signals) = with_tables("CREATE TABLE t (k TEXT PRIMARY KEY)");
+        let (events, writes, mut signals) = with_tables("CREATE TABLE t (k TEXT PRIMARY KEY)");
         let row = |k| json!({ "store": { "table": "t", "row": { "k": k } } });
         let good = two_with(&writes, row("g"));
         // A store row, then an item that is not one.
@@ -738,7 +738,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn an_event_whose_data_does_not_serialize_gets_a_minus_1_and_its_inbox_goes_on() {
-        let (queue, signals) = mpsc::channel();
+        let (queue, mut signals) = mpsc::unbounded_channel();
         let events = Arc::new(Events::new(rannoch_core::forgr::empty_store(), queue));
         let rannoch = rannoch_core::Rannoch::<Ty, Data>::open(rannoch_core::Config {
             append: Some(events.clone()),
@@ -804,7 +804,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn run_at_is_rfc3339_utc_at_millis() {
         let mut store = rannoch_core::forgr::empty_store();
-        let (queue, _signals) = mpsc::channel();
+        let (queue, _signals) = mpsc::unbounded_channel();
         let at = chrono::DateTime::from_timestamp_micros(1_763_100_000_123_456).unwrap();
         let batch = [Event {
             run_at: Some(at),

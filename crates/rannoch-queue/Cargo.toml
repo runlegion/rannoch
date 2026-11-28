@@ -12,6 +12,7 @@ rannoch-core = { path = "../rannoch-core" }
 rannoch-settings = { path = "../rannoch-settings" }
 rusqlite = { version = "0.41", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time"] }
 uuid = { version = "1", features = ["v7"] }
 
 [dev-dependencies]
@@ -20,6 +21,7 @@ rannoch-events = { path = "../rannoch-events" }
 rannoch-processor = { path = "../rannoch-processor" }
 rannoch-store = { path = "../rannoch-store" }
 serde_json = "1"
+tokio = { version = "1", features = ["macros", "test-util"] }
 uuid = { version = "1", features = ["v7"] }
 
 [lints]

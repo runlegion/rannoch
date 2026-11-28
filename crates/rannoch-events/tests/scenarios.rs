@@ -9,7 +9,6 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
 
 use rannoch_core::clock::new_id;
 use rannoch_core::forgr::_events;
@@ -102,9 +101,10 @@ async fn a_batch_handed_to_the_events_crate_is_kept_and_the_queue_is_told() {
     // When the batch is handed to the events crate over forgr's empty store
     let path = file_store("a_batch_handed_to_the_events_crate").unwrap();
     let mut store = Connection::open(&path).unwrap();
-    let (queue, signals) = mpsc::channel();
+    let (queue, mut signals) = tokio::sync::mpsc::unbounded_channel();
     let reader = Connection::open(&path).unwrap();
-    let queue_side = tokio::task::spawn_blocking(move || signals.recv().map(|()| rows(&reader)));
+    let queue_side =
+        tokio::task::spawn_blocking(move || signals.blocking_recv().map(|()| rows(&reader)));
     append(&mut store, &batch, &queue).unwrap();
 
     // Then each event is in _events as one row with all its fields, in one commit
@@ -145,13 +145,16 @@ async fn a_batch_handed_to_the_events_crate_is_kept_and_the_queue_is_told() {
     // When a batch is handed to the events crate over a store that cannot be written
     let mut locked = rannoch_core::forgr::empty_store();
     locked.pragma_update(None, "query_only", true).unwrap();
-    let (queue, signals) = mpsc::channel();
+    let (queue, mut signals) = tokio::sync::mpsc::unbounded_channel();
     let more = [accepted(&scratch, None, Status::Added).unwrap(), other];
     let _ = append(&mut locked, &more, &queue);
 
     // Then nothing is kept and the queue is not signalled
     assert_eq!(rows(&locked).unwrap(), Vec::<Row>::new());
-    assert_eq!(signals.try_recv(), Err(mpsc::TryRecvError::Empty));
+    assert_eq!(
+        signals.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    );
 }
 
 /// Every `.rs` file of rannoch-events's code and tests, with its path.

@@ -4,7 +4,7 @@
 
 use std::error::Error;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, mpsc};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -41,7 +41,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Vec::new(),
         ready(&path)?,
     )?);
-    let (signal, wake) = mpsc::channel();
+    let (signal, wake) = tokio::sync::mpsc::unbounded_channel();
     let append = Events::new(ready(&path)?, signal).with_writes(processor.writes());
     let rannoch = Rannoch::<u16, Value>::open(Config {
         store: Some(store),

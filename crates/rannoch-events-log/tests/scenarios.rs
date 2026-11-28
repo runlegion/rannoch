@@ -5,7 +5,6 @@
 
 use std::fs;
 use std::path::Path;
-use std::sync::mpsc;
 
 use chrono::DateTime;
 use rannoch_core::{Append, Event, Status, Storage, clock};
@@ -30,7 +29,10 @@ async fn each_event_of_a_committed_batch_is_one_json_line_in_the_log() {
         Opened::Pending(p) => panic!("pending: {p:?}"),
     };
     let file = dir.join("events.log");
-    let log = Log::new(Events::new(ready(), mpsc::channel().0), file.clone());
+    let log = Log::new(
+        Events::new(ready(), tokio::sync::mpsc::unbounded_channel().0),
+        file.clone(),
+    );
 
     // When it commits a batch of three events
     let at = DateTime::from_timestamp_millis(1_790_000_000_000);

@@ -3,8 +3,8 @@
 //! agent is a stub; its Sig is `tests/signatures.json`, its flows `tests/flows.json`.
 
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
@@ -111,7 +111,7 @@ fn a_flow_step_calls_an_agent_the_app_reaches_through_the_agent_trait() -> Resul
         vec![agent],
         ready(&path)?,
     )?);
-    let (signal, wake) = mpsc::channel();
+    let (signal, wake) = tokio::sync::mpsc::unbounded_channel();
     let append = Arc::new(Events::new(ready(&path)?, signal.clone())) as Arc<dyn Append<Ty, Value>>;
     let append = Some(append);
     let rannoch = Rannoch::open(Config { append, ..config() })?;
