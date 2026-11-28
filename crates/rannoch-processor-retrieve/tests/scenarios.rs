@@ -3,13 +3,13 @@
 //! factory, handed over by the real queue to rannoch-processor, as in rannoch-processor's
 //! scenarios; the app's source is a stub behind `Source`.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
-use std::time::{Duration, Instant};
-use std::{fs, thread};
+use std::time::Duration;
 
 use rannoch_core::forgr::_events;
-use rannoch_core::{Append, Config, Rannoch};
+use rannoch_core::{Append, Config, Rannoch, clock};
 use rannoch_events::Events;
 use rannoch_processor::{FlowDoc, Processor, Sig, check};
 use rannoch_processor_retrieve::{Retrieve, Source};
@@ -44,14 +44,14 @@ fn ready(path: &Path) -> Result<Connection> {
     }
 }
 
-/// Waits up to five seconds for `done`.
-fn until(done: impl Fn() -> bool) -> bool {
-    let start = Instant::now();
+/// Waits up to five seconds of the clock's time for `done`.
+async fn until(done: impl Fn() -> bool) -> bool {
+    let start = clock::elapsed();
     while start.elapsed() < Duration::from_secs(5) {
         if done() {
             return true;
         }
-        thread::sleep(Duration::from_millis(20));
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
     done()
 }
@@ -60,17 +60,17 @@ fn until(done: impl Fn() -> bool) -> bool {
 struct App(PathBuf, mpsc::Sender<()>, Rannoch<u16, Value>, Queue);
 
 /// A fresh store for the app, with every migration applied by opening rannoch once.
-fn migrated() -> Result<PathBuf> {
+async fn migrated() -> Result<PathBuf> {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("retrieve");
     drop(fs::remove_dir_all(&dir));
     fs::create_dir_all(&dir)?;
     let path = dir.join("store.db");
     let store = Some(Arc::new(Store::new(path.clone(), rannoch_core::migrator())) as _);
-    Rannoch::<u16, Value>::open(Config {
+    let rannoch = Rannoch::<u16, Value>::open(Config {
         store,
         ..Config::default()
-    })?
-    .shutdown();
+    })?;
+    tokio::task::spawn_blocking(move || rannoch.shutdown()).await?;
     Ok(path)
 }
 
@@ -96,7 +96,7 @@ impl App {
 
     /// An event of ty 10 with `data` from the app's forgr factory, and the queue signalled.
     fn hand(&self, data: &Value) -> Result<Uuid> {
-        let id = Uuid::now_v7();
+        let id = clock::new_id();
         let row = _events::factory().id(id.to_string()).ty(10);
         row.data(data.to_string())
             .status(0)
@@ -117,15 +117,20 @@ impl App {
         rows.into_iter().map(|(s, d)| (s, parse(&d))).collect()
     }
 
-    fn stop(self) {
-        drop(self.1);
-        self.2.shutdown();
-        assert_eq!(self.3.join(), Ok(()));
+    /// Shuts rannoch down and joins the queue; both block, so they run through `spawn_blocking`.
+    async fn stop(self) {
+        let Self(_, signal, rannoch, queue) = self;
+        drop(signal);
+        let joined = tokio::task::spawn_blocking(move || {
+            rannoch.shutdown();
+            queue.join()
+        });
+        assert_eq!(joined.await.ok(), Some(Ok(())));
     }
 }
 
-#[test]
-fn a_flow_step_queries_an_outside_source_the_app_reaches_through_the_retrieve_trait() {
+#[tokio::test(start_paused = true)]
+async fn a_flow_step_queries_an_outside_source_the_app_reaches_through_the_retrieve_trait() {
     // Given a test app that implements the retrieve trait with a stub source, declaring that
     // it gives email as a string
     let sig: Sig = serde_json::from_str(SIG).unwrap();
@@ -135,7 +140,7 @@ fn a_flow_step_queries_an_outside_source_the_app_reaches_through_the_retrieve_tr
     let docs: Vec<FlowDoc> = serde_json::from_str(FLOWS).unwrap();
     let docs: Vec<(String, FlowDoc)> = docs.into_iter().map(|d| (d.name.clone(), d)).collect();
     let flows = check(&docs, &[sig]).unwrap();
-    let path = migrated().unwrap();
+    let path = migrated().await.unwrap();
     let events = ready(&path).unwrap();
     let processor: Processor<u16, Value> = Processor::new(&flows, vec![retrieve], events).unwrap();
 
@@ -148,7 +153,7 @@ fn a_flow_step_queries_an_outside_source_the_app_reaches_through_the_retrieve_tr
     let found = app.hand(&json!({ "user": "sam@example.com" })).unwrap();
 
     // Then the step's next carries the email on
-    assert!(until(|| app.about(found).iter().any(|r| r.0 == 2)));
+    assert!(until(|| app.about(found).iter().any(|r| r.0 == 2)).await);
     let sent = app.about(found);
     let nexts: Vec<&(i64, Value)> = sent.iter().filter(|r| r.0 == 0).collect();
     assert_eq!(nexts, [&(0, json!({ "email": "sam@example.com" }))]);
@@ -157,9 +162,9 @@ fn a_flow_step_queries_an_outside_source_the_app_reaches_through_the_retrieve_tr
     let wrong = app.hand(&json!({ "user": 7 })).unwrap();
 
     // Then the step sends a -1 whose data is 'email as number', and no next
-    assert!(until(|| app.about(wrong).iter().any(|r| r.0 == -1)));
-    thread::sleep(Duration::from_millis(200));
+    assert!(until(|| app.about(wrong).iter().any(|r| r.0 == -1)).await);
+    tokio::time::sleep(Duration::from_millis(200)).await;
     let sent = app.about(wrong);
     assert_eq!(sent, [(1, json!("taken")), (-1, json!("email as number"))]);
-    app.stop();
+    app.stop().await;
 }
