@@ -6,9 +6,10 @@ use std::time::Duration;
 
 use chrono::TimeDelta;
 use tokio::sync::oneshot;
+use uuid::Uuid;
 
 use crate::broker::{Shared, lock};
-use crate::{Append, Error, Event, Status, clock};
+use crate::{Append, Error, Event, Status};
 
 /// An inbox and its heap, which holds accepted events in memory, with no size limit.
 #[derive(Debug)]
@@ -29,10 +30,10 @@ impl<T, D> Inbox<T, D> {
         }
     }
 
-    /// Accepts the event: sets its id, sets status 0 when it has no source
+    /// Accepts the event: sets its id to `id`, sets status 0 when it has no source
     /// (one with a source keeps the status it carries), and puts it on the heap.
-    pub(crate) fn accept(&mut self, mut event: Event<T, D>) -> Status {
-        event.id = clock::new_id();
+    pub(crate) fn accept(&mut self, id: Uuid, mut event: Event<T, D>) -> Status {
+        event.id = id;
         if event.source.is_none() {
             event.status = Status::Added;
         }
@@ -90,7 +91,8 @@ fn hand_over<T: PartialEq, D>(broker: &Shared<T, D>, index: usize, append: &dyn 
             return;
         }
         for reply in replies {
-            held.inboxes[index].accept(reply);
+            let id = held.stamp();
+            held.inboxes[index].accept(id, reply);
         }
     }
 }
@@ -99,6 +101,7 @@ fn hand_over<T: PartialEq, D>(broker: &Shared<T, D>, index: usize, append: &dyn 
 mod tests {
     use chrono::TimeDelta;
     use uuid::Uuid;
+    use uuid::timestamp::context::ContextV7;
 
     use std::sync::{Arc, Mutex};
 
@@ -121,8 +124,9 @@ mod tests {
     async fn an_event_with_a_source_keeps_its_status_and_one_without_is_accepted_at_0() {
         let mut inbox = Inbox::new("default".to_owned(), Vec::new(), TimeDelta::zero());
 
-        assert_eq!(inbox.accept(event(Some(clock::new_id()))), Status::Added);
-        assert_eq!(inbox.accept(event(None)), Status::Added);
+        let accepted =
+            [event(Some(clock::new_id())), event(None)].map(|e| inbox.accept(clock::new_id(), e));
+        assert_eq!(accepted, [Status::Added; 2]);
 
         let statuses: Vec<Status> = inbox.heap.iter().map(|e| e.status).collect();
         assert_eq!(statuses, [Status::Processed, Status::Added]);
@@ -158,8 +162,9 @@ mod tests {
                 TimeDelta::zero(),
             )],
             closed: false,
+            ids: ContextV7::new(),
         }));
-        let accept = |e| lock(&broker).inboxes[0].accept(e);
+        let accept = |e| lock(&broker).inboxes[0].accept(clock::new_id(), e);
         let recorder = Recorder {
             failing: Mutex::new(true),
             ..Recorder::default()
@@ -192,6 +197,7 @@ mod tests {
                 Inbox::new("ones".to_owned(), vec![1], TimeDelta::zero()),
             ],
             closed: false,
+            ids: ContextV7::new(),
         }));
         let heap = |i: usize| -> Vec<(u8, Status, usize)> {
             let held = lock(&broker);
@@ -208,7 +214,7 @@ mod tests {
 
         // A reply is sent as any event is: accepted, with its id, onto the heap of the inbox for
         // its ty.
-        lock(&broker).inboxes[0].accept(event(None));
+        lock(&broker).inboxes[0].accept(clock::new_id(), event(None));
         *recorder.replies.lock().unwrap() = vec![reply()];
         hand_over(&broker, 0, &recorder);
         assert_eq!(heap(0), []);
@@ -217,7 +223,7 @@ mod tests {
         // At shutdown the broker takes no send, so the inbox that handed the batch over writes
         // its reply itself, in one more hand-over.
         lock(&broker).closed = true;
-        lock(&broker).inboxes[0].accept(event(None));
+        lock(&broker).inboxes[0].accept(clock::new_id(), event(None));
         *recorder.replies.lock().unwrap() = vec![reply()];
         hand_over(&broker, 0, &recorder);
         let batches = recorder.batches.lock().unwrap().clone();

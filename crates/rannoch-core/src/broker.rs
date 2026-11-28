@@ -8,9 +8,11 @@ use std::time::Duration;
 use std::{env, fmt};
 use tokio::runtime::{Handle, Runtime};
 use tokio::sync::{mpsc, oneshot};
+use uuid::timestamp::context::ContextV7;
+use uuid::{Timestamp, Uuid};
 
 use crate::inbox::{Inbox, run};
-use crate::{Error, Event, Status};
+use crate::{Error, Event, Status, clock};
 
 /// What core needs from the app's store at start.
 pub trait Storage: fmt::Debug + Send + Sync {
@@ -100,6 +102,23 @@ pub(crate) struct Broker<T, D> {
     /// The default inbox first, then the configured inboxes.
     pub(crate) inboxes: Vec<Inbox<T, D>>,
     pub(crate) closed: bool,
+    /// This rannoch's own id counter, never started over, so its ids strictly increase even
+    /// when another rannoch's frozen clock stands later.
+    pub(crate) ids: ContextV7,
+}
+
+impl<T, D> Broker<T, D> {
+    /// A new id from [`clock::now`]: a `UUIDv7` greater than every id this broker stamped
+    /// before, taken under the lock the caller holds.
+    pub(crate) fn stamp(&self) -> Uuid {
+        let now = clock::now();
+        let seconds = u64::try_from(now.timestamp()).unwrap_or(0);
+        Uuid::new_v7(Timestamp::from_unix(
+            &self.ids,
+            seconds,
+            now.timestamp_subsec_nanos(),
+        ))
+    }
 }
 
 impl<T: PartialEq, D> Broker<T, D> {
@@ -113,7 +132,8 @@ impl<T: PartialEq, D> Broker<T, D> {
             .iter()
             .position(|inbox| inbox.types.contains(&event.ty))
             .unwrap_or(0);
-        Ok(self.inboxes[index].accept(event))
+        let id = self.stamp();
+        Ok(self.inboxes[index].accept(id, event))
     }
 }
 
@@ -210,6 +230,7 @@ impl<T: PartialEq + Send + 'static, D: Send + 'static> Rannoch<T, D> {
         let broker = Arc::new(Mutex::new(Broker {
             inboxes,
             closed: false,
+            ids: ContextV7::new(),
         }));
         let (finished, done) = mpsc::channel::<()>(1);
         let (mut stops, mut runtime) = (Vec::new(), None);

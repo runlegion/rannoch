@@ -734,3 +734,53 @@ async fn no_real_time_call_outside_the_clock() {
         );
     }
 }
+
+#[test]
+fn ids_from_one_rannoch_keep_their_order() {
+    const SENT: usize = 200;
+    // One frozen test: a Rannoch on a paused runtime of its own whose clock stands `ahead` past
+    // its start, sending `SENT` events in one frozen millisecond and waiting on `turn` after
+    // each; it returns the ids its append kept, in send order.
+    let frozen_test = |ahead: Duration, turn: Arc<std::sync::Barrier>| {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            tokio::time::advance(ahead).await;
+            let ids = Arc::new(Ids::default());
+            let rannoch = open_with(ids.clone(), TimeDelta::hours(1)).unwrap();
+            let first = clock::now();
+            for _ in 0..SENT {
+                rannoch.sender().send(event()).unwrap();
+                turn.wait();
+            }
+            assert_eq!(clock::now(), first);
+            shutdown(rannoch).await;
+            ids.0
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(_, id)| *id)
+                .collect::<Vec<Uuid>>()
+        })
+    };
+
+    // Given two Rannochs in one process, each in its own frozen test running in parallel: one
+    // clock stands an hour past the other
+    let turn = Arc::new(std::sync::Barrier::new(2));
+    let tests = [Duration::ZERO, Duration::from_secs(3_600)].map(|ahead| {
+        let turn = Arc::clone(&turn);
+        std::thread::spawn(move || frozen_test(ahead, turn))
+    });
+
+    // When each sends events in the same frozen millisecond, the two taking turns
+    for test in tests {
+        let ids = test.join().unwrap();
+
+        // Then each Rannoch's ids strictly increase in the order its events were sent
+        assert_eq!(ids.len(), SENT);
+        assert!(ids.windows(2).all(|w| w[0] < w[1]), "{ids:?}");
+    }
+}
