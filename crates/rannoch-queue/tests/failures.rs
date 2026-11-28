@@ -3,14 +3,15 @@
 //! rannoch-processor on the built-in steps of rannoch-processor's fixture `tests/built_in.json`,
 //! over `_events` seeded from the app's forgr factory as a crash or a change to the app's `ty`
 //! leaves it. A run that panics, the runs channel closing and a panic on the queue's thread have
-//! no test here: no built-in step panics.
+//! no test here: no built-in step panics. Every test runs with the clock frozen.
 
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, mpsc};
-use std::time::{Duration, Instant};
-use std::{fs, thread};
+use std::sync::Arc;
+use std::time::Duration;
 
-use chrono::{TimeDelta, Utc};
+use chrono::TimeDelta;
+use rannoch_core::clock::{self, new_id};
 use rannoch_core::forgr::_events;
 use rannoch_core::{Append, Config, Rannoch};
 use rannoch_events::Events;
@@ -19,6 +20,7 @@ use rannoch_queue::{Queue, Settings};
 use rannoch_store::{Opened, Store};
 use rusqlite::Connection;
 use serde_json::Value;
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 /// The app's `ty`: the built-in flows' 80 to 87, and no other.
@@ -49,7 +51,7 @@ const FAST: TimeDelta = TimeDelta::milliseconds(20);
 const WAIT: Duration = Duration::from_secs(5);
 
 /// A migrated store in a fresh directory `name`, applied by opening rannoch once.
-fn store(name: &str) -> Result<PathBuf> {
+async fn store(name: &str) -> Result<PathBuf> {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
     if dir.exists() {
         fs::remove_dir_all(&dir)?;
@@ -61,7 +63,8 @@ fn store(name: &str) -> Result<PathBuf> {
         store: Some(store),
         ..Config::default()
     };
-    Rannoch::<Ty, Value>::open(config)?.shutdown();
+    let rannoch = Rannoch::<Ty, Value>::open(config)?;
+    tokio::task::spawn_blocking(move || rannoch.shutdown()).await?;
     Ok(path)
 }
 
@@ -95,7 +98,7 @@ fn seed(path: &Path, rows: &[Seed<'_>]) -> Result<()> {
 /// The app: rannoch over the store with `Events` as its append, its default inbox handing over
 /// every `interval`, and the queue handing each event to rannoch-processor on the built-in flows.
 struct App {
-    signal: mpsc::Sender<()>,
+    signal: mpsc::UnboundedSender<()>,
     rannoch: Rannoch<Ty, Value>,
     queue: Queue,
 }
@@ -106,7 +109,7 @@ impl App {
         let docs: Vec<(String, FlowDoc)> = serde_json::from_str(built_in)?;
         let flows = check(&docs, &[]).map_err(|errors| errors.join("\n"))?;
         let processor = Arc::new(Processor::new(&flows, Vec::new(), ready(path)?)?);
-        let (signal, wake) = mpsc::channel();
+        let (signal, wake) = mpsc::unbounded_channel();
         let events = Events::new(ready(path)?, signal.clone()).with_writes(processor.writes());
         let rannoch = Rannoch::open(Config {
             default_interval: interval,
@@ -126,19 +129,24 @@ impl App {
     }
 
     /// Signals the queue twice, a pass apart, so an event it would take twice is taken twice.
-    fn signal_twice(&self) -> Result<()> {
+    async fn signal_twice(&self) -> Result<()> {
         for _ in 0..2 {
             self.signal.send(())?;
-            thread::sleep(Duration::from_millis(200));
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
         Ok(())
     }
 
-    /// Stops the app; every event it sent is then on disk.
-    fn stop(self) -> Result<()> {
+    /// Stops the app; every event it sent is then on disk. Shutdown and join block, so they run
+    /// through `spawn_blocking`.
+    async fn stop(self) -> Result<()> {
         drop(self.signal);
-        self.rannoch.shutdown();
-        self.queue.join()?;
+        let (rannoch, queue) = (self.rannoch, self.queue);
+        tokio::task::spawn_blocking(move || {
+            rannoch.shutdown();
+            queue.join()
+        })
+        .await??;
         Ok(())
     }
 }
@@ -174,38 +182,38 @@ fn said(why: &str) -> String {
     Value::from(why).to_string()
 }
 
-/// Waits up to `limit` for `done`.
-fn until(limit: Duration, done: impl Fn() -> bool) -> bool {
-    let start = Instant::now();
+/// Waits up to `limit` on the clock for `done`.
+async fn until(limit: Duration, done: impl Fn() -> bool) -> bool {
+    let start = clock::elapsed();
     while start.elapsed() < limit {
         if done() {
             return true;
         }
-        thread::sleep(Duration::from_millis(20));
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
     done()
 }
 
 /// An id `secs` seconds ago.
 fn ago(secs: i64) -> String {
-    let at = u64::try_from(Utc::now().timestamp() - secs).unwrap_or_default();
+    let at = u64::try_from(clock::now().timestamp() - secs).unwrap_or_default();
     Uuid::new_v7(uuid::Timestamp::from_unix(uuid::NoContext, at, 0)).to_string()
 }
 
 fn id() -> String {
-    Uuid::now_v7().to_string()
+    new_id().to_string()
 }
 
 /// 357-364: the queue cannot send a status of the app's `T` for this event, so it writes the -1.
-#[test]
-fn a_due_event_whose_ty_is_not_the_apps_gets_a_minus_1() -> Result<()> {
-    let path = store("ty_not_the_apps")?;
+#[tokio::test(start_paused = true)]
+async fn a_due_event_whose_ty_is_not_the_apps_gets_a_minus_1() -> Result<()> {
+    let path = store("ty_not_the_apps").await?;
     let event = id();
     seed(&path, &[(&event, None, 9, r#"{"ticket":"t1"}"#, None, 0)])?;
 
     let app = App::start(&path, HOUR, once())?;
-    app.signal_twice()?;
-    app.stop()?;
+    app.signal_twice().await?;
+    app.stop().await?;
 
     assert_eq!(
         about(&path, &event)?,
@@ -216,17 +224,17 @@ fn a_due_event_whose_ty_is_not_the_apps_gets_a_minus_1() -> Result<()> {
 
 /// Starts the app over the store at `path` with the hunt running every 300 ms, waits for a -1
 /// about `event`, and stops it.
-fn hunt(path: &Path, event: &str) -> Result<()> {
+async fn hunt(path: &Path, event: &str) -> Result<()> {
     let app = App::start(path, FAST, hunting())?;
     let binned = || about(path, event).is_ok_and(|rows| rows.iter().any(|r| r.0 == -1));
-    assert!(until(WAIT, binned), "no -1 about {event}");
-    app.stop()
+    assert!(until(WAIT, binned).await, "no -1 about {event}");
+    app.stop().await
 }
 
 /// 487-489: a stalled event the hunt would resend, but whose ty is not the app's.
-#[test]
-fn the_hunt_bins_a_stalled_event_whose_ty_is_not_the_apps() -> Result<()> {
-    let path = store("hunt_ty_not_the_apps")?;
+#[tokio::test(start_paused = true)]
+async fn the_hunt_bins_a_stalled_event_whose_ty_is_not_the_apps() -> Result<()> {
+    let path = store("hunt_ty_not_the_apps").await?;
     let event = ago(7200);
     seed(
         &path,
@@ -236,7 +244,7 @@ fn the_hunt_bins_a_stalled_event_whose_ty_is_not_the_apps() -> Result<()> {
         ],
     )?;
 
-    hunt(&path, &event)?;
+    hunt(&path, &event).await?;
 
     let binned = (-1, 9, said("ty 9 is not the app's"));
     assert_eq!(about(&path, &event)?, [(1, 9, said("taken")), binned]);
@@ -244,9 +252,9 @@ fn the_hunt_bins_a_stalled_event_whose_ty_is_not_the_apps() -> Result<()> {
 }
 
 /// 426-428 and 447-457: a failed run whose retry's wait overflows.
-#[test]
-fn a_failed_run_whose_retry_wait_overflows_gets_a_minus_1_and_no_retry() -> Result<()> {
-    let path = store("retry_wait_overflows")?;
+#[tokio::test(start_paused = true)]
+async fn a_failed_run_whose_retry_wait_overflows_gets_a_minus_1_and_no_retry() -> Result<()> {
+    let path = store("retry_wait_overflows").await?;
     let event = id();
     seed(&path, &[(&event, None, 87, r#"{"order":"o1"}"#, None, 0)])?;
     let settings = Settings {
@@ -255,8 +263,8 @@ fn a_failed_run_whose_retry_wait_overflows_gets_a_minus_1_and_no_retry() -> Resu
     };
 
     let app = App::start(&path, HOUR, settings)?;
-    app.signal_twice()?;
-    app.stop()?;
+    app.signal_twice().await?;
+    app.stop().await?;
 
     let rows = [
         (1, 87, said("taken")),

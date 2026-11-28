@@ -10,7 +10,8 @@
 //!
 //! # Taking an event
 //!
-//! The queue runs on a thread of its own. It wakes when it starts, on each signal, when the
+//! The queue runs as a task on the tokio runtime [`Queue::start`] is called in, or on one it
+//! starts when called outside a runtime. It wakes when it starts, on each signal, when the
 //! earliest `run_at` among the waiting events comes, and when the hunt is due. For each due event
 //! it sends a 1 with the data `"taken"`, then asks [`Flows::flow`] for the event's flow; an event
 //! whose `ty` has no flow gets a -1 with the data `"no processor"` and no retry. When rannoch
@@ -78,8 +79,9 @@
 //! [`rannoch_core::Rannoch::shutdown`], every send fails with `Closed`, the queue's and the
 //! processors' alike, and the queue logs each of its own; a result sent then is not written. So
 //! the app shuts rannoch down once the results it waits for are written, then joins the queue.
-//! [`Queue::join`] returns `Error::Queue` when the queue's thread panicked; the runs and jobs it
-//! started may then still be going.
+//! [`Queue::join`] returns `Error::Queue` when the queue's task panicked; the runs and jobs it
+//! started may then still be going. Join blocks, so async code calls it through
+//! `tokio::task::spawn_blocking`, as it does [`rannoch_core::Rannoch::shutdown`].
 //!
 //! # Example
 //!
@@ -92,10 +94,10 @@
 //! use std::error::Error;
 //! use std::fs;
 //! use std::path::Path;
-//! use std::sync::{Arc, mpsc};
-//! use std::thread;
-//! use std::time::{Duration, Instant};
+//! use std::sync::Arc;
+//! use std::time::Duration;
 //!
+//! use rannoch_core::clock::{elapsed, new_id};
 //! use rannoch_core::{Config, Event, Rannoch, Sender, Status, Storage};
 //! use rannoch_events::Events;
 //! use rannoch_queue::{Flow, Flows, Queue, Row, Settings};
@@ -160,8 +162,10 @@
 //!     }
 //! }
 //!
-//! fn main() -> Result<(), Box<dyn Error>> {
-//!     let dir = std::env::temp_dir().join(Uuid::now_v7().to_string());
+//! // The clock frozen, as in every rannoch-queue test.
+//! #[tokio::main(flavor = "current_thread", start_paused = true)]
+//! async fn main() -> Result<(), Box<dyn Error>> {
+//!     let dir = std::env::temp_dir().join(new_id().to_string());
 //!     fs::create_dir_all(&dir)?;
 //!     let path = dir.join("app.db");
 //!
@@ -178,7 +182,7 @@
 //!     let flows = Arc::new(pages());
 //!
 //!     // 4. The channel the append signals the queue on.
-//!     let (signal, wake) = mpsc::channel();
+//!     let (signal, wake) = tokio::sync::mpsc::unbounded_channel();
 //!
 //!     // 5. The append, holding the only signal sender, so the queue stops once it drops.
 //!     let append = Events::new(for_append, signal);
@@ -207,17 +211,18 @@
 //!
 //!     // The page, the queue's 1 and the flow's 2 are each written at a hand-over.
 //!     let written = [(Status::Added, 1), (Status::InProgress, 1), (Status::Processed, 1)];
-//!     let start = Instant::now();
+//!     let start = elapsed();
 //!     while rannoch_queue::report(&reads)? != written {
 //!         if start.elapsed() > Duration::from_secs(10) {
 //!             return Err("the page was not processed".into());
 //!         }
-//!         thread::sleep(Duration::from_millis(20));
+//!         tokio::time::sleep(Duration::from_millis(20)).await;
 //!     }
 //!
-//!     // Shutdown drops the append, and with it the signal sender, so the queue stops.
-//!     rannoch.shutdown();
-//!     queue.join()?;
+//!     // Shutdown drops the append, and with it the signal sender, so the queue stops. Both
+//!     // block, so async code runs them through spawn_blocking.
+//!     tokio::task::spawn_blocking(move || rannoch.shutdown()).await?;
+//!     tokio::task::spawn_blocking(move || queue.join()).await??;
 //!
 //!     drop(reads);
 //!     fs::remove_dir_all(&dir)?;
@@ -230,14 +235,15 @@ mod queries;
 use std::collections::HashSet;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use rannoch_core::{Error, Event, Sender, Status};
+use rannoch_core::{Error, Event, Sender, Status, clock};
 use rusqlite::{Connection, Params, params};
 use serde::Deserialize;
+use tokio::runtime::{Handle, Runtime};
+use tokio::sync::mpsc::{self, UnboundedReceiver};
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 /// An event as `_events` holds it: `ty` as its `u16`, data as its JSON text.
@@ -305,7 +311,7 @@ impl Section {
 
 /// What runs an event: the processor, and whether its flow has a job step.
 pub struct Flow<T, D> {
-    /// Long-running work: a job runs on a thread of its own and never holds up a run.
+    /// Long-running work: a job runs on a blocking thread of its own and never holds up a run.
     pub job: bool,
     /// The processor.
     pub run: Processor<T, D>,
@@ -329,19 +335,27 @@ pub trait Flows<T, D>: Send + Sync {
 /// crate's signal closes.
 #[derive(Debug)]
 pub struct Queue {
-    thread: JoinHandle<()>,
+    task: JoinHandle<()>,
+    handle: Handle,
+    /// The runtime start started when it was called outside one, kept until the queue is joined.
+    runtime: Option<Runtime>,
 }
 
 impl Queue {
-    /// Starts the queue over `conn`, woken by `signal`, sending through `sender`, on a thread of
-    /// its own. `T` is the app's `ty`, read back from its `u16` in `_events`; `D` is the app's
-    /// data, made from text: the queue's own, such as `"taken"`, and a failed run's result for a
-    /// retry. Each key the `[queue]` section of the app's settings file holds replaces its value
-    /// in `settings`.
+    /// Starts the queue over `conn`, woken by `signal`, sending through `sender`, as a task on the
+    /// tokio runtime it is called in, or on one it starts when called outside a runtime. `T` is
+    /// the app's `ty`, read back from its `u16` in `_events`; `D` is the app's data, made from
+    /// text: the queue's own, such as `"taken"`, and a failed run's result for a retry. Each key
+    /// the `[queue]` section of the app's settings file holds replaces its value in `settings`.
+    ///
+    /// # Panics
+    ///
+    /// When it is called outside a runtime and the runtime it starts cannot be built, as the
+    /// operating system refusing it threads.
     #[must_use]
     pub fn start<T, D>(
         conn: Connection,
-        signal: Receiver<()>,
+        signal: UnboundedReceiver<()>,
         sender: Sender<T, D>,
         flows: Arc<dyn Flows<T, D>>,
         settings: Settings,
@@ -352,8 +366,19 @@ impl Queue {
     {
         let section = rannoch_settings::section::<Section>("queue");
         let (settings, idle) = section.apply(settings, IDLE);
+        let mut runtime = None;
+        let handle = Handle::try_current().unwrap_or_else(|_| {
+            // Building a runtime fails only when the system refuses its threads or its driver,
+            // as `std::thread::spawn` panicked on before.
+            #[allow(clippy::expect_used)]
+            let started = Runtime::new().expect("the queue could not start a tokio runtime");
+            runtime.insert(started).handle().clone()
+        });
+        let task = handle.spawn(run(conn, signal, sender, flows, settings, idle));
         Self {
-            thread: thread::spawn(move || run(&conn, &signal, &sender, &*flows, settings, idle)),
+            task,
+            handle,
+            runtime,
         }
     }
 
@@ -363,11 +388,18 @@ impl Queue {
     ///
     /// # Errors
     ///
-    /// `Error::Queue` when the queue's thread panicked, as a panic in the app's [`Flows::flow`]
+    /// `Error::Queue` when the queue's task panicked, as a panic in the app's [`Flows::flow`]
     /// makes it. It then has not waited for the runs and jobs the queue started, which may still
     /// be going.
+    ///
+    /// # Panics
+    ///
+    /// When it is called on a thread that runs async tasks, rather than through
+    /// `tokio::task::spawn_blocking`.
     pub fn join(self) -> Result<(), Error> {
-        self.thread.join().map_err(|_| Error::Queue)
+        let joined = self.handle.block_on(self.task);
+        drop(self.runtime);
+        joined.map_err(|_| Error::Queue)
     }
 }
 
@@ -378,11 +410,15 @@ const IDLE: Duration = Duration::from_secs(3600);
 /// The data of the hunt's resend, by which [`root`] knows it.
 const HUNG: &str = "hung";
 
-fn run<T, D>(
-    conn: &Connection,
-    signal: &Receiver<()>,
-    sender: &Sender<T, D>,
-    flows: &dyn Flows<T, D>,
+/// A run handed to the runs: its flow, the event, its root, the failed attempts before it and
+/// its `ty`.
+type Run<T, D> = (Arc<Flow<T, D>>, Row, Row, u32, T);
+
+async fn run<T, D>(
+    conn: Connection,
+    mut signal: UnboundedReceiver<()>,
+    sender: Sender<T, D>,
+    flows: Arc<dyn Flows<T, D>>,
     settings: Settings,
     idle: Duration,
 ) where
@@ -390,33 +426,28 @@ fn run<T, D>(
     D: From<String> + Send + 'static,
 {
     // Every 1 accepted from this millisecond on is this queue's own, so the hunt leaves it.
-    let started = Utc::now().timestamp_millis();
-    let (runs, bucket) = mpsc::channel::<(Arc<Flow<T, D>>, Row, Row, u32, T)>();
-    let run_sender = sender.clone();
-    let runs_thread = thread::spawn(move || {
-        for (flow, event, root, before, ty) in bucket {
-            attempt(&flow, &event, &root, before, ty, &run_sender, settings);
-        }
-    });
+    let started = clock::now().timestamp_millis();
+    let (runs, bucket) = mpsc::unbounded_channel::<Run<T, D>>();
+    let runs_task = tokio::spawn(one_after_another(bucket, sender.clone(), settings));
     let mut jobs: Vec<JoinHandle<()>> = Vec::new();
     let mut taken = HashSet::new();
-    let mut next_hunt = Instant::now() + settings.hunt;
+    let mut next_hunt = clock::elapsed() + settings.hunt;
     // The first pass takes the events already due when the queue starts.
     let mut wait = Duration::ZERO;
     loop {
-        if signal.recv_timeout(wait) == Err(RecvTimeoutError::Disconnected) {
+        if let Ok(None) = tokio::time::timeout(wait, signal.recv()).await {
             break;
         }
         jobs.retain(|job| !job.is_finished());
-        if Instant::now() >= next_hunt {
+        if clock::elapsed() >= next_hunt {
             // A hunt the store could not read for runs again after `first_wait`.
-            let read_all = hunt(conn, sender, settings.window, started);
-            next_hunt = Instant::now() + settings.hunt;
+            let read_all = hunt(&conn, &sender, settings.window, started);
+            next_hunt = clock::elapsed() + settings.hunt;
             if !read_all {
-                next_hunt = Instant::now() + settings.first_wait;
+                next_hunt = clock::elapsed() + settings.first_wait;
             }
         }
-        let Ok(due) = read(conn, queries::DUE, [now()]) else {
+        let Ok(due) = read(&conn, queries::DUE, [now()]) else {
             log::error!("the queue could not read the due events");
             wait = settings.first_wait;
             continue;
@@ -430,10 +461,10 @@ fn run<T, D>(
                 continue;
             }
             let Ok(ty) = T::try_from(row.ty) else {
-                not_the_apps(conn, row.id, row.ty);
+                not_the_apps(&conn, row.id, row.ty);
                 continue;
             };
-            let (root, before) = match root(conn, row.clone()) {
+            let (root, before) = match root(&conn, row.clone()) {
                 Ok(Some(found)) => found,
                 Ok(None) => continue,
                 Err(err) => {
@@ -444,37 +475,58 @@ fn run<T, D>(
                 }
             };
             // An event whose 1 was not accepted stays at 0 and is not run.
-            if !send(sender, row.id, ty, "taken", Status::InProgress) {
+            if !send(&sender, row.id, ty, "taken", Status::InProgress) {
                 taken.remove(&row.id);
                 continue;
             }
             let Some(flow) = flows.flow(row.ty) else {
-                send(sender, row.id, ty, "no processor", Status::Binned);
+                send(&sender, row.id, ty, "no processor", Status::Binned);
                 continue;
             };
             if flow.job {
                 let job_sender = sender.clone();
-                jobs.push(thread::spawn(move || {
+                jobs.push(tokio::task::spawn_blocking(move || {
                     attempt(&flow, &row, &root, before, ty, &job_sender, settings);
                 }));
-            } else if let Err(mpsc::SendError((_, row, ..))) =
+            } else if let Err(mpsc::error::SendError((_, row, ..))) =
                 runs.send((flow, row, root, before, ty))
             {
                 let why = "the queue's runs have stopped";
-                send(sender, row.id, ty, why, Status::Binned);
+                send(&sender, row.id, ty, why, Status::Binned);
             }
         }
-        wait = next_due(conn, settings.first_wait)
+        wait = next_due(&conn, settings.first_wait)
             .unwrap_or(idle)
-            .min(next_hunt.saturating_duration_since(Instant::now()));
+            .min(next_hunt.saturating_duration_since(clock::elapsed()));
         if unread {
             wait = wait.min(settings.first_wait);
         }
     }
     drop(runs);
-    let _ = runs_thread.join();
+    let _ = runs_task.await;
     for job in jobs {
-        let _ = job.join();
+        let _ = job.await;
+    }
+}
+
+/// The runs: each run handed to `bucket`, one after another, each on a blocking thread. They
+/// stop when a run's thread panics, as the runs' own thread stopped before.
+async fn one_after_another<T, D>(
+    mut bucket: UnboundedReceiver<Run<T, D>>,
+    sender: Sender<T, D>,
+    settings: Settings,
+) where
+    T: PartialEq + Send + 'static,
+    D: From<String> + Send + 'static,
+{
+    while let Some((flow, event, root, before, ty)) = bucket.recv().await {
+        let sender = sender.clone();
+        let ran = tokio::task::spawn_blocking(move || {
+            attempt(&flow, &event, &root, before, ty, &sender, settings);
+        });
+        if ran.await.is_err() {
+            return;
+        }
     }
 }
 
@@ -511,7 +563,7 @@ fn attempt<T, D>(
     };
     let run_at = chrono::TimeDelta::from_std(wait)
         .ok()
-        .and_then(|delay| Utc::now().checked_add_signed(delay));
+        .and_then(|delay| clock::now().checked_add_signed(delay));
     let Some(run_at) = run_at else {
         let why = "its retry's wait overflows";
         send(sender, event.id, ty, why, Status::Binned);
@@ -567,7 +619,7 @@ where
     let mut read_all = true;
     for (one, event, ty) in ones {
         let ours = taken_at(one).is_none_or(|at| at.timestamp_millis() >= started);
-        if ours || !older_than(one, window, Utc::now()) {
+        if ours || !older_than(one, window, clock::now()) {
             continue;
         }
         match after(conn, event, one) {
@@ -698,7 +750,7 @@ fn send<T: PartialEq, D: From<String>>(
 /// itself, as the append writes one.
 fn not_the_apps(conn: &Connection, source: Uuid, ty: u16) {
     let why = format!("ty {ty} is not the app's");
-    let row = params![Uuid::now_v7().to_string(), source.to_string(), ty, why];
+    let row = params![clock::new_id().to_string(), source.to_string(), ty, why];
     if let Err(err) = conn.execute(queries::BIN, row) {
         log::error!("the queue could not write a -1 for {source}: {err}");
     }
@@ -746,7 +798,7 @@ fn next_due(conn: &Connection, first_wait: Duration) -> Option<Duration> {
         Ok(None)
     };
     match next() {
-        Ok(at) => at.map(|at| (at - Utc::now()).to_std().unwrap_or(Duration::ZERO)),
+        Ok(at) => at.map(|at| (at - clock::now()).to_std().unwrap_or(Duration::ZERO)),
         Err(err) => {
             log::error!("the queue could not read the next run_at: {err}");
             Some(first_wait)
@@ -755,7 +807,7 @@ fn next_due(conn: &Connection, first_wait: Duration) -> Option<Duration> {
 }
 
 fn now() -> String {
-    Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+    clock::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
 /// The rows `sql` selects, as id, source, ty, data, `run_at` and status.
@@ -811,8 +863,16 @@ mod tests {
     use rannoch_core::forgr::_events;
     use uuid::Uuid;
 
-    fn put(conn: &rusqlite::Connection, source: Option<&str>, data: &str, status: i64) -> String {
-        let id = Uuid::now_v7().to_string();
+    /// A row from the app's forgr factory, its id a millisecond after the last one's, so ids
+    /// keep their order whatever another test's frozen clock reads.
+    async fn put(
+        conn: &rusqlite::Connection,
+        source: Option<&str>,
+        data: &str,
+        status: i64,
+    ) -> String {
+        tokio::time::advance(std::time::Duration::from_millis(1)).await;
+        let id = rannoch_core::clock::new_id().to_string();
         let row = _events::factory()
             .id(id.clone())
             .ty(1)
@@ -831,9 +891,9 @@ mod tests {
         read(conn, queries::EVENT, [id]).unwrap().pop().unwrap()
     }
 
-    #[test]
-    fn a_row_is_old_once_the_window_has_passed_since_it_was_accepted() {
-        let now = chrono::Utc::now();
+    #[tokio::test(start_paused = true)]
+    async fn a_row_is_old_once_the_window_has_passed_since_it_was_accepted() {
+        let now = rannoch_core::clock::now();
         let at = |ago: i64| {
             let t = now - chrono::TimeDelta::seconds(ago);
             let secs = u64::try_from(t.timestamp()).unwrap();
@@ -845,43 +905,43 @@ mod tests {
         assert!(!super::older_than(at(10), window, now));
     }
 
-    #[test]
-    fn something_after_a_1_anywhere_in_the_tree_counts() {
+    #[tokio::test(start_paused = true)]
+    async fn something_after_a_1_anywhere_in_the_tree_counts() {
         let store = rannoch_core::forgr::empty_store();
-        let hung = put(&store, None, "{}", 0);
-        let one = put(&store, Some(&hung), "\"taken\"", 1);
+        let hung = put(&store, None, "{}", 0).await;
+        let one = put(&store, Some(&hung), "\"taken\"", 1).await;
         let hung_id: Uuid = hung.parse().unwrap();
         let one_id: Uuid = one.parse().unwrap();
 
         assert!(!super::after(&store, hung_id, one_id).unwrap());
 
-        let failed = put(&store, None, "{}", 0);
-        let failed_one = put(&store, Some(&failed), "\"taken\"", 1);
-        let retry = put(&store, Some(&failed), "\"failed\"", 0);
-        put(&store, Some(&retry), "\"taken\"", 1);
+        let failed = put(&store, None, "{}", 0).await;
+        let failed_one = put(&store, Some(&failed), "\"taken\"", 1).await;
+        let retry = put(&store, Some(&failed), "\"failed\"", 0).await;
+        put(&store, Some(&retry), "\"taken\"", 1).await;
         let failed_id: Uuid = failed.parse().unwrap();
 
         assert!(super::after(&store, failed_id, failed_one.parse().unwrap()).unwrap());
         // Only a grandchild comes after this 1, so only the walk down the tree finds it.
-        let deep = put(&store, None, "{}", 0);
-        let child = put(&store, Some(&deep), "{}", 0);
-        let deep_one = put(&store, Some(&deep), "\"taken\"", 1);
-        put(&store, Some(&child), "\"later\"", 0);
+        let deep = put(&store, None, "{}", 0).await;
+        let child = put(&store, Some(&deep), "{}", 0).await;
+        let deep_one = put(&store, Some(&deep), "\"taken\"", 1).await;
+        put(&store, Some(&child), "\"later\"", 0).await;
         let deep_id: Uuid = deep.parse().unwrap();
         assert!(super::after(&store, deep_id, deep_one.parse().unwrap()).unwrap());
     }
 
-    #[test]
-    fn the_hunt_reads_only_the_1s_whose_event_has_no_result() {
+    #[tokio::test(start_paused = true)]
+    async fn the_hunt_reads_only_the_1s_whose_event_has_no_result() {
         let store = rannoch_core::forgr::empty_store();
-        let hung = put(&store, None, "{}", 0);
-        let hung_one = put(&store, Some(&hung), "\"taken\"", 1);
-        let done = put(&store, None, "{}", 0);
-        put(&store, Some(&done), "\"taken\"", 1);
-        put(&store, Some(&done), "\"made\"", 2);
-        let failed = put(&store, None, "{}", 0);
-        put(&store, Some(&failed), "\"taken\"", 1);
-        put(&store, Some(&failed), "\"failed\"", -1);
+        let hung = put(&store, None, "{}", 0).await;
+        let hung_one = put(&store, Some(&hung), "\"taken\"", 1).await;
+        let done = put(&store, None, "{}", 0).await;
+        put(&store, Some(&done), "\"taken\"", 1).await;
+        put(&store, Some(&done), "\"made\"", 2).await;
+        let failed = put(&store, None, "{}", 0).await;
+        put(&store, Some(&failed), "\"taken\"", 1).await;
+        put(&store, Some(&failed), "\"failed\"", -1).await;
 
         let ones: Vec<String> = super::ones_without_result(&store)
             .unwrap()
@@ -892,8 +952,8 @@ mod tests {
         assert_eq!(ones, [format!("{hung_one} {hung}")]);
     }
 
-    #[test]
-    fn the_backoff_doubles_and_stops_at_the_attempts_setting() {
+    #[tokio::test(start_paused = true)]
+    async fn the_backoff_doubles_and_stops_at_the_attempts_setting() {
         let settings = super::Settings {
             attempts: 3,
             ..super::Settings::new(std::time::Duration::from_millis(100))
@@ -905,8 +965,8 @@ mod tests {
         assert_eq!(super::backoff(settings, 2), None);
     }
 
-    #[test]
-    fn a_key_in_the_section_replaces_its_value_and_an_absent_one_leaves_it() {
+    #[tokio::test(start_paused = true)]
+    async fn a_key_in_the_section_replaces_its_value_and_an_absent_one_leaves_it() {
         use std::time::Duration;
         let given = super::Settings::new(Duration::from_millis(100));
         let section = super::Section {
@@ -928,12 +988,12 @@ mod tests {
         assert_eq!(idle, super::IDLE);
     }
 
-    #[test]
-    fn an_event_that_is_not_a_retry_is_its_own_root() {
+    #[tokio::test(start_paused = true)]
+    async fn an_event_that_is_not_a_retry_is_its_own_root() {
         let store = rannoch_core::forgr::empty_store();
-        let first = put(&store, None, "{\"in\":1}", 0);
-        let done = put(&store, Some(&first), "\"made\"", 2);
-        let output = put(&store, Some(&first), "{\"out\":1}", 0);
+        let first = put(&store, None, "{\"in\":1}", 0).await;
+        let done = put(&store, Some(&first), "\"made\"", 2).await;
+        let output = put(&store, Some(&first), "{\"out\":1}", 0).await;
 
         assert_eq!(
             root(&store, event(&store, &first))
@@ -956,14 +1016,14 @@ mod tests {
         let _ = done;
     }
 
-    #[test]
-    fn a_retry_of_a_retry_walks_back_to_the_original() {
+    #[tokio::test(start_paused = true)]
+    async fn a_retry_of_a_retry_walks_back_to_the_original() {
         let store = rannoch_core::forgr::empty_store();
-        let original = put(&store, None, "{\"in\":1}", 0);
-        put(&store, Some(&original), "\"failed\"", -1);
-        let first = put(&store, Some(&original), "\"failed\"", 0);
-        put(&store, Some(&first), "\"failed again\"", -1);
-        let second = put(&store, Some(&first), "\"failed again\"", 0);
+        let original = put(&store, None, "{\"in\":1}", 0).await;
+        put(&store, Some(&original), "\"failed\"", -1).await;
+        let first = put(&store, Some(&original), "\"failed\"", 0).await;
+        put(&store, Some(&first), "\"failed again\"", -1).await;
+        let second = put(&store, Some(&first), "\"failed again\"", 0).await;
 
         let (found, before) = root(&store, event(&store, &second)).unwrap().unwrap();
 

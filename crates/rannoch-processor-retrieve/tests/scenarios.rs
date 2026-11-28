@@ -4,7 +4,7 @@
 //! scenarios; the app's source is a stub behind `Source`.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, mpsc};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
@@ -57,7 +57,12 @@ fn until(done: impl Fn() -> bool) -> bool {
 }
 
 /// The app's store, rannoch, and the queue handing events to rannoch-processor.
-struct App(PathBuf, mpsc::Sender<()>, Rannoch<u16, Value>, Queue);
+struct App(
+    PathBuf,
+    tokio::sync::mpsc::UnboundedSender<()>,
+    Rannoch<u16, Value>,
+    Queue,
+);
 
 /// A fresh store for the app, with every migration applied by opening rannoch once.
 fn migrated() -> Result<PathBuf> {
@@ -81,7 +86,7 @@ impl App {
             store: Some(store.clone()),
             ..Config::default()
         };
-        let (signal, wake) = mpsc::channel();
+        let (signal, wake) = tokio::sync::mpsc::unbounded_channel();
         let append = Arc::new(Events::new(ready(&path)?, signal.clone()));
         let append = Some(append as Arc<dyn Append<u16, Value>>);
         let rannoch = Rannoch::open(Config { append, ..config() })?;

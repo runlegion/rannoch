@@ -12,7 +12,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Once, mpsc};
+use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
 use std::{env, fs, process};
 
@@ -185,7 +185,7 @@ fn open_with(
 }
 
 /// The events crate's append over the store at `path`, signalling `queue`.
-fn events(path: &Path, queue: mpsc::Sender<()>) -> Result<Arc<Events>> {
+fn events(path: &Path, queue: tokio::sync::mpsc::UnboundedSender<()>) -> Result<Arc<Events>> {
     Ok(Arc::new(Events::new(
         rusqlite::Connection::open(path)?,
         queue,
@@ -196,7 +196,7 @@ fn events(path: &Path, queue: mpsc::Sender<()>) -> Result<Arc<Events>> {
 async fn fr_rannoch_005_c1() {
     // Given events on an inbox's heap
     let path = empty_store("fr_rannoch_005_c1").unwrap();
-    let (queue, signals) = mpsc::channel();
+    let (queue, mut signals) = tokio::sync::mpsc::unbounded_channel();
     let rannoch = open_with(events(&path, queue).unwrap(), TimeDelta::milliseconds(200)).unwrap();
     let sender = rannoch.sender();
     for _ in 0..3 {
@@ -213,7 +213,10 @@ async fn fr_rannoch_005_c1() {
 
     // And the heap is empty: shutdown hands over what is left, and nothing is
     shutdown(rannoch).await;
-    assert_eq!(signals.try_recv(), Err(mpsc::TryRecvError::Disconnected));
+    assert_eq!(
+        signals.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+    );
     assert_eq!(events_in(&path).unwrap(), 3);
 }
 
@@ -225,7 +228,7 @@ async fn fr_rannoch_005_c2() {
     if let Ok(path) = env::var(CRASH_STORE) {
         // The child: events on an inbox's heap, then the process stops
         // before the batch is handed over.
-        let (queue, _signals) = mpsc::channel();
+        let (queue, _signals) = tokio::sync::mpsc::unbounded_channel();
         let rannoch = open_with(
             events(Path::new(&path), queue).unwrap(),
             TimeDelta::hours(1),
@@ -311,7 +314,7 @@ async fn fr_rannoch_005_c3() {
 
     // Given the events crate cannot append
     let path = empty_store("fr_rannoch_005_c3").unwrap();
-    let (queue, signals) = mpsc::channel();
+    let (queue, mut signals) = tokio::sync::mpsc::unbounded_channel();
     let flaky = Arc::new(Flaky {
         failing: AtomicBool::new(true),
         events: events(&path, queue).unwrap(),
@@ -329,7 +332,10 @@ async fn fr_rannoch_005_c3() {
 
     // And the events are still on the heap: none reached _events
     assert_eq!(events_in(&path).unwrap(), 0);
-    assert_eq!(signals.try_recv(), Err(mpsc::TryRecvError::Empty));
+    assert_eq!(
+        signals.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    );
 
     // When the events crate can append again and the next interval passes
     flaky.failing.store(false, Ordering::SeqCst);
@@ -486,7 +492,7 @@ async fn an_app_opens_rannoch_over_its_database() {
     let held = rusqlite::Connection::open(&path).unwrap();
     held.query_row("SELECT count(*) FROM _events", [], |r| r.get::<_, i64>(0))
         .unwrap();
-    let (queue, _signals) = mpsc::channel();
+    let (queue, _signals) = tokio::sync::mpsc::unbounded_channel();
     let rannoch = Rannoch::<u8, String>::open(Config {
         store: Some(Arc::new(Store::new(path.clone(), rannoch_core::migrator()))),
         append: Some(Arc::new(Events::new(conn, queue))),
@@ -543,9 +549,12 @@ fn with_settings(test: &str, settings: &Path) -> Result<()> {
 fn open_an_hour(
     name: &str,
     settings: PathBuf,
-) -> Result<(Rannoch<u8, String>, mpsc::Receiver<()>)> {
+) -> Result<(
+    Rannoch<u8, String>,
+    tokio::sync::mpsc::UnboundedReceiver<()>,
+)> {
     let path = empty_store(name)?;
-    let (queue, signals) = mpsc::channel();
+    let (queue, signals) = tokio::sync::mpsc::unbounded_channel();
     let rannoch = Rannoch::open(Config {
         default_interval: TimeDelta::hours(1),
         append: Some(events(&path, queue)?),
@@ -560,7 +569,7 @@ fn open_an_hour(
 async fn core_settings_c1() -> Result<()> {
     if let Ok(settings) = env::var(CORE_SETTINGS) {
         // When Rannoch::open is called with that file's path and an event is sent
-        let (rannoch, signals) = open_an_hour("core_settings_c1", settings.into())?;
+        let (rannoch, mut signals) = open_an_hour("core_settings_c1", settings.into())?;
 
         // Then the default inbox hands it over at the interval the [core] section gives
         tokio::time::sleep(Duration::from_millis(60)).await;
@@ -578,11 +587,14 @@ async fn core_settings_c1() -> Result<()> {
 async fn core_settings_c2() -> Result<()> {
     if let Ok(settings) = env::var(CORE_SETTINGS) {
         // When Rannoch::open is called with that file's path and an event is sent
-        let (rannoch, signals) = open_an_hour("core_settings_c2", settings.into())?;
+        let (rannoch, mut signals) = open_an_hour("core_settings_c2", settings.into())?;
 
         // Then the default inbox does not hand it over before shutdown
         tokio::time::sleep(Duration::from_millis(500)).await;
-        assert_eq!(signals.try_recv(), Err(mpsc::TryRecvError::Empty));
+        assert_eq!(
+            signals.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        );
         shutdown(rannoch).await;
         assert_eq!(signals.try_recv(), Ok(()));
         return Ok(());

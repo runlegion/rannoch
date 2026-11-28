@@ -5,16 +5,18 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, mpsc};
-use std::time::{Duration, Instant};
-use std::{env, fs, thread};
+use std::sync::Arc;
+use std::time::Duration;
+use std::{env, fs};
 
+use rannoch_core::clock::{self, new_id};
 use rannoch_core::forgr::_events;
 use rannoch_core::{Append, Config, Event, Rannoch, Sender, Status, Storage};
 use rannoch_events::Events;
 use rannoch_queue::{Flow, Flows, Queue, Row, Settings};
 use rannoch_store::{Opened, Store};
 use rusqlite::Connection;
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -111,26 +113,26 @@ fn about(conn: &Connection, id: Uuid, status: i64) -> Result<Vec<Uuid>> {
     Ok(ids.iter().filter_map(|id| id.parse().ok()).collect())
 }
 
-/// Waits up to five seconds for the retry of `id`.
-fn retry_of(conn: &Connection, id: Uuid) -> Result<Option<Uuid>> {
-    let start = Instant::now();
+/// Waits up to five seconds on the clock for the retry of `id`.
+async fn retry_of(conn: &Connection, id: Uuid) -> Result<Option<Uuid>> {
+    let start = clock::elapsed();
     while start.elapsed() < Duration::from_secs(5) {
         if let Some(retry) = about(conn, id, 0)?.first() {
             return Ok(Some(*retry));
         }
-        thread::sleep(Duration::from_millis(20));
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
     Ok(about(conn, id, 0)?.first().copied())
 }
 
-/// Waits up to five seconds for a -1 about `id`.
-fn binned(conn: &Connection, id: Uuid) -> Result<bool> {
-    let start = Instant::now();
+/// Waits up to five seconds on the clock for a -1 about `id`.
+async fn binned(conn: &Connection, id: Uuid) -> Result<bool> {
+    let start = clock::elapsed();
     while start.elapsed() < Duration::from_secs(5) {
         if !about(conn, id, -1)?.is_empty() {
             return Ok(true);
         }
-        thread::sleep(Duration::from_millis(20));
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
     Ok(!about(conn, id, -1)?.is_empty())
 }
@@ -138,13 +140,13 @@ fn binned(conn: &Connection, id: Uuid) -> Result<bool> {
 /// Opens rannoch with the settings file the parent wrote, starts the queue with `settings` over
 /// the failing flow, and sends one event for it. Returns the attempts the chain ran: the event
 /// and each retry, each followed by its -1.
-fn attempts(name: &str, settings: Settings) -> Result<usize> {
+async fn attempts(name: &str, settings: Settings) -> Result<usize> {
     let path = dir(&format!("{name}-store"))?.join("store.db");
     let store = Arc::new(Store::new(path.clone(), rannoch_core::migrator()));
     if store.pending()? {
         store.apply()?;
     }
-    let (signal, wake) = mpsc::channel();
+    let (signal, wake) = mpsc::unbounded_channel();
     let rannoch = Rannoch::open(Config {
         settings: Some(PathBuf::from(env::var(SETTINGS)?)),
         store: Some(store),
@@ -162,7 +164,7 @@ fn attempts(name: &str, settings: Settings) -> Result<usize> {
     );
     let read = ready(&path)?;
 
-    let mut attempt = Uuid::now_v7();
+    let mut attempt = new_id();
     _events::factory()
         .id(attempt.to_string())
         .ty(4)
@@ -172,23 +174,27 @@ fn attempts(name: &str, settings: Settings) -> Result<usize> {
     signal.send(())?;
 
     let mut ran = 0;
-    while binned(&read, attempt)? {
+    while binned(&read, attempt).await? {
         ran += 1;
         // A chain with attempts left sends its retry within the first wait.
-        let Some(retry) = retry_of(&read, attempt)? else {
+        let Some(retry) = retry_of(&read, attempt).await? else {
             break;
         };
         attempt = retry;
     }
 
     drop(signal);
-    rannoch.shutdown();
-    queue.join()?;
+    // Shutdown and join block, so they run through `spawn_blocking`.
+    tokio::task::spawn_blocking(move || {
+        rannoch.shutdown();
+        queue.join()
+    })
+    .await??;
     Ok(ran)
 }
 
-#[test]
-fn the_queue_sections_attempts_replaces_the_attempts_passed_to_start() -> Result<()> {
+#[tokio::test(start_paused = true)]
+async fn the_queue_sections_attempts_replaces_the_attempts_passed_to_start() -> Result<()> {
     const NAME: &str = "the_queue_sections_attempts_replaces_the_attempts_passed_to_start";
     if env::var(CHILD).is_ok() {
         // And Settings with 10 attempts passed to Queue::start
@@ -197,15 +203,15 @@ fn the_queue_sections_attempts_replaces_the_attempts_passed_to_start() -> Result
 
         // When a run that always fails is taken
         // Then it is binned after its second attempt, and no third attempt is sent
-        assert_eq!(attempts(NAME, settings)?, 2);
+        assert_eq!(attempts(NAME, settings).await?, 2);
         return Ok(());
     }
     // Given a settings file whose [queue] section sets attempts = 2
     child(NAME, "[queue]\nattempts = 2\n")
 }
 
-#[test]
-fn with_no_queue_section_the_queue_behaves_as_today() -> Result<()> {
+#[tokio::test(start_paused = true)]
+async fn with_no_queue_section_the_queue_behaves_as_today() -> Result<()> {
     const NAME: &str = "with_no_queue_section_the_queue_behaves_as_today";
     if env::var(CHILD).is_ok() {
         // And Settings with 3 attempts passed to Queue::start
@@ -216,7 +222,7 @@ fn with_no_queue_section_the_queue_behaves_as_today() -> Result<()> {
 
         // When a run that always fails is taken
         // Then it is binned after its third attempt, as the Settings passed in say
-        assert_eq!(attempts(NAME, settings)?, 3);
+        assert_eq!(attempts(NAME, settings).await?, 3);
         return Ok(());
     }
     // Given a settings file with no [queue] section
