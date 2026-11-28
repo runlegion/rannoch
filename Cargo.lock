@@ -1431,7 +1431,7 @@ dependencies = [
  "rannoch-settings",
  "rusqlite",
  "serde",
- "uuid",
+ "tokio",
 ]
 
 [[package]]

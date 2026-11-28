@@ -12,11 +12,12 @@ rannoch-core = { path = "../rannoch-core" }
 rannoch-settings = { path = "../rannoch-settings" }
 rusqlite = { version = "0.41", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time"] }
 
 [dev-dependencies]
 rannoch-core = { path = "../rannoch-core", features = ["testing"] }
 rannoch-events = { path = "../rannoch-events" }
-uuid = { version = "1", features = ["v7"] }
+tokio = { version = "1", features = ["macros", "test-util"] }
 
 [lints]
 workspace = true

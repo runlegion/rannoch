@@ -4,8 +4,7 @@
 use std::fs;
 use std::path::Path;
 use std::sync::{Mutex, PoisonError};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use rannoch_core::Storage;
 use rannoch_store::{Opened, Store, open};
@@ -35,8 +34,8 @@ fn unopened() -> usize {
     *UNOPENED.0.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-#[test]
-fn store_settings_c1() {
+#[tokio::test(start_paused = true)]
+async fn store_settings_c1() {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("store_settings_c1");
     if dir.exists() {
         fs::remove_dir_all(&dir).unwrap();
@@ -74,11 +73,7 @@ fn store_settings_c1() {
     // And the checkpointer runs at that interval: a store whose database cannot open logs each
     // try, and at 50 ms it tries several times before the default's first try at one second.
     let store = Store::new(dir.join("none").join("store.db"), rannoch_core::migrator());
-    let start = Instant::now();
-    while unopened() < 5 && start.elapsed() < Duration::from_millis(900) {
-        thread::sleep(Duration::from_millis(10));
-    }
-    let elapsed = start.elapsed();
+    tokio::time::sleep(Duration::from_millis(900)).await;
     drop(store);
-    assert!(unopened() >= 5, "{} tries in {elapsed:?}", unopened());
+    assert!(unopened() >= 5, "{} tries in 900 ms", unopened());
 }
