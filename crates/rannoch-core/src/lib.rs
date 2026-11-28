@@ -2,38 +2,57 @@
 //! Rannoch's core types: the event, its status and the error vocabulary, and the broker an app
 //! opens rannoch with.
 //!
-//! An app opens [`Rannoch`] with a [`Config`]: its inboxes, the default inbox's batch interval,
-//! its store as a [`Storage`] and the events crate's [`Append`]. [`Rannoch::open`] applies the
-//! store's pending migrations before anything else; [`Rannoch::sender`] gives each producer a
-//! [`Sender`], and [`Rannoch::shutdown`] stops it. [`migrator`] is every crate's migrations as
-//! one migrator, for the app's store.
+//! An app opens [`Rannoch`] with a [`Config`]: its store as a [`Storage`], the events crate's
+//! [`Append`] and its settings file. [`Rannoch::open`] applies the store's pending migrations
+//! before anything else; [`Rannoch::sender`] gives each producer a [`Sender`], and
+//! [`Rannoch::shutdown`] stops it. [`migrator`] is every crate's migrations as one migrator, for
+//! the app's store.
+//!
+//! # Lanes
+//!
+//! The lanes come from the settings file, one `[lane.<name>]` section each: the `tys` it holds,
+//! its `memory_limit_bytes` (8 MB by default) and its `heartbeat_ms` (20 by default). A `ty` no
+//! lane lists goes to the default lane, and an event with a `run_at` goes to the scheduled lane;
+//! a `[lane.default]` or `[lane.scheduled]` section sets that lane's limit and heartbeat. A `ty`
+//! listed in two lanes, or one that is not the app's, fails open with [`Error::Config`].
+//!
+//! ```toml
+//! [lane.default]
+//! heartbeat_ms = 50
+//!
+//! [lane.assets]
+//! tys = [2, 3]
+//! memory_limit_bytes = 1048576
+//! heartbeat_ms = 500
+//! ```
 //!
 //! # From a send to the store
 //!
-//! [`Sender::send`] puts the event on the heap of the inbox for its `ty`, in memory, and returns
-//! [`Status::Added`]: the event is not on disk yet. Each inbox hands its whole heap to the append
-//! as one batch once per interval, so a sent event reaches the append at its inbox's next
-//! hand-over. The default inbox's interval is 20 ms in [`Config::default`].
+//! [`Sender::send`] stamps the event's id and puts it on its lane's heap, in memory, and returns
+//! [`Status::Added`]: the event is not on disk yet. Each lane hands its whole heap to the append
+//! as one batch when its heartbeat expires or when the heap reaches its memory limit, whichever
+//! comes first; each lane runs as a task of its own, so a large event in one lane does not delay
+//! another lane's batches. An event's size is the event and its data's JSON. The id is stamped
+//! under the lock that puts the event on its heap, so a lane's events reach the append in id
+//! order.
 //!
 //! The append returns the events it sends in reply, as a -1 for an event of the batch it did not
-//! write, and the inbox sends each as [`Sender::send`] does, to the inbox for its `ty`. Once
-//! rannoch is shutting down the broker takes no send, so the inbox that handed the batch over
-//! accepts its replies onto its own heap and hands them over itself, in one more hand-over.
+//! write; the lane stamps each, accepts it onto its own heap and hands it over in one more batch.
 //!
-//! When the append fails, the inbox logs the failure at `error`, puts the batch back on its heap
-//! ahead of the events sent since, and hands all of them over again at its next interval. With
+//! When the append fails, the lane logs the failure at `error`, puts the batch back on its heap
+//! ahead of the events sent since, and hands all of them over again at its next batch. With
 //! rannoch-events' `Events`, which writes a batch in one transaction, a batch that always fails
-//! holds up its inbox: nothing sent to that inbox after it is written either.
+//! holds up its lane: nothing sent to that lane after it is written either.
 //!
-//! [`Rannoch::shutdown`] refuses every send after it with [`Error::Closed`], has each inbox hand
-//! over what is left on its heap, and blocks until each inbox's task has returned. When that last
+//! [`Rannoch::shutdown`] refuses every send after it with [`Error::Closed`], has each lane hand
+//! over what is left on its heap, and blocks until each lane's task has returned. When that last
 //! hand-over fails, the failure is logged and those events are not written.
 //!
-//! With no append in the [`Config`], no inbox hands anything over and no sent event is written.
+//! With no append in the [`Config`], no lane hands anything over and no sent event is written.
 //!
 //! # Time
 //!
-//! Every time rannoch reads or waits on goes through [`clock`], on tokio's time. Each inbox runs
+//! Every time rannoch reads or waits on goes through [`clock`], on tokio's time. Each lane runs
 //! as a task on the tokio runtime [`Rannoch::open`] is called in, or on one it starts when called
 //! outside a runtime. [`Rannoch::shutdown`] blocks, so async code calls it through
 //! `tokio::task::spawn_blocking`.
@@ -48,45 +67,32 @@
 //!
 //! # Example
 //!
-//! The app's own `ty` enum, an inbox for one of its types, a send, and shutdown. This `Config`
-//! has no store and no append, so open checks no migration and nothing is written;
-//! rannoch-queue's crate docs start rannoch over a store.
+//! The app's own `ty` enum, a send, and shutdown. This `Config` has no store and no append, so
+//! open checks no migration and nothing is written; rannoch-queue's crate docs start rannoch over
+//! a store.
 //!
 //! ```
-//! use chrono::TimeDelta;
-//! use rannoch_core::{Config, Error, Event, InboxConfig, Rannoch, Status};
+//! use rannoch_core::{Config, Error, Event, Rannoch, Status};
 //! use uuid::Uuid;
 //!
 //! /// The app's event types.
 //! #[derive(Debug, Clone, Copy, PartialEq)]
 //! enum Ty {
-//!     Page,
-//!     Asset,
+//!     Page = 1,
+//! }
+//!
+//! /// A settings file lists a lane's `tys` as their `u16`.
+//! impl TryFrom<u16> for Ty {
+//!     type Error = u16;
+//!     fn try_from(ty: u16) -> Result<Self, u16> {
+//!         if ty == 1 { Ok(Ty::Page) } else { Err(ty) }
+//!     }
 //! }
 //!
 //! // The clock frozen, as in every rannoch-core test.
 //! #[tokio::main(flavor = "current_thread", start_paused = true)]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     // Assets go to an inbox with a half-second interval; every other ty goes to the default
-//!     // inbox.
-//!     let assets = InboxConfig {
-//!         name: "assets".to_owned(),
-//!         types: vec![Ty::Asset],
-//!         interval: TimeDelta::milliseconds(500),
-//!     };
-//!
-//!     // A ty listed in two inboxes fails open.
-//!     let twice = Config {
-//!         inboxes: vec![assets.clone(), assets.clone()],
-//!         ..Config::default()
-//!     };
-//!     assert_eq!(Rannoch::<Ty, String>::open(twice).err(), Some(Error::Config));
-//!
-//!     let config = Config {
-//!         inboxes: vec![assets],
-//!         ..Config::default()
-//!     };
-//!     let rannoch = Rannoch::<Ty, String>::open(config)?;
+//!     let rannoch = Rannoch::<Ty, String>::open(Config::default())?;
 //!     let sender = rannoch.sender();
 //!
 //!     let page = Event {
@@ -109,9 +115,9 @@
 
 mod broker;
 pub mod clock;
-mod inbox;
+mod lane;
 
-pub use broker::{Append, Config, InboxConfig, Rannoch, Sender, Storage};
+pub use broker::{Append, Config, Rannoch, Sender, Storage};
 
 use std::fmt;
 

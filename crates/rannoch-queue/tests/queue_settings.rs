@@ -153,7 +153,6 @@ async fn attempts(name: &str, settings: Settings) -> Result<usize> {
         append: Some(
             Arc::new(Events::new(ready(&path)?, signal.clone())) as Arc<dyn Append<Ty, String>>
         ),
-        ..Config::default()
     })?;
     let queue = Queue::start(
         ready(&path)?,

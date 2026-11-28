@@ -12,7 +12,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::TimeDelta;
 use rannoch_core::clock::{self, new_id};
 use rannoch_core::forgr::_events;
 use rannoch_core::{Append, Config, Rannoch};
@@ -46,10 +45,6 @@ impl TryFrom<u16> for Ty {
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-/// An inbox that hands over only at shutdown, so a status the queue sent twice is on disk twice.
-const HOUR: TimeDelta = TimeDelta::hours(1);
-/// The default inbox's interval.
-const FAST: TimeDelta = TimeDelta::milliseconds(20);
 const WAIT: Duration = Duration::from_secs(5);
 
 /// Held for each test's whole run, so the tests take turns.
@@ -100,8 +95,8 @@ fn seed(path: &Path, rows: &[Seed<'_>]) -> Result<()> {
     Ok(())
 }
 
-/// The app: rannoch over the store with `Events` as its append, its default inbox handing over
-/// every `interval`, and the queue handing each event to rannoch-processor on the built-in flows.
+/// The app: rannoch over the store with `Events` as its append, and the queue handing each event
+/// to rannoch-processor on the built-in flows.
 struct App {
     signal: mpsc::UnboundedSender<()>,
     rannoch: Rannoch<Ty, Value>,
@@ -109,7 +104,7 @@ struct App {
 }
 
 impl App {
-    fn start(path: &Path, interval: TimeDelta, settings: Settings) -> Result<Self> {
+    fn start(path: &Path, settings: Settings) -> Result<Self> {
         let built_in = include_str!("../../rannoch-processor/tests/built_in.json");
         let docs: Vec<(String, FlowDoc)> = serde_json::from_str(built_in)?;
         let flows = check(&docs, &[]).map_err(|errors| errors.join("\n"))?;
@@ -117,7 +112,6 @@ impl App {
         let (signal, wake) = mpsc::unbounded_channel();
         let events = Events::new(ready(path)?, signal.clone()).with_writes(processor.writes());
         let rannoch = Rannoch::open(Config {
-            default_interval: interval,
             store: Some(Arc::new(Store::new(
                 path.to_owned(),
                 rannoch_core::migrator(),
@@ -217,7 +211,7 @@ async fn a_due_event_whose_ty_is_not_the_apps_gets_a_minus_1() -> Result<()> {
     let event = id();
     seed(&path, &[(&event, None, 9, r#"{"ticket":"t1"}"#, None, 0)])?;
 
-    let app = App::start(&path, HOUR, once())?;
+    let app = App::start(&path, once())?;
     app.signal_twice().await?;
     app.stop().await?;
 
@@ -231,7 +225,7 @@ async fn a_due_event_whose_ty_is_not_the_apps_gets_a_minus_1() -> Result<()> {
 /// Starts the app over the store at `path` with the hunt running every 300 ms, waits for a -1
 /// about `event`, and stops it.
 async fn hunt(path: &Path, event: &str) -> Result<()> {
-    let app = App::start(path, FAST, hunting())?;
+    let app = App::start(path, hunting())?;
     let binned = || about(path, event).is_ok_and(|rows| rows.iter().any(|r| r.0 == -1));
     assert!(until(WAIT, binned).await, "no -1 about {event}");
     app.stop().await
@@ -270,7 +264,7 @@ async fn a_failed_run_whose_retry_wait_overflows_gets_a_minus_1_and_no_retry() -
         ..Settings::new(Duration::MAX)
     };
 
-    let app = App::start(&path, HOUR, settings)?;
+    let app = App::start(&path, settings)?;
     app.signal_twice().await?;
     app.stop().await?;
 

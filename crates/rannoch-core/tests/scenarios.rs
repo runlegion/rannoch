@@ -19,7 +19,7 @@ use std::{env, fs, process};
 
 use chrono::TimeDelta;
 use log::{Level, Log, Metadata, Record};
-use rannoch_core::{Append, Config, Error, Event, InboxConfig, Rannoch, Status, clock};
+use rannoch_core::{Append, Config, Error, Event, Rannoch, Status, clock};
 use rannoch_events::Events;
 use rannoch_store::{Opened, Store};
 use uuid::Uuid;
@@ -173,13 +173,11 @@ fn events_in(path: &Path) -> Result<i64> {
         .query_row("SELECT count(*) FROM _events", [], |r| r.get(0))?)
 }
 
-/// Rannoch with one default inbox at `interval`, handing over to `append`.
+/// Rannoch with its default lanes, handing over to `append`.
 fn open_with(
     append: Arc<dyn Append<u8, String>>,
-    interval: TimeDelta,
 ) -> std::result::Result<Rannoch<u8, String>, Error> {
     Rannoch::open(Config {
-        default_interval: interval,
         append: Some(append),
         ..Config::default()
     })
@@ -198,7 +196,7 @@ async fn fr_rannoch_005_c1() {
     // Given events on an inbox's heap
     let path = empty_store("fr_rannoch_005_c1").unwrap();
     let (queue, mut signals) = tokio::sync::mpsc::unbounded_channel();
-    let rannoch = open_with(events(&path, queue).unwrap(), TimeDelta::milliseconds(200)).unwrap();
+    let rannoch = open_with(events(&path, queue).unwrap()).unwrap();
     let sender = rannoch.sender();
     for _ in 0..3 {
         assert_eq!(sender.send(event()), Ok(Status::Added));
@@ -230,11 +228,7 @@ async fn fr_rannoch_005_c2() {
         // The child: events on an inbox's heap, then the process stops
         // before the batch is handed over.
         let (queue, _signals) = tokio::sync::mpsc::unbounded_channel();
-        let rannoch = open_with(
-            events(Path::new(&path), queue).unwrap(),
-            TimeDelta::hours(1),
-        )
-        .unwrap();
+        let rannoch = open_with(events(Path::new(&path), queue).unwrap()).unwrap();
         for _ in 0..3 {
             assert_eq!(rannoch.sender().send(event()), Ok(Status::Added));
         }
@@ -320,7 +314,7 @@ async fn fr_rannoch_005_c3() {
         failing: AtomicBool::new(true),
         events: events(&path, queue).unwrap(),
     });
-    let rannoch = open_with(flaky.clone(), TimeDelta::milliseconds(100)).unwrap();
+    let rannoch = open_with(flaky.clone()).unwrap();
     for _ in 0..2 {
         assert_eq!(rannoch.sender().send(event()), Ok(Status::Added));
     }
@@ -545,9 +539,16 @@ fn with_settings(test: &str, settings: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Opens rannoch over a fresh store under `name` with the settings file at `settings` and a
-/// default inbox of an hour, sends one event, and returns rannoch and the append's signals.
-fn open_an_hour(
+/// A settings file holding `toml`, in a fresh directory for `name`.
+fn settings_file(name: &str, toml: &str) -> Result<PathBuf> {
+    let settings = database(&format!("{name}_file"))?.with_file_name("app.toml");
+    fs::write(&settings, toml)?;
+    Ok(settings)
+}
+
+/// Opens rannoch over a fresh store under `name` with the settings file at `settings`, sends one
+/// event, and returns rannoch and the append's signals.
+fn open_settled(
     name: &str,
     settings: PathBuf,
 ) -> Result<(
@@ -557,7 +558,6 @@ fn open_an_hour(
     let path = empty_store(name)?;
     let (queue, signals) = tokio::sync::mpsc::unbounded_channel();
     let rannoch = Rannoch::open(Config {
-        default_interval: TimeDelta::hours(1),
         append: Some(events(&path, queue)?),
         settings: Some(settings),
         ..Config::default()
@@ -570,27 +570,9 @@ fn open_an_hour(
 async fn core_settings_c1() -> Result<()> {
     if let Ok(settings) = env::var(CORE_SETTINGS) {
         // When Rannoch::open is called with that file's path and an event is sent
-        let (rannoch, mut signals) = open_an_hour("core_settings_c1", settings.into())?;
+        let (rannoch, mut signals) = open_settled("core_settings_c1", settings.into())?;
 
-        // Then the default inbox hands it over at the interval the [core] section gives
-        tokio::time::sleep(Duration::from_millis(60)).await;
-        assert_eq!(signals.try_recv(), Ok(()));
-        shutdown(rannoch).await;
-        return Ok(());
-    }
-    // Given a settings file whose [core] section sets default_interval_ms
-    let settings = database("core_settings_c1_file")?.with_file_name("app.toml");
-    fs::write(&settings, "[core]\ndefault_interval_ms = 50\n")?;
-    with_settings("core_settings_c1", &settings)
-}
-
-#[tokio::test(start_paused = true)]
-async fn core_settings_c2() -> Result<()> {
-    if let Ok(settings) = env::var(CORE_SETTINGS) {
-        // When Rannoch::open is called with that file's path and an event is sent
-        let (rannoch, mut signals) = open_an_hour("core_settings_c2", settings.into())?;
-
-        // Then the default inbox does not hand it over before shutdown
+        // Then the default lane does not hand it over before shutdown
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert_eq!(
             signals.try_recv(),
@@ -600,9 +582,28 @@ async fn core_settings_c2() -> Result<()> {
         assert_eq!(signals.try_recv(), Ok(()));
         return Ok(());
     }
-    // Given a settings file with no [core] section
-    let settings = database("core_settings_c2_file")?.with_file_name("app.toml");
-    fs::write(&settings, "[queue]\ndepth = 4\n")?;
+    // Given a settings file whose [lane.default] section sets an hour's heartbeat
+    let settings = settings_file(
+        "core_settings_c1",
+        "[lane.default]\nheartbeat_ms = 3600000\n",
+    )?;
+    with_settings("core_settings_c1", &settings)
+}
+
+#[tokio::test(start_paused = true)]
+async fn core_settings_c2() -> Result<()> {
+    if let Ok(settings) = env::var(CORE_SETTINGS) {
+        // When Rannoch::open is called with that file's path and an event is sent
+        let (rannoch, mut signals) = open_settled("core_settings_c2", settings.into())?;
+
+        // Then the default lane hands it over at the default heartbeat, 20 ms
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(signals.try_recv(), Ok(()));
+        shutdown(rannoch).await;
+        return Ok(());
+    }
+    // Given a settings file with no lane section
+    let settings = settings_file("core_settings_c2", "[queue]\ndepth = 4\n")?;
     with_settings("core_settings_c2", &settings)
 }
 
@@ -634,7 +635,7 @@ fn id_millis(id: Uuid) -> i64 {
 async fn a_frozen_clock_does_not_move() {
     // Given a test running with the clock frozen
     let ids = Arc::new(Ids::default());
-    let rannoch = open_with(ids.clone(), TimeDelta::hours(1)).unwrap();
+    let rannoch = open_with(ids.clone()).unwrap();
 
     // When it reads the clock's wall time, sends an event, waits on nothing and reads the wall
     // time and sends an event again
@@ -655,24 +656,27 @@ async fn a_frozen_clock_does_not_move() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn advancing_the_clock_moves_time_exactly_and_wakes_the_waits_it_passes() {
-    // Given a frozen clock, and two waits with deadlines 50 ms and 200 ms from now: an inbox at
-    // 50 ms for ty 1 and the default inbox at 200 ms, each holding one event
+async fn advancing_the_clock_moves_time_exactly_and_wakes_the_waits_it_passes() -> Result<()> {
+    let Ok(settings) = env::var(CORE_SETTINGS) else {
+        let lanes =
+            "[lane.default]\nheartbeat_ms = 200\n[lane.short]\ntys = [1]\nheartbeat_ms = 50\n";
+        let settings = settings_file("advancing_the_clock", lanes)?;
+        return with_settings(
+            "advancing_the_clock_moves_time_exactly_and_wakes_the_waits_it_passes",
+            &settings,
+        );
+    };
+    // Given a frozen clock, and two waits with deadlines 50 ms and 200 ms from now: a lane at
+    // 50 ms for ty 1 and the default lane at 200 ms, each holding one event
     let ids = Arc::new(Ids::default());
     let rannoch = Rannoch::open(Config {
-        default_interval: TimeDelta::milliseconds(200),
-        inboxes: vec![InboxConfig {
-            name: "short".to_owned(),
-            types: vec![1],
-            interval: TimeDelta::milliseconds(50),
-        }],
         append: Some(ids.clone() as Arc<dyn Append<u8, String>>),
+        settings: Some(settings.into()),
         ..Config::default()
-    })
-    .unwrap();
-    rannoch.sender().send(Event { ty: 1, ..event() }).unwrap();
-    rannoch.sender().send(event()).unwrap();
-    // The inboxes' tasks start their waits once they first run.
+    })?;
+    rannoch.sender().send(Event { ty: 1, ..event() })?;
+    rannoch.sender().send(event())?;
+    // The lanes' tasks start their waits once they first run.
     tokio::task::yield_now().await;
     let (wall, elapsed, id) = (clock::now(), clock::elapsed(), clock::new_id());
 
@@ -689,6 +693,7 @@ async fn advancing_the_clock_moves_time_exactly_and_wakes_the_waits_it_passes() 
     let handed: Vec<u8> = ids.0.lock().unwrap().iter().map(|(ty, _)| *ty).collect();
     assert_eq!(handed, [1]);
     shutdown(rannoch).await;
+    Ok(())
 }
 
 #[tokio::test(start_paused = true)]
@@ -750,7 +755,7 @@ fn ids_from_one_rannoch_keep_their_order() {
         runtime.block_on(async move {
             tokio::time::advance(ahead).await;
             let ids = Arc::new(Ids::default());
-            let rannoch = open_with(ids.clone(), TimeDelta::hours(1)).unwrap();
+            let rannoch = open_with(ids.clone()).unwrap();
             let first = clock::now();
             for _ in 0..SENT {
                 rannoch.sender().send(event()).unwrap();
@@ -783,4 +788,222 @@ fn ids_from_one_rannoch_keep_their_order() {
         assert_eq!(ids.len(), SENT);
         assert!(ids.windows(2).all(|w| w[0] < w[1]), "{ids:?}");
     }
+}
+
+/// Every `debug` line naming the lane an event was accepted into, as (id, lane).
+struct Accepted(Mutex<Vec<(String, String)>>);
+
+impl Log for Accepted {
+    fn enabled(&self, _: &Metadata<'_>) -> bool {
+        true
+    }
+    fn log(&self, record: &Record<'_>) {
+        let line = record.args().to_string();
+        if let Some((id, lane)) = line
+            .strip_prefix("accepted ")
+            .and_then(|rest| rest.split_once(" into "))
+            && let Ok(mut lines) = self.0.lock()
+        {
+            lines.push((id.to_owned(), lane.to_owned()));
+        }
+    }
+    fn flush(&self) {}
+}
+
+static ACCEPTED: Accepted = Accepted(Mutex::new(Vec::new()));
+
+#[tokio::test(start_paused = true)]
+async fn each_event_goes_to_its_lane_and_run_at_events_to_the_scheduled_lane() -> Result<()> {
+    let Ok(settings) = env::var(CORE_SETTINGS) else {
+        // Given a settings file whose lane table lists ty 12 in lane 'items'
+        let settings = settings_file("lane_per_ty", "[lane.items]\ntys = [12]\n")?;
+        return with_settings(
+            "each_event_goes_to_its_lane_and_run_at_events_to_the_scheduled_lane",
+            &settings,
+        );
+    };
+    log::set_logger(&ACCEPTED).map_err(|_| "a logger is already set")?;
+    log::set_max_level(log::LevelFilter::Debug);
+    let ids = Arc::new(Ids::default());
+    let rannoch = Rannoch::open(Config {
+        append: Some(ids.clone() as Arc<dyn Append<u8, String>>),
+        settings: Some(settings.into()),
+        ..Config::default()
+    })?;
+
+    // When events of ty 12 and 30 and a ty 12 event with a run_at an hour away are sent, and the
+    // clock advances an hour
+    let sender = rannoch.sender();
+    sender.send(Event { ty: 12, ..event() })?;
+    sender.send(Event { ty: 30, ..event() })?;
+    let later = Some(clock::now() + TimeDelta::hours(1));
+    sender.send(Event {
+        ty: 12,
+        run_at: later,
+        ..event()
+    })?;
+    tokio::time::sleep(Duration::from_secs(3_600)).await;
+
+    // Then the ty 12 event is in lane 'items', the ty 30 event in the default lane, and the
+    // scheduled event in the scheduled lane, each written through its lane. When the scheduled
+    // lane runs its events is rannoch-queue's.
+    let mut kept = ids.0.lock().map_err(|_| "poisoned")?.clone();
+    kept.sort_by_key(|(_, id)| *id);
+    let accepted = ACCEPTED.0.lock().map_err(|_| "poisoned")?.clone();
+    let lane_of = |id: Uuid| {
+        accepted
+            .iter()
+            .find(|(seen, _)| *seen == id.to_string())
+            .map(|(_, lane)| lane.clone())
+    };
+    let lanes: Vec<(u8, Option<String>)> =
+        kept.iter().map(|(ty, id)| (*ty, lane_of(*id))).collect();
+    let lane = |name: &str| Some(name.to_owned());
+    assert_eq!(
+        lanes,
+        [
+            (12, lane("items")),
+            (30, lane("default")),
+            (12, lane("scheduled"))
+        ]
+    );
+    shutdown(rannoch).await;
+    Ok(())
+}
+
+/// The number of rows of `ty` in `_events` at `path`.
+fn rows_of(path: &Path, ty: u8) -> Result<i64> {
+    Ok(rusqlite::Connection::open(path)?.query_row(
+        "SELECT count(*) FROM _events WHERE ty = ?1",
+        [ty],
+        |r| r.get(0),
+    )?)
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_lane_writes_at_its_limit_or_heartbeat_alone() -> Result<()> {
+    let Ok(settings) = env::var(CORE_SETTINGS) else {
+        // Given lane 'big' with a 1 MB memory limit and lane 'small' with a 50 ms heartbeat
+        let lanes = "[lane.big]\ntys = [1]\nmemory_limit_bytes = 1048576\nheartbeat_ms = 1000\n\
+                     [lane.small]\ntys = [2]\nheartbeat_ms = 50\n";
+        let settings = settings_file("limit_or_heartbeat", lanes)?;
+        return with_settings("a_lane_writes_at_its_limit_or_heartbeat_alone", &settings);
+    };
+    let path = empty_store("limit_or_heartbeat")?;
+    let (queue, _signals) = tokio::sync::mpsc::unbounded_channel();
+    let rannoch = Rannoch::open(Config {
+        append: Some(events(&path, queue)? as Arc<dyn Append<u8, String>>),
+        settings: Some(settings.into()),
+        ..Config::default()
+    })?;
+    let sized = |ty: u8, kb: usize| Event {
+        ty,
+        data: "x".repeat(kb * 1024),
+        ..event()
+    };
+
+    // When a 900 KB event is sent to 'big' and small events to 'small', and the clock advances
+    // 50 ms
+    let sender = rannoch.sender();
+    sender.send(sized(1, 900))?;
+    for _ in 0..3 {
+        sender.send(sized(2, 0))?;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::task::yield_now().await;
+
+    // Then the small events are in _events, and the big event, under its lane's limit, waits on
+    // its heartbeat without delaying them
+    assert_eq!((rows_of(&path, 2)?, rows_of(&path, 1)?), (3, 0));
+
+    // And once its lane reaches its limit, its batch is written before its heartbeat comes
+    sender.send(sized(1, 200))?;
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert_eq!(rows_of(&path, 1)?, 2);
+
+    // And an event under the limit is written when the heartbeat comes
+    sender.send(sized(1, 1))?;
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert_eq!(rows_of(&path, 1)?, 2);
+    tokio::time::sleep(Duration::from_millis(110)).await;
+    assert_eq!(rows_of(&path, 1)?, 3);
+    shutdown(rannoch).await;
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_lanes_events_reach_events_in_id_order() -> Result<()> {
+    // Given one lane receiving events from several producers
+    let path = empty_store("lane_id_order")?;
+    let (queue, mut signals) = tokio::sync::mpsc::unbounded_channel();
+    let rannoch = open_with(events(&path, queue)?)?;
+    let producers: Vec<_> = (0..4)
+        .map(|_| {
+            let sender = rannoch.sender();
+            std::thread::spawn(move || {
+                for _ in 0..500 {
+                    if sender.send(event()).is_err() {
+                        return;
+                    }
+                }
+            })
+        })
+        .collect();
+
+    // When its batches are written
+    while producers.iter().any(|p| !p.is_finished()) {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    for producer in producers {
+        producer.join().map_err(|_| "a producer panicked")?;
+    }
+    shutdown(rannoch).await;
+    let mut batches = 0;
+    while signals.try_recv().is_ok() {
+        batches += 1;
+    }
+    assert!(batches >= 1);
+
+    // Then the lane's events are in _events in increasing id order
+    let conn = rusqlite::Connection::open(&path)?;
+    let ids: Vec<Uuid> = conn
+        .prepare("SELECT id FROM _events ORDER BY rowid")?
+        .query_map([], |r| r.get::<_, String>(0))?
+        .map(|id| Ok(id?.parse()?))
+        .collect::<Result<_>>()?;
+    assert_eq!(ids.len(), 2_000);
+    assert!(ids.windows(2).all(|w| w[0] < w[1]));
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_writes_every_lane() -> Result<()> {
+    let Ok(settings) = env::var(CORE_SETTINGS) else {
+        // Given two lanes whose heartbeats are an hour
+        let lanes = "[lane.default]\nheartbeat_ms = 3600000\n\
+                     [lane.other]\ntys = [1]\nheartbeat_ms = 3600000\n";
+        let settings = settings_file("shutdown_every_lane", lanes)?;
+        return with_settings("shutdown_writes_every_lane", &settings);
+    };
+    let path = empty_store("shutdown_every_lane")?;
+    let (queue, _signals) = tokio::sync::mpsc::unbounded_channel();
+    let rannoch = Rannoch::open(Config {
+        append: Some(events(&path, queue)? as Arc<dyn Append<u8, String>>),
+        settings: Some(settings.into()),
+        ..Config::default()
+    })?;
+
+    // Each with events accepted but not yet written, their heartbeats not yet expired
+    for ty in [0, 0, 1, 1, 1] {
+        rannoch.sender().send(Event { ty, ..event() })?;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(events_in(&path)?, 0);
+
+    // When rannoch shuts down
+    shutdown(rannoch).await;
+
+    // Then every accepted event is in _events when shutdown returns
+    assert_eq!((rows_of(&path, 0)?, rows_of(&path, 1)?), (2, 3));
+    Ok(())
 }

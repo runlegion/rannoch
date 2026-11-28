@@ -461,6 +461,13 @@ mod tests {
         }
     }
 
+    impl TryFrom<u16> for Ty {
+        type Error = u16;
+        fn try_from(ty: u16) -> Result<Self, u16> {
+            if ty == 7 { Ok(Ty::Page) } else { Err(ty) }
+        }
+    }
+
     fn event(id: Uuid) -> Event<Ty, String> {
         Event {
             id,

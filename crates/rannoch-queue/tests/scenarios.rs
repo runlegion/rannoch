@@ -310,10 +310,42 @@ async fn the_queue_runs_what_is_due() {
     stop(rannoch, queue).await.unwrap();
 }
 
-/// Not a scenario: the queue's own memory of what it took. With an hour-long inbox interval each
-/// 1 stays on the inbox's heap, so only that memory stops a second signal taking the event again.
+/// Set in the child process `an_event_taken_before_its_1_is_kept_is_not_taken_again` runs: the
+/// settings file it opens with.
+const HOUR_LANE: &str = "RANNOCH_QUEUE_HOUR_LANE";
+
+/// Not a scenario: the queue's own memory of what it took. With an hour-long heartbeat on the
+/// default lane each 1 stays on the lane's heap, so only that memory stops a second signal taking
+/// the event again. The settings are held for the life of the process, so it runs in a child.
 #[tokio::test(start_paused = true)]
 async fn an_event_taken_before_its_1_is_kept_is_not_taken_again() {
+    let Ok(settings) = std::env::var(HOUR_LANE) else {
+        let settings = database("an_event_taken_before_its_1_is_kept_settings")
+            .unwrap()
+            .with_file_name("app.toml");
+        fs::write(&settings, "[lane.default]\nheartbeat_ms = 3600000\n").unwrap();
+        let test = "an_event_taken_before_its_1_is_kept_is_not_taken_again";
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([test, "--exact", "--nocapture"])
+            .env(HOUR_LANE, &settings)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}"
+        );
+        return;
+    };
+    // The first open loads the settings, so this one does, before the store's.
+    let settings = Some(settings.into());
+    drop(
+        Rannoch::<Ty, String>::open(Config {
+            settings,
+            ..Config::default()
+        })
+        .unwrap(),
+    );
     let path = database("an_event_taken_before_its_1_is_kept").unwrap();
     let store = migrated(&path).await.unwrap();
     let event = waiting(&ready(&path).unwrap(), 1, None).unwrap();
@@ -337,7 +369,6 @@ async fn an_event_taken_before_its_1_is_kept_is_not_taken_again() {
     });
     let (signal, wake) = mpsc::unbounded_channel();
     let rannoch = Rannoch::open(Config {
-        default_interval: TimeDelta::hours(1),
         store: Some(store.clone()),
         append: Some(Arc::new(Events::new(ready(&path).unwrap(), signal.clone()))
             as Arc<dyn Append<Ty, String>>),
