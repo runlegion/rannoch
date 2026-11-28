@@ -1,14 +1,14 @@
 //! The inbox: it holds accepted events on its heap.
 
 use std::mem;
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::TimeDelta;
-use uuid::Uuid;
+use tokio::sync::oneshot;
 
 use crate::broker::{Shared, lock};
-use crate::{Append, Error, Event, Status};
+use crate::{Append, Error, Event, Status, clock};
 
 /// An inbox and its heap, which holds accepted events in memory, with no size limit.
 #[derive(Debug)]
@@ -32,7 +32,7 @@ impl<T, D> Inbox<T, D> {
     /// Accepts the event: sets its id, sets status 0 when it has no source
     /// (one with a source keeps the status it carries), and puts it on the heap.
     pub(crate) fn accept(&mut self, mut event: Event<T, D>) -> Status {
-        event.id = Uuid::now_v7();
+        event.id = clock::new_id();
         if event.source.is_none() {
             event.status = Status::Added;
         }
@@ -42,18 +42,18 @@ impl<T, D> Inbox<T, D> {
     }
 }
 
-/// Inbox `index`'s thread: on each interval it hands over its heap; when
+/// Inbox `index`'s task: on each interval it hands over its heap; when
 /// `stop` closes, it hands over what is left and returns.
-pub(crate) fn run<T: PartialEq, D>(
-    broker: &Shared<T, D>,
+pub(crate) async fn run<T: PartialEq, D>(
+    broker: Shared<T, D>,
     index: usize,
     every: Duration,
-    stop: &Receiver<()>,
-    append: &dyn Append<T, D>,
+    mut stop: oneshot::Receiver<()>,
+    append: Arc<dyn Append<T, D>>,
 ) {
     loop {
-        let stopping = stop.recv_timeout(every) != Err(RecvTimeoutError::Timeout);
-        hand_over(broker, index, append);
+        let stopping = tokio::time::timeout(every, &mut stop).await.is_ok();
+        hand_over(&broker, index, &*append);
         if stopping {
             return;
         }
@@ -104,7 +104,7 @@ mod tests {
 
     use super::{Inbox, hand_over};
     use crate::broker::{Broker, lock};
-    use crate::{Append, Error, Event, Status};
+    use crate::{Append, Error, Event, Status, clock};
 
     fn event(source: Option<Uuid>) -> Event<u8, ()> {
         Event {
@@ -117,11 +117,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn an_event_with_a_source_keeps_its_status_and_one_without_is_accepted_at_0() {
+    #[tokio::test(start_paused = true)]
+    async fn an_event_with_a_source_keeps_its_status_and_one_without_is_accepted_at_0() {
         let mut inbox = Inbox::new("default".to_owned(), Vec::new(), TimeDelta::zero());
 
-        assert_eq!(inbox.accept(event(Some(Uuid::now_v7()))), Status::Added);
+        assert_eq!(inbox.accept(event(Some(clock::new_id()))), Status::Added);
         assert_eq!(inbox.accept(event(None)), Status::Added);
 
         let statuses: Vec<Status> = inbox.heap.iter().map(|e| e.status).collect();
@@ -149,8 +149,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_failed_batch_goes_back_ahead_of_later_events_and_an_empty_heap_hands_nothing() {
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_batch_goes_back_ahead_of_later_events_and_an_empty_heap_hands_nothing() {
         let broker = Arc::new(Mutex::new(Broker {
             inboxes: vec![Inbox::new(
                 "default".to_owned(),
@@ -166,7 +166,7 @@ mod tests {
         };
         accept(event(None));
         hand_over(&broker, 0, &recorder);
-        accept(event(Some(Uuid::now_v7())));
+        accept(event(Some(clock::new_id())));
         let heap: Vec<Status> = lock(&broker).inboxes[0]
             .heap
             .iter()
@@ -184,8 +184,8 @@ mod tests {
         assert!(lock(&broker).inboxes[0].heap.is_empty());
     }
 
-    #[test]
-    fn a_reply_goes_to_the_inbox_for_its_ty_and_at_shutdown_its_own_inbox_writes_it() {
+    #[tokio::test(start_paused = true)]
+    async fn a_reply_goes_to_the_inbox_for_its_ty_and_at_shutdown_its_own_inbox_writes_it() {
         let broker = Arc::new(Mutex::new(Broker {
             inboxes: vec![
                 Inbox::new("default".to_owned(), Vec::new(), TimeDelta::zero()),
@@ -203,7 +203,7 @@ mod tests {
         let reply = || Event {
             ty: 1,
             status: Status::Binned,
-            ..event(Some(Uuid::now_v7()))
+            ..event(Some(clock::new_id()))
         };
 
         // A reply is sent as any event is: accepted, with its id, onto the heap of the inbox for

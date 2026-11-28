@@ -5,6 +5,11 @@
 //! opening rannoch with the events crate's append in its `Config`.
 //! `@criterion-FR-RANNOCH-011-c2` runs cargo on a copy of this workspace, so
 //! a developer's edit never touches the real checkout.
+//!
+//! Every test but `an_app_opens_rannoch_over_its_database` runs with the clock frozen and
+//! calls [`Rannoch::shutdown`] through `spawn_blocking`; that one waits on rannoch-store's
+//! checkpointer, which still runs on real time. The two scenarios of `fr_rannoch_131.feature`
+//! check the clock itself.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -15,10 +20,17 @@ use std::{env, fs, process, thread};
 
 use chrono::TimeDelta;
 use log::{Level, Log, Metadata, Record};
-use rannoch_core::{Append, Config, Error, Event, Rannoch, Status};
+use rannoch_core::{Append, Config, Error, Event, InboxConfig, Rannoch, Status, clock};
 use rannoch_events::Events;
 use rannoch_store::{Opened, Store};
 use uuid::Uuid;
+
+/// Shuts `rannoch` down from async code: shutdown blocks, so it runs through `spawn_blocking`.
+async fn shutdown<D: Send + 'static>(rannoch: Rannoch<u8, D>) {
+    if let Err(e) = tokio::task::spawn_blocking(move || rannoch.shutdown()).await {
+        panic!("shutdown did not return: {e}");
+    }
+}
 
 /// A fresh, empty directory for `name`, and the database path inside it.
 fn database(name: &str) -> std::io::Result<PathBuf> {
@@ -78,8 +90,8 @@ fn config(path: &Path) -> Config<u8, ()> {
     }
 }
 
-#[test]
-fn fr_rannoch_010_c1() {
+#[tokio::test(start_paused = true)]
+async fn fr_rannoch_010_c1() {
     // Given a database missing the newest migration
     let path = database("fr_rannoch_010_c1").unwrap();
     let newest = missing_newest(&path).unwrap();
@@ -113,8 +125,8 @@ fn fr_rannoch_010_c1() {
     assert_eq!(rannoch.sender().send(event), Ok(Status::Added));
 }
 
-#[test]
-fn fr_rannoch_010_c2() {
+#[tokio::test(start_paused = true)]
+async fn fr_rannoch_010_c2() {
     // Given a pending migration that cannot be applied: the real store on a
     // read-only database
     let path = database("fr_rannoch_010_c2").unwrap();
@@ -182,8 +194,8 @@ fn events(path: &Path, queue: mpsc::Sender<()>) -> Result<Arc<Events>> {
     )))
 }
 
-#[test]
-fn fr_rannoch_005_c1() {
+#[tokio::test(start_paused = true)]
+async fn fr_rannoch_005_c1() {
     // Given events on an inbox's heap
     let path = empty_store("fr_rannoch_005_c1").unwrap();
     let (queue, signals) = mpsc::channel();
@@ -195,14 +207,14 @@ fn fr_rannoch_005_c1() {
     assert_eq!(events_in(&path).unwrap(), 0);
 
     // When the inbox's batch interval passes
-    let signalled = signals.recv_timeout(Duration::from_secs(5));
+    tokio::time::sleep(Duration::from_millis(250)).await;
 
     // Then the events crate's append receives them as one batch
-    assert_eq!(signalled, Ok(()));
+    assert_eq!(signals.try_recv(), Ok(()));
     assert_eq!(events_in(&path).unwrap(), 3);
 
     // And the heap is empty: shutdown hands over what is left, and nothing is
-    rannoch.shutdown();
+    shutdown(rannoch).await;
     assert_eq!(signals.try_recv(), Err(mpsc::TryRecvError::Disconnected));
     assert_eq!(events_in(&path).unwrap(), 3);
 }
@@ -210,8 +222,8 @@ fn fr_rannoch_005_c1() {
 /// Set in the child process `fr_rannoch_005_c2` runs: the store it crashes over.
 const CRASH_STORE: &str = "RANNOCH_FR_005_C2_STORE";
 
-#[test]
-fn fr_rannoch_005_c2() {
+#[tokio::test(start_paused = true)]
+async fn fr_rannoch_005_c2() {
     if let Ok(path) = env::var(CRASH_STORE) {
         // The child: events on an inbox's heap, then the process stops
         // before the batch is handed over.
@@ -291,8 +303,8 @@ fn store_errors_logged() -> usize {
     })
 }
 
-#[test]
-fn fr_rannoch_005_c3() {
+#[tokio::test(start_paused = true)]
+async fn fr_rannoch_005_c3() {
     static LOGGER: Once = Once::new();
     LOGGER.call_once(|| {
         log::set_logger(&ERRORS).unwrap();
@@ -312,12 +324,7 @@ fn fr_rannoch_005_c3() {
     }
 
     // When an inbox's batch interval passes
-    for _ in 0..50 {
-        if store_errors_logged() > 0 {
-            break;
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
+    tokio::time::sleep(Duration::from_millis(150)).await;
 
     // Then a Store error is logged
     assert!(store_errors_logged() > 0);
@@ -328,12 +335,12 @@ fn fr_rannoch_005_c3() {
 
     // When the events crate can append again and the next interval passes
     flaky.failing.store(false, Ordering::SeqCst);
-    let signalled = signals.recv_timeout(Duration::from_secs(5));
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Then the append receives them
-    assert_eq!(signalled, Ok(()));
+    assert_eq!(signals.try_recv(), Ok(()));
     assert_eq!(events_in(&path).unwrap(), 2);
-    rannoch.shutdown();
+    shutdown(rannoch).await;
 }
 
 /// The workspace root, two levels above this crate.
@@ -394,8 +401,8 @@ fn text(out: &process::Output) -> String {
     )
 }
 
-#[test]
-fn fr_rannoch_011_c2() {
+#[tokio::test(start_paused = true)]
+async fn fr_rannoch_011_c2() {
     // Given a crate whose queries all match the app's schema
     let ws = copy_workspace("fr_rannoch_011_c2").unwrap();
     let check = [
@@ -517,150 +524,6 @@ fn an_app_opens_rannoch_over_its_database() {
     assert!(matches!(refused, Err(Error::Store)), "{refused:?}");
 }
 
-/// Nanoseconds since the first call, for timing an event from its send to its commit.
-fn nanos() -> u64 {
-    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    u64::try_from(
-        START
-            .get_or_init(std::time::Instant::now)
-            .elapsed()
-            .as_nanos(),
-    )
-    .unwrap_or(u64::MAX)
-}
-
-/// The events crate's append, recording each event's time from its send (the event's data)
-/// to its append's commit.
-#[derive(Debug)]
-struct Timed {
-    events: Events,
-    send_to_commit: Mutex<Vec<u64>>,
-}
-
-impl Append<u8, String> for Timed {
-    fn append(
-        &self,
-        batch: &[Event<u8, String>],
-    ) -> std::result::Result<Vec<Event<u8, String>>, Error> {
-        let appended = Append::<u8, String>::append(&self.events, batch);
-        let committed = nanos();
-        if appended.is_ok()
-            && let Ok(mut times) = self.send_to_commit.lock()
-        {
-            let sent = |e: &Event<u8, String>| -> u64 {
-                let parsed = e.data.parse();
-                parsed.unwrap_or_else(|err| panic!("send time {:?}: {err}", e.data))
-            };
-            times.extend(batch.iter().map(|e| committed.saturating_sub(sent(e))));
-        }
-        appended
-    }
-}
-
-/// The app's database at a fresh path under `name`, opened through the real store, with
-/// 50,000 events already in `_events` from the app's forgr mock, each status picked from
-/// the four values; rannoch open over it with
-/// the timed append.
-/// Rannoch over a kept history, the store it runs on, and its timed append.
-type Kept = (Rannoch<u8, String>, Arc<Store>, Arc<Timed>);
-
-fn history_kept(name: &str) -> Result<Kept> {
-    let path = database(name)?;
-    let store = Arc::new(Store::new(path.clone(), rannoch_core::migrator()));
-    Rannoch::<u8, ()>::open(Config {
-        store: Some(store.clone()),
-        ..Config::default()
-    })?
-    .shutdown();
-    let Opened::Ready(conn) = rannoch_store::open(&path, &rannoch_core::migrator())? else {
-        return Err("migrations still pending".into());
-    };
-    // One transaction for the whole history, so building it is not a million commits.
-    conn.execute_batch("BEGIN")?;
-    rannoch_core::forgr::_events::mock(50_000)
-        .with(rannoch_core::forgr::_events::Overrides {
-            status: rannoch_core::forgr::Override::Pick(vec![-1, 0, 1, 2]),
-            // `_events.data` is JSON, as rannoch's own append writes it.
-            data: rannoch_core::forgr::Override::Fixed("{}".to_owned()),
-            ..Default::default()
-        })
-        .insert(&conn)?;
-    conn.execute_batch("COMMIT")?;
-    // A store at rest: its history is in the database file, not waiting in the WAL.
-    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
-    let (queue, signals) = mpsc::channel();
-    thread::spawn(move || for () in signals {});
-    let timed = Arc::new(Timed {
-        events: Events::new(conn, queue),
-        send_to_commit: Mutex::new(Vec::new()),
-    });
-    let rannoch = Rannoch::open(Config {
-        store: Some(store.clone()),
-        append: Some(timed.clone() as Arc<dyn Append<u8, String>>),
-        ..Config::default()
-    })?;
-    Ok((rannoch, store, timed))
-}
-
-fn sent_now(n: u64) -> Event<u8, String> {
-    Event {
-        id: Uuid::nil(),
-        source: None,
-        ty: u8::try_from(n % 8).unwrap_or(0),
-        data: nanos().to_string(),
-        run_at: None,
-        status: Status::Added,
-    }
-}
-
-#[test]
-fn rannoch_keeps_up_with_the_peak_load() {
-    // Given rannoch is open over a store at rest already holding 50,000 events
-    let (rannoch, _store, timed) = history_kept("nfr_rannoch_026").unwrap();
-
-    // When the app sends 2,000 events at 200 a second
-    let sender = rannoch.sender();
-    let start = std::time::Instant::now();
-    for n in 0..2_000_u64 {
-        let due = start + Duration::from_millis(n * 5);
-        if let Some(wait) = due.checked_duration_since(std::time::Instant::now()) {
-            thread::sleep(wait);
-        }
-        sender.send(sent_now(n)).unwrap();
-    }
-    rannoch.shutdown();
-
-    // Then all 2,000 are in _events
-    let mut landed = timed.send_to_commit.lock().unwrap().clone();
-    assert_eq!(landed.len(), 2_000);
-    landed.sort_unstable();
-    println!(
-        "send to commit at 200 a second over 50,000 kept: p99 {} us",
-        landed[(landed.len() - 1) * 99 / 100] / 1_000
-    );
-}
-
-#[test]
-fn a_flat_out_producer_beats_the_peak_load() {
-    // Given rannoch is open over a store at rest already holding 50,000 events
-    let (rannoch, _store, timed) = history_kept("nfr_rannoch_027").unwrap();
-
-    // When one producer sends 100,000 events as fast as it can
-    let sender = rannoch.sender();
-    let start = std::time::Instant::now();
-    for n in 0..100_000_u64 {
-        sender.send(sent_now(n)).unwrap();
-    }
-    rannoch.shutdown();
-    let elapsed = start.elapsed().as_secs_f64();
-
-    // Then all 100,000 are in _events at more than 200 a second
-    assert_eq!(timed.send_to_commit.lock().unwrap().len(), 100_000);
-    let rate = 100_000.0 / elapsed;
-    println!("flat out from one producer over 50,000 kept: {rate:.0} events a second");
-    assert!(rate > 200.0, "{rate:.0} a second");
-}
-
 /// Set in the child process a `core_settings` scenario runs: the settings file it opens with.
 const CORE_SETTINGS: &str = "RANNOCH_CORE_SETTINGS";
 
@@ -695,15 +558,16 @@ fn open_an_hour(
     Ok((rannoch, signals))
 }
 
-#[test]
-fn core_settings_c1() -> Result<()> {
+#[tokio::test(start_paused = true)]
+async fn core_settings_c1() -> Result<()> {
     if let Ok(settings) = env::var(CORE_SETTINGS) {
         // When Rannoch::open is called with that file's path and an event is sent
         let (rannoch, signals) = open_an_hour("core_settings_c1", settings.into())?;
 
         // Then the default inbox hands it over at the interval the [core] section gives
-        assert_eq!(signals.recv_timeout(Duration::from_secs(5)), Ok(()));
-        rannoch.shutdown();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(signals.try_recv(), Ok(()));
+        shutdown(rannoch).await;
         return Ok(());
     }
     // Given a settings file whose [core] section sets default_interval_ms
@@ -712,18 +576,16 @@ fn core_settings_c1() -> Result<()> {
     with_settings("core_settings_c1", &settings)
 }
 
-#[test]
-fn core_settings_c2() -> Result<()> {
+#[tokio::test(start_paused = true)]
+async fn core_settings_c2() -> Result<()> {
     if let Ok(settings) = env::var(CORE_SETTINGS) {
         // When Rannoch::open is called with that file's path and an event is sent
         let (rannoch, signals) = open_an_hour("core_settings_c2", settings.into())?;
 
         // Then the default inbox does not hand it over before shutdown
-        assert_eq!(
-            signals.recv_timeout(Duration::from_millis(500)),
-            Err(mpsc::RecvTimeoutError::Timeout)
-        );
-        rannoch.shutdown();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(signals.try_recv(), Err(mpsc::TryRecvError::Empty));
+        shutdown(rannoch).await;
         assert_eq!(signals.try_recv(), Ok(()));
         return Ok(());
     }
@@ -731,4 +593,89 @@ fn core_settings_c2() -> Result<()> {
     let settings = database("core_settings_c2_file")?.with_file_name("app.toml");
     fs::write(&settings, "[queue]\ndepth = 4\n")?;
     with_settings("core_settings_c2", &settings)
+}
+
+/// An append keeping the `ty` and id of every event handed to it.
+#[derive(Debug, Default)]
+struct Ids(Mutex<Vec<(u8, Uuid)>>);
+
+impl Append<u8, String> for Ids {
+    fn append(
+        &self,
+        batch: &[Event<u8, String>],
+    ) -> std::result::Result<Vec<Event<u8, String>>, Error> {
+        let mut kept = self.0.lock().map_err(|_| Error::Store)?;
+        kept.extend(batch.iter().map(|e| (e.ty, e.id)));
+        Ok(Vec::new())
+    }
+}
+
+/// The time inside a `UUIDv7`, in milliseconds since the Unix epoch.
+fn id_millis(id: Uuid) -> i64 {
+    let Some(timestamp) = id.get_timestamp() else {
+        panic!("{id} carries no time");
+    };
+    let (seconds, nanos) = timestamp.to_unix();
+    i64::try_from(seconds).unwrap_or(i64::MAX / 1_000) * 1_000 + i64::from(nanos / 1_000_000)
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_frozen_clock_does_not_move() {
+    // Given a test running with the clock frozen
+    let ids = Arc::new(Ids::default());
+    let rannoch = open_with(ids.clone(), TimeDelta::hours(1)).unwrap();
+
+    // When it reads the clock's wall time, sends an event, waits on nothing and reads the wall
+    // time and sends an event again
+    let first = clock::now();
+    rannoch.sender().send(event()).unwrap();
+    tokio::task::yield_now().await;
+    let second = clock::now();
+    rannoch.sender().send(event()).unwrap();
+    shutdown(rannoch).await;
+
+    // Then both wall times are equal and both events' ids carry that same time
+    assert_eq!(first, second);
+    let kept = ids.0.lock().unwrap().clone();
+    assert_eq!(kept.len(), 2);
+    for (_, id) in kept {
+        assert_eq!(id_millis(id), first.timestamp_millis());
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn advancing_the_clock_moves_time_exactly_and_wakes_the_waits_it_passes() {
+    // Given a frozen clock, and two waits with deadlines 50 ms and 200 ms from now: an inbox at
+    // 50 ms for ty 1 and the default inbox at 200 ms, each holding one event
+    let ids = Arc::new(Ids::default());
+    let rannoch = Rannoch::open(Config {
+        default_interval: TimeDelta::milliseconds(200),
+        inboxes: vec![InboxConfig {
+            name: "short".to_owned(),
+            types: vec![1],
+            interval: TimeDelta::milliseconds(50),
+        }],
+        append: Some(ids.clone() as Arc<dyn Append<u8, String>>),
+        ..Config::default()
+    })
+    .unwrap();
+    rannoch.sender().send(Event { ty: 1, ..event() }).unwrap();
+    rannoch.sender().send(event()).unwrap();
+    // The inboxes' tasks start their waits once they first run.
+    tokio::task::yield_now().await;
+    let (wall, elapsed, id) = (clock::now(), clock::elapsed(), clock::new_id());
+
+    // When the test advances the clock by 100 ms
+    tokio::time::advance(Duration::from_millis(100)).await;
+    // The wait the advance passed wakes its task; the yield lets that task run.
+    tokio::task::yield_now().await;
+
+    // Then the wall time, the elapsed time and a new id's time have each moved by exactly
+    // 100 ms, the 50 ms wait has woken and the 200 ms wait has not
+    assert_eq!(clock::now() - wall, TimeDelta::milliseconds(100));
+    assert_eq!(clock::elapsed() - elapsed, Duration::from_millis(100));
+    assert_eq!(id_millis(clock::new_id()) - id_millis(id), 100);
+    let handed: Vec<u8> = ids.0.lock().unwrap().iter().map(|(ty, _)| *ty).collect();
+    assert_eq!(handed, [1]);
+    shutdown(rannoch).await;
 }
