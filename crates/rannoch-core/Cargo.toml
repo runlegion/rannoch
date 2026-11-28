@@ -26,6 +26,10 @@ rannoch-store = { path = "../rannoch-store" }
 rusqlite = { version = "0.41", features = ["bundled"] }
 tokio = { version = "1", features = ["macros", "test-util"] }
 
+[[bench]]
+name = "inbox"
+harness = false
+
 [build-dependencies]
 migratr = "0.3"
 rusqlite = { version = "0.41", features = ["bundled"] }
