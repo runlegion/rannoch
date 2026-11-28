@@ -1411,48 +1411,6 @@ async fn a_number_above_i64_max_gets_a_minus_1_and_no_2() {
         .unwrap();
 }
 
-/// How many payments #102's measurement runs to their 2.
-const RATE_EVENTS: u32 = 100_000;
-
-/// Not a scenario: #102's measurement of what the `store` step's savepoint costs. `RATE_EVENTS`
-/// payments are written at 0 in one transaction, the queue is signalled, and the flow rate is
-/// the payments over the time until every one has its 2; each has its row. Run it in release:
-/// `cargo test --release -p rannoch-processor --test scenarios -- --ignored --nocapture
-/// the_store_flow_rate`.
-#[tokio::test(start_paused = true)]
-#[ignore = "a measurement: run it in release"]
-async fn the_store_flow_rate() {
-    let _turn = TURN.lock().await;
-    // Given an app whose payment flow's step stores each payment's row
-    let app = App::built_in("store_flow_rate", &built_in().unwrap())
-        .await
-        .unwrap();
-    app.read.execute_batch(PAYMENTS).unwrap();
-
-    // When the payments are written at 0 and the queue is signalled
-    let mut conn = ready(&app.path).unwrap();
-    let tx = conn.transaction().unwrap();
-    for i in 0..RATE_EVENTS {
-        let data = json!({ "order": format!("o{i}"), "amount": i }).to_string();
-        let row = _events::factory().id(clock::new_id().to_string()).ty(86);
-        row.data(data).status(0).insert(&tx).unwrap();
-    }
-    tx.commit().unwrap();
-    let start = clock::elapsed();
-    app.signal.send(()).unwrap();
-
-    // Then every payment reaches its 2 with its row, at the rate printed
-    let all = i64::from(RATE_EVENTS);
-    while app.count("SELECT count(*) FROM _events WHERE status = 2") < all {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    let elapsed = start.elapsed();
-    let rate = f64::from(RATE_EVENTS) / elapsed.as_secs_f64();
-    println!("{RATE_EVENTS} payments to their 2 in {elapsed:?}: {rate:.0} events/s");
-    assert_eq!(app.count("SELECT count(*) FROM payments"), all);
-    app.stop().await;
-}
-
 /// How many events wait their turn behind each other in #85's backlog.
 const BACKLOG: i64 = 5_000;
 
@@ -2386,6 +2344,6 @@ async fn every_rannoch_processor_test_runs_with_the_clock_frozen() {
             }
         }
     }
-    // 17 in lib.rs, 15 in check.rs, 3 in doc.rs, 38 here and pay-app's main
-    assert_eq!(runs, 74);
+    // 17 in lib.rs, 15 in check.rs, 3 in doc.rs, 37 here and pay-app's main
+    assert_eq!(runs, 73);
 }
