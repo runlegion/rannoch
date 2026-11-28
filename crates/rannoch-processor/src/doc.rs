@@ -201,8 +201,8 @@ mod tests {
         v.as_object().cloned().unwrap_or_default()
     }
 
-    #[test]
-    fn eval_reads_a_field_joins_a_concat_and_gives_or_for_an_absent_field() {
+    #[tokio::test(start_paused = true)]
+    async fn eval_reads_a_field_joins_a_concat_and_gives_or_for_an_absent_field() {
         let vals = vals(&json!({ "text": "SAM", "n": 2 }));
         assert_eq!(super::eval(&json!("$text"), &vals), json!("SAM"));
         let concat = json!({ "$concat": ["hi ", "$text", "!", "$n"] });
@@ -212,8 +212,8 @@ mod tests {
         assert_eq!(super::eval(&json!(7), &vals), json!(7));
     }
 
-    #[test]
-    fn type_expr_types_a_field_a_concat_an_or_and_a_literal_and_names_a_missing_field() {
+    #[tokio::test(start_paused = true)]
+    async fn type_expr_types_a_field_a_concat_an_or_and_a_literal_and_names_a_missing_field() {
         let scope = [("text", "string"), ("n", "number")]
             .map(|(f, t)| (f.to_owned(), t.to_owned()))
             .into();
@@ -236,8 +236,8 @@ mod tests {
         assert_eq!(typed(json!({ "$concat": ["$greeting", "!"] })), missing);
     }
 
-    #[test]
-    fn type_of_names_each_shape_type() {
+    #[tokio::test(start_paused = true)]
+    async fn type_of_names_each_shape_type() {
         let named: Vec<&str> = [
             json!("a"),
             json!(1),

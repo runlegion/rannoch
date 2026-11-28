@@ -5,10 +5,9 @@
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use rannoch_core::{Config, Event, Rannoch, Status, Storage};
+use rannoch_core::{Config, Event, Rannoch, Status, Storage, clock};
 use rannoch_events::Events;
 use rannoch_processor::Processor;
 use rannoch_queue::{Queue, Settings};
@@ -32,7 +31,9 @@ fn ready(path: &Path) -> Result<Connection, Box<dyn Error>> {
     }
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+// The clock frozen, as in every rannoch-processor test.
+#[tokio::main(flavor = "current_thread", start_paused = true)]
+async fn main() -> Result<(), Box<dyn Error>> {
     let path = PathBuf::from(std::env::args().nth(1).ok_or("no store path")?);
     let store = Arc::new(Store::new(path.clone(), migrator()));
     store.apply()?;
@@ -60,7 +61,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         status: Status::Added,
     };
     rannoch.sender().send(payment)?;
-    let (reads, start) = (ready(&path)?, Instant::now());
+    let (reads, start) = (ready(&path)?, clock::elapsed());
     while !rannoch_queue::report(&reads)?
         .iter()
         .any(|(status, _)| *status == Status::Processed)
@@ -68,9 +69,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         if start.elapsed() > Duration::from_secs(10) {
             return Err("the payment has no 2".into());
         }
-        thread::sleep(Duration::from_millis(20));
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    rannoch.shutdown();
-    queue.join()?;
+    // Shutdown and join block, so they run through spawn_blocking.
+    tokio::task::spawn_blocking(move || rannoch.shutdown()).await?;
+    tokio::task::spawn_blocking(move || queue.join()).await??;
     Ok(())
 }

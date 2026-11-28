@@ -6,17 +6,18 @@
 //! ontology path builds and runs pay-app of the same workspace, over onto-pay's table.
 //! FR-RANNOCH-124's scenarios, from `tests/features/fr_rannoch_124.feature`, run `BUILT_IN`'s
 //! flows on the built-in steps alone, `check`ed with no signature, the append an `Events` made
-//! `with_writes`.
+//! `with_writes`. `tests/features/clock.feature`'s two scenarios read this crate's code and
+//! tests: every test runs with the clock frozen, and moves time only through tokio.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, mpsc};
-use std::time::{Duration, Instant};
-use std::{fs, thread};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
 use rannoch_core::forgr::_events;
-use rannoch_core::{Append, Config, Error, Event, InboxConfig, Rannoch, Status};
+use rannoch_core::{Append, Config, Error, Event, InboxConfig, Rannoch, Status, clock};
 use rannoch_events::Events;
 use rannoch_processor::{Action, FlowDoc, Processor, Sig, check};
 use rannoch_queue::{Flows, Queue, Settings};
@@ -116,15 +117,34 @@ fn database(name: &str) -> Result<PathBuf> {
 }
 
 /// The app's store over `path`, with every migration applied by opening rannoch once.
-fn migrated(path: &Path) -> Result<Arc<Store>> {
+async fn migrated(path: &Path) -> Result<Arc<Store>> {
     let store = Arc::new(Store::new(path.to_owned(), rannoch_core::migrator()));
-    Rannoch::<Ty, Value>::open(Config {
+    let rannoch = Rannoch::<Ty, Value>::open(Config {
         store: Some(store.clone()),
         ..Config::default()
-    })?
-    .shutdown();
+    })?;
+    shutdown(rannoch).await;
     Ok(store)
 }
+
+/// Shuts `rannoch` down from async code: shutdown blocks, so it runs through `spawn_blocking`.
+async fn shutdown(rannoch: Rannoch<Ty, Value>) {
+    if let Err(e) = tokio::task::spawn_blocking(move || rannoch.shutdown()).await {
+        panic!("shutdown did not return: {e}");
+    }
+}
+
+/// Joins `queue` from async code: join blocks, so it runs through `spawn_blocking`.
+async fn join(queue: Queue) -> std::result::Result<(), Error> {
+    match tokio::task::spawn_blocking(move || queue.join()).await {
+        Ok(joined) => joined,
+        Err(e) => panic!("join did not return: {e}"),
+    }
+}
+
+/// Held for each scenario's whole run, so the scenarios take turns: ids made in the same frozen
+/// millisecond keep their order only while no other test's paused runtime makes ids beside them.
+static TURN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn ready(path: &Path) -> Result<Connection> {
     match rannoch_store::open(path, &rannoch_core::migrator())? {
@@ -133,14 +153,14 @@ fn ready(path: &Path) -> Result<Connection> {
     }
 }
 
-/// Waits up to `limit` for `done`.
-fn until(limit: Duration, done: impl Fn() -> bool) -> bool {
-    let start = Instant::now();
+/// Waits up to `limit` on the clock for `done`.
+async fn until(limit: Duration, done: impl Fn() -> bool) -> bool {
+    let start = clock::elapsed();
     while start.elapsed() < limit {
         if done() {
             return true;
         }
-        thread::sleep(Duration::from_millis(20));
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
     done()
 }
@@ -150,6 +170,20 @@ type About = (Uuid, i64, i64, Value, Option<String>);
 
 /// The app's actions over what they record and the rating `rate` gives.
 type Made = fn(&Calls, &Arc<Mutex<Obj>>) -> Vec<Arc<dyn Action>>;
+
+/// An append that tells its channel of each batch it is handed, then appends it with `Events`.
+#[derive(Debug)]
+struct Told(Events, std::sync::mpsc::Sender<()>);
+
+impl Append<Ty, Value> for Told {
+    fn append(
+        &self,
+        batch: &[Event<Ty, Value>],
+    ) -> std::result::Result<Vec<Event<Ty, Value>>, Error> {
+        let _ = self.1.send(());
+        self.0.append(batch)
+    }
+}
 
 /// The app: the store, rannoch, the queue handing events to rannoch-processor, the processor,
 /// and what the fake actions saw.
@@ -165,32 +199,32 @@ struct App {
 }
 
 impl App {
-    fn start(name: &str, attempts: u32) -> Result<Self> {
-        Self::open(database(name)?, attempts)
+    async fn start(name: &str, attempts: u32) -> Result<Self> {
+        Self::open(database(name)?, attempts).await
     }
 
     /// The app over the store at `path`, as it is.
-    fn open(path: PathBuf, attempts: u32) -> Result<Self> {
+    async fn open(path: PathBuf, attempts: u32) -> Result<Self> {
         let settings = Settings {
             attempts,
             ..Settings::new(Duration::from_millis(100))
         };
-        Self::open_with(path, settings)
+        Self::open_with(path, settings).await
     }
 
     /// The app over a fresh store `name` running `flows` on the built-in steps, no action of its
     /// own.
-    fn built_in(name: &str, flows: &str) -> Result<Self> {
-        Self::built_in_at(database(name)?, flows, Config::default())
+    async fn built_in(name: &str, flows: &str) -> Result<Self> {
+        Self::built_in_at(database(name)?, flows, Config::default()).await
     }
 
     /// As `built_in`, over the store at `path`, rannoch's inboxes as `config` has them.
-    fn built_in_at(path: PathBuf, flows: &str, config: Config<Ty, Value>) -> Result<Self> {
+    async fn built_in_at(path: PathBuf, flows: &str, config: Config<Ty, Value>) -> Result<Self> {
         let settings = Settings {
             attempts: 1,
             ..Settings::new(Duration::from_millis(100))
         };
-        Self::with(path, flows, |_, _| Vec::new(), config, settings)
+        Self::with(path, flows, |_, _| Vec::new(), config, settings).await
     }
 
     /// Runs the flow of the event `id`, of `ty` with `data`, again, its sends handed to rannoch.
@@ -210,31 +244,46 @@ impl App {
     }
 
     /// The app over the store at `path`, as it is, its queue on `settings`.
-    fn open_with(path: PathBuf, settings: Settings) -> Result<Self> {
-        Self::over(path, include_str!("flows.json"), actions, settings)
+    async fn open_with(path: PathBuf, settings: Settings) -> Result<Self> {
+        Self::over(path, include_str!("flows.json"), actions, settings).await
     }
 
     /// The app over the store at `path` running `flows` with the actions `made`, its queue on
     /// `settings`; its `Events` writes the processor's store rows with each 2.
-    fn over(path: PathBuf, flows: &str, made: Made, settings: Settings) -> Result<Self> {
-        Self::with(path, flows, made, Config::default(), settings)
+    async fn over(path: PathBuf, flows: &str, made: Made, settings: Settings) -> Result<Self> {
+        Self::with(path, flows, made, Config::default(), settings).await
     }
 
     /// As `over`, rannoch's inboxes as `config` has them.
-    fn with(
+    async fn with(
         path: PathBuf,
         flows: &str,
         made: Made,
         config: Config<Ty, Value>,
         settings: Settings,
     ) -> Result<Self> {
-        let store = migrated(&path)?;
+        Self::told(path, flows, made, (config, None), settings).await
+    }
+
+    /// As `with`, its append first telling `told`, when there is one, of each batch it is
+    /// handed.
+    async fn told(
+        path: PathBuf,
+        flows: &str,
+        made: Made,
+        (config, told): (Config<Ty, Value>, Option<std::sync::mpsc::Sender<()>>),
+        settings: Settings,
+    ) -> Result<Self> {
+        let store = migrated(&path).await?;
         let (calls, rating) = (Calls::default(), Arc::default());
         let actions = made(&calls, &rating);
         let processor = Arc::new(Processor::new(flows, actions, ready(&path)?)?);
         let (signal, wake) = tokio::sync::mpsc::unbounded_channel();
         let events = Events::new(ready(&path)?, signal.clone()).with_writes(processor.writes());
-        let append = Arc::new(events) as Arc<dyn Append<Ty, Value>>;
+        let append = match told {
+            Some(told) => Arc::new(Told(events, told)) as Arc<dyn Append<Ty, Value>>,
+            None => Arc::new(events) as Arc<dyn Append<Ty, Value>>,
+        };
         let rannoch = Rannoch::open(Config {
             store: Some(store),
             append: Some(append),
@@ -261,7 +310,7 @@ impl App {
 
     /// An event of `ty` with `data` from the app's forgr factory, and the queue signalled.
     fn hand(&self, ty: i64, data: &Value) -> Result<Uuid> {
-        let id = Uuid::now_v7();
+        let id = clock::new_id();
         let row = _events::factory()
             .id(id.to_string())
             .ty(ty)
@@ -317,41 +366,42 @@ impl App {
     }
 
     /// Waits for the retry of `event` and returns its id.
-    fn retry(&self, event: Uuid) -> Uuid {
-        assert!(until(WAIT, || !self.sent(event, 0).is_empty()));
+    async fn retry(&self, event: Uuid) -> Uuid {
+        assert!(until(WAIT, || !self.sent(event, 0).is_empty()).await);
         self.about(event)
             .into_iter()
             .find(|r| r.2 == 0)
             .map_or_default(|r| r.0)
     }
 
-    fn stop(self) {
+    async fn stop(self) {
         drop(self.signal);
-        self.rannoch.shutdown();
-        assert_eq!(self.queue.join(), Ok(()));
+        shutdown(self.rannoch).await;
+        assert_eq!(join(self.queue).await, Ok(()));
     }
 }
 
 const WAIT: Duration = Duration::from_secs(5);
 
-#[test]
-fn rannoch_processor_runs_the_flow_for_an_event_the_queue_hands_it() {
+#[tokio::test(start_paused = true)]
+async fn rannoch_processor_runs_the_flow_for_an_event_the_queue_hands_it() {
+    let _turn = TURN.lock().await;
     // Given an app built with a flow whose step is the chain trim.upper.greet, from a test
     // processor crate, ending in a next with a delay of 500 whose shape fills who with or and
     // builds msg with $concat
     // And a flow for the receiving ty whose step has no next
     // And a flow whose step puts its result under a field with as
-    let app = App::start("runs_the_flow", 10).unwrap();
+    let app = App::start("runs_the_flow", 10).await.unwrap();
 
     // When the queue hands rannoch-processor an event of the chain's ty
-    let before = Utc::now() - TimeDelta::milliseconds(1);
+    let before = clock::now() - TimeDelta::milliseconds(1);
     let event = app
         .hand(10, &json!({ "text": "  sam ", "lang": "en" }))
         .unwrap();
 
     // Then trim, upper and greet run on the one event, with no event written between them
-    assert!(until(WAIT, || app.statuses(event).contains(&2)));
-    let after = Utc::now();
+    assert!(until(WAIT, || app.statuses(event).contains(&2)).await);
+    let after = clock::now();
     assert_eq!(app.names(), ["trim", "upper", "greet"]);
     assert_eq!(app.statuses(event), [1, 0, 2]);
     assert_eq!(
@@ -386,8 +436,8 @@ fn rannoch_processor_runs_the_flow_for_an_event_the_queue_hands_it() {
 
     // When the queue hands rannoch-processor the next
     // Then its flow ends with the processor's 2 and nothing more is sent
-    assert!(until(WAIT, || app.statuses(next.0).contains(&2)));
-    thread::sleep(Duration::from_millis(200));
+    assert!(until(WAIT, || app.statuses(next.0).contains(&2)).await);
+    tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(app.statuses(next.0), [1, 2]);
     assert_eq!(
         app.count("SELECT count(*) FROM _events"),
@@ -399,26 +449,27 @@ fn rannoch_processor_runs_the_flow_for_an_event_the_queue_hands_it() {
     let shout = app.hand(12, &json!({ "text": "sam" })).unwrap();
 
     // Then the step's result is under the field as names, and the input's fields are still there
-    assert!(until(WAIT, || app.statuses(shout).contains(&2)));
+    assert!(until(WAIT, || app.statuses(shout).contains(&2)).await);
     assert_eq!(
         app.sent(shout, 0),
         [(22, json!({ "shout": { "text": "SAM" }, "text": "sam" }))]
     );
 
-    app.stop();
+    app.stop().await;
 }
 
-#[test]
-fn a_failing_link_fails_the_step_and_the_retry_reruns_the_chain() {
+#[tokio::test(start_paused = true)]
+async fn a_failing_link_fails_the_step_and_the_retry_reruns_the_chain() {
+    let _turn = TURN.lock().await;
     // Given an app built with a flow whose step is a chain with a link limit that fails on text
     // longer than 5
-    let app = App::start("a_failing_link", 2).unwrap();
+    let app = App::start("a_failing_link", 2).await.unwrap();
 
     // When the queue hands rannoch-processor an event whose text is 13 long
     let event = app.hand(15, &json!({ "text": "too long text" })).unwrap();
 
     // Then the links after limit do not run
-    assert!(until(WAIT, || app.statuses(event).contains(&-1)));
+    assert!(until(WAIT, || app.statuses(event).contains(&-1)).await);
     assert_eq!(app.names(), ["trim", "limit"]);
 
     // And the processor sends one -1 whose source is the event and whose data is
@@ -429,12 +480,12 @@ fn a_failing_link_fails_the_step_and_the_retry_reruns_the_chain() {
     // And no next and no 2 are sent
     assert!(!app.statuses(event).contains(&2));
     // the only 0 about the event is the queue's retry, of its own ty with the failure as data
-    let retry = app.retry(event);
+    let retry = app.retry(event).await;
     assert_eq!(app.sent(event, 0), [(15, failed.clone())]);
 
     // When the queue's retry of the event comes due
     // Then the chain runs again from its first link
-    assert!(until(WAIT, || app.statuses(retry).contains(&-1)));
+    assert!(until(WAIT, || app.statuses(retry).contains(&-1)).await);
     assert_eq!(app.names(), ["trim", "limit", "trim", "limit"]);
     assert_eq!(
         app.sent(retry, -1),
@@ -442,19 +493,20 @@ fn a_failing_link_fails_the_step_and_the_retry_reruns_the_chain() {
         "the retry ran on the root's data"
     );
 
-    app.stop();
+    app.stop().await;
 }
 
-#[test]
-fn branch_and_each_send_their_nexts() {
+#[tokio::test(start_paused = true)]
+async fn branch_and_each_send_their_nexts() {
+    let _turn = TURN.lock().await;
     // Given an app built with a flow whose branch has a case when crash naming ty 31, a case when
     // question naming ty 32, and an else
     // And a flow whose branch has a case when level is the number 1, and an else
     // And a flow whose each sends one next per item of a list
-    let app = App::start("branch_and_each", 1).unwrap();
+    let app = App::start("branch_and_each", 1).await.unwrap();
     // the nexts whose source is `event`, once its flow has sent its 2
-    let nexts = |event| {
-        assert!(until(WAIT, || app.statuses(event).contains(&2)));
+    let nexts = async |event| {
+        assert!(until(WAIT, || app.statuses(event).contains(&2)).await);
         app.sent(event, 0)
     };
 
@@ -466,9 +518,9 @@ fn branch_and_each_send_their_nexts() {
 
     // Then one next of ty 31, one of ty 32 and one else next are sent, each with its event as
     // source
-    assert_eq!(nexts(crash), [(31, json!({ "severity": 1 }))]);
-    assert_eq!(nexts(question), [(32, json!({}))]);
-    assert_eq!(nexts(other), [(33, json!({}))]);
+    assert_eq!(nexts(crash).await, [(31, json!({ "severity": 1 }))]);
+    assert_eq!(nexts(question).await, [(32, json!({}))]);
+    assert_eq!(nexts(other).await, [(33, json!({}))]);
 
     // When the queue hands rannoch-processor an event whose level is the number 1, and one whose
     // level is the string "1"
@@ -476,32 +528,33 @@ fn branch_and_each_send_their_nexts() {
     let string = app.hand(51, &json!({ "level": "1" })).unwrap();
 
     // Then the first sends the case's next and the second sends the else next
-    assert_eq!(nexts(number), [(31, json!({ "severity": 1 }))]);
-    assert_eq!(nexts(string), [(33, json!({}))]);
+    assert_eq!(nexts(number).await, [(31, json!({ "severity": 1 }))]);
+    assert_eq!(nexts(string).await, [(33, json!({}))]);
 
     // When the queue hands rannoch-processor an event whose list is 'a b c'
     let list = app.hand(52, &json!({ "list": ["a", "b", "c"] })).unwrap();
 
     // Then three nexts are sent, one per item, each with that event as source
-    let mut sent = nexts(list);
+    let mut sent = nexts(list).await;
     sent.sort_by_key(|n| n.1.to_string());
     let words = ["a", "b", "c"].map(|w| (41, json!({ "word": w })));
     assert_eq!(sent, words);
 
-    app.stop();
+    app.stop().await;
 }
 
-#[test]
-fn a_two_step_flow_sends_its_next_only_when_every_step_succeeds() {
+#[tokio::test(start_paused = true)]
+async fn a_two_step_flow_sends_its_next_only_when_every_step_succeeds() {
+    let _turn = TURN.lock().await;
     // Given an app built with a two-step flow whose step 0 sends a next and whose step 1 runs a
     // test action that fails on the first attempt and succeeds on the next
-    let app = App::start("a_two_step_flow", 2).unwrap();
+    let app = App::start("a_two_step_flow", 2).await.unwrap();
 
     // When the queue hands rannoch-processor an event of that flow
     let event = app.hand(40, &json!({ "text": "  sam " })).unwrap();
 
     // Then step 1 is passed the options step 0 gave
-    assert!(until(WAIT, || app.statuses(event).contains(&-1)));
+    assert!(until(WAIT, || app.statuses(event).contains(&-1)).await);
     assert_eq!(app.names(), ["trim", "classify"]);
     assert_eq!(app.calls.lock().unwrap()[1].1["text"], "sam");
 
@@ -509,7 +562,7 @@ fn a_two_step_flow_sends_its_next_only_when_every_step_succeeds() {
     let failed = json!("classify: no answer");
     assert_eq!(app.sent(event, -1), [(40, failed.clone())]);
     assert!(!app.statuses(event).contains(&2));
-    let retry = app.retry(event);
+    let retry = app.retry(event).await;
     assert_eq!(
         app.sent(event, 0),
         [(40, failed)],
@@ -518,7 +571,7 @@ fn a_two_step_flow_sends_its_next_only_when_every_step_succeeds() {
 
     // When the queue's retry of the event comes due
     // Then step 0's next is sent, and the processor sends its 2
-    assert!(until(WAIT, || app.statuses(retry).contains(&2)));
+    assert!(until(WAIT, || app.statuses(retry).contains(&2)).await);
     assert_eq!(app.names()[..4], ["trim", "classify", "trim", "classify"]);
     assert_eq!(
         app.sent(retry, 0),
@@ -529,21 +582,22 @@ fn a_two_step_flow_sends_its_next_only_when_every_step_succeeds() {
     let nexts = app.count("SELECT count(*) FROM _events WHERE ty = 20 AND status = 0");
     assert_eq!(nexts, 1, "one next across both attempts");
 
-    app.stop();
+    app.stop().await;
 }
 
-#[test]
-fn an_actions_real_output_is_checked_at_run_time() {
+#[tokio::test(start_paused = true)]
+async fn an_actions_real_output_is_checked_at_run_time() {
+    let _turn = TURN.lock().await;
     // Given an app built with a flow whose step runs a test action that declares it gives
     // severity
-    let app = App::start("an_actions_real_output", 1).unwrap();
+    let app = App::start("an_actions_real_output", 1).await.unwrap();
 
     // When the queue hands rannoch-processor an event and the action's output has a severity
     *app.rating.lock().unwrap() = obj(&json!({ "severity": 2 }));
     let rated = app.hand(30, &json!({ "text": "it crashed" })).unwrap();
 
     // Then the step's next carries it on
-    assert!(until(WAIT, || app.statuses(rated).contains(&2)));
+    assert!(until(WAIT, || app.statuses(rated).contains(&2)).await);
     assert_eq!(app.sent(rated, 0), [(31, json!({ "severity": 2 }))]);
 
     // When the queue hands rannoch-processor an event and the action's output has no severity
@@ -551,15 +605,15 @@ fn an_actions_real_output_is_checked_at_run_time() {
     let unrated = app.hand(30, &json!({ "text": "it crashed" })).unwrap();
 
     // Then the step sends a -1 naming severity, and no next and no 2
-    assert!(until(WAIT, || app.statuses(unrated).contains(&-1)));
-    thread::sleep(Duration::from_millis(200));
+    assert!(until(WAIT, || app.statuses(unrated).contains(&-1)).await);
+    tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(app.statuses(unrated), [1, -1]);
     assert_eq!(
         app.sent(unrated, -1),
         [(30, json!("rate gave no severity"))]
     );
 
-    app.stop();
+    app.stop().await;
 }
 
 /// The builds of the test app that fail, in the order of the scenario: the flow set, whether
@@ -694,8 +748,8 @@ impl Fixture {
     }
 }
 
-#[test]
-fn the_apps_build_checks_its_flow_docs() -> Result<()> {
+#[tokio::test(start_paused = true)]
+async fn the_apps_build_checks_its_flow_docs() -> Result<()> {
     let _one = CARGO.lock().unwrap_or_else(PoisonError::into_inner);
     // Given an app whose flow docs are a valid set over the actions of a test processor crate,
     // one of whose actions is a job
@@ -720,8 +774,8 @@ fn the_apps_build_checks_its_flow_docs() -> Result<()> {
     app.assert_bad(true)
 }
 
-#[test]
-fn the_apps_build_gathers_the_signatures_a_separate_processor_crate_exports() -> Result<()> {
+#[tokio::test(start_paused = true)]
+async fn the_apps_build_gathers_the_signatures_a_separate_processor_crate_exports() -> Result<()> {
     let _one = CARGO.lock().unwrap_or_else(PoisonError::into_inner);
     // Given a workspace with a processor crate, separate from the app, that exports its
     // actions' signatures as data, among them greet
@@ -744,8 +798,8 @@ fn the_apps_build_gathers_the_signatures_a_separate_processor_crate_exports() ->
     Ok(())
 }
 
-#[test]
-fn an_apps_ontology_crate_holds_the_table_its_store_step_writes() -> Result<()> {
+#[tokio::test(start_paused = true)]
+async fn an_apps_ontology_crate_holds_the_table_its_store_step_writes() -> Result<()> {
     let _one = CARGO.lock().unwrap_or_else(PoisonError::into_inner);
     // Given an ontology crate, separate from the app, with a payments table in its own
     // migrations and its own MIGRATIONS_DIR
@@ -775,22 +829,23 @@ fn an_apps_ontology_crate_holds_the_table_its_store_step_writes() -> Result<()> 
     Ok(())
 }
 
-#[test]
-fn a_wait_kept_in_events_matches_times_out_and_sends_a_late_match_to_late_across_a_restart() {
+#[tokio::test(start_paused = true)]
+async fn a_wait_kept_in_events_matches_times_out_and_sends_a_late_match_to_late_across_a_restart() {
+    let _turn = TURN.lock().await;
     // Given an app built with a flow whose step waits for a payment keyed by its order, with a
     // timeout, a match next, a timeout next and a late next
-    let app = App::start("a_wait_kept_in_events", 1).unwrap();
+    let app = App::start("a_wait_kept_in_events", 1).await.unwrap();
 
     // When orders o1 and o2 start waiting
-    let before = Utc::now() - TimeDelta::milliseconds(1);
+    let before = clock::now() - TimeDelta::milliseconds(1);
     let o1 = app.hand(70, &json!({ "order": "o1" })).unwrap();
     let o2 = app.hand(70, &json!({ "order": "o2" })).unwrap();
 
     // Then each wait is kept in _events as an event whose source is the waiting event and whose
     // run_at is its timeout
-    let wait = |order: Uuid, key: &str| {
-        assert!(until(WAIT, || app.statuses(order).contains(&2)));
-        let after = Utc::now();
+    let wait = async |order: Uuid, key: &str| {
+        assert!(until(WAIT, || app.statuses(order).contains(&2)).await);
+        let after = clock::now();
         let wait = app.about(order).into_iter().find(|r| r.2 == 0).unwrap();
         let data = json!({ "$wait": { "step": 0, "for": 71 }, "key": key,
             "vals": { "order": key } });
@@ -800,25 +855,25 @@ fn a_wait_kept_in_events_matches_times_out_and_sends_a_late_match_to_late_across
         assert!(run_at >= before + within && run_at <= after + within);
         wait.0
     };
-    let (w1, w2) = (wait(o1, "o1"), wait(o2, "o2"));
+    let (w1, w2) = (wait(o1, "o1").await, wait(o2, "o2").await);
 
     // When the app's process is dropped and its _events file reopened
     let path = app.path.clone();
-    app.stop();
-    let app = App::open(path, 1).unwrap();
+    app.stop().await;
+    let app = App::open(path, 1).await.unwrap();
 
     // And two payments for o1 arrive before o1's timeout
-    let pay = |order: &str, amount: u64| {
+    let pay = async |order: &str, amount: u64| {
         let paid = app.hand(71, &json!({ "order": order, "amount": amount }));
         let paid = paid.unwrap();
-        assert!(until(WAIT, || app.statuses(paid).contains(&2)));
+        assert!(until(WAIT, || app.statuses(paid).contains(&2)).await);
     };
-    pay("o1", 5);
-    pay("o1", 6);
+    pay("o1", 5).await;
+    pay("o1", 6).await;
 
     // Then o1's match next is sent once, with the wait as its source
     let matched = (72, json!({ "order": "o1", "paid": 5 }));
-    assert!(until(WAIT, || !app.sent(w1, 0).is_empty()));
+    assert!(until(WAIT, || !app.sent(w1, 0).is_empty()).await);
     assert!(
         app.statuses(w1).iter().all(|s| *s == 0),
         "o1 is not due yet"
@@ -826,8 +881,8 @@ fn a_wait_kept_in_events_matches_times_out_and_sends_a_late_match_to_late_across
     assert_eq!(app.sent(w1, 0), std::slice::from_ref(&matched));
 
     // When the waits come due, and the due events are run again
-    let due = |w| until(WAIT, || app.statuses(w).contains(&2));
-    assert!(due(w1) && due(w2));
+    let due = async |w| until(WAIT, || app.statuses(w).contains(&2)).await;
+    assert!(due(w1).await && due(w2).await);
 
     // Then o1's wait sends no timeout, and o2's wait sends its timeout next once
     assert_eq!(app.sent(w1, 0), [matched]);
@@ -837,30 +892,31 @@ fn a_wait_kept_in_events_matches_times_out_and_sends_a_late_match_to_late_across
     assert_eq!(app.sent(w2, 2), [(70, json!("timeout"))]);
 
     // When a payment for o2 arrives after its timeout, and the due events are run again
-    pay("o2", 7);
+    pay("o2", 7).await;
 
     // Then o2's late next is sent once, and no match next
     let late = (74, json!({ "order": "o2", "paid": 7 }));
-    assert!(until(WAIT, || app.sent(w2, 0).len() > 1));
-    thread::sleep(Duration::from_millis(200));
+    assert!(until(WAIT, || app.sent(w2, 0).len() > 1).await);
+    tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(app.sent(w2, 0), [timeout, late]);
     let sent = app.count("SELECT count(*) FROM _events WHERE ty = 72 AND status = 0");
     assert_eq!(sent, 1, "o1's match only");
 
-    app.stop();
+    app.stop().await;
 }
 
 /// Not a scenario: #84. The hunt's resend of a run a crash dropped runs that run's flow on the
 /// dropped event's data.
-#[test]
-fn the_hunts_resend_runs_the_dropped_events_flow_on_its_data() {
+#[tokio::test(start_paused = true)]
+async fn the_hunts_resend_runs_the_dropped_events_flow_on_its_data() {
+    let _turn = TURN.lock().await;
     // Given a store with an event of the flow that uses as, whose 1 is an hour old with nothing
     // after it, as a crash leaves it
     let path = database("the_hunts_resend").unwrap();
-    migrated(&path).unwrap();
+    migrated(&path).await.unwrap();
     let seed = ready(&path).unwrap();
     let ago = |secs: i64| {
-        let at = u64::try_from(Utc::now().timestamp() - secs).unwrap();
+        let at = u64::try_from(clock::now().timestamp() - secs).unwrap();
         Uuid::new_v7(uuid::Timestamp::from_unix(uuid::NoContext, at, 0))
     };
     let dropped = ago(7200);
@@ -887,17 +943,20 @@ fn the_hunts_resend_runs_the_dropped_events_flow_on_its_data() {
         hunt: Duration::from_millis(300),
         ..Settings::new(Duration::from_millis(100))
     };
-    let app = App::open_with(path, settings).unwrap();
+    let app = App::open_with(path, settings).await.unwrap();
 
     // Then the hunt resends the dropped event
-    let resend = app.retry(dropped);
+    let resend = app.retry(dropped).await;
     assert_eq!(app.sent(dropped, 0), [(12, json!("hung"))]);
 
     // And rannoch-processor runs the resend's flow on the dropped event's data
-    assert!(until(WAIT, || app
-        .statuses(resend)
-        .iter()
-        .any(|s| *s == 2 || *s == -1)));
+    assert!(
+        until(WAIT, || app
+            .statuses(resend)
+            .iter()
+            .any(|s| *s == 2 || *s == -1))
+        .await
+    );
     assert_eq!(
         app.sent(resend, -1),
         Vec::<(i64, Value)>::new(),
@@ -909,20 +968,20 @@ fn the_hunts_resend_runs_the_dropped_events_flow_on_its_data() {
     );
     assert_eq!(app.statuses(resend), [1, 0, 2]);
 
-    app.stop();
+    app.stop().await;
 }
 
 /// An id `secs` seconds ago.
 fn ago(secs: i64) -> Uuid {
-    let at = u64::try_from(Utc::now().timestamp() - secs).unwrap_or_default();
+    let at = u64::try_from(clock::now().timestamp() - secs).unwrap_or_default();
     Uuid::new_v7(uuid::Timestamp::from_unix(uuid::NoContext, at, 0))
 }
 
 /// A store at `path` holding o9's wait, as the order flow keeps it, two hours old with a 1 after
 /// it, then each of `about` as (seconds ago, status, data) with the wait as its source; the
 /// wait's id.
-fn waiting(path: &Path, about: &[(i64, i64, Value)]) -> Result<Uuid> {
-    migrated(path)?;
+async fn waiting(path: &Path, about: &[(i64, i64, Value)]) -> Result<Uuid> {
+    migrated(path).await?;
     let seed = ready(path)?;
     let wait = ago(7200);
     let data = json!({ "$wait": { "step": 0, "for": 71 }, "key": "o9", "vals": { "order": "o9" } });
@@ -946,11 +1005,12 @@ fn waiting(path: &Path, about: &[(i64, i64, Value)]) -> Result<Uuid> {
 }
 
 /// Not a scenario: #91. The hunt's resend of a wait a crash dropped sends the wait's timeout.
-#[test]
-fn a_wait_the_hunt_resends_sends_its_timeout_once_and_its_2_says_timeout() {
+#[tokio::test(start_paused = true)]
+async fn a_wait_the_hunt_resends_sends_its_timeout_once_and_its_2_says_timeout() {
+    let _turn = TURN.lock().await;
     // Given a store with o9's wait, whose 1 is on disk with nothing after it, as a crash leaves it
     let path = database("a_wait_the_hunt_resends").unwrap();
-    let wait = waiting(&path, &[]).unwrap();
+    let wait = waiting(&path, &[]).await.unwrap();
 
     // When the queue starts with a hunt that runs soon
     let settings = Settings {
@@ -959,64 +1019,71 @@ fn a_wait_the_hunt_resends_sends_its_timeout_once_and_its_2_says_timeout() {
         hunt: Duration::from_millis(300),
         ..Settings::new(Duration::from_millis(100))
     };
-    let app = App::open_with(path, settings).unwrap();
+    let app = App::open_with(path, settings).await.unwrap();
 
     // Then the hunt resends the wait
-    let resend = app.retry(wait);
+    let resend = app.retry(wait).await;
     assert_eq!(app.sent(wait, 0).first(), Some(&(70, json!("hung"))));
 
     // And the resend sends the wait's timeout once, with the wait as its source, and its 2 says
     // "timeout"
-    assert!(until(WAIT, || app
-        .statuses(resend)
-        .iter()
-        .any(|s| *s == 2 || *s == -1)));
-    thread::sleep(Duration::from_millis(200));
+    assert!(
+        until(WAIT, || app
+            .statuses(resend)
+            .iter()
+            .any(|s| *s == 2 || *s == -1))
+        .await
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
     let timeout = (73, json!({ "order": "o9" }));
     assert_eq!(app.sent(wait, 0), [(70, json!("hung")), timeout]);
     assert_eq!(app.sent(resend, 2), [(70, json!("timeout"))]);
     assert_eq!(app.statuses(resend), [1, 2]);
 
-    app.stop();
+    app.stop().await;
 }
 
 /// Not a scenario: #91. The queue's retry of a wait whose run failed sends the wait's timeout.
-#[test]
-fn a_wait_the_queue_retries_sends_its_timeout_once_and_its_2_says_timeout() {
+#[tokio::test(start_paused = true)]
+async fn a_wait_the_queue_retries_sends_its_timeout_once_and_its_2_says_timeout() {
+    let _turn = TURN.lock().await;
     // Given a store with o9's wait, whose run failed, and the queue's retry of it
     let path = database("a_wait_the_queue_retries").unwrap();
     let failed = json!("database is locked");
     let about = [(5000, -1, failed.clone()), (4800, 0, failed.clone())];
-    let wait = waiting(&path, &about).unwrap();
+    let wait = waiting(&path, &about).await.unwrap();
 
     // When the queue starts and takes the retry
-    let app = App::open(path, 3).unwrap();
+    let app = App::open(path, 3).await.unwrap();
     app.signal.send(()).unwrap();
-    let retry = app.retry(wait);
+    let retry = app.retry(wait).await;
 
     // Then the retry sends the wait's timeout once, with the wait as its source, and its 2 says
     // "timeout"
-    assert!(until(WAIT, || app
-        .statuses(retry)
-        .iter()
-        .any(|s| *s == 2 || *s == -1)));
-    thread::sleep(Duration::from_millis(200));
+    assert!(
+        until(WAIT, || app
+            .statuses(retry)
+            .iter()
+            .any(|s| *s == 2 || *s == -1))
+        .await
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
     let timeout = (73, json!({ "order": "o9" }));
     assert_eq!(app.sent(wait, 0), [(70, failed), timeout]);
     assert_eq!(app.sent(retry, 2), [(70, json!("timeout"))]);
     assert_eq!(app.statuses(retry), [1, 2]);
 
-    app.stop();
+    app.stop().await;
 }
 
 /// Two payments for o9, `paid` the first's amount, each waited for until its 2; then the wait's
 /// 0s, which must be `first`, the timeout and one late, for the first payment.
-fn pays_late(app: &App, wait: Uuid, first: (i64, Value), paid: u64) -> Result<()> {
+async fn pays_late(app: &App, wait: Uuid, first: (i64, Value), paid: u64) -> Result<()> {
     for amount in [paid, paid + 1] {
         let payment = app.hand(71, &json!({ "order": "o9", "amount": amount }))?;
-        assert!(until(WAIT, || app.statuses(payment).contains(&2)));
+        assert!(until(WAIT, || app.statuses(payment).contains(&2)).await);
     }
-    thread::sleep(Duration::from_millis(200));
+    tokio::time::sleep(Duration::from_millis(200)).await;
     let (timeout, late) = (
         json!({ "order": "o9" }),
         json!({ "order": "o9", "paid": paid }),
@@ -1027,11 +1094,12 @@ fn pays_late(app: &App, wait: Uuid, first: (i64, Value), paid: u64) -> Result<()
 
 /// Not a scenario: #95. After the hunt's resend of a wait sends its timeout, the first match
 /// sends the wait's late, once.
-#[test]
-fn a_wait_the_hunt_resends_sends_late_on_the_first_match_after_its_timeout() {
+#[tokio::test(start_paused = true)]
+async fn a_wait_the_hunt_resends_sends_late_on_the_first_match_after_its_timeout() {
+    let _turn = TURN.lock().await;
     // Given a store with o9's wait, whose 1 is on disk with nothing after it, as a crash leaves it
     let path = database("a_wait_the_hunt_resends_late").unwrap();
-    let wait = waiting(&path, &[]).unwrap();
+    let wait = waiting(&path, &[]).await.unwrap();
 
     // And the hunt's resend of the wait has sent its timeout
     let settings = Settings {
@@ -1040,52 +1108,54 @@ fn a_wait_the_hunt_resends_sends_late_on_the_first_match_after_its_timeout() {
         hunt: Duration::from_millis(300),
         ..Settings::new(Duration::from_millis(100))
     };
-    let app = App::open_with(path, settings).unwrap();
-    let resend = app.retry(wait);
-    assert!(until(WAIT, || app.statuses(resend).contains(&2)));
+    let app = App::open_with(path, settings).await.unwrap();
+    let resend = app.retry(wait).await;
+    assert!(until(WAIT, || app.statuses(resend).contains(&2)).await);
     assert_eq!(app.sent(resend, 2), [(70, json!("timeout"))]);
 
     // When two payments for o9 arrive
     // Then the wait's late is sent once, for the first, with the wait as its source
-    pays_late(&app, wait, (70, json!("hung")), 7).unwrap();
+    pays_late(&app, wait, (70, json!("hung")), 7).await.unwrap();
 
-    app.stop();
+    app.stop().await;
 }
 
 /// Not a scenario: #95. After the queue's retry of a wait sends its timeout, the first match
 /// sends the wait's late, once.
-#[test]
-fn a_wait_the_queue_retries_sends_late_on_the_first_match_after_its_timeout() {
+#[tokio::test(start_paused = true)]
+async fn a_wait_the_queue_retries_sends_late_on_the_first_match_after_its_timeout() {
+    let _turn = TURN.lock().await;
     // Given a store with o9's wait, whose run failed, and the queue's retry of it
     let path = database("a_wait_the_queue_retries_late").unwrap();
     let failed = json!("database is locked");
     let about = [(5000, -1, failed.clone()), (4800, 0, failed.clone())];
-    let wait = waiting(&path, &about).unwrap();
+    let wait = waiting(&path, &about).await.unwrap();
 
     // And the retry has sent the wait's timeout
-    let app = App::open(path, 3).unwrap();
+    let app = App::open(path, 3).await.unwrap();
     app.signal.send(()).unwrap();
-    let retry = app.retry(wait);
-    assert!(until(WAIT, || app.statuses(retry).contains(&2)));
+    let retry = app.retry(wait).await;
+    assert!(until(WAIT, || app.statuses(retry).contains(&2)).await);
     assert_eq!(app.sent(retry, 2), [(70, json!("timeout"))]);
 
     // When two payments for o9 arrive
     // Then the wait's late is sent once, for the first, with the wait as its source
-    pays_late(&app, wait, (70, failed), 7).unwrap();
+    pays_late(&app, wait, (70, failed), 7).await.unwrap();
 
-    app.stop();
+    app.stop().await;
 }
 
 /// Not a scenario: #97. A queue that starts over a store holding due events takes them without
 /// a signal.
-#[test]
-fn a_queue_that_starts_takes_the_events_already_due_without_a_signal() {
+#[tokio::test(start_paused = true)]
+async fn a_queue_that_starts_takes_the_events_already_due_without_a_signal() {
+    let _turn = TURN.lock().await;
     // Given a store with two events at 0 with nothing after them, as a crash leaves them: one
     // with no run_at, and one whose run_at has passed
     let path = database("a_queue_that_starts").unwrap();
-    migrated(&path).unwrap();
+    migrated(&path).await.unwrap();
     let seed = ready(&path).unwrap();
-    let (unset, passed) = (Uuid::now_v7(), Uuid::now_v7());
+    let (unset, passed) = (clock::new_id(), clock::new_id());
     let event = |id: Uuid| {
         let data = json!({ "ticket": id.to_string() }).to_string();
         _events::factory()
@@ -1095,7 +1165,7 @@ fn a_queue_that_starts_takes_the_events_already_due_without_a_signal() {
             .status(0)
     };
     event(unset).insert(&seed).unwrap();
-    let past = (Utc::now() - TimeDelta::hours(1)).to_rfc3339_opts(SecondsFormat::Millis, true);
+    let past = (clock::now() - TimeDelta::hours(1)).to_rfc3339_opts(SecondsFormat::Millis, true);
     event(passed).run_at(past).insert(&seed).unwrap();
 
     // When the queue starts, and nothing signals it
@@ -1103,17 +1173,19 @@ fn a_queue_that_starts_takes_the_events_already_due_without_a_signal() {
         attempts: 1,
         ..Settings::new(Duration::from_millis(100))
     };
-    let app = App::over(path, &built_in().unwrap(), |_, _| Vec::new(), settings).unwrap();
+    let app = App::over(path, &built_in().unwrap(), |_, _| Vec::new(), settings)
+        .await
+        .unwrap();
 
     // Then it takes both, and rannoch-processor runs each
     for event in [unset, passed] {
         assert!(
-            until(WAIT, || app.statuses(event) == [1, 2]),
+            until(WAIT, || app.statuses(event) == [1, 2]).await,
             "{event} was not taken"
         );
     }
 
-    app.stop();
+    app.stop().await;
 }
 
 /// FR-RANNOCH-124's flows, from the fixture `tests/built_in.json`, each with the name of its
@@ -1133,14 +1205,17 @@ fn built_in() -> std::result::Result<String, Vec<String>> {
 /// The table the payment flow stores into, keyed by its order.
 const PAYMENTS: &str = "CREATE TABLE payments (order_id TEXT PRIMARY KEY, amount INTEGER)";
 
-#[test]
-fn a_flow_of_built_in_steps_runs_with_no_action_of_the_apps() {
+#[tokio::test(start_paused = true)]
+async fn a_flow_of_built_in_steps_runs_with_no_action_of_the_apps() {
+    let _turn = TURN.lock().await;
     // Given an app whose flow has an emit step that branches on a field and an emit step that
     // waits for another event, and no action of its own
     // When the app's build checks the flow and an event of its ty is handed to it
     // Then the build passes
     let flows = built_in().unwrap();
-    let app = App::built_in("a_flow_of_built_in_steps", &flows).unwrap();
+    let app = App::built_in("a_flow_of_built_in_steps", &flows)
+        .await
+        .unwrap();
     let rush = app
         .hand(80, &json!({ "ticket": "t1", "kind": "rush" }))
         .unwrap();
@@ -1155,10 +1230,10 @@ fn a_flow_of_built_in_steps_runs_with_no_action_of_the_apps() {
             .0
     };
     // t1's answer is handed as soon as its wait is kept, well before the wait is due.
-    assert!(until(WAIT, || app.statuses(rush).contains(&2)));
+    assert!(until(WAIT, || app.statuses(rush).contains(&2)).await);
     let w1 = wait(rush);
     let answer = app.hand(83, &json!({ "ticket": "t1" })).unwrap();
-    assert!(until(WAIT, || app.statuses(slow).contains(&2)));
+    assert!(until(WAIT, || app.statuses(slow).contains(&2)).await);
 
     // the branch's next is sent for the case the field matches
     let next = |event, ty| app.sent(event, 0).into_iter().filter(move |n| n.0 == ty);
@@ -1174,34 +1249,37 @@ fn a_flow_of_built_in_steps_runs_with_no_action_of_the_apps() {
 
     // and the wait sends its next when the other event arrives
     let w2 = wait(slow);
-    assert!(until(WAIT, || app.statuses(answer).contains(&2)));
-    assert!(until(WAIT, || app.statuses(w1).contains(&2)));
+    assert!(until(WAIT, || app.statuses(answer).contains(&2)).await);
+    assert!(until(WAIT, || app.statuses(w1).contains(&2)).await);
     assert_eq!(app.sent(w1, 0), [(84, json!({ "ticket": "t1" }))]);
     assert_eq!(app.sent(w1, 2), [(80, json!("matched"))]);
 
     // and its timeout when none does
-    assert!(until(WAIT, || app.statuses(w2).contains(&2)));
+    assert!(until(WAIT, || app.statuses(w2).contains(&2)).await);
     assert_eq!(app.sent(w2, 0), [(85, json!({ "ticket": "t2" }))]);
     assert_eq!(app.sent(w2, 2), [(80, json!("timeout"))]);
 
-    app.stop();
+    app.stop().await;
 }
 
-#[test]
-fn store_keeps_one_row_with_the_events_2() {
+#[tokio::test(start_paused = true)]
+async fn store_keeps_one_row_with_the_events_2() {
+    let _turn = TURN.lock().await;
     // Given a table with a key, and a flow whose step stores a row shaped from the event's fields
     // into it
-    let app = App::built_in("store_keeps_one_row", &built_in().unwrap()).unwrap();
+    let app = App::built_in("store_keeps_one_row", &built_in().unwrap())
+        .await
+        .unwrap();
     app.read.execute_batch(PAYMENTS).unwrap();
 
     // When events are handed to the flow, and one of them is run again
     let data = |i: i64| json!({ "order": format!("o{i}"), "amount": i * 10 });
     let paid: Vec<Uuid> = (0..5).map(|i| app.hand(86, &data(i)).unwrap()).collect();
     for event in &paid {
-        assert!(until(WAIT, || app.statuses(*event).contains(&2)));
+        assert!(until(WAIT, || app.statuses(*event).contains(&2)).await);
     }
     app.rerun(paid[0], 86, &data(0)).unwrap();
-    assert!(until(WAIT, || app.statuses(paid[0]) == [1, 2, 2]));
+    assert!(until(WAIT, || app.statuses(paid[0]) == [1, 2, 2]).await);
 
     // Then every event that has its 2 has exactly its one row in the table, with the values its
     // fields gave
@@ -1228,13 +1306,16 @@ fn store_keeps_one_row_with_the_events_2() {
     // and the event run again added none
     assert_eq!(app.count("SELECT count(*) FROM payments"), 5);
 
-    app.stop();
+    app.stop().await;
 }
 
-#[test]
-fn store_refuses_a_table_it_does_not_have() {
+#[tokio::test(start_paused = true)]
+async fn store_refuses_a_table_it_does_not_have() {
+    let _turn = TURN.lock().await;
     // Given a flow whose step stores a row into a table the store does not have
-    let app = App::built_in("store_refuses_a_table", &built_in().unwrap()).unwrap();
+    let app = App::built_in("store_refuses_a_table", &built_in().unwrap())
+        .await
+        .unwrap();
     app.read.execute_batch(PAYMENTS).unwrap();
 
     // When an event is handed to the flow
@@ -1244,24 +1325,24 @@ fn store_refuses_a_table_it_does_not_have() {
         .unwrap();
 
     // Then the event gets a -1 naming the table
-    assert!(until(WAIT, || app.statuses(lost).contains(&-1)));
+    assert!(until(WAIT, || app.statuses(lost).contains(&-1)).await);
     assert_eq!(
         app.sent(lost, -1),
         [(87, json!("store: no such table: nope"))]
     );
 
     // and later events of the same inbox are written
-    assert!(until(WAIT, || app.statuses(later).contains(&2)));
+    assert!(until(WAIT, || app.statuses(later).contains(&2)).await);
     let row = "SELECT count(*) FROM payments WHERE order_id = 'o2' AND amount = 5";
     assert_eq!(app.count(row), 1);
 
-    app.stop();
+    app.stop().await;
 }
 
 /// Not a scenario: #102. An invoice whose row `payments` refuses gets, in place of its 2 and its
 /// row, a -1 whose data is `reason`, and the receipt its step sent stands; a later invoice of the
 /// same inbox is written.
-fn a_refused_row_gets_a_minus_1(
+async fn a_refused_row_gets_a_minus_1(
     name: &str,
     payments: &str,
     refused: &Value,
@@ -1269,7 +1350,7 @@ fn a_refused_row_gets_a_minus_1(
 ) -> Result<()> {
     // Given a table that refuses the first invoice's row, and a flow whose step stores into it
     // and sends a receipt
-    let app = built_in_with(name, Config::default())?;
+    let app = built_in_with(name, Config::default()).await?;
     app.read.execute_batch(payments)?;
 
     // When that invoice is handed to the flow, then one the table takes
@@ -1278,7 +1359,7 @@ fn a_refused_row_gets_a_minus_1(
 
     // Then the first gets a -1 naming the reason, and neither its 2 nor its row is written; the
     // receipt its step sent stands
-    assert!(until(WAIT, || app.statuses(first).contains(&-1)));
+    assert!(until(WAIT, || app.statuses(first).contains(&-1)).await);
     assert_eq!(app.sent(first, -1), [(88, json!(reason))]);
     assert_eq!(app.sent(first, 2), []);
     assert_eq!(
@@ -1288,76 +1369,46 @@ fn a_refused_row_gets_a_minus_1(
     assert_eq!(app.sent(first, 0), [(89, json!({ "order": "o1" }))]);
 
     // And the later invoice is written, with its 2, its row and its receipt
-    assert!(until(WAIT, || app.statuses(later).contains(&2)));
+    assert!(until(WAIT, || app.statuses(later).contains(&2)).await);
     let row = "SELECT count(*) FROM payments WHERE order_id = 'o2' AND amount = 5";
     assert_eq!(app.count(row), 1);
     assert_eq!(app.sent(later, 0), [(89, json!({ "order": "o2" }))]);
 
-    app.stop();
+    app.stop().await;
     Ok(())
 }
 
-#[test]
-fn a_row_that_breaks_not_null_gets_a_minus_1_and_no_2() {
+#[tokio::test(start_paused = true)]
+async fn a_row_that_breaks_not_null_gets_a_minus_1_and_no_2() {
+    let _turn = TURN.lock().await;
     let payments = "CREATE TABLE payments (order_id TEXT PRIMARY KEY, amount INTEGER NOT NULL)";
     let absent = json!({ "order": "o1" });
     let reason = "store: NOT NULL constraint failed: payments.amount";
-    a_refused_row_gets_a_minus_1("refused_not_null", payments, &absent, reason).unwrap();
+    a_refused_row_gets_a_minus_1("refused_not_null", payments, &absent, reason)
+        .await
+        .unwrap();
 }
 
-#[test]
-fn a_row_that_breaks_a_foreign_key_gets_a_minus_1_and_no_2() {
+#[tokio::test(start_paused = true)]
+async fn a_row_that_breaks_a_foreign_key_gets_a_minus_1_and_no_2() {
+    let _turn = TURN.lock().await;
     let payments = format!("{ORDERS}; INSERT INTO orders (id) VALUES ('o2')");
     let unknown = json!({ "order": "o1", "amount": 5 });
     let reason = "store: FOREIGN KEY constraint failed";
-    a_refused_row_gets_a_minus_1("refused_foreign_key", &payments, &unknown, reason).unwrap();
+    a_refused_row_gets_a_minus_1("refused_foreign_key", &payments, &unknown, reason)
+        .await
+        .unwrap();
 }
 
-#[test]
-fn a_number_above_i64_max_gets_a_minus_1_and_no_2() {
+#[tokio::test(start_paused = true)]
+async fn a_number_above_i64_max_gets_a_minus_1_and_no_2() {
+    let _turn = TURN.lock().await;
     let payments = "CREATE TABLE payments (order_id TEXT PRIMARY KEY, amount INTEGER NOT NULL)";
     let above = json!({ "order": "o1", "amount": u64::MAX });
     let reason = "store: 18446744073709551615 cannot be held exactly: payments.amount";
-    a_refused_row_gets_a_minus_1("refused_above_i64_max", payments, &above, reason).unwrap();
-}
-
-/// How many payments #102's measurement runs to their 2.
-const RATE_EVENTS: u32 = 100_000;
-
-/// Not a scenario: #102's measurement of what the `store` step's savepoint costs. `RATE_EVENTS`
-/// payments are written at 0 in one transaction, the queue is signalled, and the flow rate is
-/// the payments over the time until every one has its 2; each has its row. Run it in release:
-/// `cargo test --release -p rannoch-processor --test scenarios -- --ignored --nocapture
-/// the_store_flow_rate`.
-#[test]
-#[ignore = "a measurement: run it in release"]
-fn the_store_flow_rate() {
-    // Given an app whose payment flow's step stores each payment's row
-    let app = App::built_in("store_flow_rate", &built_in().unwrap()).unwrap();
-    app.read.execute_batch(PAYMENTS).unwrap();
-
-    // When the payments are written at 0 and the queue is signalled
-    let mut conn = ready(&app.path).unwrap();
-    let tx = conn.transaction().unwrap();
-    for i in 0..RATE_EVENTS {
-        let data = json!({ "order": format!("o{i}"), "amount": i }).to_string();
-        let row = _events::factory().id(Uuid::now_v7().to_string()).ty(86);
-        row.data(data).status(0).insert(&tx).unwrap();
-    }
-    tx.commit().unwrap();
-    let start = Instant::now();
-    app.signal.send(()).unwrap();
-
-    // Then every payment reaches its 2 with its row, at the rate printed
-    let all = i64::from(RATE_EVENTS);
-    while app.count("SELECT count(*) FROM _events WHERE status = 2") < all {
-        thread::sleep(Duration::from_millis(50));
-    }
-    let elapsed = start.elapsed();
-    let rate = f64::from(RATE_EVENTS) / elapsed.as_secs_f64();
-    println!("{RATE_EVENTS} payments to their 2 in {elapsed:?}: {rate:.0} events/s");
-    assert_eq!(app.count("SELECT count(*) FROM payments"), all);
-    app.stop();
+    a_refused_row_gets_a_minus_1("refused_above_i64_max", payments, &above, reason)
+        .await
+        .unwrap();
 }
 
 /// How many events wait their turn behind each other in #85's backlog.
@@ -1375,17 +1426,18 @@ fn hunting(window: Duration, hunt: Duration) -> Settings {
 
 /// Not a scenario: #85. The hunt does not resend an event whose run the running queue still
 /// holds: waiting its turn, going, or with its 2 not yet on disk.
-#[test]
-fn the_hunt_does_not_resend_a_run_the_queue_still_holds() {
+#[tokio::test(start_paused = true)]
+async fn the_hunt_does_not_resend_a_run_the_queue_still_holds() {
+    let _turn = TURN.lock().await;
     // Given a store with a backlog of events of a flow of built-in steps, each at 0 with nothing
     // after it
     let path = database("the_hunt_leaves_held_runs").unwrap();
-    migrated(&path).unwrap();
+    migrated(&path).await.unwrap();
     let mut seed = ready(&path).unwrap();
     let tx = seed.transaction().unwrap();
     for i in 0..BACKLOG {
         let data = json!({ "ticket": format!("t{i}") }).to_string();
-        let row = _events::factory().id(Uuid::now_v7().to_string()).ty(82);
+        let row = _events::factory().id(clock::new_id().to_string()).ty(82);
         row.data(data).status(0).insert(&tx).unwrap();
     }
     tx.commit().unwrap();
@@ -1393,28 +1445,31 @@ fn the_hunt_does_not_resend_a_run_the_queue_still_holds() {
     // When the queue runs them one after another, its window and hunt far shorter than the
     // backlog
     let settings = hunting(Duration::from_millis(20), Duration::from_millis(60));
-    let app = App::over(path, &built_in().unwrap(), |_, _| Vec::new(), settings).unwrap();
+    let app = App::over(path, &built_in().unwrap(), |_, _| Vec::new(), settings)
+        .await
+        .unwrap();
     app.signal.send(()).unwrap();
 
     // Then each event runs once, to its 2, and the hunt resends none of them
     let twos = "SELECT count(*) FROM _events WHERE ty = 82 AND status = 2";
-    assert!(until(Duration::from_secs(60), || app.count(twos) >= BACKLOG));
-    thread::sleep(Duration::from_millis(300));
+    assert!(until(Duration::from_secs(60), || app.count(twos) >= BACKLOG).await);
+    tokio::time::sleep(Duration::from_millis(300)).await;
     let hung = "SELECT count(*) FROM _events WHERE data = '\"hung\"'";
     assert_eq!(app.count(hung), 0, "the hunt resent runs the queue held");
     assert_eq!(app.count(twos), BACKLOG);
 
-    app.stop();
+    app.stop().await;
 }
 
 /// Not a scenario: #85. The hunt still resends an event whose 1 is on disk with nothing after it
 /// and no running queue holds, as a crash leaves it.
-#[test]
-fn the_hunt_resends_an_event_a_crash_dropped() {
+#[tokio::test(start_paused = true)]
+async fn the_hunt_resends_an_event_a_crash_dropped() {
+    let _turn = TURN.lock().await;
     // Given a store with an event of a flow of built-in steps whose 1 is an hour old with nothing
     // after it
     let path = database("the_hunt_resends_a_crash_dropped").unwrap();
-    migrated(&path).unwrap();
+    migrated(&path).await.unwrap();
     let seed = ready(&path).unwrap();
     let dropped = ago(7200);
     let data = json!({ "ticket": "t1" }).to_string();
@@ -1431,15 +1486,17 @@ fn the_hunt_resends_an_event_a_crash_dropped() {
 
     // When the queue starts with a hunt that runs soon
     let settings = hunting(Duration::from_mins(1), Duration::from_millis(300));
-    let app = App::over(path, &built_in().unwrap(), |_, _| Vec::new(), settings).unwrap();
+    let app = App::over(path, &built_in().unwrap(), |_, _| Vec::new(), settings)
+        .await
+        .unwrap();
 
     // Then the hunt resends it once, and the resend runs to its 2
-    let resend = app.retry(dropped);
-    assert!(until(WAIT, || app.statuses(resend) == [1, 2]));
-    thread::sleep(Duration::from_millis(700));
+    let resend = app.retry(dropped).await;
+    assert!(until(WAIT, || app.statuses(resend) == [1, 2]).await);
+    tokio::time::sleep(Duration::from_millis(700)).await;
     assert_eq!(app.sent(dropped, 0), [(82, json!("hung"))]);
 
-    app.stop();
+    app.stop().await;
 }
 
 // #92: the README's "What you can rely on" and "How it fails", each item through the real store,
@@ -1479,9 +1536,12 @@ impl App {
     }
 
     /// Waits for the event sent with `data` to have its 2, and returns its id.
-    fn ran(&self, data: &Value) -> Uuid {
-        let id = poll(WAIT, || self.root(data)).unwrap_or_default();
-        assert!(until(WAIT, || self.statuses(id).contains(&2)), "{data} ran");
+    async fn ran(&self, data: &Value) -> Uuid {
+        let id = poll(WAIT, || self.root(data)).await.unwrap_or_default();
+        assert!(
+            until(WAIT, || self.statuses(id).contains(&2)).await,
+            "{data} ran"
+        );
         id
     }
 
@@ -1511,8 +1571,8 @@ fn event(ty: u16, data: &Value) -> Event<Ty, Value> {
 }
 
 /// Polls `found` every 5 ms for up to `limit`: its first `Some`.
-fn poll<T>(limit: Duration, found: impl Fn() -> Option<T>) -> Option<T> {
-    let start = Instant::now();
+async fn poll<T>(limit: Duration, found: impl Fn() -> Option<T>) -> Option<T> {
+    let start = clock::elapsed();
     loop {
         if let Some(t) = found() {
             return Some(t);
@@ -1520,15 +1580,15 @@ fn poll<T>(limit: Duration, found: impl Fn() -> Option<T>) -> Option<T> {
         if start.elapsed() > limit {
             return None;
         }
-        thread::sleep(Duration::from_millis(5));
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
 
 /// The app over a fresh store `name` on `BUILT_IN`'s flows, rannoch's inboxes as `config` has
 /// them.
-fn built_in_with(name: &str, config: Config<Ty, Value>) -> Result<App> {
+async fn built_in_with(name: &str, config: Config<Ty, Value>) -> Result<App> {
     let flows = built_in().map_err(|e| e.join("\n"))?;
-    App::built_in_at(database(name)?, &flows, config)
+    App::built_in_at(database(name)?, &flows, config).await
 }
 
 /// A default inbox that hands over every `ms` milliseconds.
@@ -1589,11 +1649,11 @@ impl log::Log for Errors {
 static ERRORS: Errors = Errors(Mutex::new(Vec::new()));
 
 /// One scenario that reads the log at a time: every app in this binary logs to `ERRORS`.
-static LOGGED: Mutex<()> = Mutex::new(());
+static LOGGED: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Holds `LOGGED`, with `ERRORS` taking rannoch's `error` lines, emptied.
-fn logged() -> std::sync::MutexGuard<'static, ()> {
-    let one = LOGGED.lock().unwrap_or_else(PoisonError::into_inner);
+async fn logged() -> tokio::sync::MutexGuard<'static, ()> {
+    let one = LOGGED.lock().await;
     let _ = log::set_logger(&ERRORS);
     log::set_max_level(log::LevelFilter::Error);
     ERRORS
@@ -1614,14 +1674,15 @@ fn failed_hand_overs() -> Vec<usize> {
     lines.iter().filter_map(held).collect()
 }
 
-#[test]
-fn an_accepted_event_is_in_memory_until_its_inbox_hands_it_over() {
+#[tokio::test(start_paused = true)]
+async fn an_accepted_event_is_in_memory_until_its_inbox_hands_it_over() {
+    let _turn = TURN.lock().await;
     // Given an app whose default inbox hands over every 400 ms; under Config::default, every 20
     assert_eq!(
         Config::<Ty, Value>::default().default_interval,
         TimeDelta::milliseconds(20)
     );
-    let app = built_in_with("in_memory", every(400)).unwrap();
+    let app = built_in_with("in_memory", every(400)).await.unwrap();
     let landed = || app.count(ROOTS);
 
     // When it sends three events
@@ -1630,12 +1691,15 @@ fn an_accepted_event_is_in_memory_until_its_inbox_hands_it_over() {
     }
 
     // Then none is in _events before the inbox's interval has passed
-    thread::sleep(Duration::from_millis(150));
+    tokio::time::sleep(Duration::from_millis(150)).await;
     assert_eq!(landed(), 0, "on the heap, not on disk");
 
     // And the inbox hands its whole heap over as one batch: the first read to see one sees three,
     // each at 0 with a v7 id
-    assert_eq!(poll(WAIT, || Some(landed()).filter(|n| *n > 0)), Some(3));
+    assert_eq!(
+        poll(WAIT, || Some(landed()).filter(|n| *n > 0)).await,
+        Some(3)
+    );
     let v7 = "SELECT count(*) FROM _events WHERE source IS NULL AND status = 0
         AND substr(id, 15, 1) = '7'";
     assert_eq!(app.count(v7), 3);
@@ -1646,14 +1710,17 @@ fn an_accepted_event_is_in_memory_until_its_inbox_hands_it_over() {
     }
 
     // Then they wait out the inbox's interval after it too, and are handed over together
-    thread::sleep(Duration::from_millis(150));
+    tokio::time::sleep(Duration::from_millis(150)).await;
     assert_eq!(landed(), 3);
-    assert_eq!(poll(WAIT, || Some(landed()).filter(|n| *n > 3)), Some(5));
-    app.stop();
+    assert_eq!(
+        poll(WAIT, || Some(landed()).filter(|n| *n > 3)).await,
+        Some(5)
+    );
+    app.stop().await;
 
     // Given rannoch opened over a store with no append
     let path = database("no_append").unwrap();
-    let store = migrated(&path).unwrap();
+    let store = migrated(&path).await.unwrap();
     let rannoch = Rannoch::<Ty, Value>::open(Config {
         store: Some(store),
         ..Config::default()
@@ -1663,8 +1730,8 @@ fn an_accepted_event_is_in_memory_until_its_inbox_hands_it_over() {
     // When it is sent an event, then shut down
     let kept = event(82, &json!({ "ticket": "kept" }));
     rannoch.sender().send(kept).unwrap();
-    thread::sleep(Duration::from_millis(200));
-    rannoch.shutdown();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    shutdown(rannoch).await;
 
     // Then nothing was handed over
     let all = ready(&path)
@@ -1673,9 +1740,10 @@ fn an_accepted_event_is_in_memory_until_its_inbox_hands_it_over() {
     assert_eq!(all.unwrap(), 0);
 }
 
-#[test]
-fn a_batch_the_store_never_takes_stops_its_inbox_and_is_lost_at_shutdown() {
-    let _errors = logged();
+#[tokio::test(start_paused = true)]
+async fn a_batch_the_store_never_takes_stops_its_inbox_and_is_lost_at_shutdown() {
+    let _turn = TURN.lock().await;
+    let _errors = logged().await;
     // Given an app whose payments must name an order the store has by the time their batch
     // commits, whose default inbox hands over every 300 ms, and whose queued tickets have an inbox
     // of their own
@@ -1688,17 +1756,17 @@ fn a_batch_the_store_never_takes_stops_its_inbox_and_is_lost_at_shutdown() {
         inboxes: vec![queued],
         ..every(300)
     };
-    let app = built_in_with("never_taken", config).unwrap();
+    let app = built_in_with("never_taken", config).await.unwrap();
     app.read.execute_batch(DEFERRED).unwrap();
 
     // When a payment for an order the store does not have runs
     let paid = json!({ "order": "o1", "amount": 5 });
     app.send(86, &paid).unwrap();
-    let payment = poll(WAIT, || app.root(&paid)).unwrap();
+    let payment = poll(WAIT, || app.root(&paid)).await.unwrap();
 
     // Then the hand-over of the batch with its 2 and its row fails whole at commit, and is logged
     // at error
-    assert!(until(WAIT, || !failed_hand_overs().is_empty()));
+    assert!(until(WAIT, || !failed_hand_overs().is_empty()).await);
     assert_eq!(app.sent(payment, 2), []);
     assert_eq!(app.count("SELECT count(*) FROM payments"), 0);
 
@@ -1712,27 +1780,27 @@ fn a_batch_the_store_never_takes_stops_its_inbox_and_is_lost_at_shutdown() {
 
     // Then every later hand-over of the default inbox holds the failed batch and them, and
     // fails: its heap grows, and nothing more from it reaches the disk
-    assert!(until(WAIT, || failed_hand_overs().last() == Some(&(held + 2))));
+    assert!(until(WAIT, || failed_hand_overs().last() == Some(&(held + 2))).await);
     let rushed = "SELECT count(*) FROM _events WHERE ty = 81";
     assert_eq!(app.count(rushed), 0);
 
     // And the other inbox still writes: the queued ticket is written and runs
-    app.ran(&queued);
+    app.ran(&queued).await;
 
     // When it sends one more just after a failed hand-over, then shuts down
     let tried = failed_hand_overs().len();
-    assert!(until(WAIT, || failed_hand_overs().len() > tried));
+    assert!(until(WAIT, || failed_hand_overs().len() > tried).await);
     let held = *failed_hand_overs().last().unwrap();
     app.send(81, &json!({ "ticket": "r3" })).unwrap();
     drop(app.signal);
-    app.rannoch.shutdown();
+    shutdown(app.rannoch).await;
 
     // Then shutdown's hand-over, which holds it, fails and is logged, and is not tried again
     assert_eq!(failed_hand_overs().last(), Some(&(held + 1)));
     let tried = failed_hand_overs().len();
-    thread::sleep(Duration::from_millis(400));
+    tokio::time::sleep(Duration::from_millis(400)).await;
     assert_eq!(failed_hand_overs().len(), tried);
-    assert_eq!(app.queue.join(), Ok(()));
+    assert_eq!(join(app.queue).await, Ok(()));
 
     // And the batch and every event after it are lost
     let read = ready(&app.path).unwrap();
@@ -1742,40 +1810,55 @@ fn a_batch_the_store_never_takes_stops_its_inbox_and_is_lost_at_shutdown() {
     assert_eq!(count(&two), 0);
 }
 
-#[test]
-fn a_failed_hand_over_is_tried_again_ahead_of_what_arrived_since() {
-    let _errors = logged();
+#[tokio::test(start_paused = true)]
+async fn a_failed_hand_over_is_tried_again_ahead_of_what_arrived_since() {
+    let _turn = TURN.lock().await;
+    let _errors = logged().await;
     // Given an app whose default inbox hands over every 300 ms, and another connection holding
     // the store's write lock past the append's busy timeout of 5 s
-    let app = built_in_with("tried_again", every(300)).unwrap();
+    let (told, handed) = std::sync::mpsc::channel();
+    let (path, flows) = (database("tried_again").unwrap(), built_in().unwrap());
+    let settings = Settings {
+        attempts: 1,
+        ..Settings::new(Duration::from_millis(100))
+    };
+    let config = (every(300), Some(told));
+    let app = App::told(path, &flows, |_, _| Vec::new(), config, settings)
+        .await
+        .unwrap();
     let writer = ready(&app.path).unwrap();
     writer.execute_batch("BEGIN IMMEDIATE").unwrap();
 
-    // When it sends an event, and another while the first's hand-over waits on the lock. Rannoch
-    // shows no sign of a hand-over starting, so the second is sent 1 s after the first: the
-    // hand-over that takes the first starts within one 300 ms interval and waits 5 s. The checks
-    // confirm it: no hand-over has failed when the second is sent, and the one that fails holds
-    // the first alone.
+    // When it sends an event, and another while the first's hand-over waits on the lock: the
+    // append tells of the batch it is handed before it waits, and the second is sent then, from a
+    // thread of its own, since the waiting hand-over holds the test's. The check confirms it: no
+    // hand-over has failed when the second is sent, and the one that fails holds the first alone.
     let (first, second) = (json!({ "ticket": "d" }), json!({ "ticket": "e" }));
     app.send(82, &first).unwrap();
-    thread::sleep(Duration::from_secs(1));
-    app.send(82, &second).unwrap();
+    let (sender, sent) = (app.rannoch.sender(), second.clone());
+    let sending = tokio::task::spawn_blocking(move || {
+        handed.recv().unwrap();
+        sender.send(event(82, &sent)).unwrap();
+        failed_hand_overs()
+    });
+    // The thread waiting on the append stops tokio's auto-advance, so the clock is moved here.
+    assert!(advancing(WAIT, || sending.is_finished()).await);
     let none = Vec::<usize>::new();
     assert_eq!(
-        failed_hand_overs(),
+        sending.await.unwrap(),
         none,
         "the first's hand-over still waits"
     );
 
     // Then that hand-over fails holding the first alone, and is logged at error
-    assert!(until(Duration::from_secs(10), || !failed_hand_overs().is_empty()));
+    assert!(until(Duration::from_secs(10), || !failed_hand_overs().is_empty()).await);
     assert_eq!(failed_hand_overs(), [1]);
 
     // And once the lock is released, the inbox tries again at its next interval: both are
     // written in one hand-over, the failed batch ahead of what arrived since
     writer.execute_batch("ROLLBACK").unwrap();
     assert_eq!(
-        poll(WAIT, || Some(app.count(ROOTS)).filter(|n| *n > 0)),
+        poll(WAIT, || Some(app.count(ROOTS)).filter(|n| *n > 0)).await,
         Some(2)
     );
     let sql = "SELECT json_extract(data, '$.ticket') FROM _events WHERE source IS NULL
@@ -1790,17 +1873,18 @@ fn a_failed_hand_over_is_tried_again_ahead_of_what_arrived_since() {
     // And as they run, the rows already in _events are only added to
     let written = app.rows();
     assert_ne!(written, Vec::<String>::new());
-    app.ran(&first);
-    app.ran(&second);
+    app.ran(&first).await;
+    app.ran(&second).await;
     let rows = app.rows();
     assert!(rows.len() > written.len() && rows.starts_with(&written));
-    app.stop();
+    app.stop().await;
 }
 
-#[test]
-fn the_queue_takes_each_due_event_once() {
+#[tokio::test(start_paused = true)]
+async fn the_queue_takes_each_due_event_once() {
+    let _turn = TURN.lock().await;
     // Given an app whose default inbox hands over every 300 ms, so each 1 is on the heap a while
-    let app = built_in_with("taken_once", every(300)).unwrap();
+    let app = built_in_with("taken_once", every(300)).await.unwrap();
 
     // When it sends ten events, and the queue is woken every 10 ms until each has its 2
     let events: Vec<Value> = (0..10)
@@ -1809,15 +1893,15 @@ fn the_queue_takes_each_due_event_once() {
     for data in &events {
         app.send(82, data).unwrap();
     }
-    let ids: Vec<Uuid> = events
-        .iter()
-        .filter_map(|d| poll(WAIT, || app.root(d)))
-        .collect();
+    let mut ids: Vec<Uuid> = Vec::new();
+    for data in &events {
+        ids.extend(poll(WAIT, || app.root(data)).await);
+    }
     assert_eq!(ids.len(), 10);
-    let start = Instant::now();
+    let start = clock::elapsed();
     while !ids.iter().all(|id| app.statuses(*id).contains(&2)) {
         app.signal.send(()).unwrap();
-        thread::sleep(Duration::from_millis(10));
+        tokio::time::sleep(Duration::from_millis(10)).await;
         assert!(start.elapsed() < WAIT, "each ran");
     }
 
@@ -1825,11 +1909,12 @@ fn the_queue_takes_each_due_event_once() {
     for id in &ids {
         assert_eq!(app.statuses(*id), [1, 2]);
     }
-    app.stop();
+    app.stop().await;
 }
 
-#[test]
-fn the_hunt_runs_a_hunt_after_the_queue_starts_then_every_hunt_on_the_stalled_events_data() {
+#[tokio::test(start_paused = true)]
+async fn the_hunt_runs_a_hunt_after_the_queue_starts_then_every_hunt_on_the_stalled_events_data() {
+    let _turn = TURN.lock().await;
     // Given the queue's defaults: a 20-minute window and an hour between hunts
     let defaults = Settings::new(Duration::from_millis(100));
     assert_eq!(
@@ -1840,7 +1925,7 @@ fn the_hunt_runs_a_hunt_after_the_queue_starts_then_every_hunt_on_the_stalled_ev
     // And a store as a crash leaves it: a payment whose 1 is an hour old with nothing after it,
     // and one whose 1 is 30 s old
     let path = database("hunt_every").unwrap();
-    migrated(&path).unwrap();
+    migrated(&path).await.unwrap();
     let seed = ready(&path).unwrap();
     seed.execute_batch(PAYMENTS).unwrap();
     let stalled = stall(&seed, &json!({ "order": "o1", "amount": 10 }), 3600).unwrap();
@@ -1849,20 +1934,22 @@ fn the_hunt_runs_a_hunt_after_the_queue_starts_then_every_hunt_on_the_stalled_ev
     // When the queue starts with a window of a minute and a hunt every 2 s, and is woken before
     // the first hunt
     let settings = hunting(Duration::from_mins(1), Duration::from_secs(2));
-    let started = Instant::now();
-    let app = App::over(path, &built_in().unwrap(), |_, _| Vec::new(), settings).unwrap();
-    thread::sleep(Duration::from_millis(100));
+    let started = clock::elapsed();
+    let app = App::over(path, &built_in().unwrap(), |_, _| Vec::new(), settings)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
     app.signal.send(()).unwrap();
 
     // Then nothing is resent before the first hunt, a hunt after the start
-    thread::sleep(Duration::from_millis(900));
+    tokio::time::sleep(Duration::from_millis(900)).await;
     assert_eq!(app.sent(stalled, 0), []);
-    let resend = app.retry(stalled);
+    let resend = app.retry(stalled).await;
     assert!(started.elapsed() >= Duration::from_secs(2));
     assert_eq!(app.sent(stalled, 0), [(86, json!("hung"))]);
 
     // And the resend runs the payment's flow on the stalled payment's data
-    assert!(until(WAIT, || app.statuses(resend) == [1, 2]));
+    assert!(until(WAIT, || app.statuses(resend) == [1, 2]).await);
     let row = "SELECT count(*) FROM payments WHERE order_id = 'o1' AND amount = 10";
     assert_eq!(app.count(row), 1);
 
@@ -1871,19 +1958,20 @@ fn the_hunt_runs_a_hunt_after_the_queue_starts_then_every_hunt_on_the_stalled_ev
     app.signal.send(()).unwrap();
 
     // Then the wake does not hunt: the next hunt, a hunt after the first, resends it
-    thread::sleep(Duration::from_millis(500));
+    tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(app.sent(later, 0), []);
-    app.retry(later);
+    app.retry(later).await;
     assert!(started.elapsed() >= Duration::from_secs(4));
     assert_eq!(app.sent(later, 0), [(86, json!("hung"))]);
 
     // And neither hunt resent the payment whose 1 is younger than the window
     assert_eq!(app.sent(young, 0), []);
-    app.stop();
+    app.stop().await;
 }
 
-#[test]
-fn a_failed_run_is_retried_with_backoff_and_an_event_with_no_flow_gets_no_processor() {
+#[tokio::test(start_paused = true)]
+async fn a_failed_run_is_retried_with_backoff_and_an_event_with_no_flow_gets_no_processor() {
+    let _turn = TURN.lock().await;
     // Given the queue's default of 10 attempts
     assert_eq!(Settings::new(Duration::from_millis(100)).attempts, 10);
 
@@ -1893,7 +1981,9 @@ fn a_failed_run_is_retried_with_backoff_and_an_event_with_no_flow_gets_no_proces
         ..Settings::new(Duration::from_millis(200))
     };
     let (path, flows) = (database("retried").unwrap(), built_in().unwrap());
-    let app = App::over(path, &flows, |_, _| Vec::new(), settings).unwrap();
+    let app = App::over(path, &flows, |_, _| Vec::new(), settings)
+        .await
+        .unwrap();
 
     // When it sends an order lost to a table the store does not have, and an event of ty 99,
     // which no flow runs
@@ -1905,10 +1995,10 @@ fn a_failed_run_is_retried_with_backoff_and_an_event_with_no_flow_gets_no_proces
     // retry: a new event at 0 whose source is the failed run and whose data is the failure, due
     // 200 ms after the first failure and twice that after the second
     let failed = json!("store: no such table: nope");
-    let mut run = poll(WAIT, || app.root(&lost)).unwrap();
+    let mut run = poll(WAIT, || app.root(&lost)).await.unwrap();
     let mut written = Vec::new();
     for wait in [200, 400] {
-        let retry = app.retry(run);
+        let retry = app.retry(run).await;
         let rows = app.about(run);
         let one = |status| rows.iter().find(|r| r.2 == status).cloned().unwrap();
         let (binned, due) = (one(-1), one(0));
@@ -1923,8 +2013,8 @@ fn a_failed_run_is_retried_with_backoff_and_an_event_with_no_flow_gets_no_proces
     }
 
     // And the third failure sends its -1 and no retry: the chain has had its 3 attempts
-    assert!(until(WAIT, || app.statuses(run).contains(&-1)));
-    thread::sleep(Duration::from_secs(1));
+    assert!(until(WAIT, || app.statuses(run).contains(&-1)).await);
+    tokio::time::sleep(Duration::from_secs(1)).await;
     assert_eq!(app.statuses(run), [1, -1]);
     assert_ne!(written, Vec::<String>::new());
     assert!(app.rows().starts_with(&written), "rows are only added");
@@ -1933,14 +2023,34 @@ fn a_failed_run_is_retried_with_backoff_and_an_event_with_no_flow_gets_no_proces
     let other = app.root(&orphan).unwrap();
     let rows: Vec<(i64, Value)> = app.about(other).into_iter().map(|r| (r.2, r.3)).collect();
     assert_eq!(rows, [(1, json!("taken")), (-1, json!("no processor"))]);
-    app.stop();
+    app.stop().await;
 }
 
-#[test]
-fn after_shutdown_a_send_is_closed_and_join_waits_for_signal_senders_and_runs() {
+/// Advances the clock 20 ms at a time, up to `limit`, until `done`. A run held on a blocking
+/// thread stops tokio's auto-advance, so a scenario that holds one moves the clock itself.
+async fn advancing(limit: Duration, done: impl Fn() -> bool) -> bool {
+    let start = clock::elapsed();
+    while start.elapsed() < limit {
+        if done() {
+            return true;
+        }
+        tokio::time::advance(Duration::from_millis(20)).await;
+    }
+    done()
+}
+
+#[tokio::test(start_paused = true)]
+#[expect(
+    clippy::await_holding_lock,
+    reason = "the writes are held across the scenario's waits, so the runs cannot finish"
+)]
+async fn after_shutdown_a_send_is_closed_and_join_waits_for_signal_senders_and_runs() {
+    let _turn = TURN.lock().await;
     // Given an app whose payment flow's step stores each payment's row, and the processor's writes
     // held, so a payment's run cannot put its row there and finish until they are let go
-    let app = App::built_in("after_shutdown", &built_in().unwrap()).unwrap();
+    let app = App::built_in("after_shutdown", &built_in().unwrap())
+        .await
+        .unwrap();
     app.read.execute_batch(PAYMENTS).unwrap();
     let writes = app.processor.writes();
     let holding = writes.lock().unwrap();
@@ -1949,12 +2059,12 @@ fn after_shutdown_a_send_is_closed_and_join_waits_for_signal_senders_and_runs() 
     let data = |i: i64| json!({ "order": format!("o{i}"), "amount": i * 10 });
     let paid: Vec<Uuid> = (0..3).map(|i| app.hand(86, &data(i)).unwrap()).collect();
     for event in &paid {
-        assert!(until(WAIT, || app.statuses(*event) == [1]));
+        assert!(advancing(WAIT, || app.statuses(*event) == [1]).await);
     }
 
     // When the app shuts rannoch down while they run, and drops its signal sender
     let sender = app.rannoch.sender();
-    app.rannoch.shutdown();
+    shutdown(app.rannoch).await;
     drop(app.signal);
     let at_drop = holding.len();
 
@@ -1963,23 +2073,20 @@ fn after_shutdown_a_send_is_closed_and_join_waits_for_signal_senders_and_runs() 
     assert_eq!(late, Err(Error::Closed));
 
     // And join does not return while the runs the queue started are going
-    let (returned, done) = mpsc::channel();
-    let queue = app.queue;
-    let waiting = thread::spawn(move || {
-        queue.join().unwrap();
-        let _ = returned.send(());
-    });
-    let kept = done.recv_timeout(Duration::from_millis(300));
-    assert!(kept.is_err(), "a run still going keeps join waiting");
+    let joining = tokio::task::spawn_blocking(move || app.queue.join());
+    tokio::time::advance(Duration::from_millis(300)).await;
+    assert!(
+        !joining.is_finished(),
+        "a run still going keeps join waiting"
+    );
 
     // And returns once they have finished: each ran after the drop and none after join, each
     // keeping the row its 2 could not carry
     drop(holding);
-    assert!(done.recv_timeout(WAIT).is_ok());
-    waiting.join().unwrap();
+    assert_eq!(joining.await.unwrap(), Ok(()));
     let held = || writes.lock().map_or(0, |w| w.len());
     let at_join = held();
-    thread::sleep(Duration::from_millis(300));
+    tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(held(), at_join, "a run went on after join returned");
     assert_eq!(
         (at_drop, at_join),
@@ -1989,48 +2096,50 @@ fn after_shutdown_a_send_is_closed_and_join_waits_for_signal_senders_and_runs() 
 
     // Given another app, with nothing running, that shuts rannoch down and keeps its signal
     // sender
-    let app = App::built_in("kept_signal", &built_in().unwrap()).unwrap();
-    app.rannoch.shutdown();
+    let app = App::built_in("kept_signal", &built_in().unwrap())
+        .await
+        .unwrap();
+    shutdown(app.rannoch).await;
 
     // Then join does not return while the app keeps it, and returns once it is dropped
-    let (returned, done) = mpsc::channel();
-    let queue = app.queue;
-    let waiting = thread::spawn(move || {
-        queue.join().unwrap();
-        let _ = returned.send(());
-    });
-    let kept = done.recv_timeout(Duration::from_millis(300));
-    assert!(kept.is_err(), "a kept signal sender keeps join waiting");
+    let joining = tokio::task::spawn_blocking(move || app.queue.join());
+    tokio::time::advance(Duration::from_millis(300)).await;
+    assert!(
+        !joining.is_finished(),
+        "a kept signal sender keeps join waiting"
+    );
     drop(app.signal);
-    assert!(done.recv_timeout(WAIT).is_ok());
-    waiting.join().unwrap();
+    assert_eq!(joining.await.unwrap(), Ok(()));
 }
 
-#[test]
-fn a_second_app_on_the_same_store_is_not_stopped() {
+#[tokio::test(start_paused = true)]
+async fn a_second_app_on_the_same_store_is_not_stopped() {
+    let _turn = TURN.lock().await;
     // Given an app whose default inbox hands over every second
     let path = database("second_app").unwrap();
-    let open = || {
+    let open = async || {
         let flows = built_in().unwrap();
-        App::built_in_at(path.clone(), &flows, every(1000)).unwrap()
+        App::built_in_at(path.clone(), &flows, every(1000))
+            .await
+            .unwrap()
     };
-    let first = open();
+    let first = open().await;
 
     // When a second app opens rannoch and starts its queue over the same store
     // Then nothing stops it
-    let second = open();
+    let second = open().await;
 
     // When an event is written, and both queues are woken while the first's 1 is on its heap
     let ticket = first.hand(82, &json!({ "ticket": "t6" })).unwrap();
     second.signal.send(()).unwrap();
 
     // Then both take it, and both run its flow
-    assert!(until(WAIT, || first.sent(ticket, 2).len() == 2));
+    assert!(until(WAIT, || first.sent(ticket, 2).len() == 2).await);
     let mut statuses = first.statuses(ticket);
     statuses.sort_unstable();
     assert_eq!(statuses, [1, 1, 2, 2]);
-    second.stop();
-    first.stop();
+    second.stop().await;
+    first.stop().await;
 }
 
 /// #109's flows on the built-in steps: a list whose emit step sends one next per item of
@@ -2061,33 +2170,39 @@ fn failing() -> Result<String> {
 
 /// The data of each -1 about `event` once its flow has run, which must have sent no next and
 /// no 2.
-fn failed(app: &App, event: Uuid) -> Vec<Value> {
-    let ran = until(WAIT, || app.statuses(event).contains(&-1));
+async fn failed(app: &App, event: Uuid) -> Vec<Value> {
+    let ran = until(WAIT, || app.statuses(event).contains(&-1)).await;
     assert!(ran, "{:?}", app.about(event));
     assert_eq!(app.statuses(event), [1, -1]);
     app.sent(event, -1).into_iter().map(|r| r.1).collect()
 }
 
 /// Not a scenario: #109. A next due further on than a time can hold fails its step.
-#[test]
-fn a_next_delayed_past_the_last_time_fails_its_step() {
+#[tokio::test(start_paused = true)]
+async fn a_next_delayed_past_the_last_time_fails_its_step() {
+    let _turn = TURN.lock().await;
     // Given a flow whose emit step sends a next with a delay_ms of u64::MAX
-    let app = App::built_in("a_next_delayed_past", &failing().unwrap()).unwrap();
+    let app = App::built_in("a_next_delayed_past", &failing().unwrap())
+        .await
+        .unwrap();
 
     // When an event is handed to it
     let event = app.hand(92, &json!({})).unwrap();
 
     // Then its -1 names the delay, and no next is sent
     let delay = "a delay of 18446744073709551615 ms to ty 91 is out of range";
-    assert_eq!(failed(&app, event), [json!(delay)]);
-    app.stop();
+    assert_eq!(failed(&app, event).await, [json!(delay)]);
+    app.stop().await;
 }
 
 /// Not a scenario: #109. A due wait whose `$wait` names no ty fails its step.
-#[test]
-fn a_due_wait_whose_for_is_not_a_ty_fails_its_step() {
+#[tokio::test(start_paused = true)]
+async fn a_due_wait_whose_for_is_not_a_ty_fails_its_step() {
+    let _turn = TURN.lock().await;
     // Given the ticket flow, which waits for its answer
-    let app = App::built_in("a_due_wait_whose_for", &failing().unwrap()).unwrap();
+    let app = App::built_in("a_due_wait_whose_for", &failing().unwrap())
+        .await
+        .unwrap();
 
     // When a due wait of it is handed over whose $wait is for 70000, which is no u16
     let data = json!({ "$wait": { "step": 1, "for": 70000 }, "key": "t1",
@@ -2095,15 +2210,21 @@ fn a_due_wait_whose_for_is_not_a_ty_fails_its_step() {
     let wait = app.hand(80, &data).unwrap();
 
     // Then its -1 names the for, and it sends no timeout
-    assert_eq!(failed(&app, wait), [json!("$wait for 70000 is not a ty")]);
-    app.stop();
+    assert_eq!(
+        failed(&app, wait).await,
+        [json!("$wait for 70000 is not a ty")]
+    );
+    app.stop().await;
 }
 
 /// Not a scenario: #109. An each over a field that is absent or not a list fails its step.
-#[test]
-fn each_over_a_field_that_is_not_a_list_fails_its_step() {
+#[tokio::test(start_paused = true)]
+async fn each_over_a_field_that_is_not_a_list_fails_its_step() {
+    let _turn = TURN.lock().await;
     // Given a flow whose emit step sends one next per item of items
-    let app = App::built_in("each_over_a_field", &failing().unwrap()).unwrap();
+    let app = App::built_in("each_over_a_field", &failing().unwrap())
+        .await
+        .unwrap();
 
     // When events are handed to it whose items is absent, and a string
     for data in [json!({}), json!({ "items": "a" })] {
@@ -2111,19 +2232,22 @@ fn each_over_a_field_that_is_not_a_list_fails_its_step() {
 
         // Then each one's -1 names the field, and no next is sent
         let reason = json!("each over items, which is not a list");
-        assert_eq!(failed(&app, event), [reason]);
+        assert_eq!(failed(&app, event).await, [reason]);
     }
-    app.stop();
+    app.stop().await;
 }
 
 /// Not a scenario: #109. A reply whose wait's next cannot be shaped from it fails, and answers
 /// the wait all the same, so a later reply with the same key runs.
-#[test]
-fn a_reply_a_waits_next_cannot_be_shaped_from_fails_once_and_a_later_reply_runs() {
+#[tokio::test(start_paused = true)]
+async fn a_reply_a_waits_next_cannot_be_shaped_from_fails_once_and_a_later_reply_runs() {
+    let _turn = TURN.lock().await;
     // Given t1's asked event, whose wait for its reply sends one next per item of its items
-    let app = App::built_in("a_reply_a_waits_next", &failing().unwrap()).unwrap();
+    let app = App::built_in("a_reply_a_waits_next", &failing().unwrap())
+        .await
+        .unwrap();
     let asked = app.hand(93, &json!({ "ticket": "t1" })).unwrap();
-    assert!(until(WAIT, || app.statuses(asked).contains(&2)));
+    assert!(until(WAIT, || app.statuses(asked).contains(&2)).await);
     let wait = app.about(asked).into_iter().find(|r| r.1 == 93 && r.2 == 0);
     let wait = wait.unwrap().0;
 
@@ -2133,14 +2257,93 @@ fn a_reply_a_waits_next_cannot_be_shaped_from_fails_once_and_a_later_reply_runs(
 
     // Then its -1 names the wait and the field its next cannot be shaped from
     let reason = format!("wait {wait}: each over got.items, which is not a list");
-    assert_eq!(failed(&app, first), [json!(reason)]);
+    assert_eq!(failed(&app, first).await, [json!(reason)]);
 
     // When a later reply for t1 is handed over, also with no items
     let later = app.hand(94, &reply).unwrap();
 
     // Then it runs as if the wait were not there, and the wait sends nothing
-    assert!(until(WAIT, || app.statuses(later).contains(&2)));
+    assert!(until(WAIT, || app.statuses(later).contains(&2)).await);
     assert_eq!(app.statuses(later), [1, 2]);
     assert_eq!(app.sent(wait, 0), Vec::<(i64, Value)>::new());
-    app.stop();
+    app.stop().await;
+}
+
+/// Every `.rs` file of rannoch-processor's code and tests, the test apps' among them, with its
+/// path.
+fn sources() -> std::io::Result<Vec<(PathBuf, String)>> {
+    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let (mut files, mut dirs) = (
+        Vec::new(),
+        vec![crate_dir.join("src"), crate_dir.join("tests")],
+    );
+    while let Some(dir) = dirs.pop() {
+        for entry in fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let text = fs::read_to_string(&path)?;
+                files.push((path, text));
+            }
+        }
+    }
+    Ok(files)
+}
+
+#[tokio::test(start_paused = true)]
+async fn rannoch_processor_calls_no_real_time_function() {
+    // Given rannoch-processor's code and tests
+    let files = sources().unwrap();
+    assert!(files.len() >= 9, "{files:?}");
+
+    // When they are read for a call to any real-time function; the opening paren is added here,
+    // so this list is not itself a call
+    let names = [
+        "thread::sleep",
+        "thread::spawn",
+        "recv_timeout",
+        "Instant::now",
+        "SystemTime::now",
+        "Utc::now",
+        "now_v7",
+    ];
+    let calls: Vec<String> = names.iter().map(|name| format!("{name}(")).collect();
+
+    // Then none is found
+    for (path, text) in &files {
+        for call in &calls {
+            assert!(
+                !text.contains(call.as_str()),
+                "{} calls {call}",
+                path.display()
+            );
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn every_rannoch_processor_test_runs_with_the_clock_frozen() {
+    // Given rannoch-processor's tests
+    let files = sources().unwrap();
+
+    // When they are read for how each one runs
+    let mut runs = 0;
+    for (path, text) in &files {
+        for line in text.lines().map(str::trim) {
+            // Then none runs as a plain test, and each tokio test or main freezes the clock
+            assert_ne!(line, "#[test]", "{} has a plain test", path.display());
+            let tokio_run = line.starts_with("#[tokio::test") || line.starts_with("#[tokio::main");
+            if tokio_run {
+                assert!(
+                    line.ends_with("start_paused = true)]"),
+                    "{}: {line}",
+                    path.display()
+                );
+                runs += 1;
+            }
+        }
+    }
+    // 17 in lib.rs, 15 in check.rs, 3 in doc.rs, 37 here and pay-app's main
+    assert_eq!(runs, 73);
 }
