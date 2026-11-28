@@ -2,8 +2,10 @@
 //! names the reason. Each test runs the real store, rannoch, `Events`, the queue and
 //! rannoch-processor on the built-in steps of rannoch-processor's fixture `tests/built_in.json`,
 //! over `_events` seeded from the app's forgr factory as a crash or a change to the app's `ty`
-//! leaves it. A run that panics, the runs channel closing and a panic on the queue's thread have
-//! no test here: no built-in step panics. Every test runs with the clock frozen.
+//! leaves it. A run that panics, the runs channel closing and a panic on the queue's task have
+//! no test here: no built-in step panics. Every test runs with the clock frozen, and the tests
+//! take turns: ids made in the same frozen millisecond keep their order only while no other
+//! test's frozen clock mints ids beside them.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -49,6 +51,9 @@ const HOUR: TimeDelta = TimeDelta::hours(1);
 /// The default inbox's interval.
 const FAST: TimeDelta = TimeDelta::milliseconds(20);
 const WAIT: Duration = Duration::from_secs(5);
+
+/// Held for each test's whole run, so the tests take turns.
+static ONE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// A migrated store in a fresh directory `name`, applied by opening rannoch once.
 async fn store(name: &str) -> Result<PathBuf> {
@@ -207,6 +212,7 @@ fn id() -> String {
 /// 357-364: the queue cannot send a status of the app's `T` for this event, so it writes the -1.
 #[tokio::test(start_paused = true)]
 async fn a_due_event_whose_ty_is_not_the_apps_gets_a_minus_1() -> Result<()> {
+    let _one = ONE.lock().await;
     let path = store("ty_not_the_apps").await?;
     let event = id();
     seed(&path, &[(&event, None, 9, r#"{"ticket":"t1"}"#, None, 0)])?;
@@ -234,6 +240,7 @@ async fn hunt(path: &Path, event: &str) -> Result<()> {
 /// 487-489: a stalled event the hunt would resend, but whose ty is not the app's.
 #[tokio::test(start_paused = true)]
 async fn the_hunt_bins_a_stalled_event_whose_ty_is_not_the_apps() -> Result<()> {
+    let _one = ONE.lock().await;
     let path = store("hunt_ty_not_the_apps").await?;
     let event = ago(7200);
     seed(
@@ -254,6 +261,7 @@ async fn the_hunt_bins_a_stalled_event_whose_ty_is_not_the_apps() -> Result<()> 
 /// 426-428 and 447-457: a failed run whose retry's wait overflows.
 #[tokio::test(start_paused = true)]
 async fn a_failed_run_whose_retry_wait_overflows_gets_a_minus_1_and_no_retry() -> Result<()> {
+    let _one = ONE.lock().await;
     let path = store("retry_wait_overflows").await?;
     let event = id();
     seed(&path, &[(&event, None, 87, r#"{"order":"o1"}"#, None, 0)])?;
