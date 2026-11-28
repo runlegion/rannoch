@@ -1,13 +1,18 @@
 //! FR-RANNOCH-120's scenario from `tests/features/lib.feature` (`@criterion-FR-RANNOCH-120-c1`),
 //! on rannoch-processor's scenario fixture: its store and queue setup, copied. The test app's
 //! agent is a stub; its Sig is `tests/signatures.json`, its flows `tests/flows.json`.
+//!
+//! And `tests/features/clock.feature`, one scenario for each of #169's criteria:
+//! rannoch-processor-agent reads and waits on time only through rannoch-core's clock and tokio,
+//! and every test runs with the clock frozen.
 
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
-use std::{fs, thread};
+use std::time::Duration;
 
+use rannoch_core::clock;
 use rannoch_core::forgr::_events;
 use rannoch_core::{Append, Config, Rannoch};
 use rannoch_events::Events;
@@ -71,19 +76,20 @@ fn about(read: &Connection, id: Uuid) -> Vec<(i64, i64, Value)> {
     rows.unwrap_or_default()
 }
 
-/// Waits up to five seconds for a row at `status` about `id`, then gives the rows about it.
-fn ended(read: &Connection, id: Uuid, status: i64) -> Vec<(i64, i64, Value)> {
-    let start = Instant::now();
+/// Waits up to five seconds on the clock for a row at `status` about `id`, then gives the rows
+/// about it.
+async fn ended(read: &Connection, id: Uuid, status: i64) -> Vec<(i64, i64, Value)> {
+    let start = clock::elapsed();
     while start.elapsed() < Duration::from_secs(5) && about(read, id).iter().all(|r| r.1 != status)
     {
-        thread::sleep(Duration::from_millis(20));
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    thread::sleep(Duration::from_millis(200));
+    tokio::time::sleep(Duration::from_millis(200)).await;
     about(read, id)
 }
 
-#[test]
-fn a_flow_step_calls_an_agent_the_app_reaches_through_the_agent_trait() -> Result<()> {
+#[tokio::test(start_paused = true)]
+async fn a_flow_step_calls_an_agent_the_app_reaches_through_the_agent_trait() -> Result<()> {
     // Given a test app that implements the agent trait with a stub agent classify, declaring
     // that it takes text as a string and gives severity
     let sigs: Vec<Sig> = serde_json::from_str(include_str!("signatures.json"))?;
@@ -105,7 +111,9 @@ fn a_flow_step_calls_an_agent_the_app_reaches_through_the_agent_trait() -> Resul
         store: Some(store.clone()),
         ..Config::default()
     };
-    Rannoch::open(config())?.shutdown();
+    // Shutdown blocks, so it runs through `spawn_blocking`.
+    let migrated = Rannoch::open(config())?;
+    tokio::task::spawn_blocking(move || migrated.shutdown()).await?;
     let processor = Arc::new(Processor::<Ty, Value>::new(
         &flows,
         vec![agent],
@@ -122,7 +130,7 @@ fn a_flow_step_calls_an_agent_the_app_reaches_through_the_agent_trait() -> Resul
     let (sender, read) = (rannoch.sender(), ready(&path)?);
     let queue = Queue::start(ready(&path)?, wake, sender, processor.clone(), settings);
     let hand = |data: Value| -> Result<Uuid> {
-        let id = Uuid::now_v7();
+        let id = clock::new_id();
         let row = _events::factory().id(id.to_string()).ty(60);
         row.data(data.to_string()).status(0).insert(&read)?;
         signal.send(())?;
@@ -140,7 +148,7 @@ fn a_flow_step_calls_an_agent_the_app_reaches_through_the_agent_trait() -> Resul
     let next = (61, 0, json!({ "severity": 2 }));
     let done = (60, 2, json!("done"));
     assert_eq!(
-        ended(&read, rated, 2),
+        ended(&read, rated, 2).await,
         [(60, 1, json!("taken")), next, done]
     );
 
@@ -152,7 +160,7 @@ fn a_flow_step_calls_an_agent_the_app_reaches_through_the_agent_trait() -> Resul
     // declares string', and the stub is not called
     let failed = json!("agent classify input gave text as number, it declares string");
     let rows = [(60, 1, json!("taken")), (60, -1, failed)];
-    assert_eq!(ended(&read, five, -1), rows);
+    assert_eq!(ended(&read, five, -1).await, rows);
     assert_eq!(
         stub.0.load(Ordering::SeqCst),
         calls,
@@ -165,10 +173,94 @@ fn a_flow_step_calls_an_agent_the_app_reaches_through_the_agent_trait() -> Resul
     // Then the step sends a -1 whose data is 'agent classify gave no severity', and no next
     let failed = json!("agent classify gave no severity");
     let rows = [(60, 1, json!("taken")), (60, -1, failed)];
-    assert_eq!(ended(&read, unsure, -1), rows);
+    assert_eq!(ended(&read, unsure, -1).await, rows);
 
+    // Shutdown and join block, so they run through `spawn_blocking`.
     drop(signal);
-    rannoch.shutdown();
-    queue.join().unwrap();
+    tokio::task::spawn_blocking(move || {
+        rannoch.shutdown();
+        queue.join()
+    })
+    .await??;
+    Ok(())
+}
+
+/// Every `.rs` file of rannoch-processor-agent's code and tests, with its path.
+fn sources() -> std::io::Result<Vec<(PathBuf, String)>> {
+    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    for dir in ["src", "tests"] {
+        for entry in fs::read_dir(crate_dir.join(dir))? {
+            let path = entry?.path();
+            if path.extension().is_some_and(|e| e == "rs") {
+                let text = fs::read_to_string(&path)?;
+                files.push((path, text));
+            }
+        }
+    }
+    Ok(files)
+}
+
+#[tokio::test(start_paused = true)]
+async fn rannoch_processor_agent_calls_no_real_time_function() -> Result<()> {
+    // Given rannoch-processor-agent's code and tests
+    let files = sources()?;
+    assert_eq!(files.len(), 2, "{files:?}");
+
+    // When they are read for a call to any real-time function; the opening paren is added here,
+    // so this list is not itself a call
+    let names = [
+        "thread::sleep",
+        "thread::spawn",
+        "recv_timeout",
+        "Instant::now",
+        "SystemTime::now",
+        "Utc::now",
+        "now_v7",
+    ];
+    let calls: Vec<String> = names.iter().map(|name| format!("{name}(")).collect();
+
+    // Then none is found, and their time and waiting go through rannoch-core's clock and tokio
+    for (path, text) in &files {
+        for call in &calls {
+            assert!(
+                !text.contains(call.as_str()),
+                "{} calls {call}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn every_rannoch_processor_agent_test_runs_with_the_clock_frozen() -> Result<()> {
+    // Given rannoch-processor-agent's tests
+    let files = sources()?;
+
+    // When they are read for how each one runs
+    let mut runs = 0;
+    for (path, text) in &files {
+        for line in text.lines().map(str::trim) {
+            // Then none runs as a plain test, each freezes the clock, and none resumes it
+            assert_ne!(line, "#[test]", "{} has a plain test", path.display());
+            assert!(
+                !line.contains(&format!("{}(", "resume")),
+                "{}: {line}",
+                path.display()
+            );
+            if line.starts_with("#[tokio::test") {
+                assert_eq!(
+                    line,
+                    "#[tokio::test(start_paused = true)]",
+                    "{}",
+                    path.display()
+                );
+                runs += 1;
+            }
+        }
+    }
+    // 3 in the library and 3 here
+    assert_eq!(runs, 6);
     Ok(())
 }

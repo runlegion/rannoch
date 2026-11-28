@@ -144,23 +144,23 @@ mod tests {
         )
     }
 
-    #[test]
-    fn input_of_the_wrong_type_returns_the_input_error_and_does_not_call_the_agent() {
+    #[tokio::test(start_paused = true)]
+    async fn input_of_the_wrong_type_returns_the_input_error_and_does_not_call_the_agent() {
         let (ran, calls) = classify(&json!({ "severity": 2 }), &json!({ "text": 5 }));
         let error = "agent classify input gave text as number, it declares string";
         assert_eq!(ran.unwrap_err(), error);
         assert_eq!(calls, 0);
     }
 
-    #[test]
-    fn a_missing_given_field_returns_gave_no_field() {
+    #[tokio::test(start_paused = true)]
+    async fn a_missing_given_field_returns_gave_no_field() {
         let (ran, calls) = classify(&json!({}), &json!({ "text": "it crashed" }));
         assert_eq!(ran.unwrap_err(), "agent classify gave no severity");
         assert_eq!(calls, 1);
     }
 
-    #[test]
-    fn a_fitting_answer_passes_through() {
+    #[tokio::test(start_paused = true)]
+    async fn a_fitting_answer_passes_through() {
         let (ran, _) = classify(&json!({ "severity": 2 }), &json!({ "text": "it crashed" }));
         assert_eq!(
             ran.unwrap(),
