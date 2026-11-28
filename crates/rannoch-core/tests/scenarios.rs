@@ -6,17 +6,15 @@
 //! `@criterion-FR-RANNOCH-011-c2` runs cargo on a copy of this workspace, so
 //! a developer's edit never touches the real checkout.
 //!
-//! Every test but `an_app_opens_rannoch_over_its_database` runs with the clock frozen and
-//! calls [`Rannoch::shutdown`] through `spawn_blocking`; that one waits on rannoch-store's
-//! checkpointer, which still runs on real time. The two scenarios of `fr_rannoch_131.feature`
-//! check the clock itself.
+//! Every test runs with the clock frozen and calls [`Rannoch::shutdown`] through
+//! `spawn_blocking`. The two scenarios of `fr_rannoch_131.feature` check the clock itself.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Once, mpsc};
 use std::time::Duration;
-use std::{env, fs, process, thread};
+use std::{env, fs, process};
 
 use chrono::TimeDelta;
 use log::{Level, Log, Metadata, Record};
@@ -453,8 +451,8 @@ fn pragma(conn: &rusqlite::Connection, pragma: &str) -> rusqlite::Result<String>
     })
 }
 
-#[test]
-fn an_app_opens_rannoch_over_its_database() {
+#[tokio::test(start_paused = true)]
+async fn an_app_opens_rannoch_over_its_database() {
     // Given an app's database without its newest migration
     let path = database("an_app_opens_rannoch_over_its_database").unwrap();
     let newest = missing_newest(&path).unwrap();
@@ -469,7 +467,7 @@ fn an_app_opens_rannoch_over_its_database() {
     // Then the newest migration is applied before rannoch accepts an event
     assert!(applied(&path).unwrap().contains(&newest));
     assert_eq!(opened.sender().send(event()), Ok(Status::Added));
-    opened.shutdown();
+    shutdown(opened).await;
 
     // And every connection the store opens has foreign keys on, journal mode
     // WAL, a 64 MiB cache, automatic checkpoints off and fullfsync on
@@ -499,7 +497,7 @@ fn an_app_opens_rannoch_over_its_database() {
     for _ in 0..3 {
         sender.send(event()).unwrap();
     }
-    thread::sleep(Duration::from_secs(2));
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     // Then the WAL's frames are in the database file while rannoch runs: a
     // copy of the file alone, without its WAL, holds the events
@@ -510,7 +508,7 @@ fn an_app_opens_rannoch_over_its_database() {
         .query_row("SELECT count(*) FROM _events", [], |r| r.get(0))
         .unwrap();
     assert_eq!(kept, 3);
-    rannoch.shutdown();
+    shutdown(rannoch).await;
     drop(held);
 
     // When the app opens rannoch over a path the store cannot open

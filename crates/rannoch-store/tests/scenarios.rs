@@ -35,8 +35,8 @@ fn ready(opened: Opened) -> rusqlite::Connection {
     }
 }
 
-#[test]
-fn fr_rannoch_011_c1() {
+#[tokio::test(start_paused = true)]
+async fn fr_rannoch_011_c1() {
     // Given an open store
     let path = database("fr_rannoch_011_c1").unwrap();
     current(&path).unwrap();
