@@ -1,15 +1,15 @@
 //! #155's scenarios, from `tests/features/events_log_settings.feature`, one test each, named for
 //! its criterion. The settings are held for the life of the process, so each test re-runs this
 //! test binary as a child process that loads its settings and runs the scenario alone; the
-//! parent checks that the child ran it and passed.
+//! parent checks that the child ran it and passed. Each runs with the clock frozen, and calls the
+//! sync, blocking append through `tokio::task::spawn_blocking`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::{env, fs};
 
-use rannoch_core::{Append, Error, Event, Status};
+use rannoch_core::{Append, Error, Event, Status, clock};
 use rannoch_events_log::Log;
-use uuid::Uuid;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -53,9 +53,9 @@ fn child(test: &str, dir: &Path) -> Result<()> {
 }
 
 /// Builds the log over `passed` and commits a batch of two events; returns their ids.
-fn commit(passed: PathBuf) -> Result<Vec<String>> {
+async fn commit(passed: PathBuf) -> Result<Vec<String>> {
     let event = |data| Event {
-        id: Uuid::now_v7(),
+        id: clock::new_id(),
         source: None,
         ty: 10_u16,
         data,
@@ -63,7 +63,8 @@ fn commit(passed: PathBuf) -> Result<Vec<String>> {
         status: Status::Added,
     };
     let batch = [event(1_u8), event(2)];
-    Log::new(Committed, passed).append(&batch)?;
+    let log = Log::new(Committed, passed);
+    let batch = tokio::task::spawn_blocking(move || log.append(&batch).map(|_| batch)).await??;
     Ok(batch.iter().map(|e| e.id.to_string()).collect())
 }
 
@@ -78,15 +79,15 @@ fn written(path: &Path) -> Result<Vec<String>> {
     Ok(ids)
 }
 
-#[test]
-fn criterion_1_the_section_path_replaces_the_path_passed_in() -> Result<()> {
+#[tokio::test(start_paused = true)]
+async fn criterion_1_the_section_path_replaces_the_path_passed_in() -> Result<()> {
     if env::var(CHILD).is_ok() {
         let dir = PathBuf::from(env::var("DIR")?);
         // Given settings loaded before Log::new whose [events-log] section sets path
         rannoch_settings::load(&dir.join("app.toml"))?;
 
         // When the log's append commits a batch
-        let ids = commit(dir.join("passed.log"))?;
+        let ids = commit(dir.join("passed.log")).await?;
 
         // Then each event of the batch is written to that file, and none to the passed path
         assert_eq!(written(&dir.join("set.log"))?, ids);
@@ -103,17 +104,17 @@ fn criterion_1_the_section_path_replaces_the_path_passed_in() -> Result<()> {
     )
 }
 
-#[test]
-fn criterion_2_no_section_the_passed_path_stands() -> Result<()> {
+#[tokio::test(start_paused = true)]
+async fn criterion_2_no_section_the_passed_path_stands() -> Result<()> {
     if env::var(CHILD).is_ok() {
         let dir = PathBuf::from(env::var("DIR")?);
         // Given no settings loaded: the passed path stands
-        let ids = commit(dir.join("unloaded.log"))?;
+        let ids = commit(dir.join("unloaded.log")).await?;
         assert_eq!(written(&dir.join("unloaded.log"))?, ids);
 
         // Given settings loaded with no [events-log] section: the passed path stands
         rannoch_settings::load(&dir.join("app.toml"))?;
-        let ids = commit(dir.join("passed.log"))?;
+        let ids = commit(dir.join("passed.log")).await?;
         assert_eq!(written(&dir.join("passed.log"))?, ids);
         return Ok(());
     }

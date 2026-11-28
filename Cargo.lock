@@ -1287,6 +1287,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "tokio",
  "uuid",
 ]
 
@@ -1302,7 +1303,7 @@ dependencies = [
  "rannoch-store",
  "serde",
  "serde_json",
- "uuid",
+ "tokio",
 ]
 
 [[package]]
@@ -1316,6 +1317,7 @@ dependencies = [
  "rannoch-store",
  "rusqlite",
  "serde_json",
+ "tokio",
  "uuid",
 ]
 
@@ -1347,6 +1349,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "tokio",
  "uuid",
 ]
 
@@ -1361,6 +1364,7 @@ dependencies = [
  "rannoch-store",
  "rusqlite",
  "serde_json",
+ "tokio",
  "uuid",
 ]
 
@@ -1377,6 +1381,7 @@ dependencies = [
  "rannoch-store",
  "rusqlite",
  "serde_json",
+ "tokio",
  "tract-onnx",
  "uuid",
 ]
@@ -1392,6 +1397,7 @@ dependencies = [
  "rannoch-store",
  "rusqlite",
  "serde_json",
+ "tokio",
  "uuid",
 ]
 
@@ -1409,6 +1415,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "tokio",
  "uuid",
 ]
 
@@ -1432,7 +1439,7 @@ dependencies = [
  "rannoch-settings",
  "rusqlite",
  "serde",
- "uuid",
+ "tokio",
 ]
 
 [[package]]

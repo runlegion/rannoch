@@ -5,7 +5,7 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, mpsc};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{fs, thread};
 
@@ -149,7 +149,7 @@ fn a_flow_whose_step_is_trim_deletes_the_processed_events_older_than_its_options
 
     // And rannoch running over the store
     let store = Arc::new(Store::new(path.clone(), rannoch_core::migrator()));
-    let (signal, wake) = mpsc::channel();
+    let (signal, wake) = tokio::sync::mpsc::unbounded_channel();
     let append = Arc::new(Events::new(ready(&path).unwrap(), signal.clone()));
     let rannoch = Rannoch::open(Config {
         store: Some(store),

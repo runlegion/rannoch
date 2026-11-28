@@ -38,10 +38,11 @@
 //!
 //! use rannoch_core::Storage;
 //! use rannoch_store::{Opened, Store};
-//! use uuid::Uuid;
 //!
-//! fn main() -> Result<(), Box<dyn Error>> {
-//!     let dir = std::env::temp_dir().join(Uuid::now_v7().to_string());
+//! // The clock frozen, as in every rannoch-store test.
+//! #[tokio::main(flavor = "current_thread", start_paused = true)]
+//! async fn main() -> Result<(), Box<dyn Error>> {
+//!     let dir = std::env::temp_dir().join(rannoch_core::clock::new_id().to_string());
 //!     fs::create_dir_all(&dir)?;
 //!     let path = dir.join("app.db");
 //!     let migrator = rannoch_core::migrator();
@@ -66,14 +67,14 @@
 //! ```
 
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Mutex, PoisonError};
-use std::thread::{self, JoinHandle};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use rannoch_core::{Error, Storage};
 use rusqlite::Connection;
 use serde::Deserialize;
+use tokio::runtime::{Handle, Runtime};
+use tokio::sync::oneshot;
 
 /// The pragmas every connection the store opens has, beside its page cache.
 const PRAGMAS: &str = "PRAGMA foreign_keys = ON;
@@ -122,26 +123,49 @@ fn connection(path: &Path) -> Result<Connection, Error> {
     Ok(conn)
 }
 
-/// The thread that checkpoints the WAL every `every`; dropping it stops it.
+/// The checkpointer's connection, and whether it was stopped. The task checkpoints only while
+/// holding it, so a drop that takes it waits out a checkpoint underway, as joining the thread
+/// did, without waiting on the task.
+type Checkpoints = Arc<Mutex<(bool, Option<Connection>)>>;
+
+/// The task that checkpoints the WAL every `every`; dropping it stops it.
 #[derive(Debug)]
 struct Checkpointer {
-    stop: Option<mpsc::Sender<()>>,
-    thread: Option<JoinHandle<()>>,
+    stop: Option<oneshot::Sender<()>>,
+    checkpoints: Checkpoints,
+    /// The runtime `start` started when it was called outside one.
+    runtime: Option<Runtime>,
 }
 
 impl Checkpointer {
+    /// Spawns the task on the tokio runtime this is called in, or on one it starts when called
+    /// outside a runtime.
     fn start(path: PathBuf, every: Duration) -> Self {
-        let (stop, wait) = mpsc::channel::<()>();
-        let thread = thread::spawn(move || {
-            let mut conn = None;
-            while wait.recv_timeout(every) == Err(RecvTimeoutError::Timeout) {
+        let (stop, mut wait) = oneshot::channel::<()>();
+        let checkpoints: Checkpoints = Arc::new(Mutex::new((false, None)));
+        let shared = Arc::clone(&checkpoints);
+        let mut runtime = None;
+        let handle = Handle::try_current().unwrap_or_else(|_| {
+            // Building a runtime fails only when the system refuses its threads or its driver,
+            // as starting a thread did before.
+            #[allow(clippy::expect_used)]
+            let started = Runtime::new().expect("the store could not start a tokio runtime");
+            runtime.insert(started).handle().clone()
+        });
+        handle.spawn(async move {
+            while tokio::time::timeout(every, &mut wait).await.is_err() {
+                let mut held = shared.lock().unwrap_or_else(PoisonError::into_inner);
+                let (stopped, conn) = &mut *held;
+                if *stopped {
+                    return;
+                }
                 if conn.is_none() {
                     match connection(&path) {
-                        Ok(opened) => conn = Some(opened),
+                        Ok(opened) => *conn = Some(opened),
                         Err(e) => log::error!("checkpointer cannot open its connection: {e}"),
                     }
                 }
-                if let Some(conn) = &conn
+                if let Some(conn) = conn
                     && conn
                         .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()))
                         .is_err()
@@ -152,16 +176,24 @@ impl Checkpointer {
         });
         Self {
             stop: Some(stop),
-            thread: Some(thread),
+            checkpoints,
+            runtime,
         }
     }
 }
 
 impl Drop for Checkpointer {
     fn drop(&mut self) {
+        // Taking the lock waits out a checkpoint underway; the connection closes here, and the
+        // task returns without another.
+        *self
+            .checkpoints
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = (true, None);
         drop(self.stop.take());
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        // Dropping a runtime blocks, which panics in async code; this does not.
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
         }
     }
 }
@@ -268,15 +300,14 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use std::sync::{Mutex, PoisonError};
-    use std::thread;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use rannoch_core::Storage;
 
     use super::{Error, Settings, Store, connection, open};
 
-    #[test]
-    fn with_no_settings_loaded_the_store_keeps_todays_values() {
+    #[tokio::test(start_paused = true)]
+    async fn with_no_settings_loaded_the_store_keeps_todays_values() {
         let settings: Settings = rannoch_settings::section("store");
         assert_eq!(
             settings,
@@ -299,8 +330,8 @@ mod tests {
         assert_eq!(cache, -65536);
     }
 
-    #[test]
-    fn store_reports_pending_then_applies_through_its_migrator() {
+    #[tokio::test(start_paused = true)]
+    async fn store_reports_pending_then_applies_through_its_migrator() {
         let dir =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp/rannoch-store-apply");
         if dir.exists() {
@@ -332,8 +363,8 @@ mod tests {
 
     static ERRORS: Errors = Errors(Mutex::new(Vec::new()));
 
-    #[test]
-    fn a_checkpointer_that_cannot_open_its_connection_logs_at_error_each_time() {
+    #[tokio::test(start_paused = true)]
+    async fn a_checkpointer_that_cannot_open_its_connection_logs_at_error_each_time() {
         let _ = log::set_logger(&ERRORS);
         log::set_max_level(log::LevelFilter::Error);
         // A database in a directory that does not exist: no connection opens.
@@ -348,18 +379,16 @@ mod tests {
         };
 
         let store = Store::new(dir.join("store.db"), rannoch_core::migrator());
-        // It tries once a second: the first two tries, each logged.
-        let start = Instant::now();
-        while unopened() < 2 && start.elapsed() < Duration::from_secs(5) {
-            thread::sleep(Duration::from_millis(50));
-        }
+        // It tries once a second: the first two tries, each logged, by the time the frozen clock
+        // has moved two and a half seconds.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
         drop(store);
 
         assert!(unopened() >= 2, "{} lines", unopened());
     }
 
-    #[test]
-    fn a_plan_that_fails_fails_with_store() {
+    #[tokio::test(start_paused = true)]
+    async fn a_plan_that_fails_fails_with_store() {
         // A file that is not a database: it opens, and the plan cannot read it.
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp/rannoch-store-plan");
         fs::create_dir_all(&dir).unwrap();
