@@ -1303,7 +1303,7 @@ dependencies = [
  "rannoch-store",
  "serde",
  "serde_json",
- "uuid",
+ "tokio",
 ]
 
 [[package]]
