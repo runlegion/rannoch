@@ -327,6 +327,7 @@ pub(crate) fn walk(
 #[cfg(test)]
 pub(crate) mod tests {
     use std::collections::{HashMap, VecDeque};
+    use std::time::Duration;
 
     use rusqlite::{Connection, params};
     use serde_json::json;
@@ -368,8 +369,10 @@ pub(crate) mod tests {
     /// d1 cites d2 and d3, d2 cites d4, d4 cites d1, each at 1,000 but d1's cite of d3 at 2,000;
     /// ada wrote d1 and d4. d1 is titled at 1,000 by its first event, and retitled at 2,000 by
     /// an event whose source is the first.
-    fn small(conn: &Connection, [titles, cites, wrote]: [&str; 3]) -> [String; 2] {
+    /// The two events' ids carry times a millisecond apart, so the fix's id is the greater.
+    async fn small(conn: &Connection, [titles, cites, wrote]: [&str; 3]) -> [String; 2] {
         let first = event(conn, None);
+        tokio::time::advance(Duration::from_millis(1)).await;
         let fix = event(conn, Some(&first));
         let title = format!("INSERT INTO {titles} VALUES (?1, ?2, ?3, ?4)");
         conn.execute(&title, params!["d1", "graph notes", first, 1_000])
@@ -398,7 +401,7 @@ pub(crate) mod tests {
     #[tokio::test(start_paused = true)]
     async fn fr_rannoch_125_c3() {
         let conn = store(DOCS);
-        let [first, fix] = small(&conn, ["doc_titles", "cites", "wrote"]);
+        let [first, fix] = small(&conn, ["doc_titles", "cites", "wrote"]).await;
 
         // As of: the row at or before the time, or none before the first.
         let title = |at| as_of(&conn, "doc_titles", "doc", "written", "d1", at).unwrap();
@@ -497,8 +500,8 @@ pub(crate) mod tests {
     #[tokio::test(start_paused = true)]
     async fn criterion_01a216c8_utils_work_on_variable_tables_and_columns() {
         let (docs, papers) = (store(DOCS), store(PAPERS));
-        let [_, fix] = small(&docs, ["doc_titles", "cites", "wrote"]);
-        let [_, fixed] = small(&papers, ["paper", "refs", ""]);
+        let [_, fix] = small(&docs, ["doc_titles", "cites", "wrote"]).await;
+        let [_, fixed] = small(&papers, ["paper", "refs", ""]).await;
 
         let title = as_of(&docs, "doc_titles", "doc", "written", "d1", 1_500).unwrap();
         let name = as_of(&papers, "paper", "pid", "at_ms", "d1", 1_500).unwrap();
@@ -526,8 +529,8 @@ pub(crate) mod tests {
     #[tokio::test(start_paused = true)]
     async fn criterion_01a216c8_scoring_tools_work_on_variable_tables_and_columns() {
         let (docs, papers) = (store(DOCS), store(PAPERS));
-        small(&docs, ["doc_titles", "cites", "wrote"]);
-        small(&papers, ["paper", "refs", ""]);
+        small(&docs, ["doc_titles", "cites", "wrote"]).await;
+        small(&papers, ["paper", "refs", ""]).await;
         let scored = |conn, scorer, options: serde_json::Value| {
             let scores = score(conn, scorer, &options, "d1").unwrap();
             let nodes = scores["nodes"].as_array().unwrap().iter();
